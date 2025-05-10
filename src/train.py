@@ -101,7 +101,7 @@ def train_model(model, train_data, test_data, epochs, learning_rate, device, num
         model.eval()
         correct = 0
         total = 0
-        for _ in range(100):
+        for _ in range(1000):
             input_seq, target = generate_single_sample(test_data)
             input_seq = torch.tensor(input_seq, dtype=torch.float32).unsqueeze(0).to(device)
             target = np.argmax(target)
@@ -124,12 +124,13 @@ if __name__ == "__main__":
 
     train_data, test_data = load_and_preprocess_data('./data')
 
-    d_model = 64
-    epochs = 100
+    d_model = 24
     input_dim = 8
-    nhead = 8
+    nhead = 6
     num_layers = 4
     output_dim = 3
+
+    epochs = 80
     num_samples_per_epoch = 1000
     learning_rate = 0.001
 

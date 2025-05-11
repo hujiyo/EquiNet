@@ -257,9 +257,8 @@ def calculate_metrics(outputs, targets):
 
 ## 联系方式
 
-- Issues: [Gitee Issues](https://gitee.com/yourname/EquiNet/issues)
-- 邮箱: your_email@example.com
+- 邮箱: hj18914255909@outlook.com
 
 ## 致谢
 
-感谢所有开源社区贡献者及金融数据支持者。更多开源项目可参考 [Gitee Explore](https://gitee.com/explore)。
+感谢通达信提供的股票数据

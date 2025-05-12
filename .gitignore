@@ -1,2 +1,3 @@
 src/out/
 .vs/
+src/__pycache__/

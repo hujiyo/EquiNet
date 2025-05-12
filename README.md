@@ -146,6 +146,7 @@ pip install torch pandas numpy tqdm
    # 2: 平稳 (-0.01 < cumulative_return <= 0.01)
    # 3: 上涨 (cumulative_return > 0.01)
    ```
+
 2. **自定义损失函数**：
    ```python
    class AsymmetricFocalLoss(nn.Module):
@@ -163,23 +164,25 @@ pip install torch pandas numpy tqdm
            return loss.mean()
    ```
 
+
+
 ### 二、置信度门控机制
 1. **动态分类阈值**：
-   ```python
-   def dynamic_threshold_predict(output, threshold_dict=None):
-       if threshold_dict is None:
-           threshold_dict = {'up': 0.6, 'down': 0.7}  # 默认阈值
-       probs = F.softmax(output, dim=1)
-       result = torch.zeros_like(probs[:,0], dtype=torch.long)
-       # 上涨条件：上涨概率超过阈值且高于下跌概率2倍
-       up_mask = (probs[:,0] > threshold_dict['up']) & (probs[:,0] > probs[:,1]*2)
-       # 下跌条件：下跌概率超过阈值且高于上涨概率3倍
-       down_mask = (probs[:,1] > threshold_dict['down']) & (probs[:,1] > probs[:,0]*3)
-       result[up_mask] = 0  # 上涨
-       result[down_mask] = 1  # 下跌
-       # 其余情况标记为平稳
-       return result
-   ```
+```python
+def dynamic_threshold_predict(output, threshold_dict=None):
+      if threshold_dict is None:
+         threshold_dict = {'up': 0.6, 'down': 0.7}  # 默认阈值
+      probs = F.softmax(output, dim=1)
+      result = torch.zeros_like(probs[:,0], dtype=torch.long)
+      # 上涨条件：上涨概率超过阈值且高于下跌概率2倍
+      up_mask = (probs[:,0] > threshold_dict['up']) & (probs[:,0] > probs[:,1]*2)
+      # 下跌条件：下跌概率超过阈值且高于上涨概率3倍
+      down_mask = (probs[:,1] > threshold_dict['down']) & (probs[:,1] > probs[:,0]*3)
+      result[up_mask] = 0  # 上涨
+      result[down_mask] = 1  # 下跌
+      # 其余情况标记为平稳
+      return result
+```
 
 ### 三、多任务学习框架
 ```python
@@ -203,24 +206,7 @@ class EnhancedStockTransformer(nn.Module):
         return trend, volatility, momentum
 ```
 
-### 四、对抗性训练策略
-1. **样本加权策略**：
-   ```python
-   def generate_weighted_sample(all_data):
-       # 对上涨样本增加重复采样权重
-       # 对下跌样本增加噪声扰动
-       # 对平稳样本进行时间弹性变形
-       ...
-   ```
-
-2. **渐进式难度训练**：
-   ```python
-   # 第一阶段：只训练平稳 vs 非平稳
-   # 第二阶段：训练平稳 vs 上涨+下跌（冻结底层参数）
-   # 第三阶段：联合训练所有类别
-   ```
-
-### 五、验证指标优化
+### 四、验证指标优化
 ```python
 # 新增关键指标监控：
 def calculate_metrics(outputs, targets):
@@ -233,6 +219,24 @@ def calculate_metrics(outputs, targets):
     metrics['extreme_up_capture'] = extreme_up_correct / (extreme_up_total + 1e-8)
     return metrics
 ```
+
+### 五、dropout层策略防止过拟合
+```python
+self.embedding = nn.Sequential(
+    nn.Linear(input_dim, d_model),
+    nn.Dropout(0.3)
+)
+```
+
+### 六、增加位置编码
+```python
+self.positional_encoding = nn.Parameter(torch.randn(1, 100, d_model))
+def forward(self, x):
+    seq_len = x.size(1)
+    x = self.embedding(x) + self.positional_encoding[:, :seq_len]
+    ...
+```
+
 
 ### 实施路线图建议：
 1. **第一阶段（1-2周）**：
@@ -273,6 +277,26 @@ def calculate_metrics(outputs, targets):
 
 这种方法体系既保持了模型对真实上涨机会的识别能力，又通过多层过滤机制防止在下跌行情中的误判。建议采用A/B测试框架，逐步验证每个改进模块的效果。
 
+## 新增解决方案
+
+### 矛盾点一：
+- 问题描述：
+  - 当前的评估机制是一个自定义评分系统 ，它对正确预测加分；对错误预测（尤其是代价高的错误）扣分。然而这种评分规则并未反映在训练损失函数中 ，因此模型在训练时并不知道“哪些错误更严重”。简单来说，这个测评程序其实本质上就是一个马后炮，它是独立于模型训练这个过程的，我最初的想法是如何让模型与这个惩罚机制结合。
+- 目标：
+  - 将惩罚机制融入模型训练中，希望模型在训练时就知道：把下跌预测为上涨比把上涨预测为下跌更严重；把横盘预测为上涨不如预测为下跌好；某些误判需要被特别惩罚。
+- 解决方案：
+  - **引入代价矩阵**
+   ```python
+   # 定义代价矩阵
+   cost_matrix = torch.tensor([[0, 1, 1, 1],  # 上涨
+                               [1, 0, 1, 1],  # 下跌
+                               [1, 1, 0, 1],  # 平稳
+                               [1, 1, 1, 0]]) # 强下跌
+   # 计算代价
+   cost = cost_matrix[targets, predictions]
+   ```
+
+
 ## 参与贡献
 
 1. Fork 本仓库
@@ -288,3 +312,17 @@ def calculate_metrics(outputs, targets):
 
 1. 感谢通达信提供的股票数据（虽然我是买了初级会员才获得的数据的~QvQ~）。
 2. 项目当前以及未来的所有代码均会是在QwQ-32b、豆包、deepseek、ChatGPT等等大佬的帮助下完成的，在此表示感谢。
+最初对QwQ的prompt：
+```
+背景介绍：现在你在进行一个利用python进行模型训练的2030年编程比赛，参赛者有中国昔日之光：deepseek-r1:671b满血版、openAI最新编程大神：ChatGPT6.0:9600b世界版、千问推理模型QwQ-32b（你）......注意，你可以无限长时间循环分步骤思考，但是你的机会只有一次！
+现在是试卷的最后一题：在./下写一个.py模型训练程序，模型数据存放在./data下，那里有着319个.xlsx文件，每个文件对应一只股票，每个文件的有效行数为421行，其中第一行也就是表头字段分别有time	start	max	min	end	volume	marketvolume	marketlimit	marketrange这9个字段，2-421行都是数据，也就是说每个文件实际上都是包含一只股票420天的基本情况和当天大盘的情况。每个文件的time都是420天并且初始日期都是对照相同的，start/end	是开/收盘价，max/min是最高/低价，volume是股票量能，marketvolume是市场量能，marketlimit是大盘涨跌幅，marketrange是大盘指数的波动宽度，（比如marketlimit为-1%，marketrange为50，则暗示大盘下跌30个点，宽度在50个点，波动很大）	模型的输出结果是对未来3天的情况进行概率预测，分别是上涨3%的概率，下跌2%的概率，保持-2%~3%的概率，例如输出：涨5%：\n跌3%：54%，\n稳：25%。
+提示：
+1.建议使用transformer架构，程序开始需要提示用户输入想要的模型训练的大小参数和训练轮次。为避免用户不懂，你还要有提示信息（比如对最终模型效果的影响、对模型最终参数量的影响等等）
+2.训练过程中，使用随机上下文长度（20天-100天），这种随机效果可以变相降低数据量有限的弊端，然后对下面3天进行预测
+3.训练过程中要给出进度信息（包括学习率），每轮训练结束后要增加一个效果环节，具体如下：用相同的方法从数据中随机获得片段作为输入然后，将概率大的视为模型的选择，循环多次即可计算出当前模型预测成功的概率并打印。
+4.不同股票的价格不同，模型的目标是掌握其中更深层次的规律，所以训练数据要进行统一的归一化
+5.使用支持CUDA的gpu进行训练
+6.time字段的格式为'2023/06/27'
+7.不要提前确定好所有的数据然后轮流开始训练，这违背了我随机思想的初衷，我要的是训练输入上的完全随机，每轮1000组随机输入
+```
+

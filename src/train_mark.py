@@ -1,6 +1,12 @@
 '''
-默认训练脚本---
-使用预测准确率来评估模型的性能
+训练脚本---
+使用得分制来评估模型的性能
+具体如下：
+提供1000次预测机会，预测正确加一分
+预测错误则按下面策略处理：
+1.上涨的股票预测为下跌：-1分 
+2.下跌的股票预测为上涨：-2分 
+3.其余情况不加分也不扣分。
 '''
 
 import os,torch,torch.nn as nn,torch.optim as optim,pandas as pd,numpy as np
@@ -102,23 +108,28 @@ def train_model(model, train_data, test_data, epochs, learning_rate, device, num
             total_loss += loss.item()
             pbar.set_postfix({'Loss': total_loss / (pbar.n + 1)})
         scheduler.step()
-        # 评估模型
+        # 评估模型（得分制）
         model.eval()
-        correct = 0
+        score = 0
         total = 0
         for _ in range(1000):
             input_seq, target = generate_single_sample(test_data)
             input_seq = torch.tensor(input_seq, dtype=torch.float32).unsqueeze(0).to(device)
-            target = np.argmax(target)
+            target_idx = np.argmax(target)
             output = model(input_seq)
             prediction = torch.argmax(output, dim=1).item()
-            if prediction == target:
-                correct += 1
+            # 评分规则
+            if prediction == target_idx:
+                score += 1
+            elif target_idx == 0 and prediction == 1:
+                score -= 1  # 上涨预测为下跌
+            elif target_idx == 1 and prediction == 0:
+                score -= 2  # 下跌预测为上涨
+            # 其余情况不加分也不扣分
             total += 1
-        accuracy = correct / total
-        print(f'Epoch {epoch + 1} evaluation accuracy: {accuracy * 100:.2f}%')
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
+        print(f'Epoch {epoch + 1} evaluation score: {score} (out of {total})')
+        if score > best_accuracy:
+            best_accuracy = score
             torch.save(model.state_dict(), './out/EquiNet_best.pth')
 
 if __name__ == "__main__":
@@ -129,9 +140,9 @@ if __name__ == "__main__":
 
     train_data, test_data = load_and_preprocess_data('./data')
 
-    d_model = 24
+    d_model = 128
     input_dim = 8
-    nhead = 6
+    nhead = 8
     num_layers = 4
     output_dim = 3
 

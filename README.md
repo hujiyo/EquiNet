@@ -2,11 +2,12 @@
 
 ## 项目背景
 
-在金融量化领域，如何利用历史数据预测股票未来走势一直是核心难题。传统方法往往难以捕捉复杂的时序与市场联动特征。EquiNet 基于 Transformer 架构，结合多只股票与大盘数据，致力于提升未来3天涨跌概率预测的准确性，助力量化投资与学术研究。
+在金融量化领域，如何利用历史数据预测股票未来走势一直是核心难题。传统方法往往难以捕捉复杂的时序与市场联动特征。EquiNet 基于 Transformer 架构，结合多只股票与大盘数据，致力于专注提升未来3天涨跌概率预测的准确性，本项为学习偏教程项目，任何人可以随意使用。
 
 ## 项目简介
 
-EquiNet 是一个基于 PyTorch 的深度学习项目，支持灵活参数配置和高效GPU训练。通过对319只股票420天的历史数据建模，输出未来3天内上涨、下跌、平稳的概率分布。
+ - EquiNet 旨在从0开始构建一个深度学习模型，通过对319只A股股票420天的历史数据进行建模，仅仅使用不到半小时的时间，即可训练出一个具备一定预测能力的模型EquiNet
+ - EquiNet 基于 PyTorch 的深度学习项目，支持灵活参数配置和高效GPU训练。通过历史数据建模输出未来3天内上涨、下跌、平稳的概率分布。
 
 ## 主要特性
 
@@ -26,6 +27,7 @@ EquiNet/
 ├── out/                 # 训练输出的模型权重
 ├── src/
 │   ├── train.py         # 主训练脚本
+│   ├── train_mark.py    # 使用积分制评估模型的训练脚本
 │   ├── test_best_model.py # 模型评估脚本
 │   └── ...              # 其他源码
 ├── README.md
@@ -46,6 +48,7 @@ EquiNet/
   - `marketvolume`：市场总成交量
   - `marketlimit`：大盘涨跌幅（如-1%）
   - `marketrange`：大盘指数波动宽度
+- 数据来源：通达信
 
 ## 安装与环境
 
@@ -61,6 +64,25 @@ pip install torch pandas numpy tqdm
 
 ## 使用流程
 
+### 快速开始
+1. **克隆项目**
+   ```bash
+   git clone https://gitee.com/hujiyo/EquiNet.git
+   ```
+
+2. **运行训练脚本**
+   ```bash
+   python src/train.py
+   ```
+
+3. **模型评估**
+   - 训练完成后，模型权重保存在`./out/EquiNet{d_model}.pth`。
+   - 可使用`src/test_best_model.py`对训练集、测试集、全集进行准确率评估：
+     ```bash
+     python src/test_best_model.py
+     ```
+
+### 常规训练流程
 1. **准备数据**
    - 将319个`.xlsx`股票数据文件放入`./data`目录下。
 
@@ -78,7 +100,7 @@ pip install torch pandas numpy tqdm
      python src/test_best_model.py
      ```
 
-4. **模型输出说明**
+### 模型输出
    - 输出为对未来3天的概率预测：
      - 上涨3%及以上的概率
      - 下跌2%及以下的概率
@@ -90,21 +112,24 @@ pip install torch pandas numpy tqdm
      稳：25%
      ```
 
-## 实验结果展示
+## 实验结果
 
-- 支持多组参数实验，详见`src/test-result.CSV`。
+- 详见`src/test-result.CSV`。
 - 主要指标为不同参数下的训练集、测试集、全集准确率，便于横向对比模型表现。
+- 为了更好地评估模型的实际能力，最新版本提供积分制评估模型的训练脚本`src/train_mark.py`。
 
 ## 常见问题 FAQ
 
 - **Q: 数据文件格式有要求吗？**
-  - A: 需为Excel `.xlsx` 格式，字段顺序与上述一致，且每只股票420天数据。
+  - A: 需为Excel `.xlsx` 格式，字段顺序与上述一致，且每只股票提供地数据量要大于60天。
 - **Q: 如何调整模型大小？**
-  - A: 运行时输入提示参数即可，模型维度越大，效果和参数量越高，但训练更慢。
+  - A: 直接修改`src/trainXXX.py`中的`d_model`参数即可.
 - **Q: 支持多GPU吗？**
   - A: 当前版本默认单GPU，可自行扩展`DataParallel`等方式。
 - **Q: 训练慢怎么办？**
   - A: 建议使用CUDA GPU，或减少模型参数/训练轮数。
+- **Q: 模型的参数如何选择？**
+  - A: 目前正在尝试不同参数组合，具体的测试数据也会放在`src/test-result.xlsx`中。
 
 ## 当前方向
 
@@ -251,7 +276,7 @@ def calculate_metrics(outputs, targets):
 ## 参与贡献
 
 1. Fork 本仓库
-2. 新建分支（如 `feat_xxx`）
+2. 新建分支（如 `dev_yourname`）
 3. 提交代码
 4. 新建 Pull Request
 
@@ -261,4 +286,5 @@ def calculate_metrics(outputs, targets):
 
 ## 致谢
 
-感谢通达信提供的股票数据
+1. 感谢通达信提供的股票数据（虽然我是买了初级会员才获得的数据的~QvQ~）。
+2. 项目当前以及未来的所有代码均会是在QwQ-32b、豆包、deepseek、ChatGPT等等大佬的帮助下完成的，在此表示感谢。

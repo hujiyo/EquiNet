@@ -52,8 +52,15 @@ class FocalLoss(nn.Module):
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-ce_loss)
         
+        targets = targets.to(self.alpha.device)
         # 现在alpha自动在正确的设备上，不用检查
         alpha_t = self.alpha[targets]  # 直接用，不用担心设备问题
+
+        # 保证 alpha_t, pt, ce_loss 在同一设备
+        device = inputs.device
+        alpha_t = alpha_t.to(device)
+        pt = pt.to(device)
+        ce_loss = ce_loss.to(device)
         
         focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
         
@@ -336,42 +343,6 @@ class EnhancedStockTransformer(nn.Module):
         
         return output
 
-# 数据预处理
-def load_and_preprocess_data(data_dir, test_ratio=0.1, seed=42):
-    """
-    加载和预处理股票数据
-    每只股票单独标准化，避免不同价格区间的股票相互干扰
-    """
-    all_files = [f for f in os.listdir(data_dir) if f.endswith('.xlsx')]
-    random.seed(seed)
-    test_size = max(1, int(len(all_files) * test_ratio))
-    test_files = set(random.sample(all_files, test_size))
-    train_files = [f for f in all_files if f not in test_files]
-
-    def process_files(file_list):
-        data_list = []
-        for file in file_list:
-            file_path = os.path.join(data_dir, file)
-            df = pd.read_excel(file_path)
-            try:
-                # 提取8个特征：开盘、最高、最低、收盘、成交量、市值、市限、市幅
-                data = df[['start', 'max', 'min', 'end', 'volume', 'marketvolume', 'marketlimit', 'marketrange']].values
-                
-                # 每只股票单独标准化（这样做是合理的，因为不同股票价格范围差异很大）
-                mean = np.mean(data, axis=0)
-                std = np.std(data, axis=0)
-                if np.any(std == 0):
-                    raise ValueError(f"文件 {file} 包含标准差为0的列")
-                normalized_data = (data - mean) / std
-                data_list.append(normalized_data)
-            except Exception as e:
-                print(f"处理文件 {file} 时出错: {e}")
-        return data_list
-
-    train_data = process_files(train_files)
-    test_data = process_files(test_files)
-    return train_data, test_data
-
 # 生成单个样本
 def generate_single_sample(all_data):
     """
@@ -413,116 +384,279 @@ def generate_single_sample(all_data):
     
     raise ValueError("无法生成有效样本：股票数据长度不足或收盘价为0")
 
-# 训练模型
-def train_model(model, train_data, test_data, epochs, learning_rate, device, num_samples_per_epoch):
+def generate_batch_samples(all_data, batch_size):
     """
-    训练增强版的Transformer模型，使用Focal Loss处理类别不平衡
+    批量生成训练样本
+    返回: (batch_inputs, batch_targets)
+    batch_inputs: numpy array, shape [batch_size, context_length, 8]  
+    batch_targets: numpy array, shape [batch_size]
     """
-    # 使用Focal Loss替代交叉熵损失
-    # alpha权重：[上涨, 下跌, 震荡] = [1.5, 2.0, 1.0]
-    # 给下跌更高权重，因为预测错误的代价更大
-    criterion = FocalLoss(alpha=[1.5, 2.0, 1.0], gamma=2.0)
+    batch_inputs = []
+    batch_targets = []
     
-    # 动态权重调整器
-    weight_adjuster = DynamicClassWeightAdjuster()
-   
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)  # 加入权重衰减防过拟合
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)  # 学习率衰减
+    attempts = 0
+    max_attempts = batch_size * 10  # 防止无限循环
     
-    best_accuracy = 0.0
-    
-    for epoch in range(epochs):
-        model.train()  # 设置为训练模式
-        total_loss = 0
-        batch_targets = []  # 收集这个epoch的所有标签，用于权重调整
-        
-        # 训练进度条
-        pbar = tqdm(range(num_samples_per_epoch), 
-                   desc=f'Epoch {epoch + 1}/{epochs}, LR: {scheduler.get_last_lr()[0]:.6f}')
-        
-        for step in pbar:
-            # 生成一个训练样本
-            input_seq, target = generate_single_sample(train_data)
+    while len(batch_inputs) < batch_size and attempts < max_attempts:
+        attempts += 1
+        try:
+            input_seq, target = generate_single_sample(all_data)
+            batch_inputs.append(input_seq)
             batch_targets.append(target)
-            
-            # 转换为PyTorch张量并移到GPU/CPU
-            input_seq = torch.tensor(input_seq, dtype=torch.float32).unsqueeze(0).to(device)  # [1, 60, 8]
-            target = torch.tensor(target, dtype=torch.long).unsqueeze(0).to(device)  # [1]
-            
-            # 前向传播
-            optimizer.zero_grad()
-            output = model(input_seq)  # [1, 3] logits
-            loss = criterion(output, target)
-            
-            # 反向传播和参数更新
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 梯度裁剪，防止梯度爆炸
-            optimizer.step()
-            
-            total_loss += loss.item()
-            pbar.set_postfix({'Loss': total_loss / (step + 1)})
-        
-        # 更新动态权重
-        weight_adjuster.update(batch_targets)
-        current_weights = weight_adjuster.get_weights()
-        print(f"当前类别权重: 上涨={current_weights[0]:.2f}, 下跌={current_weights[1]:.2f}, 震荡={current_weights[2]:.2f}")
-        
-        # 更新Focal Loss的权重
-        criterion.alpha = torch.tensor(current_weights)
-        
-        scheduler.step()  # 更新学习率
-        
-        # 每个epoch结束后进行评估
-        model.eval()  # 设置为评估模式
-        score = 0
-        total = 0
-        class_correct = [0, 0, 0]  # 每个类别的正确预测数
-        class_total = [0, 0, 0]    # 每个类别的总数
-        
-        print("正在评估模型性能...")
-        with torch.no_grad():  # 评估时不需要计算梯度
-            for _ in tqdm(range(1000), desc='评估中'):
-                input_seq, target = generate_single_sample(test_data)
-                input_seq = torch.tensor(input_seq, dtype=torch.float32).unsqueeze(0).to(device)
+        except ValueError:
+            continue
+    
+    if len(batch_inputs) < batch_size:
+        raise ValueError(f"无法生成足够的样本，只生成了 {len(batch_inputs)}/{batch_size} 个")
+    
+    return np.array(batch_inputs), np.array(batch_targets)
+
+def create_evaluation_dataset(test_data, num_samples=1000):
+    eval_inputs = []
+    eval_targets = []
+    
+    for _ in tqdm(range(num_samples), desc='生成评估样本'):
+        input_seq, target = generate_single_sample(test_data)
+        eval_inputs.append(input_seq)
+        eval_targets.append(target)
+    
+    return np.array(eval_inputs), np.array(eval_targets)
+
+# 数据预处理函数
+def load_and_preprocess_data(data_dir, test_ratio=0.1, seed=42):
+    """
+    改进的数据加载和预处理函数
+    确保训练集和测试集完全独立，没有数据泄露
+    """
+    all_files = [f for f in os.listdir(data_dir) if f.endswith('.xlsx')]
+    random.seed(seed)
+    
+    # 按股票文件划分训练集和测试集
+    test_size = max(1, int(len(all_files) * test_ratio))
+    test_files = set(random.sample(all_files, test_size))
+    train_files = [f for f in all_files if f not in test_files]
+    
+    print(f"训练股票文件: {len(train_files)} 个")
+    print(f"测试股票文件: {len(test_files)} 个")
+
+    def process_files(file_list):
+        data_list = []
+        for file in file_list:
+            file_path = os.path.join(data_dir, file)
+            df = pd.read_excel(file_path)
+            try:
+                data = df[['start', 'max', 'min', 'end', 'volume', 'marketvolume', 'marketlimit', 'marketrange']].values
                 
-                output = model(input_seq)
-                prediction = torch.argmax(output, dim=1).item()
+                # 每只股票单独标准化
+                mean = np.mean(data, axis=0)
+                std = np.std(data, axis=0)
+                if np.any(std == 0):
+                    raise ValueError(f"文件 {file} 包含标准差为0的列")
+                normalized_data = (data - mean) / std
+                data_list.append(normalized_data)
+            except Exception as e:
+                print(f"处理文件 {file} 时出错: {e}")
+        return data_list
+
+    train_data = process_files(train_files)
+    test_data = process_files(test_files)
+    return train_data, test_data
+
+# 创建固定的评估数据集
+def create_fixed_evaluation_dataset(test_data, num_samples=1000, seed=42):
+    """
+    创建固定的评估数据集，确保每次评估使用相同的样本
+    这样可以准确衡量模型的进步情况
+    """
+    print("正在创建固定的评估数据集...")
+    np.random.seed(seed)  # 固定随机种子
+    random.seed(seed)
+    
+    eval_inputs = []
+    eval_targets = []
+    
+    # 预先生成所有可能的样本
+    all_possible_samples = []
+    context_length = 60
+    required_length = context_length + 3
+    
+    for stock_idx, stock_data in enumerate(test_data):
+        if len(stock_data) < required_length:
+            continue
+            
+        # 为每只股票生成所有可能的时间窗口样本
+        for start_idx in range(len(stock_data) - required_length + 1):
+            input_seq = stock_data[start_idx:start_idx + context_length]
+            target_seq = stock_data[start_idx + context_length:start_idx + required_length]
+            
+            start_price = input_seq[-1, 3]  # 当前收盘价
+            end_price = target_seq[-1, 3]   # 3天后收盘价
+            
+            if start_price == 0:
+                continue
+                
+            cumulative_return = (end_price - start_price) / start_price
+            
+            # 确定类别标签
+            if cumulative_return >= 0.03:
+                target = 0  # 大涨
+            elif cumulative_return <= -0.02:
+                target = 1  # 大跌
+            else:
+                target = 2  # 震荡
+                
+            all_possible_samples.append((input_seq, target, stock_idx, start_idx))
+    
+    print(f"总共可用样本: {len(all_possible_samples)} 个")
+    
+    # 随机选择固定的评估样本
+    if len(all_possible_samples) < num_samples:
+        print(f"警告: 可用样本数 ({len(all_possible_samples)}) 少于请求的样本数 ({num_samples})")
+        selected_samples = all_possible_samples
+    else:
+        selected_samples = random.sample(all_possible_samples, num_samples)
+    
+    # 分离输入和标签
+    for input_seq, target, stock_idx, start_idx in selected_samples:
+        eval_inputs.append(input_seq)
+        eval_targets.append(target)
+    
+    eval_inputs = np.array(eval_inputs)
+    eval_targets = np.array(eval_targets)
+    
+    # 打印类别分布
+    unique, counts = np.unique(eval_targets, return_counts=True)
+    class_names = ['大涨', '大跌', '震荡']
+    print("评估集类别分布:")
+    for cls, count in zip(unique, counts):
+        print(f"  {class_names[cls]}: {count} 个样本 ({count/len(eval_targets)*100:.1f}%)")
+    
+    return eval_inputs, eval_targets
+
+# 批量评估函数
+def evaluate_model_batch(model, eval_inputs, eval_targets, device, batch_size=100):
+    """
+    使用批处理进行快速评估
+    """
+    model.eval()
+    score = 0
+    total = 0
+    class_correct = [0, 0, 0]
+    class_total = [0, 0, 0]
+    
+    num_samples = len(eval_inputs)
+    num_batches = (num_samples + batch_size - 1) // batch_size
+    
+    with torch.no_grad():
+        for i in tqdm(range(num_batches), desc='批量评估中'):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, num_samples)
+            
+            # 批量处理
+            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], 
+                                      dtype=torch.float32).to(device)
+            batch_targets = eval_targets[start_idx:end_idx]
+            
+            # 批量推理
+            batch_outputs = model(batch_inputs)  # [batch_size, 3]
+            batch_predictions = torch.argmax(batch_outputs, dim=1).cpu().numpy()
+            
+            # 批量计算得分
+            for j in range(len(batch_targets)):
+                target = batch_targets[j]
+                prediction = batch_predictions[j]
                 
                 class_total[target] += 1
                 
                 # 应用特殊的评分规则
                 if prediction == target:
-                    score += 1  # 预测正确：+1分
+                    score += 1
                     class_correct[target] += 1
                 elif target == 0 and prediction == 1:  # 上涨预测为下跌
-                    score -= 1  # -1分
+                    score -= 1
                 elif target == 1 and prediction == 0:  # 下跌预测为上涨  
-                    score -= 2  # -2分（惩罚更重，因为这种错误在实际投资中损失更大）
-                # 其余情况（震荡预测错误）不加分也不扣分
+                    score -= 2
                 
                 total += 1
+    
+    return score, total, class_correct, class_total
+
+# 改进的训练函数
+def train_model(model, train_data, test_data, epochs, learning_rate, device, batch_size, batches_per_epoch):
+    """
+    使用固定评估集的训练函数
+    """
+    # 创建固定的评估数据集（训练开始前创建一次）
+    eval_inputs, eval_targets = create_fixed_evaluation_dataset(test_data, num_samples=1000)
+    
+    criterion = FocalLoss(alpha=[1.5, 2.0, 1.0], gamma=2.0)
+    weight_adjuster = DynamicClassWeightAdjuster()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    
+    best_score = float('-inf')  # 改用得分而不是准确率
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        batch_targets = []
         
-        # 计算每个类别的准确率
-        class_accuracies = []
-        class_names = ['上涨', '下跌', '震荡']
+        # 训练阶段
+        pbar = tqdm(range(batches_per_epoch), 
+                   desc=f'Epoch {epoch + 1}/{epochs}, LR: {scheduler.get_last_lr()[0]:.6f}')
+        
+        for step in pbar:
+            batch_inputs, batch_targets_np = generate_batch_samples(train_data, batch_size)
+            batch_targets.extend(batch_targets_np.tolist())
+            
+            batch_inputs = torch.tensor(batch_inputs, dtype=torch.float32).to(device)
+            batch_targets_tensor = torch.tensor(batch_targets_np, dtype=torch.long).to(device)
+            
+            optimizer.zero_grad()
+            output = model(batch_inputs)
+            loss = criterion(output, batch_targets_tensor)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            total_loss += loss.item()
+            pbar.set_postfix({'Loss': total_loss / (step + 1)})
+        
+        # 更新权重
+        weight_adjuster.update(batch_targets)
+        current_weights = weight_adjuster.get_weights()
+        criterion.alpha = torch.tensor(current_weights, device=next(model.parameters()).device)
+        scheduler.step()
+        
+        # 固定评估集评估
+        print("正在评估模型性能...")
+        score, total, class_correct, class_total = evaluate_model_batch(
+            model, eval_inputs, eval_targets, device, batch_size=100
+        )
+        
+        # 打印详细结果
+        class_names = ['大涨', '大跌', '震荡']
+        print(f"\nEpoch {epoch + 1} 评估结果:")
         for i in range(3):
             if class_total[i] > 0:
                 acc = class_correct[i] / class_total[i]
-                class_accuracies.append(acc)
-                print(f'{class_names[i]}类别: {class_correct[i]}/{class_total[i]} = {acc:.3f}')
+                print(f'  {class_names[i]}: {class_correct[i]}/{class_total[i]} = {acc:.3f}')
             else:
-                class_accuracies.append(0.0)
-                print(f'{class_names[i]}类别: 0/0 = 0.000 (无样本)')
+                print(f'  {class_names[i]}: 0/0 = 0.000 (无样本)')
         
-        print(f'Epoch {epoch + 1} 评估得分: {score} (总共 {total} 次预测)')
-        print(f'平均得分: {score/total:.3f}')
-        print(f'整体准确率: {sum(class_correct)/sum(class_total):.3f}')
+        overall_acc = sum(class_correct) / sum(class_total) if sum(class_total) > 0 else 0
+        avg_score = score / total if total > 0 else 0
         
-        # 保存最佳模型（相当于早停法的变种）
-        if score > best_accuracy:
-            best_accuracy = score
+        print(f'  总体准确率: {overall_acc:.3f}')
+        print(f'  评估得分: {score} / {total} = {avg_score:.3f}')
+        
+        # 保存最佳模型
+        if score > best_score:
+            best_score = score
             torch.save(model.state_dict(), './out/EnhancedEquiNet_focal_best.pth')
-            print(f'发现更好的模型！得分: {score}, 已保存到 EnhancedEquiNet_focal_best.pth')
+            print(f'  ✓ 发现更好的模型！得分提升到: {score}')
+        
+        print("-" * 50)
 
 if __name__ == "__main__":
     # 设置工作目录
@@ -538,7 +672,7 @@ if __name__ == "__main__":
     # 创建输出目录
     os.makedirs('./out', exist_ok=True)
     
-    # 加载和预处理数据
+    # 使用改进的数据加载函数
     print("正在加载和预处理数据...")
     train_data, test_data = load_and_preprocess_data('./data')
     print(f"训练数据: {len(train_data)} 只股票")
@@ -553,8 +687,9 @@ if __name__ == "__main__":
 
     # 训练超参数  
     epochs = 80                    # 训练轮数
-    num_samples_per_epoch = 1000   # 每轮训练的样本数
     learning_rate = 0.001          # 初始学习率
+    batch_size = 50  # GPU每次并行训练的样本数
+    batches_per_epoch = 20  # 相当于每轮（epochs） 20*50=1000 个样本
 
     print("正在创建 Transformer 模型...")
     model = EnhancedStockTransformer(
@@ -572,8 +707,10 @@ if __name__ == "__main__":
     print(f"可训练参数数: {trainable_params:,}")
 
     print("开始训练...")
-    train_model(model, train_data, test_data, epochs, learning_rate, device, num_samples_per_epoch)
-
+    # 使用带固定评估集的训练函数
+    train_model(model, train_data, test_data, epochs, learning_rate, device, batch_size, batches_per_epoch)
+    
+    
     # 保存最终模型
     final_model_path = f'./out/EnhancedEquiNet_{d_model}.pth'
     torch.save(model.state_dict(), final_model_path)

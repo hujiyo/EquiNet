@@ -14,20 +14,22 @@
 import os, torch, torch.nn as nn, torch.optim as optim, numpy as np
 import copy
 import argparse
+import random
 from datetime import datetime
 from config import (ModelConfig, TrainingConfig, DataConfig,
                    DeviceConfig, ModelSaveConfig,
                    print_config_summary)
 
 from train import (
-    WarmupScheduler, RMSNorm, PositionalEncoding, 
+    WarmupScheduler, RMSNorm, PositionalEncoding,
     MultiHeadAttention, TransformerLayer,
     load_and_preprocess_data, calculate_stock_weights,
-    create_fixed_evaluation_dataset, precompute_training_dataset,
-    EnhancedStockTransformer
+    create_fixed_evaluation_dataset,
+    TemporalSampler, sample_with_pools,
+    EnhancedStockTransformer,
+    evaluate_model,           # 统一的评估函数
+    generate_pseudo_labels    # 统一的top-k伪标签生成
 )
-
-from train_clone import evaluate_model
 
 
 def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock_info, train_weights, 
@@ -37,7 +39,11 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
                        batch_size=TrainingConfig.BATCH_SIZE, 
                        batches_per_epoch=TrainingConfig.BATCHES_PER_EPOCH,
                        pseudo_pos_ratio=0.01,
-                       pseudo_neg_ratio=0.05):
+                       pseudo_neg_ratio=0.05,
+                       use_return_weight=False,
+                       return_weight_alpha=3.0,
+                       return_weight_clip=0.20,
+                       seed=DataConfig.RANDOM_SEED):
     """
     进化训练函数（支持多教师模型）
     
@@ -57,7 +63,12 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     # 确保teacher_paths是列表
     if isinstance(teacher_paths, str):
         teacher_paths = [teacher_paths]
-    
+
+    # 收益加权功能暂时禁用（TemporalSampler不提供收益率数据）
+    if use_return_weight:
+        print("  ⚠ 警告：use_return_weight与TemporalSampler不兼容，已自动禁用")
+        use_return_weight = False
+
     num_teachers = len(teacher_paths)
     
     print("\n" + "="*60)
@@ -146,6 +157,16 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         eps = 1e-7
         pred_clamp = torch.clamp(pred, eps, 1 - eps)
         return (-target * torch.log(pred_clamp) - (1 - target) * torch.log(1 - pred_clamp)).mean()
+
+    def bce_loss_weighted(pred, target, sample_weight):
+        pred = pred.squeeze()
+        target = target.squeeze()
+        sample_weight = sample_weight.squeeze()
+        eps = 1e-7
+        pred_clamp = torch.clamp(pred, eps, 1 - eps)
+        per_sample = (-target * torch.log(pred_clamp) - (1 - target) * torch.log(1 - pred_clamp))
+        weighted = per_sample * sample_weight
+        return weighted.mean()
     
     # 记录最佳状态（以学生B的初始收益率为基准）
     best_return_b = stats_b_init['top_return']  # 初始基准为B自己的收益率
@@ -158,34 +179,39 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     # 早停机制
     patience = 15
     no_improve_count = 0
-    
+
+    # 创建时间顺序采样器（使用train.py的统一采样机制）
+    samples_per_epoch = batch_size * batches_per_epoch
+    sampler = TemporalSampler(train_stock_info, epochs, samples_per_epoch)
+    train_rng = random.Random(seed)
+
     for epoch in range(epochs):
         # 所有教师固定不训练
         model_b.train()
-        
+
         total_loss_b = 0
         total_pseudo_pos = 0
         total_unchanged = 0
-        
+
         # 获取当前学习率（调度器在epoch结束后调用）
         current_lr = optimizer_b.param_groups[0]['lr']
         phase = "进化训练"
-        
-        # 生成训练数据
-        train_inputs, train_targets = precompute_training_dataset(
-            train_stock_info, train_weights, batch_size, batches_per_epoch
+
+        # 使用时间顺序采样器生成训练数据（与train.py统一）
+        train_inputs, train_targets = sample_with_pools(
+            sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
         )
-        
+
         # 统计标签分布
         up_count = np.sum(train_targets == 1.0)
         boundary_count = np.sum((train_targets > 0) & (train_targets < 1.0))
         down_count = np.sum(train_targets == 0.0)
-        
+
         print(f"Epoch {epoch+1}/{epochs}, LR: {current_lr:.6f} ({phase})")
         print(f"  标签分布: 上涨={up_count}({up_count/len(train_targets)*100:.1f}%), "
               f"边界={boundary_count}({boundary_count/len(train_targets)*100:.1f}%), "
               f"不涨={down_count}({down_count/len(train_targets)*100:.1f}%)")
-        
+
         # 用所有教师模型生成伪标签（取平均预测）
         all_teacher_preds = []
         for teacher in teachers:
@@ -202,26 +228,17 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         
         # 计算教师平均预测
         avg_preds = np.mean(all_teacher_preds, axis=0)
-        
-        # 计算伪正标签阈值（前pseudo_pos_ratio%）
-        pseudo_pos_threshold = np.percentile(avg_preds, 100 * (1 - pseudo_pos_ratio))
-        # 计算伪负标签阈值（倒数pseudo_neg_ratio%）
-        pseudo_neg_threshold = np.percentile(avg_preds, 100 * pseudo_neg_ratio)
-        
-        # 生成伪标签
-        pseudo_targets = train_targets.copy()
-        
-        # 伪正：教师预测Top N% → 强制标签=1
-        pseudo_pos_mask = avg_preds >= pseudo_pos_threshold
-        pseudo_targets[pseudo_pos_mask] = 1.0
-        
-        # 伪负：教师预测倒数M% → 强制标签=0
-        pseudo_neg_mask = avg_preds <= pseudo_neg_threshold
-        pseudo_targets[pseudo_neg_mask] = 0.0
-        
-        total_pseudo_pos = np.sum(pseudo_pos_mask)
-        total_pseudo_neg = np.sum(pseudo_neg_mask)
-        total_unchanged = len(train_targets) - total_pseudo_pos - total_pseudo_neg
+
+        # 使用统一的top-k方式生成伪标签
+        pseudo_targets, pseudo_stats = generate_pseudo_labels(
+            avg_preds, train_targets,
+            pseudo_pos_ratio=pseudo_pos_ratio,
+            pseudo_neg_ratio=pseudo_neg_ratio
+        )
+
+        total_pseudo_pos = pseudo_stats['pseudo_pos_count']
+        total_pseudo_neg = pseudo_stats['pseudo_neg_count']
+        total_unchanged = pseudo_stats['unchanged_count']
         
         # 训练模型B
         num_batches = len(train_inputs) // batch_size
@@ -234,10 +251,20 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
                                         dtype=torch.bfloat16).to(device)
             batch_targets = torch.tensor(pseudo_targets[start_idx:end_idx], 
                                         dtype=torch.bfloat16).to(device)
+
+            if use_return_weight:
+                batch_returns = torch.tensor(train_returns[start_idx:end_idx], dtype=torch.float32).to(device)
+                batch_returns = torch.clamp(batch_returns, -return_weight_clip, return_weight_clip)
+                batch_weight = 1.0 + return_weight_alpha * torch.abs(batch_returns)
+                batch_weight = batch_weight / (batch_weight.mean() + 1e-8)
+                batch_weight = batch_weight.to(dtype=torch.bfloat16)
             
             optimizer_b.zero_grad()
             preds_b = torch.sigmoid(model_b(batch_inputs))
-            loss_b = bce_loss(preds_b, batch_targets)
+            if use_return_weight:
+                loss_b = bce_loss_weighted(preds_b, batch_targets, batch_weight)
+            else:
+                loss_b = bce_loss(preds_b, batch_targets)
             
             # NaN检测
             if torch.isnan(loss_b) or torch.isinf(loss_b):
@@ -350,6 +377,14 @@ if __name__ == "__main__":
                         help='伪正标签比例（默认: 0.01，即前1%）')
     parser.add_argument('--pseudo_neg', '-n', type=float, default=0.05,
                         help='伪负标签比例（默认: 0.05，即倒数5%）')
+    parser.add_argument('--use_return_weight', action='store_true',
+                        help='启用收益加权BCE（根据逐样本收益绝对值加权）')
+    parser.add_argument('--return_weight_alpha', type=float, default=3.0,
+                        help='收益加权强度alpha（默认: 3.0）')
+    parser.add_argument('--return_weight_clip', type=float, default=0.20,
+                        help='收益裁剪阈值clip（默认: 0.20，即±20%）')
+    parser.add_argument('--seed', type=int, default=DataConfig.RANDOM_SEED,
+                        help=f'随机种子（默认: {DataConfig.RANDOM_SEED}），用于训练采样可复现')
     args = parser.parse_args()
     
     # 设置工作目录
@@ -395,7 +430,11 @@ if __name__ == "__main__":
         device=device,
         epochs=args.epochs,
         pseudo_pos_ratio=args.pseudo_pos,
-        pseudo_neg_ratio=args.pseudo_neg
+        pseudo_neg_ratio=args.pseudo_neg,
+        use_return_weight=args.use_return_weight,
+        return_weight_alpha=args.return_weight_alpha,
+        return_weight_clip=args.return_weight_clip,
+        seed=args.seed
     )
     
     print(f"\n最终结果:")

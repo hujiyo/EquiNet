@@ -109,15 +109,15 @@ class DynamicWeightedBCE(nn.Module):
             # 动态调整负样本权重，保持正负样本对总损失的贡献平衡
             # neg_weight = pos_weight * (正样本数 / 负样本数)
             neg_weight = float(self.pos_weight) * (count_positive / count_negative)
-            
+
             # 更新负样本权重（复用weight_0_0变量）
-            self.weight_0_0 = torch.tensor(neg_weight)
+            self.weight_0_0.fill_(neg_weight)
         elif count_positive == 0:
             # 没有正样本，负样本权重设为正样本权重
-            self.weight_0_0 = torch.tensor(float(self.pos_weight))
+            self.weight_0_0.fill_(float(self.pos_weight))
         else:
             # 没有负样本，权重设为较小值
-            self.weight_0_0 = torch.tensor(0.1)
+            self.weight_0_0.fill_(0.1)
         
     def forward(self, inputs, targets):
         """
@@ -129,26 +129,28 @@ class DynamicWeightedBCE(nn.Module):
             inputs = inputs.unsqueeze(1)
         
         inputs = inputs.squeeze()
-        
+
+        # BF16训练时，这里用FP32计算loss更稳定
+        inputs_fp32 = inputs.float()
+        targets_fp32 = targets.float()
+
         # 计算BCE loss（带logits）
-        # sigmoid(x) 的数值稳定计算
-        max_val = torch.clamp(inputs, min=0)
-        loss = inputs - inputs * targets + max_val + torch.log(torch.exp(-max_val) + torch.exp(-inputs - max_val))
+        loss = F.binary_cross_entropy_with_logits(inputs_fp32, targets_fp32, reduction='none')
         
         # 二分类动态权重：正样本和负样本分别使用动态权重
-        pos_weight = self.pos_weight.to(dtype=inputs.dtype, device=inputs.device)
-        neg_weight = self.weight_0_0.to(dtype=inputs.dtype, device=inputs.device)
+        pos_weight = self.pos_weight.to(dtype=loss.dtype, device=loss.device)
+        neg_weight = self.weight_0_0.to(dtype=loss.dtype, device=loss.device)
         
         # 根据标签分配权重：正样本用pos_weight，负样本用动态neg_weight
-        weights = torch.where(targets >= 0.5, pos_weight, neg_weight)
+        weights = torch.where(targets_fp32 >= 0.5, pos_weight, neg_weight)
         loss = loss * weights
         
         # 🔥 新增：对预测偏差较大的样本进行指数级额外惩罚
         # 计算预测概率值
-        predictions = torch.sigmoid(inputs)  # 将logits转为概率 [0, 1]
+        predictions = torch.sigmoid(inputs_fp32)  # 将logits转为概率 [0, 1]
         
         # 计算预测值与真实标签之间的绝对差值
-        prediction_error = torch.abs(predictions - targets)
+        prediction_error = torch.abs(predictions - targets_fp32)
         
         # 当差值 >= 0.15时，应用指数级惩罚（阈值从0.2降低到0.15）
         # 使用 3^(1.5×差值) 作为额外惩罚因子（底数从2提升到3，指数放大1.5倍）
@@ -161,6 +163,8 @@ class DynamicWeightedBCE(nn.Module):
             torch.pow(3.0, prediction_error * 1.5),   # 指数级惩罚：3^(1.5×差值)
             torch.ones_like(prediction_error)         # 差值<0.15时，惩罚因子为1（不额外惩罚）
         )
+
+        penalty_multiplier = torch.clamp(penalty_multiplier, max=3.0)
         
         # 应用额外惩罚
         loss = loss * penalty_multiplier
@@ -298,9 +302,9 @@ class EnhancedStockTransformer(nn.Module):
     改进的 Transformer 模型（Pre-Norm架构 + 分离Embedding + 渐进式FFN）
     
     核心改进1：分离Embedding - 避免LayerNorm时互相干扰
-    - 价格特征(OHLC 4维) -> Embedding -> 48维 (占75%，主导地位)
-    - 成交量特征(Volume 1维) -> Embedding -> 16维 (占25%，辅助信息)
-    - 拼接后得到64维向量，送入Transformer
+    - 价格特征(OHLC 4维) -> Embedding -> 64维 (占80%，主导地位)
+    - 流动性特征(Volume+Exchange+Rate 3维) -> Embedding -> 16维 (占20%，辅助信息)
+    - 拼接后得到80维向量，送入Transformer
     
     核心改进2：渐进式FFN - 分层学习策略
     - Layer 1: 只用Attention（专注学习时序依赖和特征关系）
@@ -308,18 +312,18 @@ class EnhancedStockTransformer(nn.Module):
     - 好处：第1层纯粹学习模式，后续层增强表达能力
     
     总体优势：
-    1. 避免成交量的大值主导LayerNorm，扭曲价格信号
+    1. 避免流动性特征的大值主导LayerNorm，扭曲价格信号
     2. 保持价格特征之间的相对关系
-    3. 价格特征有更大的表达空间（48维 vs 16维，3:1比例）
+    3. 价格特征有更大的表达空间（64维 vs 16维，4:1比例）
     4. 渐进式学习：第1层纯学模式，后续层增强表达
     5. 参数量减少约13%（第1层省掉FFN），略微降低过拟合风险
     """
     def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, max_seq_len):
         super(EnhancedStockTransformer, self).__init__()
         
-        # 分离Embedding：价格和成交量独立处理
+        # 分离Embedding：价格和流动性特征独立处理
         self.price_embedding = nn.Linear(ModelConfig.PRICE_DIM, ModelConfig.PRICE_EMBED_DIM)
-        self.volume_embedding = nn.Linear(ModelConfig.VOLUME_DIM, ModelConfig.VOLUME_EMBED_DIM)
+        self.liquidity_embedding = nn.Linear(ModelConfig.LIQUIDITY_DIM, ModelConfig.LIQUIDITY_EMBED_DIM)
         
         # 使用标准位置编码
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
@@ -347,19 +351,19 @@ class EnhancedStockTransformer(nn.Module):
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
         
     def forward(self, x):
-        # x: [batch_size, seq_len, 5] (OHLCV)
+        # x: [batch_size, seq_len, 7] (OHLC + volume + exchange + rate)
         
-        # 1. 分离Embedding：价格和成交量独立处理
+        # 1. 分离Embedding：价格和流动性特征独立处理
         prices = x[:, :, :4]   # [batch_size, seq_len, 4] OHLC
-        volumes = x[:, :, 4:5] # [batch_size, seq_len, 1] Volume
+        liquidity = x[:, :, 4:7] # [batch_size, seq_len, 3] Volume + Exchange + Rate
         
-        price_emb = self.price_embedding(prices)      # [batch_size, seq_len, 48]
-        volume_emb = self.volume_embedding(volumes)   # [batch_size, seq_len, 16]
+        price_emb = self.price_embedding(prices)          # [batch_size, seq_len, 64]
+        liquidity_emb = self.liquidity_embedding(liquidity)  # [batch_size, seq_len, 16]
         
-        # 2. 拼接成64维（而不是相加！）
-        # 这样价格和成交量各占据独立的子空间，LayerNorm时干扰最小
-        # 价格占48维(75%)，成交量占16维(25%)，价格主导
-        x = torch.cat([price_emb, volume_emb], dim=-1)  # [batch_size, seq_len, 64]
+        # 2. 拼接成80维（而不是相加！）
+        # 这样价格和流动性各占据独立的子空间，LayerNorm时干扰最小
+        # 价格占64维(80%)，流动性占16维(20%)，价格主导
+        x = torch.cat([price_emb, liquidity_emb], dim=-1)  # [batch_size, seq_len, 80]
         
         # 3. 位置编码
         x = self.pos_encoding(x)
@@ -374,8 +378,8 @@ class EnhancedStockTransformer(nn.Module):
         x = self.final_norm(x)
         
         # 6. 取最后时间步 + 输出投影
-        last_hidden = x[:, -1, :]
-        output = self.output_projection(last_hidden)
+        last_hidden = x[:, -1, :]  # [batch_size, d_model]
+        output = self.output_projection(last_hidden)  # [batch_size, output_dim]
         
         return output
 
@@ -384,23 +388,49 @@ def process_single_file(args):
     """
     处理单个文件，返回原始数据（不做全局标准化，避免数据泄露）
     按时间划分训练集和测试集：最近80天作为测试集，其余作为训练集
+    训练集会过滤掉TRAIN_START_YEAR之前的数据（过早的市场风格对未来不具备预测效能）
     """
-    file_path, file_name, test_days = args
+    file_path, file_name, test_days, train_start_year = args
     try:
-        df = pd.read_excel(file_path, engine='openpyxl')
-        # 使用OHLCV（5维特征）
-        data = df[['start', 'max', 'min', 'end', 'volume']].values
+        df = pd.read_csv(file_path)
+        
+        # 🔑 关键：数据文件是按时间倒序排列的（最新在前），需要反转为正序（最早在前）
+        df = df.iloc[::-1].reset_index(drop=True)
+        
+        # 使用7维特征：OHLC + volume + exchange(换手率) + rate(量比)
+        data = df[['start', 'max', 'min', 'end', 'volume', 'exchange', 'rate']].values
+        times = df['time'].values  # 日期列，格式为YYYYMMDD整数
         
         data_length = len(data)
         
         # 按时间划分：最近test_days天作为测试集
         if data_length > test_days:
             train_split_point = data_length - test_days
-            train_data = data[:train_split_point]  # 历史数据作为训练集
+            
+            # 🔑 训练集时间过滤：只保留train_start_year及之后的数据
+            # 时间格式为YYYYMMDD，如20210101，train_start_year=2021对应的起始值为20210101
+            train_start_date = train_start_year * 10000 + 101  # 如2021 -> 20210101
+            train_times = times[:train_split_point]
+            
+            # 找到第一个>=train_start_date的索引
+            valid_indices = np.where(train_times >= train_start_date)[0]
+            if len(valid_indices) > 0:
+                train_start_idx = valid_indices[0]
+                train_data = data[train_start_idx:train_split_point].copy()
+            else:
+                # 所有训练数据都在起始年份之前，训练集为空
+                train_data = None
+            
             test_data = data  # 保留全部数据用于测试集（需要前面历史数据作为上下文）
         else:
-            # 数据不足，只能用作训练
-            train_data = data
+            # 数据不足，只能用作训练（同样需要过滤）
+            train_start_date = train_start_year * 10000 + 101
+            valid_indices = np.where(times >= train_start_date)[0]
+            if len(valid_indices) > 0:
+                train_start_idx = valid_indices[0]
+                train_data = data[train_start_idx:].copy()
+            else:
+                train_data = None
             test_data = None
         
         stock_info = {
@@ -418,21 +448,21 @@ def process_single_file(args):
         return None
 
 # 数据预处理函数（按时间划分训练集和测试集）
-def load_and_preprocess_data(data_dir=DataConfig.DATA_DIR, test_days=DataConfig.TEST_DAYS):
+def load_and_preprocess_data(data_dir=DataConfig.DATA_DIR, test_days=DataConfig.TEST_DAYS, train_start_year=DataConfig.TRAIN_START_YEAR):
     """
     数据加载和预处理，使用多进程并行加载
     按时间划分：每只股票的最近test_days天作为测试集，其余作为训练集
     """
     from multiprocessing import Pool, cpu_count
     
-    all_files = [f for f in os.listdir(data_dir) if f.endswith('.xlsx')]
+    all_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
     all_files.sort()
     
     print(f"总共 {len(all_files)} 只股票")
-    print(f"划分策略: 每只股票的最近 {test_days} 天作为测试集，其余作为训练集")
+    print(f"划分策略: 每只股票的最近 {test_days} 天作为测试集，{train_start_year}年及之后的数据作为训练集")
     
     # 处理所有文件
-    file_args = [(os.path.join(data_dir, f), f, test_days) for f in all_files]
+    file_args = [(os.path.join(data_dir, f), f, test_days, train_start_year) for f in all_files]
     num_workers = min(cpu_count(), 8)
     
     with Pool(num_workers) as pool:
@@ -487,440 +517,613 @@ def calculate_stock_weights(stock_info_list):
     
     return normalized_weights
 
-# 改进的样本生成函数（使用滚动窗口标准化，避免数据泄露）
-def generate_single_sample_improved(stock_info_list, stock_weights):
+# 解决样本交叠导致的数据泄露问题：时间只向前推进，不回头
+
+class TemporalSampler:
     """
-    改进的样本生成函数（修复数据泄露问题）
-    1. 根据数据量大小选择股票（数据量大的概率更高）
-    2. 随机选择训练集时间范围内的时间窗口
-    3. 使用滚动窗口标准化：只使用当前样本的历史数据进行标准化
+    时间顺序采样器：采样头在多个股票上同步向前移动，不回头
+    
+    核心算法：
+    1. 计算总样本数和每个epoch需要的样本数
+    2. 将总样本数均匀分配到各个epoch
+    3. 每个epoch采样固定数量的"轮次"，确保最后一个epoch恰好到达最新时间
+    4. 每轮从所有股票当前位置各取一个样本，然后指针前进
     """
-    for _ in range(100):  # 最多尝试100次生成有效样本
-        # 第一步：根据权重选择股票
-        stock_index = np.random.choice(len(stock_info_list), p=stock_weights)
-        stock_info = stock_info_list[stock_index]
-        stock_data = stock_info['data']  # 训练集数据（已经按时间划分）
+    def __init__(self, stock_info_list, num_epochs, samples_per_epoch):
+        self.stock_info_list = stock_info_list
+        self.required_length = DataConfig.REQUIRED_LENGTH
+        self.num_epochs = num_epochs
+        self.samples_per_epoch = samples_per_epoch
+
+        # 每只股票的采样位置指针
+        self.stock_positions = [1] * len(stock_info_list)  # 从索引1开始（需要前一天数据）
+
+        # 每只股票的最大可用位置
+        self.stock_max_positions = []
+        for stock_info in stock_info_list:
+            data_length = len(stock_info['data'])
+            if data_length >= self.required_length + 1:
+                max_pos = data_length - self.required_length
+            else:
+                max_pos = 0
+            self.stock_max_positions.append(max_pos)
+
+        # 统计信息
+        total_samples = sum(self.stock_max_positions)
+        valid_stocks = sum(1 for m in self.stock_max_positions if m > 0)
         
-        context_length = DataConfig.CONTEXT_LENGTH
-        required_length = DataConfig.REQUIRED_LENGTH
+        # 计算每个epoch需要采样的轮数
+        # 总共需要的样本数 = num_epochs * samples_per_epoch
+        # 但我们要确保最后一个epoch恰好用完所有数据
+        # 策略：计算平均每个epoch应该前进多少轮
+        total_needed_samples = num_epochs * samples_per_epoch
         
-        if len(stock_data) < required_length:
-            continue
-            
-        # 第二步：在训练集范围内随机选择起始位置
-        # 注意：start_index 必须 > 0，因为需要前一天的数据来计算涨跌幅
-        max_start_index = len(stock_data) - required_length
-        if max_start_index < 1:
-            continue  # 数据不足，至少需要 required_length + 1 天
-        start_index = np.random.randint(1, max_start_index + 1)
+        # 每轮采样约等于有效股票数（因为每只股票取一个）
+        avg_samples_per_round = valid_stocks * 0.8  # 考虑到有些样本可能无效
         
-        # 提取原始数据窗口
-        input_seq_raw = stock_data[start_index:start_index + context_length]
+        # 计算需要多少轮才能采样完所有数据
+        total_rounds_needed = int(total_samples / avg_samples_per_round) if avg_samples_per_round > 0 else 0
         
-        # 🔑 特征标准化：计算每天相对前一天的涨跌幅
-        # 这是最符合人类交易思维的方式：今天相比昨天涨了多少
+        # 每个epoch应该前进的轮数
+        self.rounds_per_epoch = max(1, total_rounds_needed // num_epochs)
         
-        # 初始化标准化后的数据
-        input_seq = np.zeros_like(input_seq_raw, dtype=np.float64)
-        
-        # 获取窗口前一天的数据作为第1天的基准
-        prev_day_data = stock_data[start_index - 1]
-        prev_prices = prev_day_data[:4]  # OHLC
-        prev_volume = prev_day_data[4]   # Volume
-        
-        # 避免除零错误
-        if np.any(prev_prices == 0) or prev_volume == 0:
-            continue
-        
-        # 第1天：相对于窗口前一天的收盘价（价格特征）
-        prev_close = prev_prices[3]  # 前一天的收盘价
-        if prev_close == 0:
-            continue
-        input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
-        # 成交量特征：直接使用相对变化比例
-        input_seq[0, 4] = (input_seq_raw[0, 4] - prev_volume) / prev_volume
-        
-        # 第2-40天：相对于前一天的收盘价
-        for i in range(1, context_length):
-            # 价格特征：所有价格(OHLC)都相对于前一天的收盘价
-            # 这符合真实交易逻辑：今天的开盘/最高/最低/收盘都和昨天收盘价比
-            yesterday_close = input_seq_raw[i-1, 3]  # 前一天的收盘价
-            yesterday_volume = input_seq_raw[i-1, 4]  # 前一天的成交量
-            if yesterday_close == 0 or yesterday_volume == 0:
-                # 如果昨天收盘价或成交量为0，跳过这个样本
+        print(f"  初始化采样器: {valid_stocks}只有效股票, 总样本数={total_samples}")
+        print(f"  采样策略: 共{num_epochs}个epoch, 每epoch前进约{self.rounds_per_epoch}轮")
+        print(f"  预计最后epoch将到达最新时间")
+
+    def sample_batch_rounds(self, num_rounds):
+        """
+        批量采样多轮：一次性生成多轮的样本索引，提高效率
+
+        参数:
+            num_rounds: 要采样的轮数
+
+        返回: [(stock_idx, start_idx), ...] 所有轮次的样本索引列表
+        """
+        all_samples = []
+
+        for _ in range(num_rounds):
+            for stock_idx in range(len(self.stock_info_list)):
+                current_pos = self.stock_positions[stock_idx]
+                max_pos = self.stock_max_positions[stock_idx]
+
+                # 检查是否还有可用样本
+                if current_pos <= max_pos:
+                    all_samples.append((stock_idx, current_pos))
+                    # 指针前进一步
+                    self.stock_positions[stock_idx] += 1
+
+            # 如果所有股票都已到达终点，提前退出
+            if not any(self.stock_positions[i] <= self.stock_max_positions[i] 
+                      for i in range(len(self.stock_info_list))):
                 break
-            input_seq[i, :4] = (input_seq_raw[i, :4] - yesterday_close) / yesterday_close
-            # 成交量特征：直接使用相对变化比例
-            input_seq[i, 4] = (input_seq_raw[i, 4] - yesterday_volume) / yesterday_volume
-        else:
-            # 只有for循环正常结束（没有break）才会执行这里
-            # 这表示所有历史数据都成功标准化了
-            
-            # 统一使用旧的涨幅型标签：基于未来涨幅大小
-            original_start_price = stock_data[start_index + context_length - 1, 3]  # 当前收盘价
-            original_end_price = stock_data[start_index + DataConfig.REQUIRED_LENGTH - 1, 3]   # N天后收盘价
 
-            if original_start_price == 0:  # 避免除零错误
-                continue
-
-            cumulative_return = (original_end_price - original_start_price) / original_start_price
-
-            # 软标签机制：降低边界区域的惩罚
-            # - 收益 ≥ 8% → 1.0（明确上涨）
-            # - 收益 0-8% → 0.4（边界区域，降低矛盾惩罚）
-            # - 收益 < 0% → 0.0（明确不涨）
-            if cumulative_return >= DataConfig.UPRISE_THRESHOLD:  # 涨幅≥阈值
-                target = 1.0
-            elif cumulative_return >= 0:  # 0-8%之间
-                target = 0.4
-            else:  # 涨幅<0%
-                target = 0.0
-
-            return input_seq, target
+        return all_samples
     
-    raise ValueError("无法生成有效样本：股票数据长度不足或收盘价为0")
+    def get_progress(self):
+        """获取当前采样进度"""
+        total_samples = sum(self.stock_max_positions)
+        current_samples = sum(min(pos - 1, max_pos) for pos, max_pos in zip(self.stock_positions, self.stock_max_positions))
+        return current_samples, total_samples
+    
+    def get_rounds_per_epoch(self):
+        """获取每个epoch应该采样的轮数"""
+        return self.rounds_per_epoch
 
-def generate_batch_samples_improved(stock_info_list, stock_weights, batch_size):
+def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     """
-    改进的批量生成训练样本（使用滚动窗口标准化）
-    返回: (batch_inputs, batch_targets)
-    batch_inputs: numpy array, shape [batch_size, context_length, 5]  
-    batch_targets: numpy array, shape [batch_size]
-    """
-    batch_inputs = []
-    batch_targets = []
-    
-    attempts = 0
-    max_attempts = batch_size * 10  # 防止无限循环
-    
-    while len(batch_inputs) < batch_size and attempts < max_attempts:
-        attempts += 1
-        try:
-            input_seq, target = generate_single_sample_improved(stock_info_list, stock_weights)
-            batch_inputs.append(input_seq)
-            batch_targets.append(target)
-        except ValueError:
-            continue
-    
-    if len(batch_inputs) < batch_size:
-        raise ValueError(f"无法生成足够的样本，只生成了 {len(batch_inputs)}/{batch_size} 个")
-    
-    return np.array(batch_inputs), np.array(batch_targets)
+    根据预生成的索引生成单个样本
 
-# 创建固定的评估数据集（使用滚动窗口标准化，只使用测试集时间范围）
-def create_fixed_evaluation_dataset(test_stock_info, seed=DataConfig.RANDOM_SEED):
+    参数:
+        stock_info_list: 股票信息列表
+        stock_idx: 股票索引
+        start_idx: 样本起始索引
+
+    返回: (input_seq, target) 或 None（如果样本无效）
     """
-    创建固定的评估数据集，使用滚动窗口标准化避免数据泄露
-    只使用测试集的时间范围（最近80天），严格时间分离
-    使用全部测试样本进行评估，确保评估结果更加准确和稳定
-    """
-    print("正在创建固定的评估数据集（使用滚动窗口标准化，严格时间分离）...")
-    # 设置所有可能的随机种子以确保完全可重复
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    
-    eval_inputs = []
-    eval_targets = []
-    eval_cumulative_returns = []  # 存储实际涨跌幅
-    
-    # 预先生成所有可能的样本
-    all_possible_samples = []
+    stock_info = stock_info_list[stock_idx]
+    stock_data = stock_info['data']
     context_length = DataConfig.CONTEXT_LENGTH
     required_length = DataConfig.REQUIRED_LENGTH
-    test_days = DataConfig.TEST_DAYS
+
+    # 提取原始数据窗口
+    input_seq_raw = stock_data[start_idx:start_idx + context_length]
+
+    # 特征标准化：计算每天相对前一天的涨跌幅
+    input_seq = np.zeros_like(input_seq_raw, dtype=np.float64)
+
+    # 获取窗口前一天的数据作为第1天的基准
+    prev_day_data = stock_data[start_idx - 1]
+    prev_prices = prev_day_data[:4]  # OHLC
+    prev_volume = prev_day_data[4]   # Volume
+
+    # 避免除零错误
+    if np.any(prev_prices == 0) or prev_volume == 0:
+        return None
+
+    prev_close = prev_prices[3]  # 前一天的收盘价
+    if prev_close == 0:
+        return None
+    input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
+    input_seq[0, 4] = (input_seq_raw[0, 4] - prev_volume) / prev_volume
+    input_seq[0, 5] = np.clip(input_seq_raw[0, 5] / 100.0, 0.0, 1.0)
+    input_seq[0, 6] = np.clip(input_seq_raw[0, 6] / 10.0, 0.0, 1.0)
+
+    # 第2-N天：相对于前一天的收盘价
+    for i in range(1, context_length):
+        yesterday_close = input_seq_raw[i-1, 3]
+        yesterday_volume = input_seq_raw[i-1, 4]
+        if yesterday_close == 0 or yesterday_volume == 0:
+            return None
+        input_seq[i, :4] = (input_seq_raw[i, :4] - yesterday_close) / yesterday_close
+        input_seq[i, 4] = (input_seq_raw[i, 4] - yesterday_volume) / yesterday_volume
+        input_seq[i, 5] = np.clip(input_seq_raw[i, 5] / 100.0, 0.0, 1.0)
+        input_seq[i, 6] = np.clip(input_seq_raw[i, 6] / 10.0, 0.0, 1.0)
+
+    # 数值范围限制
+    input_seq[:, :4] = np.clip(input_seq[:, :4], -0.3, 0.3)
+    input_seq[:, 4] = np.clip(input_seq[:, 4], -5.0, 5.0)
+    input_seq[:, 4] = np.clip(input_seq[:, 4] / 10.0 + 0.5, 0.0, 1.0)
+    input_seq[:, 5] = np.clip(input_seq[:, 5], 0.0, 1.0)
+    input_seq[:, 6] = np.clip(input_seq[:, 6], 0.0, 1.0)
+
+    # NaN/Inf检测
+    if np.any(np.isnan(input_seq)) or np.any(np.isinf(input_seq)):
+        return None
+
+    # 计算标签
+    original_start_price = stock_data[start_idx + context_length - 1, 3]  # 当前收盘价
+    original_end_price = stock_data[start_idx + required_length - 1, 3]   # N天后收盘价
+
+    if original_start_price == 0:
+        return None
+
+    cumulative_return = (original_end_price - original_start_price) / original_start_price
+
+    # 二分类标签
+    if cumulative_return >= DataConfig.UPRISE_THRESHOLD:
+        target = 1.0
+    else:
+        target = 0.0
+
+    return input_seq, target
+
+def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng):
+    """
+    使用样本池机制采样：
+    1. 批量采样：一次性生成足够的样本索引
+    2. 正样本占到batch的25%时，随机抽取剩余75%的负样本组成batch
+    3. 重复直到完成指定数量的batch
+
+    返回: (inputs, targets) numpy数组
+    """
+    positive_ratio = 0.25
+    pos_quota = max(1, int(batch_size * positive_ratio))
+    neg_quota = batch_size - pos_quota
+
+    pos_pool_inputs = []
+    pos_pool_targets = []
+    neg_pool_inputs = []
+    neg_pool_targets = []
+
+    all_batch_inputs = []
+    all_batch_targets = []
+
+    batches_generated = 0
     
-    for stock_idx, stock_info in enumerate(test_stock_info):
-        stock_data = stock_info['data']  # 原始数据（包含全部历史）
-        test_split_point = stock_info['test_split_point']  # 测试集起始位置
-        
-        if len(stock_data) < required_length:
+    # 计算需要多少轮采样（一次性批量生成）
+    # 每个batch需要batch_size个样本，共需要batches_per_epoch个batch
+    # 正样本比例约5-10%，需要大量采样才能获得足够的正样本
+    # 每个batch需要pos_quota个正样本
+    # 假设正样本率约6%，需要采样 (batches_per_epoch*pos_quota/0.06) 个有效样本
+
+    # 考虑到约20%的样本无效，需要采样更多
+    needed_positive = pos_quota * batches_per_epoch  # 需要的正样本数
+    estimated_positive_rate = 0.06  # 估计正样本率6%
+    estimated_valid_rate = 0.8  # 估计有效样本率80%
+    needed_valid_samples = needed_positive / estimated_positive_rate  # 需要的有效样本数
+    needed_total_samples = needed_valid_samples / estimated_valid_rate  # 需要的总样本数
+    
+    avg_samples_per_round = len(stock_info_list) * 0.8  # 每轮约80%的股票有效
+    rounds_needed = max(1, int(needed_total_samples / avg_samples_per_round))
+
+    print(f"    批量生成样本索引: {rounds_needed}轮...")
+    
+    # 一次性批量生成所有样本索引
+    sample_indices = sampler.sample_batch_rounds(rounds_needed)
+    
+    if len(sample_indices) == 0:
+        raise ValueError("采样头已到达所有股票终点，无法生成样本")
+    
+    print(f"    生成了{len(sample_indices)}个样本索引，开始处理...")
+    
+    # 生成样本并分类放入池子
+    for idx, (stock_idx, start_idx) in enumerate(sample_indices):
+        sample = generate_sample_from_index(stock_info_list, stock_idx, start_idx)
+        if sample is None:
             continue
+
+        input_seq, target = sample
+
+        if target >= 0.5:  # 正样本
+            pos_pool_inputs.append(input_seq)
+            pos_pool_targets.append(target)
+        else:  # 负样本
+            neg_pool_inputs.append(input_seq)
+            neg_pool_targets.append(target)
         
-        # 🔑 关键：严格的测试集划分，避免数据泄露
-        # 测试集80天：[test_split_point, len(stock_data))
-        # 每只股票可生成的测试样本数 = 测试集天数 - 序列长度 - 预测天数 = 80 - 40 - 3 = 37个
-        
-        # 最早预测时间点：测试集第41天（前40天作为上下文）
-        # 最晚预测时间点：测试集倒数第4天（需要预留3天未来数据）
-        min_predict_point = test_split_point + context_length
-        max_predict_point = len(stock_data) - DataConfig.FUTURE_DAYS - 1
-        
-        # 检查是否有足够的数据
-        if min_predict_point > max_predict_point:
-            continue  # 测试集不够80天，无法生成样本
-        
-        # 将预测时间点转换为start_idx
-        # 预测时间点 = start_idx + context_length - 1
-        # start_idx = 预测时间点 - context_length + 1
-        min_start_idx = min_predict_point - context_length + 1
-        max_start_idx = max_predict_point - context_length + 1
-        
-        # 为每只股票生成测试样本
-        # 每个样本的预测时间点在测试集时间范围内
-        # 上下文使用的是测试集前部分天数+训练集数据（如有需要）
-        for start_idx in range(min_start_idx, max_start_idx + 1):
-            
-            # 提取原始数据窗口（可能包含部分训练集数据作为上下文）
-            input_seq_raw = stock_data[start_idx:start_idx + context_length]
-            
-            # 🔑 特征标准化：计算每天相对前一天的涨跌幅
-            # 初始化标准化后的数据
-            input_seq = np.zeros_like(input_seq_raw, dtype=np.float64)
-            
-            # 第1天：使用窗口前一天的数据作为基准
-            # 注意：理论上start_idx不可能为0（因为测试集前面有训练集数据）
-            # 但为了代码健壮性，仍然检查
-            if start_idx == 0:
-                continue  # 跳过，因为没有前一天数据
-            
-            prev_day_data = stock_data[start_idx - 1]
-            prev_prices = prev_day_data[:4]  # OHLC
-            prev_volume = prev_day_data[4]   # Volume
-            
-            # 避免除零错误
-            if np.any(prev_prices == 0) or prev_volume == 0:
+        # 定期显示进度
+        if (idx + 1) % 10000 == 0:
+            print(f"    已处理 {idx + 1}/{len(sample_indices)} 个样本索引", end='\r', flush=True)
+
+    print(f"    样本池: 正样本={len(pos_pool_inputs)}, 负样本={len(neg_pool_inputs)}")
+    
+    # 从池子中组成batch
+    while len(pos_pool_inputs) >= pos_quota and len(neg_pool_inputs) >= neg_quota and batches_generated < batches_per_epoch:
+        # 从正样本池取前pos_quota个
+        batch_pos_inputs = pos_pool_inputs[:pos_quota]
+        batch_pos_targets = pos_pool_targets[:pos_quota]
+        pos_pool_inputs = pos_pool_inputs[pos_quota:]
+        pos_pool_targets = pos_pool_targets[pos_quota:]
+
+        # 从负样本池随机取neg_quota个
+        neg_indices = rng.sample(range(len(neg_pool_inputs)), neg_quota)
+        batch_neg_inputs = [neg_pool_inputs[i] for i in neg_indices]
+        batch_neg_targets = [neg_pool_targets[i] for i in neg_indices]
+
+        # 从负样本池删除已使用的样本
+        neg_indices_set = set(neg_indices)
+        neg_pool_inputs = [neg_pool_inputs[i] for i in range(len(neg_pool_inputs)) if i not in neg_indices_set]
+        neg_pool_targets = [neg_pool_targets[i] for i in range(len(neg_pool_targets)) if i not in neg_indices_set]
+
+        # 合并并打乱
+        batch_inputs = batch_pos_inputs + batch_neg_inputs
+        batch_targets = batch_pos_targets + batch_neg_targets
+
+        # 打乱顺序
+        combined = list(zip(batch_inputs, batch_targets))
+        rng.shuffle(combined)
+        batch_inputs, batch_targets = zip(*combined)
+
+        all_batch_inputs.extend(batch_inputs)
+        all_batch_targets.extend(batch_targets)
+
+        batches_generated += 1
+
+    print(f"    已生成 {batches_generated}/{batches_per_epoch} 个batch")
+    
+    if batches_generated < batches_per_epoch:
+        raise ValueError(f"样本不足：仅生成{batches_generated}/{batches_per_epoch}个batch")
+
+    return np.asarray(all_batch_inputs), np.asarray(all_batch_targets)
+
+def create_fixed_evaluation_dataset(test_stock_info):
+    eval_inputs = []
+    eval_targets = []
+    eval_cumulative_returns = []
+
+    required_length = DataConfig.REQUIRED_LENGTH
+    context_length = DataConfig.CONTEXT_LENGTH
+
+    for stock_info in test_stock_info:
+        stock_data = stock_info['data']
+        data_length = len(stock_data)
+        test_split_point = stock_info.get('test_split_point', max(0, data_length - DataConfig.TEST_DAYS))
+
+        start_min = max(1, test_split_point)
+        start_max = data_length - required_length
+        if start_max < start_min:
+            continue
+
+        for start_idx in range(start_min, start_max + 1):
+            sample = generate_sample_from_index([stock_info], 0, start_idx)
+            if sample is None:
                 continue
-            
-            # 第1天：相对于窗口前一天的收盘价（价格特征）
-            prev_close = prev_prices[3]  # 前一天的收盘价
-            if prev_close == 0:
-                continue
-            input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
-            # 成交量特征：直接使用相对变化比例
-            input_seq[0, 4] = (input_seq_raw[0, 4] - prev_volume) / prev_volume
-            
-            # 第2-40天：相对于前一天的收盘价
-            valid_sample = True
-            for i in range(1, context_length):
-                yesterday_close = input_seq_raw[i-1, 3]  # 前一天的收盘价
-                yesterday_volume = input_seq_raw[i-1, 4]  # 前一天的成交量
-                
-                if yesterday_close == 0 or yesterday_volume == 0:
-                    valid_sample = False
-                    break
-                
-                input_seq[i, :4] = (input_seq_raw[i, :4] - yesterday_close) / yesterday_close
-                # 成交量特征：直接使用相对变化比例
-                input_seq[i, 4] = (input_seq_raw[i, 4] - yesterday_volume) / yesterday_volume
-            
-            if not valid_sample:
-                continue
-            
-            # 统一使用涨幅型标签：基于未来涨幅大小
+
+            input_seq, target = sample
+            eval_inputs.append(input_seq)
+            eval_targets.append(target)
+
             original_start_price = stock_data[start_idx + context_length - 1, 3]
             original_end_price = stock_data[start_idx + required_length - 1, 3]
-
             if original_start_price == 0:
                 continue
-
             cumulative_return = (original_end_price - original_start_price) / original_start_price
+            eval_cumulative_returns.append(float(cumulative_return))
 
-            # 测试集二分类：与训练集保持一致
-            if cumulative_return >= DataConfig.UPRISE_THRESHOLD:  # 涨幅≥阈值
-                target = 1.0
-            else:  # 涨幅<阈值
-                target = 0.0
+    if len(eval_inputs) == 0:
+        raise ValueError("固定评估集为空：test_stock_info中没有可用样本")
 
-            all_possible_samples.append((input_seq, target, stock_idx, start_idx, cumulative_return))
-    
-    print(f"总共可用样本: {len(all_possible_samples)} 个")
-    
-    # 使用全部样本进行评估（更科学，且评估速度很快）
-    selected_samples = all_possible_samples
-    print(f"使用全部 {len(selected_samples)} 个样本进行评估")
-    
-    # 按股票索引和时间索引排序，确保顺序一致
-    selected_samples.sort(key=lambda x: (x[2], x[3]))
-    
-    # 分离输入和标签
-    for input_seq, target, stock_idx, start_idx, cumulative_return in selected_samples:
-        eval_inputs.append(input_seq)
-        eval_targets.append(target)
-        eval_cumulative_returns.append(cumulative_return)
-    
-    eval_inputs = np.array(eval_inputs)
-    eval_targets = np.array(eval_targets)
-    eval_cumulative_returns = np.array(eval_cumulative_returns)
-    
-    # 保存评估样本信息以便调试
-    print(f"评估样本详细信息:")
-    print(f"  样本总数: {len(eval_inputs)}")
-    print(f"  来自股票数: {len(set(s[2] for s in selected_samples))}")
-    print(f"  时间窗口范围: {min(s[3] for s in selected_samples)} - {max(s[3] for s in selected_samples)}")
-    
-    # 打印类别分布
-    unique, counts = np.unique(eval_targets, return_counts=True)
-    class_names = ['不上涨', '上涨']
-    print("评估集类别分布:")
-    for cls, count in zip(unique, counts):
-        print(f"  {class_names[int(cls)]}: {count} 个样本 ({count/len(eval_targets)*100:.1f}%)")
-    
-    # 打印收益率统计
-    print(f"\n真实收益率统计:")
-    print(f"  最小值: {np.min(eval_cumulative_returns)*100:.2f}%")
-    print(f"  最大值: {np.max(eval_cumulative_returns)*100:.2f}%")
-    print(f"  平均值: {np.mean(eval_cumulative_returns)*100:.2f}%")
-    print(f"  中位数: {np.median(eval_cumulative_returns)*100:.2f}%")
-    print(f"  ≥0%样本: {np.sum(eval_cumulative_returns >= 0)} ({np.sum(eval_cumulative_returns >= 0)/len(eval_cumulative_returns)*100:.1f}%)")
-    print(f"  ≥3%样本: {np.sum(eval_cumulative_returns >= 0.03)} ({np.sum(eval_cumulative_returns >= 0.03)/len(eval_cumulative_returns)*100:.1f}%)")
-    print(f"  ≥10%样本: {np.sum(eval_cumulative_returns >= 0.10)} ({np.sum(eval_cumulative_returns >= 0.10)/len(eval_cumulative_returns)*100:.1f}%)")
-    
-    return eval_inputs, eval_targets, eval_cumulative_returns
+    return np.asarray(eval_inputs), np.asarray(eval_targets), np.asarray(eval_cumulative_returns)
 
-# 批量评估函数
-def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE):
+
+def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=100):
     """
-    使用批处理进行快速评估（二分类）
-    返回: (total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_percent_stats)
-    
-    top_percent_stats: 按预测概率排序后，前1%/5%/10%样本的收益统计
+    批量评估模型性能（详细版，用于train.py主训练流程）
+
+    返回:
+        total: 总样本数
+        class_correct: [不上涨正确数, 上涨正确数]
+        class_total: [不上涨总数, 上涨总数]
+        pred_positive_correct: 预测上涨且真实上涨的数量
+        pred_positive_total: 预测上涨的总数量
+        pred_non_negative: 预测上涨且真实收益>=0的数量
+        auc_score: AUC得分
+        confidence_stats: 置信度区间统计
+        top_stats: Top N% 收益统计
     """
     model.eval()
-    total = 0
-    class_correct = [0, 0]  # [不上涨正确数, 上涨正确数]
-    class_total = [0, 0]    # [不上涨总数, 上涨总数]
-    
-    # 新增：预测统计
-    pred_positive_correct = 0  # 预测上涨且正确的数量
-    pred_positive_total = 0    # 预测上涨的总数量
-    pred_non_negative = 0       # 预测上涨且实际涨幅≥0%的数量
-    
-    # 新增：用于AUC计算和Top-K排序的列表
-    all_probabilities = []
+
+    all_preds = []
     all_targets = []
-    all_returns = []  # 存储所有样本的实际收益率
-    
-    # 新增：置信度区间统计 {区间名称: [预测上涨且正确数, 预测上涨总数, 预测上涨且实际涨幅≥0%数]}
-    confidence_stats = {
-        '0.50-0.55': [0, 0, 0],
-        '0.55-0.58': [0, 0, 0],
-        '0.58-0.60': [0, 0, 0],
-        '0.60-0.70': [0, 0, 0],
-        '0.70-1.00': [0, 0, 0]
-    }
-    
+    all_returns = []
+
     num_samples = len(eval_inputs)
     num_batches = (num_samples + batch_size - 1) // batch_size
-    
+
     with torch.no_grad():
         for i in range(num_batches):
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, num_samples)
-            
-            # 批量处理 (使用BF16精度)
-            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], 
-                                      dtype=torch.bfloat16).to(device)
+
+            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx],
+                                       dtype=torch.bfloat16).to(device)
             batch_targets = eval_targets[start_idx:end_idx]
-            batch_returns = eval_cumulative_returns[start_idx:end_idx]  # 获取实际涨跌幅
-            
-            # 批量推理
-            batch_outputs = model(batch_inputs)  # [batch_size, 1]
-            # BF16需要先转为FP32再转numpy
-            batch_probabilities = torch.sigmoid(batch_outputs).float().cpu().numpy().flatten()
-            batch_predictions = (batch_probabilities > 0.5).astype(int)  # 概率>0.5预测为上涨
-            
-            # 收集所有概率、标签和收益率用于后续计算
-            all_probabilities.extend(batch_probabilities)
+            batch_returns = eval_cumulative_returns[start_idx:end_idx]
+
+            preds = torch.sigmoid(model(batch_inputs))
+
+            all_preds.extend(preds.float().cpu().numpy().flatten())
             all_targets.extend(batch_targets)
             all_returns.extend(batch_returns)
-            
-            # 批量计算得分
-            for j in range(len(batch_targets)):
-                target = int(batch_targets[j])
-                prediction = batch_predictions[j]
-                actual_return = batch_returns[j]  # 获取实际涨跌幅
-                probability = batch_probabilities[j]  # 获取预测概率
-                
-                class_total[target] += 1
-                total += 1
-                
-                # 统计预测上涨的情况
-                if prediction == 1:
-                    pred_positive_total += 1
-                    if target == 1:  # 预测上涨且实际上涨
-                        pred_positive_correct += 1
-                    if actual_return >= 0:  # 预测上涨且实际涨幅≥0%
-                        pred_non_negative += 1
-                    
-                    # 统计不同置信度区间的精确度
-                    if 0.50 <= probability < 0.55:
-                        confidence_stats['0.50-0.55'][1] += 1
-                        if target == 1:
-                            confidence_stats['0.50-0.55'][0] += 1
-                        if actual_return >= 0:
-                            confidence_stats['0.50-0.55'][2] += 1
-                    elif 0.55 <= probability < 0.58:
-                        confidence_stats['0.55-0.58'][1] += 1
-                        if target == 1:
-                            confidence_stats['0.55-0.58'][0] += 1
-                        if actual_return >= 0:
-                            confidence_stats['0.55-0.58'][2] += 1
-                    elif 0.58 <= probability < 0.60:
-                        confidence_stats['0.58-0.60'][1] += 1
-                        if target == 1:
-                            confidence_stats['0.58-0.60'][0] += 1
-                        if actual_return >= 0:
-                            confidence_stats['0.58-0.60'][2] += 1
-                    elif 0.60 <= probability < 0.70:
-                        confidence_stats['0.60-0.70'][1] += 1
-                        if target == 1:
-                            confidence_stats['0.60-0.70'][0] += 1
-                        if actual_return >= 0:
-                            confidence_stats['0.60-0.70'][2] += 1
-                    elif 0.70 <= probability <= 1.00:
-                        confidence_stats['0.70-1.00'][1] += 1
-                        if target == 1:
-                            confidence_stats['0.70-1.00'][0] += 1
-                        if actual_return >= 0:
-                            confidence_stats['0.70-1.00'][2] += 1
-                
-                # 统计预测正确性（用于显示准确率）
-                if prediction == target:
-                    class_correct[target] += 1
-    
-    # 计算AUC
-    try:
-        auc_score = roc_auc_score(all_targets, all_probabilities)
-    except ValueError:
-        # 如果所有标签都是同一类，AUC无法计算
-        auc_score = 0.5  # 随机分类器的AUC
-    
-    # 🔑 核心改进：按预测概率排序，计算Top N%样本的收益统计
-    # 这能真实反映模型的排序能力（选股能力）
-    all_probabilities = np.array(all_probabilities)
+
+    all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
     all_returns = np.array(all_returns)
-    
-    # 按预测概率从高到低排序
-    sorted_indices = np.argsort(all_probabilities)[::-1]  # 降序排列
-    
-    # 计算Top N%的统计（使用配置文件中的百分比）
+
+    total = len(all_preds)
+
+    # 计算分类准确率
+    pred_labels = (all_preds >= 0.5).astype(int)
+    true_labels = (all_targets >= 0.5).astype(int)
+
+    class_correct = [0, 0]
+    class_total = [0, 0]
+
+    for i in range(2):
+        mask = true_labels == i
+        class_total[i] = np.sum(mask)
+        class_correct[i] = np.sum((pred_labels == i) & mask)
+
+    # 预测上涨的统计
+    pred_positive_mask = pred_labels == 1
+    pred_positive_total = np.sum(pred_positive_mask)
+    pred_positive_correct = np.sum(pred_positive_mask & (true_labels == 1))
+    pred_non_negative = np.sum(pred_positive_mask & (all_returns >= 0))
+
+    # 计算 AUC
+    try:
+        auc_score = roc_auc_score(true_labels, all_preds)
+    except ValueError:
+        auc_score = 0.5
+
+    # 置信度区间统计
+    confidence_intervals = ['0.50-0.55', '0.55-0.58', '0.58-0.60', '0.60-0.70', '0.70-1.00']
+    confidence_bounds = [(0.50, 0.55), (0.55, 0.58), (0.58, 0.60), (0.60, 0.70), (0.70, 1.00)]
+    confidence_stats = {}
+
+    for interval, (low, high) in zip(confidence_intervals, confidence_bounds):
+        mask = (all_preds >= low) & (all_preds < high)
+        total_in_interval = np.sum(mask)
+        correct_in_interval = np.sum(mask & (true_labels == 1))
+        non_negative_in_interval = np.sum(mask & (all_returns >= 0))
+        confidence_stats[interval] = (correct_in_interval, total_in_interval, non_negative_in_interval)
+
+    # Top N% 收益统计
     percent = DataConfig.TOP_PERCENT
-    top_k = max(1, int(len(sorted_indices) * percent / 100))  # 至少1个样本
+    top_k = max(1, int(len(all_preds) * percent / 100))
+
+    sorted_indices = np.argsort(all_preds)[::-1]
     top_indices = sorted_indices[:top_k]
-    
     top_returns = all_returns[top_indices]
-    top_targets = all_targets[top_indices]
-    
-    # 统计：样本数、累计收益、平均收益
+
     top_stats = {
         'count': top_k,
-        'total_return': np.sum(top_returns),
         'avg_return': np.mean(top_returns),
+        'total_return': np.sum(top_returns)
     }
-    
+
     return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats
 
-def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE):
+
+def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
+                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name=""):
     """
-    计算测试集损失值
+    简化版模型评估函数（用于train_clone.py和train_evolve.py）
+
+    返回统计字典，包含:
+        auc: AUC得分
+        top_return: Top1%收益率
+        top_count: Top1%样本数
+        top_threshold: Top1%最低置信度
+        high_conf_count: 高置信(>0.7)样本数
+        low_conf_count: 低置信(<0.2)样本数
+        pred_mean: 预测均值
+        pred_std: 预测标准差
     """
     model.eval()
-    total_loss = 0
+
+    all_preds = []
+    all_targets = []
+    all_returns = []
+
+    num_samples = len(eval_inputs)
+    num_batches = (num_samples + batch_size - 1) // batch_size
+
+    with torch.no_grad():
+        for i in range(num_batches):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, num_samples)
+
+            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx],
+                                       dtype=torch.bfloat16).to(device)
+            batch_targets = eval_targets[start_idx:end_idx]
+            batch_returns = eval_cumulative_returns[start_idx:end_idx]
+
+            preds = torch.sigmoid(model(batch_inputs))
+
+            all_preds.extend(preds.float().cpu().numpy().flatten())
+            all_targets.extend(batch_targets)
+            all_returns.extend(batch_returns)
+
+    all_preds = np.array(all_preds)
+    all_targets = np.array(all_targets)
+    all_returns = np.array(all_returns)
+
+    # 计算 AUC
+    try:
+        auc = roc_auc_score(all_targets, all_preds)
+    except ValueError:
+        auc = 0.5
+
+    # 计算 Top N% 收益
+    percent = DataConfig.TOP_PERCENT
+    top_k = max(1, int(len(all_preds) * percent / 100))
+
+    sorted_indices = np.argsort(all_preds)[::-1]
+    top_indices = sorted_indices[:top_k]
+    top_returns = all_returns[top_indices]
+
+    # Top K 的最低置信度阈值（用于实盘时判断是否入选Top1%）
+    top_threshold = all_preds[sorted_indices[top_k - 1]]
+
+    # 统计高置信样本
+    high_conf = all_preds > 0.7
+    low_conf = all_preds < 0.2
+
+    stats = {
+        'auc': auc,
+        'top_return': np.mean(top_returns),
+        'top_count': top_k,
+        'top_threshold': top_threshold,
+        'high_conf_count': np.sum(high_conf),
+        'low_conf_count': np.sum(low_conf),
+        'pred_mean': np.mean(all_preds),
+        'pred_std': np.std(all_preds),
+    }
+
+    return stats
+
+
+def generate_pseudo_labels(pred_scores, original_targets,
+                           pseudo_pos_ratio=0.01,
+                           pseudo_neg_ratio=0.05):
+    """
+    统一的伪标签生成函数（按数量取Top-K%方式）
+
+    核心思想：
+    - 按预测分数排序，取前 pseudo_pos_ratio 比例的样本 → 强制标签=1.0（伪正）
+    - 按预测分数排序，取倒数 pseudo_neg_ratio 比例的样本 → 强制标签=0.0（伪负）
+    - 其余样本保持原始标签不变
+
+    优点：
+    - 每轮伪标签数量固定（按比例），训练更稳定
+    - 过滤掉教师模型"不确定"的样本（中间部分）
+
+    Args:
+        pred_scores: 教师模型的预测分数 [batch_size] 或 numpy array
+        original_targets: 原始标签 [batch_size] 或 numpy array
+        pseudo_pos_ratio: 伪正标签比例（如0.01=前1%）
+        pseudo_neg_ratio: 伪负标签比例（如0.05=倒数5%）
+
+    Returns:
+        pseudo_targets: 伪标签数组，与original_targets形状相同
+        stats: 统计信息字典
+    """
+    # 转为numpy数组（BF16需要先转float32）
+    if isinstance(pred_scores, torch.Tensor):
+        pred_scores = pred_scores.float().detach().cpu().numpy()
+    if isinstance(original_targets, torch.Tensor):
+        original_targets = original_targets.float().detach().cpu().numpy()
+
+    pred_scores = np.asarray(pred_scores).flatten()
+    original_targets = np.asarray(original_targets).copy()
+
+    # 计算伪正阈值：按数量取前pseudo_pos_ratio
+    k_pos = max(1, int(len(pred_scores) * pseudo_pos_ratio))
+    threshold_pos = np.sort(pred_scores)[-k_pos]  # 第k_pos大的值
+
+    # 计算伪负阈值：按数量取倒数pseudo_neg_ratio
+    k_neg = max(1, int(len(pred_scores) * pseudo_neg_ratio))
+    threshold_neg = np.sort(pred_scores)[k_neg - 1]  # 第k_neg小的值
+
+    # 生成伪标签
+    pseudo_targets = original_targets.copy()
+
+    # 伪正：预测值 >= threshold_pos → 强制标签=1.0
+    high_mask = pred_scores >= threshold_pos
+    pseudo_targets[high_mask] = 1.0
+
+    # 伪负：预测值 <= threshold_neg → 强制标签=0.0
+    low_mask = pred_scores <= threshold_neg
+    pseudo_targets[low_mask] = 0.0
+
+    stats = {
+        'pseudo_pos_count': int(np.sum(high_mask)),
+        'pseudo_neg_count': int(np.sum(low_mask)),
+        'unchanged_count': int(len(pred_scores) - np.sum(high_mask) - np.sum(low_mask)),
+        'threshold_pos': float(threshold_pos),
+        'threshold_neg': float(threshold_neg),
+    }
+
+    return pseudo_targets, stats
+
+
+def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
+                             epoch, model_prefix="model", extra_info="",
+                             output_dir=DataConfig.OUTPUT_DIR):
+    """
+    通用的模型保存函数，带详细元数据
+
+    Args:
+        model_state_dict: 模型state_dict
+        top_return: Top1%收益率（小数，如0.015）
+        top_threshold: Top1%阈值
+        auc: AUC得分
+        epoch: 轮次
+        model_prefix: 模型前缀（如"modelA", "modelB", "evolved"）
+        extra_info: 额外信息（如教师数量）
+        output_dir: 输出目录
+
+    Returns:
+        保存的文件路径
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 生成文件名
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%m%d_%H%M")
+
+    return_str = f"{top_return*100:+.2f}".replace('+', 'p').replace('-', 'n').replace('.', '_')
+    thr_str = f"{top_threshold:.3f}".replace('.', '_')
+    auc_str = f"{auc:.4f}".replace('.', '_')
+
+    if extra_info:
+        filename = f"{model_prefix}_top{DataConfig.TOP_PERCENT}_{return_str}pct_thr{thr_str}_auc{auc_str}_ep{epoch}_{extra_info}_{timestamp}.pth"
+    else:
+        filename = f"{model_prefix}_top{DataConfig.TOP_PERCENT}_{return_str}pct_thr{thr_str}_auc{auc_str}_ep{epoch}_{timestamp}.pth"
+
+    save_path = os.path.join(output_dir, filename)
+    torch.save(model_state_dict, save_path)
+
+    return save_path
+
+def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, batch_size=100):
+    """
+    计算测试集损失
+    """
+    model.eval()
+    total_loss = 0.0
     num_samples = len(eval_inputs)
     num_batches = (num_samples + batch_size - 1) // batch_size
     
@@ -929,95 +1132,35 @@ def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, bat
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, num_samples)
             
-            # 批量处理 (使用BF16精度)
-            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], 
-                                      dtype=torch.bfloat16).to(device)
-            batch_targets = torch.tensor(eval_targets[start_idx:end_idx], 
+            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx],
                                        dtype=torch.bfloat16).to(device)
-            
-            # 计算损失
-            batch_outputs = model(batch_inputs)
-            batch_loss = criterion(batch_outputs, batch_targets)
-            # BF16的loss可以直接取item
-            total_loss += batch_loss.item()
-    
-    avg_loss = total_loss / num_batches
-    return avg_loss
+            batch_targets = torch.tensor(eval_targets[start_idx:end_idx],
+                                        dtype=torch.bfloat16).to(device)
 
-def print_sample_predictions(model, eval_inputs, eval_targets, device, num_samples=10, epoch=None):
+            # 动态更新权重：根据当前batch的正负样本比例
+            criterion.update_weights(batch_targets)
+
+            outputs = model(batch_inputs)
+            loss = criterion(outputs.squeeze(), batch_targets)
+            total_loss += loss.item() * (end_idx - start_idx)
+    
+    return total_loss / num_samples
+
+def print_sample_predictions(model, eval_inputs, eval_targets, device, num_samples=5, epoch=1):
     """
-    随机挑选样本并打印模型的输出值，用于观察预测集中的问题
+    随机打印几个样本的预测值，用于调试
     """
     model.eval()
     
-    # 随机选择样本索引
-    total_samples = len(eval_inputs)
-    if num_samples > total_samples:
-        num_samples = total_samples
+    indices = random.sample(range(len(eval_inputs)), min(num_samples, len(eval_inputs)))
     
-    # 使用当前epoch作为随机种子，确保每轮选择不同的样本
-    if epoch is not None:
-        np.random.seed(DataConfig.RANDOM_SEED + epoch)
-    
-    sample_indices = np.random.choice(total_samples, size=num_samples, replace=False)
-    sample_indices = sorted(sample_indices)  # 排序以便观察
-    
-    print(f"  随机样本预测详情 (第{epoch}轮):")
-    print(f"  {'样本':<4} {'真实标签':<8} {'模型输出':<12} {'预测概率':<10} {'预测标签':<8} {'预测结果':<8}")
-    print(f"  {'-'*4} {'-'*8} {'-'*12} {'-'*10} {'-'*8} {'-'*8}")
-    
+    print(f"  样本预测示例 (Epoch {epoch}):")
     with torch.no_grad():
-        for i, idx in enumerate(sample_indices):
-            # 获取单个样本 (使用BF16精度)
-            sample_input = torch.tensor(eval_inputs[idx:idx+1], dtype=torch.bfloat16).to(device)
-            true_label = eval_targets[idx]
-            
-            # 模型预测
-            model_output = model(sample_input)
-            # BF16需要先转为FP32再转python标量
-            raw_output = model_output.float().cpu().item()
-            probability = torch.sigmoid(model_output).float().cpu().item()
-            predicted_label = 1 if probability > 0.5 else 0
-            
-            # 判断预测结果
-            if predicted_label == int(true_label):
-                result = "✓正确"
-            else:
-                if int(true_label) == 1 and predicted_label == 0:
-                    result = "✗漏涨"
-                elif int(true_label) == 0 and predicted_label == 1:
-                    result = "✗误涨"
-                else:
-                    result = "✗错误"
-            
-            # 格式化输出
-            true_label_str = "上涨" if int(true_label) == 1 else "不上涨"
-            pred_label_str = "上涨" if predicted_label == 1 else "不上涨"
-            
-            print(f"  {i+1:<4} {true_label_str:<8} {raw_output:<12.4f} {probability:<10.4f} {pred_label_str:<8} {result:<8}")
-    
-    print()  # 空行
-
-# 预计算训练数据集函数
-def precompute_training_dataset(train_stock_info, train_weights, 
-                               batch_size, batches_per_epoch, seed=None):
-    """
-    预计算每轮训练所需的训练数据集（使用滚动窗口标准化）
-    自动根据批大小和批数量计算需要的样本数
-    返回: (epoch_inputs, epoch_targets)
-    """
-    samples_per_epoch = batch_size * batches_per_epoch
-    
-    if seed is not None:
-        # 设置随机种子确保可重复性
-        np.random.seed(seed)
-        random.seed(seed)
-    
-    # 直接生成所有需要的样本（使用滚动窗口标准化）
-    epoch_inputs, epoch_targets = generate_batch_samples_improved(
-        train_stock_info, train_weights, samples_per_epoch)
-    
-    return np.array(epoch_inputs), np.array(epoch_targets)
+        for idx in indices:
+            input_tensor = torch.tensor(eval_inputs[idx:idx+1], dtype=torch.bfloat16).to(device)
+            pred = torch.sigmoid(model(input_tensor)).item()
+            target = eval_targets[idx]
+            print(f"    样本{idx}: 预测={pred:.4f}, 真实={target:.1f}")
 
 # 改进的训练函数
 def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=TrainingConfig.EPOCHS, 
@@ -1037,8 +1180,15 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     print("="*60)
     print("训练精度: BF16 (Brain Floating Point 16)")
     print("数据标准化: 滚动窗口标准化（避免数据泄露）")
+    print("采样策略: 采样头在多股票上同步前进，使用正负样本池平衡")
     print(f"数据划分: 按时间划分，最近{DataConfig.TEST_DAYS}天作为测试集")
     print("="*60 + "\n")
+    
+    # 创建时间顺序采样器
+    print("正在初始化时间顺序采样器...")
+    samples_per_epoch = batch_size * batches_per_epoch
+    sampler = TemporalSampler(train_stock_info, epochs, samples_per_epoch)
+    
     # 设置训练随机种子
     torch.manual_seed(DataConfig.RANDOM_SEED)
     if torch.cuda.is_available():
@@ -1048,13 +1198,12 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     # 创建固定的评估数据集（训练开始前创建一次，使用滚动窗口标准化）
     eval_inputs, eval_targets, eval_cumulative_returns = create_fixed_evaluation_dataset(test_stock_info)
     
-    # 使用动态加权BCE损失函数，根据每轮训练数据的正负样本比例动态调整权重
-    # 正样本权重固定为4.0，负样本权重动态调整（0.5~1.0）
-    criterion = DynamicWeightedBCE(pos_weight=4.0)
-    
-    # 创建测试集专用的损失函数（使用标准BCE，正负样本权重都为1.0，保证可比性）
-    eval_criterion = DynamicWeightedBCE(pos_weight=1.0)
-    # 不调用update_weights，保持初始值: pos_weight=1.0, neg_weight=1.0
+    # 使用自定义动态加权BCE损失函数
+    # 特点：1. 根据batch正负样本比例动态调整负样本权重 2. 对预测偏差大的样本指数级惩罚
+    criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
+
+    # 测试集损失同样使用动态加权BCE，保持评估一致性
+    eval_criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
     
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
     
@@ -1102,9 +1251,13 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     best_model_state = None  # 缓存最佳模型状态（内存中）
     best_epoch = 0  # 记录最佳模型所在轮次
     
+    # 创建训练用的随机数生成器
+    train_rng = random.Random(DataConfig.RANDOM_SEED)
+    
     for epoch in range(epochs):
         model.train()
         total_loss = 0
+        num_valid_steps = 0
         
         # 训练阶段 - 更新学习率
         if warmup_scheduler.is_warmup_phase():
@@ -1116,62 +1269,37 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
             current_lr = main_scheduler.get_last_lr()[0]
             lr_status = "正常训练"
         
-        print(f'Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f} ({lr_status})')
+        # 显示当前采样进度
+        current_samples, total_samples = sampler.get_progress()
+        progress_pct = current_samples / total_samples * 100 if total_samples > 0 else 0
+        print(f'Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f} ({lr_status}), 采样进度: {current_samples}/{total_samples} ({progress_pct:.1f}%)')
         
-        # 预计算当前轮次的训练数据（使用滚动窗口标准化）
-        epoch_seed = DataConfig.RANDOM_SEED + epoch  # 每轮使用不同的种子确保数据多样性
-        epoch_inputs, epoch_targets = precompute_training_dataset(
-            train_stock_info, train_weights, batch_size, batches_per_epoch, epoch_seed)
+        # 使用采样器生成当前epoch的训练数据
+        print(f'  使用时间顺序采样器生成数据...')
+        epoch_inputs, epoch_targets = sample_with_pools(
+            sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
+        )
         
-        # 注意：动态权重更新已移至每个Batch内部，确保每次参数更新时都基于当前Batch的正负样本比例进行平衡
-        
-        # 打印本轮标签分布信息（二分类：1.0/0.0）
-        count_positive = np.sum(epoch_targets >= 0.5)  # 正样本（涨幅≥5%）
-        count_negative = np.sum(epoch_targets < 0.5)   # 负样本（涨幅<5%）
-        total_count = len(epoch_targets)
-        
-        print(f'  标签分布: 上涨(≥5%)={count_positive}({count_positive/total_count:.1%}), 不上涨(<5%)={count_negative}({count_negative/total_count:.1%})')
-        print(f'  动态权重: 每Batch独立计算（正样本固定={criterion.pos_weight.item():.1f}，负样本按比例动态调整）')
-        
-        # 显示预热进度和调度器信息
-        if warmup_scheduler.is_warmup_phase():
-            warmup_progress = (epoch + 1) / TrainingConfig.WARMUP_EPOCHS * 100
-            print(f'  预热进度: {warmup_progress:.1f}% (第{epoch + 1}轮/共{TrainingConfig.WARMUP_EPOCHS}轮)')
-            print(f'  学习率变化: {TrainingConfig.WARMUP_START_LR:.2e} → {current_lr:.2e} → {learning_rate:.2e}(目标)')
-        else:
-            # 预热结束后显示当前调度器状态
-            if TrainingConfig.USE_COSINE_ANNEALING:
-                # 计算余弦退火的理论学习率
-                import math
-                # 修复：使用实际的主训练轮数计算进度
-                total_main_epochs = epochs - TrainingConfig.WARMUP_EPOCHS
-                current_main_epoch = epoch - TrainingConfig.WARMUP_EPOCHS
-                progress = current_main_epoch / total_main_epochs
-                theoretical_lr = TrainingConfig.COSINE_ETA_MIN + (learning_rate - TrainingConfig.COSINE_ETA_MIN) * \
-                               (1 + math.cos(math.pi * progress)) / 2
-                print(f'  余弦退火进度: {progress*100:.1f}% (第{current_main_epoch+1}轮/共{total_main_epochs}轮), 理论学习率: {theoretical_lr:.2e}')
-            else:
-                print(f'  阶梯衰减: 每{TrainingConfig.SCHEDULER_STEP_SIZE}轮衰减{TrainingConfig.SCHEDULER_GAMMA}倍')
-        
-        # 将预计算的数据转换为tensor并移到设备上 (使用BF16精度)
+        # 将数据转换为tensor并移到设备上 (使用BF16精度)
         epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.bfloat16).to(device)
         epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.bfloat16).to(device)
         
-        # 训练循环：使用预计算的数据
+        # 训练循环：按batch顺序训练
+        num_samples = len(epoch_inputs)
         for step in range(batches_per_epoch):
             start_idx = step * batch_size
-            end_idx = min((step + 1) * batch_size, len(epoch_inputs_tensor))
+            end_idx = (step + 1) * batch_size
             
-            # 从预计算的数据中取一个batch
             batch_inputs = epoch_inputs_tensor[start_idx:end_idx]
             batch_targets = epoch_targets_tensor[start_idx:end_idx]
-            
-            # 🔑 每个Batch都更新动态权重，确保每次参数更新时正负样本贡献平衡
+
+            # 动态更新权重：根据当前batch的正负样本比例
             criterion.update_weights(batch_targets)
-            
+
             optimizer.zero_grad()
             output = model(batch_inputs)
-            loss = criterion(output, batch_targets)
+            loss = criterion(output.squeeze(), batch_targets)
+            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
             optimizer.step()
@@ -1186,7 +1314,7 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
         print()  # 换行
         print()  # 空行
         
-        # 清理预计算的数据以释放内存
+        # 清理数据以释放内存
         del epoch_inputs_tensor, epoch_targets_tensor
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1362,10 +1490,10 @@ def normalize_data_for_prediction(data):
     用于所有预测场景，确保与训练时完全一致
     
     Args:
-        data: numpy array, shape [seq_len, 5] (OHLCV)
+        data: numpy array, shape [seq_len, 7] (OHLC + volume + exchange + rate)
         
     Returns:
-        normalized_data: numpy array, shape [seq_len-1, 5] 或 None（如果数据无效）
+        normalized_data: numpy array, shape [seq_len-1, 7] 或 None（如果数据无效）
     """
     if len(data) < 2:
         return None
@@ -1376,17 +1504,33 @@ def normalize_data_for_prediction(data):
     for i in range(1, len(data)):
         yesterday_close = data[i-1, 3]  # 前一天的收盘价
         yesterday_volume = data[i-1, 4]  # 前一天的成交量
+        yesterday_exchange = data[i-1, 5]  # 前一天的换手率
+        yesterday_rate = data[i-1, 6]      # 前一天的量比
         
         if yesterday_close == 0 or yesterday_volume == 0:
             return None  # 数据异常
         
         # 价格特征：相对于前一天收盘价的涨跌幅
         normalized_data[i, :4] = (data[i, :4] - yesterday_close) / yesterday_close
-        # 成交量特征：相对于前一天成交量的变化比例
+        # 流动性特征
         normalized_data[i, 4] = (data[i, 4] - yesterday_volume) / yesterday_volume
+        normalized_data[i, 5] = np.clip(data[i, 5] / 100.0, 0.0, 1.0)  # 换手率
+        normalized_data[i, 6] = np.clip(data[i, 6] / 10.0, 0.0, 1.0)  # 量比
+    
+    # 数值范围限制
+    normalized_data[:, :4] = np.clip(normalized_data[:, :4], -0.3, 0.3)
+    normalized_data[:, 4] = np.clip(normalized_data[:, 4], -5.0, 5.0)
+    normalized_data[:, 4] = np.clip(normalized_data[:, 4] / 10.0 + 0.5, 0.0, 1.0)
+    normalized_data[:, 5] = np.clip(normalized_data[:, 5], 0.0, 1.0)
+    normalized_data[:, 6] = np.clip(normalized_data[:, 6], 0.0, 1.0)
+    
+    # NaN/Inf检测
+    result = normalized_data[1:]
+    if np.any(np.isnan(result)) or np.any(np.isinf(result)):
+        return None
     
     # 只返回标准化后的数据（去掉第0天基准数据）
-    return normalized_data[1:]
+    return result
 
 def predict_single_stock(model_path, stock_data, device=None):
     """
@@ -1394,7 +1538,7 @@ def predict_single_stock(model_path, stock_data, device=None):
     
     Args:
         model_path: 模型文件路径
-        stock_data: numpy array, shape [seq_len, 5] (OHLCV)，至少需要CONTEXT_LENGTH+1天数据
+        stock_data: numpy array, shape [seq_len, 7] (OHLC + volume + exchange + rate)，至少需要CONTEXT_LENGTH+1天数据
         device: 计算设备
         
     Returns:

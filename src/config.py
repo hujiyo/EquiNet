@@ -16,6 +16,9 @@ class DataConfig:
     TEST_DAYS = 80                   # 测试集天数（每只股票的最近N天作为测试集）
     RANDOM_SEED = 42                 # 随机种子
     
+    # 训练集时间范围限制
+    TRAIN_START_YEAR = 2021          # 训练集起始年份（2020年及以前的数据不参与训练）
+    
     # 样本生成参数
     CONTEXT_LENGTH = 60              # 历史数据长度（这是核心参数，其他地方应引用这个值）
     FUTURE_DAYS = 3                  # 未来预测天数
@@ -35,12 +38,12 @@ class DataConfig:
 class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
-    INPUT_DIM = 5                    # 输入特征维度数（OHLCV）
+    INPUT_DIM = 7                    # 输入特征维度数（OHLC + volume + exchange + rate）
     PRICE_DIM = 4                    # 价格特征维度（OHLC）
-    VOLUME_DIM = 1                   # 成交量特征维度
-    D_MODEL = 80                     # 模型维度（价格48维 + 成交量16维）
-    PRICE_EMBED_DIM = 64             # 价格Embedding维度（75%）
-    VOLUME_EMBED_DIM = 16            # 成交量Embedding维度（25%）
+    LIQUIDITY_DIM = 3                # 流动性特征维度（volume + exchange换手率 + rate量比）
+    D_MODEL = 80                     # 模型维度（价格64维 + 流动性16维）
+    PRICE_EMBED_DIM = 64             # 价格Embedding维度（80%）
+    LIQUIDITY_EMBED_DIM = 16         # 流动性Embedding维度（20%）
     NHEAD = 4                        # 注意力头数
     NUM_LAYERS = 6                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）
@@ -59,8 +62,8 @@ class TrainingConfig:
     LEARNING_RATE = 0.001            # 初始学习率（提高学习率）
 
     # 训练批处理
-    BATCH_SIZE = 2048                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 40           # 每轮训练的批次数（减少批次数）
+    BATCH_SIZE = 128                 # GPU每次并行训练的样本数（增加批大小）
+    BATCHES_PER_EPOCH = 56            # 每轮训练的批次数（调低以适配时间序采样）
 
     # 优化器参数
     WEIGHT_DECAY = 1e-5              # 权重衰减
@@ -157,6 +160,8 @@ def print_config_summary():
 
     print(f"\n数据参数:")
     print(f"  数据目录: {DataConfig.DATA_DIR}")
+    print(f"  训练集起始年份: {DataConfig.TRAIN_START_YEAR}年（过滤{DataConfig.TRAIN_START_YEAR-1}年及以前的数据）")
+    print(f"  测试集天数: {DataConfig.TEST_DAYS}天")
     print(f"  上下文长度: {DataConfig.CONTEXT_LENGTH}")
     print(f"  上涨阈值: {DataConfig.UPRISE_THRESHOLD*100}%")
     print(f"\n标签机制: 二分类（{DataConfig.UPRISE_THRESHOLD*100:.0f}%为阈值）")

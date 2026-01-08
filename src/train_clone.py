@@ -187,10 +187,15 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
         epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.bfloat16).to(device)
         epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.bfloat16).to(device)
 
-        # 训练循环
-        for step in range(batches_per_epoch):
+        # 计算实际可用的batch数量（防止索引越界）
+        actual_batches = len(epoch_inputs_tensor) // batch_size
+        if actual_batches < batches_per_epoch:
+            print(f'  ⚠ 警告：实际batch数({actual_batches}) < 期望batch数({batches_per_epoch})，将使用实际数量')
+
+        # 训练循环：使用实际的batch数量，而不是固定的batches_per_epoch
+        for step in range(actual_batches):
             start_idx = step * batch_size
-            end_idx = min((step + 1) * batch_size, len(epoch_inputs_tensor))
+            end_idx = (step + 1) * batch_size  # 不需要min，因为actual_batches已经保证了不越界
 
             batch_inputs = epoch_inputs_tensor[start_idx:end_idx]
             batch_targets = epoch_targets_tensor[start_idx:end_idx]
@@ -233,7 +238,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
                 total_loss_b += loss_b.item()
 
             # 进度显示
-            progress = (step + 1) / batches_per_epoch * 100
+            progress = (step + 1) / actual_batches * 100
             avg_loss_a = total_loss_a / (step + 1)
             if model_b is not None:
                 avg_loss_b = total_loss_b / (step + 1)
@@ -256,7 +261,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
         # 评估模型A（使用统一的评估函数）
         stats_a = evaluate_model(model_a, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="A")
 
-        avg_loss_a = total_loss_a / batches_per_epoch
+        avg_loss_a = total_loss_a / actual_batches if actual_batches > 0 else 0
 
         # 打印模型A结果
         print(f'  [模型A] 损失: {avg_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
@@ -296,7 +301,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
         if model_b is not None:
             stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B")
 
-            avg_loss_b = total_loss_b / batches_per_epoch if total_loss_b > 0 else 0
+            avg_loss_b = total_loss_b / actual_batches if actual_batches > 0 else 0
 
             print(f'  [模型B] 损失: {avg_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')

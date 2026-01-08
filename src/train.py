@@ -297,20 +297,38 @@ class TransformerLayer(nn.Module):
         
         return x
 
+def init_weights(module):
+    """
+    Xavier (Glorot) 初始化 - 适合 Transformer 模型
+
+    初始化范围:
+    - Linear层权重: uniform[-a, +a], a = sqrt(6 / (fan_in + fan_out))
+    - Linear层偏置: 0
+    - Norm层权重: 1
+    - Norm层偏置: 0
+    """
+    if isinstance(module, nn.Linear):
+        # Xavier uniform 初始化
+        nn.init.xavier_uniform_(module.weight, gain=1.0)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, RMSNorm):
+        nn.init.ones_(module.scale)
+
 class EnhancedStockTransformer(nn.Module):
     """
     改进的 Transformer 模型（Pre-Norm架构 + 分离Embedding + 渐进式FFN）
-    
+
     核心改进1：分离Embedding - 避免LayerNorm时互相干扰
     - 价格特征(OHLC 4维) -> Embedding -> 64维 (占80%，主导地位)
     - 流动性特征(Volume+Exchange+Rate 3维) -> Embedding -> 16维 (占20%，辅助信息)
     - 拼接后得到80维向量，送入Transformer
-    
+
     核心改进2：渐进式FFN - 分层学习策略
     - Layer 1: 只用Attention（专注学习时序依赖和特征关系）
     - Layer 2-5: Attention + FFN（增加非线性变换能力）
     - 好处：第1层纯粹学习模式，后续层增强表达能力
-    
+
     总体优势：
     1. 避免流动性特征的大值主导LayerNorm，扭曲价格信号
     2. 保持价格特征之间的相对关系
@@ -320,26 +338,26 @@ class EnhancedStockTransformer(nn.Module):
     """
     def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, max_seq_len):
         super(EnhancedStockTransformer, self).__init__()
-        
+
         # 分离Embedding：价格和流动性特征独立处理
         self.price_embedding = nn.Linear(ModelConfig.PRICE_DIM, ModelConfig.PRICE_EMBED_DIM)
         self.liquidity_embedding = nn.Linear(ModelConfig.LIQUIDITY_DIM, ModelConfig.LIQUIDITY_EMBED_DIM)
-        
+
         # 使用标准位置编码
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
-        
+
         # 第1层只用Attention（专注学习序列模式）
         # 第2-5层用Attention+FFN（增加非线性变换能力）
         self.layers = nn.ModuleList([
-            TransformerLayer(d_model, nhead, use_ffn=False) if i == 0 
+            TransformerLayer(d_model, nhead, use_ffn=False) if i == 0
             else TransformerLayer(d_model, nhead, use_ffn=True)
             for i in range(num_layers)
         ])
-        
+
         # Pre-Norm架构：在最后添加一个RMSNorm
         # 因为Pre-Norm的最后一层没有归一化输出
         self.final_norm = RMSNorm(d_model)
-        
+
         # 简化输出层，减少过拟合
         self.output_projection = nn.Sequential(
             nn.Linear(d_model, d_model // 2),  # 降维
@@ -347,8 +365,11 @@ class EnhancedStockTransformer(nn.Module):
             nn.Dropout(ModelConfig.DROPOUT_RATE),
             nn.Linear(d_model // 2, output_dim)  # 最终输出
         )
-        
+
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
+
+        # 应用初始化
+        self.apply(init_weights)
         
     def forward(self, x):
         # x: [batch_size, seq_len, 7] (OHLC + volume + exchange + rate)
@@ -576,26 +597,39 @@ class TemporalSampler:
 
         # 每只股票的采样位置指针（初始化为各自的train_start_idx + 1，因为需要前一天数据）
         self.stock_positions = []
-        
-        # 每只股票的最大可用位置（train_end_idx - REQUIRED_LENGTH）
+
+        # 每只股票的初始采样位置（用于计算进度）
+        self.stock_start_positions = []
+
+        # 每只股票的最大可用位置
         self.stock_max_positions = []
+        
+        # 是否可以循环采样（数据长度 > 600）
+        self.can_loop = []
         
         for stock_info in stock_info_list:
             train_start_idx = stock_info.get('train_start_idx', 0)
             train_end_idx = stock_info.get('train_end_idx', len(stock_info['data']))
+            data_length = stock_info.get('data_length', 0)
             
             # 采样起始位置：train_start_idx + 1（需要前一天数据作为基准）
             start_pos = max(1, train_start_idx + 1)
             
-            # 采样末位置：train_end_idx - REQUIRED_LENGTH（确保有足够数据生成标签）
-            max_pos = train_end_idx - self.required_length
+            # 采样末位置：直接使用train_end_idx
+            # train_end_idx = data_length - test_days - REQUIRED_LENGTH 已经考虑了边界
+            # start_idx 最大就是 train_end_idx，不需要再减 REQUIRED_LENGTH
+            max_pos = train_end_idx
             
             # 确保起始位置不超过末位置
             if start_pos > max_pos:
                 start_pos = max_pos + 1  # 设置为无效，该股票不参与采样
             
             self.stock_positions.append(start_pos)
+            self.stock_start_positions.append(start_pos)  # 保存初始位置用于进度计算
             self.stock_max_positions.append(max_pos)
+            
+            # 只有数据长度 > 600 的股票才允许循环采样
+            self.can_loop.append(data_length > 600)
 
         # 统计信息
         valid_stocks = sum(1 for i in range(len(stock_info_list)) 
@@ -611,21 +645,8 @@ class TemporalSampler:
                 f"  请检查数据质量或调整参数"
             )
         
-        # 计算每个epoch需要采样的轮数
-        total_needed_samples = num_epochs * samples_per_epoch
-        
-        # 每轮采样约等于有效股票数（因为每只股票取一个）
-        avg_samples_per_round = valid_stocks * 0.8  # 考虑到有些样本可能无效
-        
-        # 计算需要多少轮才能采样完所有数据
-        total_rounds_needed = int(total_samples / avg_samples_per_round) if avg_samples_per_round > 0 else 0
-        
-        # 每个epoch应该前进的轮数
-        self.rounds_per_epoch = max(1, total_rounds_needed // num_epochs)
-        
         print(f"  初始化采样器: {valid_stocks}只有效股票, 总样本数={total_samples}")
-        print(f"  采样策略: 共{num_epochs}个epoch, 每epoch前进约{self.rounds_per_epoch}轮")
-        print(f"  预计最后epoch将到达最新时间")
+        print(f"  采样策略: 时间顺序前进，支持循环采样（数据长度>600的股票）")
 
     def sample_batch_rounds(self, num_rounds):
         """
@@ -643,13 +664,18 @@ class TemporalSampler:
                 current_pos = self.stock_positions[stock_idx]
                 max_pos = self.stock_max_positions[stock_idx]
 
+                # 如果到达末尾且允许循环，重置到起点
+                if current_pos > max_pos and self.can_loop[stock_idx]:
+                    current_pos = self.stock_start_positions[stock_idx]
+                    self.stock_positions[stock_idx] = current_pos
+
                 # 检查是否还有可用样本
                 if current_pos <= max_pos:
                     all_samples.append((stock_idx, current_pos))
                     # 指针前进一步
                     self.stock_positions[stock_idx] += 1
 
-            # 如果所有股票都已到达终点，提前退出
+            # 如果所有股票都已到达终点（且无法循环），提前退出
             if not any(self.stock_positions[i] <= self.stock_max_positions[i] 
                       for i in range(len(self.stock_info_list))):
                 break
@@ -658,17 +684,17 @@ class TemporalSampler:
     
     def get_progress(self):
         """获取当前采样进度"""
-        total_samples = sum(self.stock_max_positions)
-        current_samples = sum(min(pos - 1, max_pos) for pos, max_pos in zip(self.stock_positions, self.stock_max_positions))
+        total_samples = 0
+        current_samples = 0
+        for start_pos, pos, max_pos in zip(self.stock_start_positions, self.stock_positions, self.stock_max_positions):
+            if start_pos <= max_pos:
+                total_samples += max_pos - start_pos + 1
+                current_samples += max(0, min(pos, max_pos + 1) - start_pos)
         return current_samples, total_samples
-    
-    def get_rounds_per_epoch(self):
-        """获取每个epoch应该采样的轮数"""
-        return self.rounds_per_epoch
 
 def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     """
-    根据预生成的索引生成单个样本
+    根据预生成的索引生成单个样本（向量化优化版）
 
     参数:
         stock_info_list: 股票信息列表
@@ -682,54 +708,54 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     context_length = DataConfig.CONTEXT_LENGTH
     required_length = DataConfig.REQUIRED_LENGTH
 
-    # 提取原始数据窗口
+    # 提取原始数据窗口（包含前一天用于计算第一天的涨跌幅）
     input_seq_raw = stock_data[start_idx:start_idx + context_length]
-
-    # 特征标准化：计算每天相对前一天的涨跌幅
-    input_seq = np.zeros_like(input_seq_raw, dtype=np.float64)
-
-    # 获取窗口前一天的数据作为第1天的基准
     prev_day_data = stock_data[start_idx - 1]
-    prev_prices = prev_day_data[:4]  # OHLC
-    prev_volume = prev_day_data[4]   # Volume
 
-    # 避免除零错误
-    if np.any(prev_prices == 0) or prev_volume == 0:
+    # 快速检查：避免除零
+    prev_close = prev_day_data[3]
+    prev_volume = prev_day_data[4]
+    if prev_close == 0 or prev_volume == 0 or np.any(prev_day_data[:4] == 0):
+        return None
+    
+    # 向量化检查：所有收盘价和成交量都不为0
+    closes = input_seq_raw[:, 3]
+    volumes = input_seq_raw[:, 4]
+    if np.any(closes == 0) or np.any(volumes == 0):
         return None
 
-    prev_close = prev_prices[3]  # 前一天的收盘价
-    if prev_close == 0:
-        return None
+    # 特征标准化：向量化计算
+    input_seq = np.empty((context_length, 7), dtype=np.float32)
+    
+    # 价格特征：相对涨跌幅（向量化）
+    # 第1天相对于前一天
     input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
-    input_seq[0, 4] = (input_seq_raw[0, 4] - prev_volume) / prev_volume
-    input_seq[0, 5] = np.clip(input_seq_raw[0, 5] / 100.0, 0.0, 1.0)
-    input_seq[0, 6] = np.clip(input_seq_raw[0, 6] / 10.0, 0.0, 1.0)
+    # 第2-N天相对于前一天（向量化）
+    if context_length > 1:
+        input_seq[1:, :4] = (input_seq_raw[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
+    
+    # 成交量特征：相对变化（向量化）
+    input_seq[0, 4] = (volumes[0] - prev_volume) / prev_volume
+    if context_length > 1:
+        input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
+    
+    # 换手率和量比：直接归一化（向量化）
+    input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
+    input_seq[:, 6] = input_seq_raw[:, 6] / 10.0
+    
+    # 数值范围限制（向量化）
+    np.clip(input_seq[:, :4], -0.3, 0.3, out=input_seq[:, :4])
+    np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
+    input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
+    np.clip(input_seq[:, 4:7], 0.0, 1.0, out=input_seq[:, 4:7])
 
-    # 第2-N天：相对于前一天的收盘价
-    for i in range(1, context_length):
-        yesterday_close = input_seq_raw[i-1, 3]
-        yesterday_volume = input_seq_raw[i-1, 4]
-        if yesterday_close == 0 or yesterday_volume == 0:
-            return None
-        input_seq[i, :4] = (input_seq_raw[i, :4] - yesterday_close) / yesterday_close
-        input_seq[i, 4] = (input_seq_raw[i, 4] - yesterday_volume) / yesterday_volume
-        input_seq[i, 5] = np.clip(input_seq_raw[i, 5] / 100.0, 0.0, 1.0)
-        input_seq[i, 6] = np.clip(input_seq_raw[i, 6] / 10.0, 0.0, 1.0)
-
-    # 数值范围限制
-    input_seq[:, :4] = np.clip(input_seq[:, :4], -0.3, 0.3)
-    input_seq[:, 4] = np.clip(input_seq[:, 4], -5.0, 5.0)
-    input_seq[:, 4] = np.clip(input_seq[:, 4] / 10.0 + 0.5, 0.0, 1.0)
-    input_seq[:, 5] = np.clip(input_seq[:, 5], 0.0, 1.0)
-    input_seq[:, 6] = np.clip(input_seq[:, 6], 0.0, 1.0)
-
-    # NaN/Inf检测
-    if np.any(np.isnan(input_seq)) or np.any(np.isinf(input_seq)):
+    # NaN/Inf检测（向量化）
+    if np.any(~np.isfinite(input_seq)):
         return None
 
     # 计算标签
-    original_start_price = stock_data[start_idx + context_length - 1, 3]  # 当前收盘价
-    original_end_price = stock_data[start_idx + required_length - 1, 3]   # N天后收盘价
+    original_start_price = closes[-1]  # 当前收盘价
+    original_end_price = stock_data[start_idx + required_length - 1, 3]  # N天后收盘价
 
     if original_start_price == 0:
         return None
@@ -737,21 +763,19 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     cumulative_return = (original_end_price - original_start_price) / original_start_price
 
     # 二分类标签
-    if cumulative_return >= DataConfig.UPRISE_THRESHOLD:
-        target = 1.0
-    else:
-        target = 0.0
+    target = 1.0 if cumulative_return >= DataConfig.UPRISE_THRESHOLD else 0.0
 
     return input_seq, target
 
 def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng):
     """
-    使用样本池机制采样：
-    1. 批量采样：一次性生成足够的样本索引
-    2. 正样本占到batch的25%时，随机抽取剩余75%的负样本组成batch
-    3. 重复直到完成指定数量的batch
-
-    返回: (inputs, targets) numpy数组
+    使用样本池机制采样（流式处理版）：
+    1. 按时间顺序遍历样本索引
+    2. 实时填充正负样本池
+    3. 一旦正样本达到配额且负样本足够，立即生成Batch并清空负样本池
+    4. 确保Batch之间的时间有序性，严格防止未来数据泄露到过去的Batch中
+    5. 支持循环采样：数据到达末尾后自动循环回起点
+    6. 动态生成索引：按需生成，直到batch数量满足要求
     """
     positive_ratio = 0.25
     pos_quota = max(1, int(batch_size * positive_ratio))
@@ -767,89 +791,95 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
 
     batches_generated = 0
     
-    # 计算需要多少轮采样（一次性批量生成）
-    # 每个batch需要batch_size个样本，共需要batches_per_epoch个batch
-    # 正样本比例约5-10%，需要大量采样才能获得足够的正样本
-    # 每个batch需要pos_quota个正样本
-    # 假设正样本率约6%，需要采样 (batches_per_epoch*pos_quota/0.06) 个有效样本
-
-    # 考虑到约20%的样本无效，需要采样更多
-    needed_positive = pos_quota * batches_per_epoch  # 需要的正样本数
-    estimated_positive_rate = 0.06  # 估计正样本率6%
-    estimated_valid_rate = 0.8  # 估计有效样本率80%
-    needed_valid_samples = needed_positive / estimated_positive_rate  # 需要的有效样本数
-    needed_total_samples = needed_valid_samples / estimated_valid_rate  # 需要的总样本数
+    # 初始估算：每次生成一批索引
+    initial_rounds = 50  # 先生成50轮试试
+    total_rounds_generated = 0
+    total_indices_generated = 0
     
-    avg_samples_per_round = len(stock_info_list) * 0.8  # 每轮约80%的股票有效
-    rounds_needed = max(1, int(needed_total_samples / avg_samples_per_round))
-
-    print(f"    批量生成样本索引: {rounds_needed}轮...")
+    print(f"    动态采样策略：按需生成索引，直到满足{batches_per_epoch}个batch...")
     
-    # 一次性批量生成所有样本索引
-    sample_indices = sampler.sample_batch_rounds(rounds_needed)
-    
-    if len(sample_indices) == 0:
-        raise ValueError("采样头已到达所有股票终点，无法生成样本")
-    
-    print(f"    生成了{len(sample_indices)}个样本索引，开始处理...")
-    
-    # 生成样本并分类放入池子
-    for idx, (stock_idx, start_idx) in enumerate(sample_indices):
-        sample = generate_sample_from_index(stock_info_list, stock_idx, start_idx)
-        if sample is None:
-            continue
-
-        input_seq, target = sample
-
-        if target >= 0.5:  # 正样本
-            pos_pool_inputs.append(input_seq)
-            pos_pool_targets.append(target)
-        else:  # 负样本
-            neg_pool_inputs.append(input_seq)
-            neg_pool_targets.append(target)
+    # 动态生成循环：不断生成新索引，直到batch够了
+    while batches_generated < batches_per_epoch:
+        # 生成一批新索引
+        sample_indices = sampler.sample_batch_rounds(initial_rounds)
         
-        # 定期显示进度
-        if (idx + 1) % 10000 == 0:
-            print(f"    已处理 {idx + 1}/{len(sample_indices)} 个样本索引", end='\r', flush=True)
+        if len(sample_indices) == 0:
+            print(f"\n    ⚠ 警告：采样头已到达所有股票终点且无法循环，停止采样")
+            break
+        
+        total_rounds_generated += initial_rounds
+        total_indices_generated += len(sample_indices)
+        
+        # 批量处理索引（优化：减少函数调用开销）
+        for stock_idx, start_idx in sample_indices:
+            # 如果已经生成了足够的Batch，提前结束
+            if batches_generated >= batches_per_epoch:
+                break
 
-    print(f"    样本池: 正样本={len(pos_pool_inputs)}, 负样本={len(neg_pool_inputs)}")
-    
-    # 从池子中组成batch
-    while len(pos_pool_inputs) >= pos_quota and len(neg_pool_inputs) >= neg_quota and batches_generated < batches_per_epoch:
-        # 从正样本池取前pos_quota个
-        batch_pos_inputs = pos_pool_inputs[:pos_quota]
-        batch_pos_targets = pos_pool_targets[:pos_quota]
-        pos_pool_inputs = pos_pool_inputs[pos_quota:]
-        pos_pool_targets = pos_pool_targets[pos_quota:]
+            sample = generate_sample_from_index(stock_info_list, stock_idx, start_idx)
+            if sample is None:
+                continue
 
-        # 从负样本池随机取neg_quota个
-        neg_indices = rng.sample(range(len(neg_pool_inputs)), neg_quota)
-        batch_neg_inputs = [neg_pool_inputs[i] for i in neg_indices]
-        batch_neg_targets = [neg_pool_targets[i] for i in neg_indices]
+            input_seq, target = sample
 
-        # 从负样本池删除已使用的样本
-        neg_indices_set = set(neg_indices)
-        neg_pool_inputs = [neg_pool_inputs[i] for i in range(len(neg_pool_inputs)) if i not in neg_indices_set]
-        neg_pool_targets = [neg_pool_targets[i] for i in range(len(neg_pool_targets)) if i not in neg_indices_set]
+            if target >= 0.5:  # 正样本
+                pos_pool_inputs.append(input_seq)
+                pos_pool_targets.append(target)
+            else:  # 负样本
+                neg_pool_inputs.append(input_seq)
+                neg_pool_targets.append(target)
+            
+            # 检查是否可以生成一个Batch
+            # 触发条件：正样本达到配额 AND 负样本也足够
+            if len(pos_pool_inputs) >= pos_quota and len(neg_pool_inputs) >= neg_quota:
+                # 1. 取正样本：按时间顺序取最早进入池子的样本（FIFO）
+                batch_pos_inputs = pos_pool_inputs[:pos_quota]
+                batch_pos_targets = pos_pool_targets[:pos_quota]
+                
+                # 2. 取负样本：从当前积累的负样本池中随机抽取（实现"随机丢弃"逻辑）
+                neg_indices = rng.sample(range(len(neg_pool_inputs)), neg_quota)
+                batch_neg_inputs = [neg_pool_inputs[i] for i in neg_indices]
+                batch_neg_targets = [neg_pool_targets[i] for i in neg_indices]
+                
+                # 3. 合并并打乱
+                batch_inputs = batch_pos_inputs + batch_neg_inputs
+                batch_targets = batch_pos_targets + batch_neg_targets
+                
+                combined = list(zip(batch_inputs, batch_targets))
+                rng.shuffle(combined)
+                b_inputs, b_targets = zip(*combined)
+                
+                all_batch_inputs.extend(b_inputs)
+                all_batch_targets.extend(b_targets)
+                
+                batches_generated += 1
+                
+                # 4. 更新池子状态
+                pos_pool_inputs = pos_pool_inputs[pos_quota:]
+                pos_pool_targets = pos_pool_targets[pos_quota:]
+                neg_pool_inputs = []
+                neg_pool_targets = []
+        
+        # 打印进度（移到外层，减少打印次数）
+        print(f"    已生成 {batches_generated}/{batches_per_epoch} 个Batch (已采样{total_rounds_generated}轮)", end='\r', flush=True)
+        
+        # 如果这批索引处理完了还不够，继续生成下一批
+        if batches_generated < batches_per_epoch:
+            # 根据当前进度调整下次生成的轮数
+            remaining_batches = batches_per_epoch - batches_generated
+            if batches_generated > 0:
+                estimated_rounds = max(20, int(remaining_batches / batches_generated * total_rounds_generated * 1.2))
+                initial_rounds = min(estimated_rounds, 100)
+            else:
+                initial_rounds = 100
 
-        # 合并并打乱
-        batch_inputs = batch_pos_inputs + batch_neg_inputs
-        batch_targets = batch_pos_targets + batch_neg_targets
-
-        # 打乱顺序
-        combined = list(zip(batch_inputs, batch_targets))
-        rng.shuffle(combined)
-        batch_inputs, batch_targets = zip(*combined)
-
-        all_batch_inputs.extend(batch_inputs)
-        all_batch_targets.extend(batch_targets)
-
-        batches_generated += 1
-
-    print(f"    已生成 {batches_generated}/{batches_per_epoch} 个batch")
+    print(f"\n    已生成 {batches_generated}/{batches_per_epoch} 个batch (总共采样{total_rounds_generated}轮, {total_indices_generated}个索引)")
     
     if batches_generated < batches_per_epoch:
-        raise ValueError(f"样本不足：仅生成{batches_generated}/{batches_per_epoch}个batch")
+        print(f"    ⚠ 警告：样本不足，仅生成 {batches_generated} 个Batch (目标: {batches_per_epoch})")
+        # 如果生成的不够，也返回已有的，而不是报错（防止训练中断）
+        if batches_generated == 0:
+             raise ValueError(f"样本严重不足：无法生成任何Batch")
 
     return np.asarray(all_batch_inputs), np.asarray(all_batch_targets)
 
@@ -1105,12 +1135,25 @@ def generate_pseudo_labels(pred_scores, original_targets,
     pred_scores = np.asarray(pred_scores).flatten()
     original_targets = np.asarray(original_targets).copy()
 
+    # 边界检查：如果样本数为0，直接返回空结果
+    if len(pred_scores) == 0:
+        stats = {
+            'pseudo_pos_count': 0,
+            'pseudo_neg_count': 0,
+            'unchanged_count': 0,
+            'threshold_pos': 0.0,
+            'threshold_neg': 0.0,
+        }
+        return original_targets, stats
+
     # 计算伪正阈值：按数量取前pseudo_pos_ratio
     k_pos = max(1, int(len(pred_scores) * pseudo_pos_ratio))
+    k_pos = min(k_pos, len(pred_scores))  # 确保不超过数组长度
     threshold_pos = np.sort(pred_scores)[-k_pos]  # 第k_pos大的值
 
     # 计算伪负阈值：按数量取倒数pseudo_neg_ratio
     k_neg = max(1, int(len(pred_scores) * pseudo_neg_ratio))
+    k_neg = min(k_neg, len(pred_scores))  # 确保不超过数组长度
     threshold_neg = np.sort(pred_scores)[k_neg - 1]  # 第k_neg小的值
 
     # 生成伪标签
@@ -1218,14 +1261,133 @@ def print_sample_predictions(model, eval_inputs, eval_targets, device, num_sampl
             target = eval_targets[idx]
             print(f"    样本{idx}: 预测={pred:.4f}, 真实={target:.1f}")
 
+# ==================== 梯度检测工具 ====================
+
+class GradientMonitor:
+    """
+    梯度监控器：检测梯度爆炸和梯度消失
+    在每个batch的backward后收集各层梯度统计信息
+    """
+    def __init__(self):
+        self.grad_stats = {}  # {layer_name: {'norm': [], 'max': [], 'mean': [], 'nan_count': 0}}
+        self.hooks = []
+
+    def _create_hook(self, name):
+        def hook(grad):
+            if grad is None:
+                return grad
+
+            grad_flat = grad.data.abs().flatten()
+
+            # 统计信息（转为float避免BF16问题）
+            grad_norm = grad_flat.norm(2).float().item()
+            grad_max = grad_flat.max().float().item()
+            grad_mean = grad_flat.mean().float().item()
+            has_nan = torch.isnan(grad.data).any().item()
+            has_inf = torch.isinf(grad.data).any().item()
+
+            if name not in self.grad_stats:
+                self.grad_stats[name] = {
+                    'norm': [],
+                    'max': [],
+                    'mean': [],
+                    'nan_count': 0,
+                    'inf_count': 0,
+                    'zero_count': 0
+                }
+
+            # 只保留最近100个batch的统计（避免内存占用过大）
+            stats = self.grad_stats[name]
+            stats['norm'].append(grad_norm)
+            stats['max'].append(grad_max)
+            stats['mean'].append(grad_mean)
+
+            if len(stats['norm']) > 100:
+                stats['norm'].pop(0)
+                stats['max'].pop(0)
+                stats['mean'].pop(0)
+
+            if has_nan:
+                stats['nan_count'] += 1
+            if has_inf:
+                stats['inf_count'] += 1
+            if grad_norm < 1e-8:
+                stats['zero_count'] += 1
+
+            return grad
+        return hook
+
+    def register_hooks(self, model):
+        """为模型所有参数注册梯度hook"""
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                hook = param.register_hook(self._create_hook(name))
+                self.hooks.append(hook)
+        print(f"  已为 {len(self.hooks)} 个参数注册梯度监控hook")
+
+    def remove_hooks(self):
+        """移除所有hook"""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+
+    def get_epoch_summary(self):
+        """获取当前epoch的梯度统计摘要"""
+        summary = {}
+        for name, stats in self.grad_stats.items():
+            if stats['norm']:
+                summary[name] = {
+                    'avg_norm': np.mean(stats['norm']),
+                    'max_norm': np.max(stats['norm']),
+                    'avg_max': np.mean(stats['max']),
+                    'avg_mean': np.mean(stats['mean']),
+                    'nan_count': stats['nan_count'],
+                    'inf_count': stats['inf_count'],
+                    'zero_count': stats['zero_count'],
+                    'total_batches': len(stats['norm'])
+                }
+        return summary
+
+    def reset(self):
+        """重置统计信息（新epoch开始时调用）"""
+        self.grad_stats.clear()
+
+    def diagnose(self):
+        """
+        诊断梯度问题，返回报告
+        返回: (爆炸层列表, 消失层列表, 异常层列表)
+        """
+        exploding = []
+        vanishing = []
+        abnormal = []
+
+        summary = self.get_epoch_summary()
+
+        for name, stats in summary.items():
+            # 梯度爆炸：平均范数 > 10 或 最大范数 > 100
+            if stats['avg_norm'] > 10 or stats['max_norm'] > 100:
+                exploding.append((name, stats))
+
+            # 梯度消失：平均范数 < 1e-5
+            elif stats['avg_norm'] < 1e-5:
+                vanishing.append((name, stats))
+
+            # 异常：出现NaN或Inf
+            if stats['nan_count'] > 0 or stats['inf_count'] > 0:
+                abnormal.append((name, stats))
+
+        return exploding, vanishing, abnormal
+
+# ==================== 训练函数 ====================
+
 # 改进的训练函数
-def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=TrainingConfig.EPOCHS, 
-               learning_rate=TrainingConfig.LEARNING_RATE, device=None, 
+def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=TrainingConfig.EPOCHS,
+               learning_rate=TrainingConfig.LEARNING_RATE, device=None,
                batch_size=TrainingConfig.BATCH_SIZE, batches_per_epoch=TrainingConfig.BATCHES_PER_EPOCH):
     """
     使用预计算训练数据集和固定评估集的训练函数（使用滚动窗口标准化避免数据泄露）
     提高训练效率，确保评估的一致性
-    
+
     注意：本训练函数使用 BF16 (bfloat16) 精度进行训练
     - 训练速度比FP32快约2倍
     - 内存占用减半
@@ -1309,149 +1471,217 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     
     # 创建训练用的随机数生成器
     train_rng = random.Random(DataConfig.RANDOM_SEED)
-    
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        num_valid_steps = 0
-        
-        # 训练阶段 - 更新学习率
-        if warmup_scheduler.is_warmup_phase():
-            # 预热阶段：使用预热调度器
-            current_lr = warmup_scheduler.step(epoch)
-            lr_status = f"预热阶段 ({epoch + 1}/{TrainingConfig.WARMUP_EPOCHS})"
-        else:
-            # 预热结束后：使用主调度器获取当前学习率
-            current_lr = main_scheduler.get_last_lr()[0]
-            lr_status = "正常训练"
-        
-        # 显示当前采样进度
-        current_samples, total_samples = sampler.get_progress()
-        progress_pct = current_samples / total_samples * 100 if total_samples > 0 else 0
-        print(f'Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f} ({lr_status}), 采样进度: {current_samples}/{total_samples} ({progress_pct:.1f}%)')
-        
-        # 使用采样器生成当前epoch的训练数据
-        print(f'  使用时间顺序采样器生成数据...')
-        epoch_inputs, epoch_targets = sample_with_pools(
-            sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
-        )
-        
-        # 将数据转换为tensor并移到设备上 (使用BF16精度)
-        epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.bfloat16).to(device)
-        epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.bfloat16).to(device)
-        
-        # 训练循环：按batch顺序训练
-        num_samples = len(epoch_inputs)
-        for step in range(batches_per_epoch):
-            start_idx = step * batch_size
-            end_idx = (step + 1) * batch_size
-            
-            batch_inputs = epoch_inputs_tensor[start_idx:end_idx]
-            batch_targets = epoch_targets_tensor[start_idx:end_idx]
 
-            # 动态更新权重：根据当前batch的正负样本比例
-            criterion.update_weights(batch_targets)
+    # 创建并注册梯度监控器
+    print("\n正在初始化梯度监控器...")
+    grad_monitor = GradientMonitor()
+    grad_monitor.register_hooks(model)
 
-            optimizer.zero_grad()
-            output = model(batch_inputs)
-            loss = criterion(output.squeeze(), batch_targets)
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
-            optimizer.step()
-            
-            total_loss += loss.item()
-            
-            # 实时更新进度显示
-            progress = (step + 1) / batches_per_epoch * 100
-            avg_loss = total_loss / (step + 1)
-            print(f'\r  训练进度: {progress:.1f}% ({step + 1}/{batches_per_epoch}), 平均损失: {avg_loss:.4f}', end='', flush=True)
-        
-        print()  # 换行
-        print()  # 空行
-        
-        # 清理数据以释放内存
-        del epoch_inputs_tensor, epoch_targets_tensor
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # 更新学习率
-        # 注意：预热阶段的学习率已经在epoch开始时由warmup_scheduler.step()更新
-        # 只有预热结束后才使用主调度器
-        if not warmup_scheduler.is_warmup_phase():
-            main_scheduler.step()  # 更新主调度器（余弦退火或阶梯衰减）
-        
-        # 固定评估集评估
-        total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats = evaluate_model_batch(
-            model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
-        )
-        
-        # 计算测试集损失（使用固定权重的eval_criterion，保证可比性）
-        test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
-        
-        # 随机挑选5组样本打印模型输出值
-        print_sample_predictions(model, eval_inputs, eval_targets, device, num_samples=5, epoch=epoch+1)
-        
-        # 打印详细结果
-        class_names = ['不上涨', '上涨']
-        for i in range(2):
-            if class_total[i] > 0:
-                acc = class_correct[i] / class_total[i]
-                print(f'  {class_names[i]}: {class_correct[i]}/{class_total[i]} = {acc:.3f}')
+    try:
+        for epoch in range(epochs):
+            # 新epoch开始，重置梯度统计
+            grad_monitor.reset()
+
+            model.train()
+            total_loss = 0
+            num_valid_steps = 0
+
+            # 训练阶段 - 更新学习率
+            if warmup_scheduler.is_warmup_phase():
+                # 预热阶段：使用预热调度器
+                current_lr = warmup_scheduler.step(epoch)
+                lr_status = f"预热阶段 ({epoch + 1}/{TrainingConfig.WARMUP_EPOCHS})"
             else:
-                print(f'  {class_names[i]}: 0/0 = 0.000 (无样本)')
-        
-        # 计算上涨准确率（预测上涨后真上涨的概率）
-        if pred_positive_total > 0:
-            precision = pred_positive_correct / pred_positive_total
-            non_negative_rate = pred_non_negative / pred_positive_total
-            print(f'  上涨准确率: {pred_positive_correct}/{pred_positive_total} = {precision:.3f} 准确率: {pred_non_negative}/{pred_positive_total} = {non_negative_rate:.3f}')
-        else:
-            print(f'  上涨准确率: 0/0 = 0.000 (无预测上涨)')
-        
-        # 打印置信度区间的精确度统计
-        print(f'  置信度区间精确度:')
-        for interval in ['0.50-0.55', '0.55-0.58', '0.58-0.60', '0.60-0.70', '0.70-1.00']:
-            correct, total_pred, non_negative = confidence_stats[interval]
-            if total_pred > 0:
-                precision = correct / total_pred
-                non_negative_rate = non_negative / total_pred
-                print(f'    {interval}: 上涨准确={correct}/{total_pred}={precision:.3f}, 非负准确={non_negative}/{total_pred}={non_negative_rate:.3f}')
+                # 预热结束后：使用主调度器获取当前学习率
+                current_lr = main_scheduler.get_last_lr()[0]
+                lr_status = "正常训练"
+
+            # 显示当前采样进度
+            current_samples, total_samples = sampler.get_progress()
+            progress_pct = current_samples / total_samples * 100 if total_samples > 0 else 0
+            print(f'Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f} ({lr_status}), 采样进度: {current_samples}/{total_samples} ({progress_pct:.1f}%)')
+
+            # 使用采样器生成当前epoch的训练数据
+            print(f'  使用时间顺序采样器生成数据...')
+            epoch_inputs, epoch_targets = sample_with_pools(
+                sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
+            )
+
+            # 将数据转换为tensor并移到设备上 (使用BF16精度)
+            epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.bfloat16).to(device)
+            epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.bfloat16).to(device)
+
+            # 计算实际可用的batch数量（防止索引越界）
+            actual_batches = len(epoch_inputs_tensor) // batch_size
+            if actual_batches < batches_per_epoch:
+                print(f'  ⚠ 警告：实际batch数({actual_batches}) < 期望batch数({batches_per_epoch})，将使用实际数量')
+
+            # 训练循环：使用实际的batch数量，而不是固定的batches_per_epoch
+            num_samples = len(epoch_inputs)
+            for step in range(actual_batches):
+                start_idx = step * batch_size
+                end_idx = (step + 1) * batch_size  # 不需要min，因为actual_batches已经保证了不越界
+
+                batch_inputs = epoch_inputs_tensor[start_idx:end_idx]
+                batch_targets = epoch_targets_tensor[start_idx:end_idx]
+
+                # 动态更新权重：根据当前batch的正负样本比例
+                criterion.update_weights(batch_targets)
+
+                optimizer.zero_grad()
+                output = model(batch_inputs)
+                loss = criterion(output.squeeze(), batch_targets)
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
+                optimizer.step()
+
+                total_loss += loss.item()
+
+                # 实时更新进度显示
+                progress = (step + 1) / actual_batches * 100
+                avg_loss = total_loss / (step + 1)
+                print(f'\r  训练进度: {progress:.1f}% ({step + 1}/{actual_batches}), 平均损失: {avg_loss:.4f}', end='', flush=True)
+
+            print()  # 换行
+            print()  # 空行
+
+            # 清理数据以释放内存
+            del epoch_inputs_tensor, epoch_targets_tensor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # 更新学习率
+            # 注意：预热阶段的学习率已经在epoch开始时由warmup_scheduler.step()更新
+            # 只有预热结束后才使用主调度器
+            if not warmup_scheduler.is_warmup_phase():
+                main_scheduler.step()  # 更新主调度器（余弦退火或阶梯衰减）
+
+            # ==================== 梯度诊断报告 ====================
+            print("  梯度状态检查:")
+            exploding, vanishing, abnormal = grad_monitor.diagnose()
+
+            if exploding:
+                print(f'    🔴 梯度爆炸警告 ({len(exploding)}层):')
+                for name, stats in exploding[:3]:  # 只显示前3层
+                    print(f'      - {name}: avg_norm={stats["avg_norm"]:.4f}, max_norm={stats["max_norm"]:.4f}')
+                if len(exploding) > 3:
+                    print(f'      ... 还有 {len(exploding) - 3} 层')
+
+            if vanishing:
+                print(f'    🟡 梯度消失警告 ({len(vanishing)}层):')
+                for name, stats in vanishing[:3]:  # 只显示前3层
+                    print(f'      - {name}: avg_norm={stats["avg_norm"]:.2e}, avg_max={stats["avg_max"]:.2e}')
+                if len(vanishing) > 3:
+                    print(f'      ... 还有 {len(vanishing) - 3} 层')
+
+            if abnormal:
+                print(f'    ⚠️ 梯度异常 ({len(abnormal)}层):')
+                for name, stats in abnormal[:3]:
+                    issues = []
+                    if stats['nan_count'] > 0:
+                        issues.append(f'NaN×{stats["nan_count"]}')
+                    if stats['inf_count'] > 0:
+                        issues.append(f'Inf×{stats["inf_count"]}')
+                    print(f'      - {name}: {", ".join(issues)}')
+                if len(abnormal) > 3:
+                    print(f'      ... 还有 {len(abnormal) - 3} 层')
+
+            if not exploding and not vanishing and not abnormal:
+                print(f'    ✅ 梯度正常')
+
+            # 打印各层梯度摘要（前5层 + 输出层）
+            summary = grad_monitor.get_epoch_summary()
+            layer_names = list(summary.keys())
+            print('    各层梯度范数摘要:')
+            for name in layer_names[:3]:
+                s = summary[name]
+                print(f'      {name}: avg_norm={s["avg_norm"]:.6f}, max={s["avg_max"]:.6f}')
+            if len(layer_names) > 3:
+                print(f'      ... (共 {len(layer_names)} 层)')
+            # 显示输出层
+            for name in layer_names:
+                if 'output' in name.lower():
+                    s = summary[name]
+                    print(f'      {name}: avg_norm={s["avg_norm"]:.6f}, max={s["avg_max"]:.6f}')
+            # ===================================================
+
+            # 固定评估集评估
+            total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats = evaluate_model_batch(
+                model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
+            )
+
+            # 计算测试集损失（使用固定权重的eval_criterion，保证可比性）
+            test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
+
+            # 随机挑选5组样本打印模型输出值
+            print_sample_predictions(model, eval_inputs, eval_targets, device, num_samples=5, epoch=epoch+1)
+
+            # 打印详细结果
+            class_names = ['不上涨', '上涨']
+            for i in range(2):
+                if class_total[i] > 0:
+                    acc = class_correct[i] / class_total[i]
+                    print(f'  {class_names[i]}: {class_correct[i]}/{class_total[i]} = {acc:.3f}')
+                else:
+                    print(f'  {class_names[i]}: 0/0 = 0.000 (无样本)')
+
+            # 计算上涨准确率（预测上涨后真上涨的概率）
+            if pred_positive_total > 0:
+                precision = pred_positive_correct / pred_positive_total
+                non_negative_rate = pred_non_negative / pred_positive_total
+                print(f'  上涨准确率: {pred_positive_correct}/{pred_positive_total} = {precision:.3f} 准确率: {pred_non_negative}/{pred_positive_total} = {non_negative_rate:.3f}')
             else:
-                print(f'    {interval}: 无预测')
-        
-        overall_acc = sum(class_correct) / sum(class_total) if sum(class_total) > 0 else 0
-        avg_loss = total_loss / batches_per_epoch
-        
-        print(f'  总体准确率: {overall_acc:.3f}')
-        print(f'  Top{DataConfig.TOP_PERCENT}%收益: 样本数={top_stats["count"]}, 平均={top_stats["avg_return"]*100:+.2f}%, 累计={top_stats["total_return"]*100:+.2f}%')
-        print(f'  AUC得分: {auc_score:.4f}')
-        print(f'  训练集损失: {avg_loss:.4f}, 测试集损失: {test_loss:.4f}')
-        
-        # 保存最佳模型（使用测试集loss作为主要标准，同时监控AUC）
-        MIN_AUC = DataConfig.MIN_AUC
-        
-        # 判断是否保存模型
-        should_save = False
-        save_reason = ""
-        
-        if auc_score < MIN_AUC:
-            print(f'  ⚠ AUC过低({auc_score:.4f}<{MIN_AUC})，模型分类能力不足，暂不更新')
-        elif test_loss < best_loss:
-            should_save = True
-            save_reason = f'测试集Loss降低: {best_loss:.4f} → {test_loss:.4f}'
-        
-        if should_save:
-            best_loss = test_loss
-            best_epoch = epoch + 1
-            # 缓存模型状态到内存（深拷贝），不立即写入磁盘
-            import copy
-            best_model_state = copy.deepcopy(model.state_dict())
-            print(f'  ✓ 发现更好的模型！{save_reason}（已缓存到内存）')
-            print(f'    详情: AUC={auc_score:.4f}, Top{DataConfig.TOP_PERCENT}%收益: 平均={top_stats["avg_return"]*100:+.2f}%, 累计={top_stats["total_return"]*100:+.2f}%')
-        
-        print("-" * 50)
-    
+                print(f'  上涨准确率: 0/0 = 0.000 (无预测上涨)')
+
+            # 打印置信度区间的精确度统计
+            print(f'  置信度区间精确度:')
+            for interval in ['0.50-0.55', '0.55-0.58', '0.58-0.60', '0.60-0.70', '0.70-1.00']:
+                correct, total_pred, non_negative = confidence_stats[interval]
+                if total_pred > 0:
+                    precision = correct / total_pred
+                    non_negative_rate = non_negative / total_pred
+                    print(f'    {interval}: 上涨准确={correct}/{total_pred}={precision:.3f}, 非负准确={non_negative}/{total_pred}={non_negative_rate:.3f}')
+                else:
+                    print(f'    {interval}: 无预测')
+
+            overall_acc = sum(class_correct) / sum(class_total) if sum(class_total) > 0 else 0
+            avg_loss = total_loss / batches_per_epoch
+
+            print(f'  总体准确率: {overall_acc:.3f}')
+            print(f'  Top{DataConfig.TOP_PERCENT}%收益: 样本数={top_stats["count"]}, 平均={top_stats["avg_return"]*100:+.2f}%, 累计={top_stats["total_return"]*100:+.2f}%')
+            print(f'  AUC得分: {auc_score:.4f}')
+            print(f'  训练集损失: {avg_loss:.4f}, 测试集损失: {test_loss:.4f}')
+
+            # 保存最佳模型（使用测试集loss作为主要标准，同时监控AUC）
+            MIN_AUC = DataConfig.MIN_AUC
+
+            # 判断是否保存模型
+            should_save = False
+            save_reason = ""
+
+            if auc_score < MIN_AUC:
+                print(f'  ⚠ AUC过低({auc_score:.4f}<{MIN_AUC})，模型分类能力不足，暂不更新')
+            elif test_loss < best_loss:
+                should_save = True
+                save_reason = f'测试集Loss降低: {best_loss:.4f} → {test_loss:.4f}'
+
+            if should_save:
+                best_loss = test_loss
+                best_epoch = epoch + 1
+                # 缓存模型状态到内存（深拷贝），不立即写入磁盘
+                import copy
+                best_model_state = copy.deepcopy(model.state_dict())
+                print(f'  ✓ 发现更好的模型！{save_reason}（已缓存到内存）')
+                print(f'    详情: AUC={auc_score:.4f}, Top{DataConfig.TOP_PERCENT}%收益: 平均={top_stats["avg_return"]*100:+.2f}%, 累计={top_stats["total_return"]*100:+.2f}%')
+
+            print("-" * 50)
+
+    finally:
+        # 训练结束或异常时，移除梯度监控hooks
+        grad_monitor.remove_hooks()
+        print("\n梯度监控器已移除")
+
     # 训练结束后，将最佳模型保存到磁盘
     if best_model_state is not None:
         print("\n" + "=" * 50)

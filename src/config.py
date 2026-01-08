@@ -62,8 +62,8 @@ class TrainingConfig:
     LEARNING_RATE = 0.001            # 初始学习率（提高学习率）
 
     # 训练批处理
-    BATCH_SIZE = 128                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 56            # 每轮训练的批次数（调低以适配时间序采样）
+    BATCH_SIZE = 1024                 # GPU每次并行训练的样本数（增加批大小）
+    BATCHES_PER_EPOCH = 40            # 每轮训练的批次数（调低以适配时间序采样）
 
     # 优化器参数
     WEIGHT_DECAY = 1e-5              # 权重衰减

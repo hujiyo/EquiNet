@@ -317,31 +317,32 @@ def init_weights(module):
 
 class EnhancedStockTransformer(nn.Module):
     """
-    改进的 Transformer 模型（Pre-Norm架构 + 分离Embedding + 渐进式FFN）
+    改进的 Transformer 模型（Pre-Norm架构 + 统一Embedding + 渐进式FFN）
 
-    核心改进1：分离Embedding - 避免LayerNorm时互相干扰
-    - 价格特征(OHLC 4维) -> Embedding -> 64维 (占80%，主导地位)
-    - 流动性特征(Volume+Exchange+Rate 3维) -> Embedding -> 16维 (占20%，辅助信息)
-    - 拼接后得到80维向量，送入Transformer
+    核心改进1：统一Embedding - 端到端学习特征融合
+    - 7个输入特征(OHLC + Volume + Exchange + Rate) -> 统一映射到 d_model 维
+    - 让模型自己学习如何组合和表达不同类型的特征
+    - 相比分离embedding，减少了人为的结构假设
 
     核心改进2：渐进式FFN - 分层学习策略
     - Layer 1: 只用Attention（专注学习时序依赖和特征关系）
-    - Layer 2-5: Attention + FFN（增加非线性变换能力）
+    - Layer 2-6: Attention + FFN（增加非线性变换能力）
     - 好处：第1层纯粹学习模式，后续层增强表达能力
 
     总体优势：
-    1. 避免流动性特征的大值主导LayerNorm，扭曲价格信号
-    2. 保持价格特征之间的相对关系
-    3. 价格特征有更大的表达空间（64维 vs 16维，4:1比例）
-    4. 渐进式学习：第1层纯学模式，后续层增强表达
-    5. 参数量减少约13%（第1层省掉FFN），略微降低过拟合风险
+    1. 统一embedding让特征在第一层就充分混合
+    2. 渐进式学习：第1层纯学模式，后续层增强表达
+    3. 参数量减少约13%（第1层省掉FFN），略微降低过拟合风险
     """
     def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, max_seq_len):
         super(EnhancedStockTransformer, self).__init__()
 
-        # 分离Embedding：价格和流动性特征独立处理
-        self.price_embedding = nn.Linear(ModelConfig.PRICE_DIM, ModelConfig.PRICE_EMBED_DIM)
-        self.liquidity_embedding = nn.Linear(ModelConfig.LIQUIDITY_DIM, ModelConfig.LIQUIDITY_EMBED_DIM)
+        # 统一Embedding：两阶段FFN结构，让特征在进入Transformer前充分混合
+        self.embedding = nn.Sequential(
+            nn.Linear(ModelConfig.INPUT_DIM, ModelConfig.EMBED_HIDDEN_DIM),  # 7维 → 160维（扩展）
+            nn.ReLU(),                                                          # 非线性激活
+            nn.Linear(ModelConfig.EMBED_HIDDEN_DIM, d_model)                  # 160维 → 80维（压缩）
+        )
 
         # 使用标准位置编码
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
@@ -373,32 +374,23 @@ class EnhancedStockTransformer(nn.Module):
         
     def forward(self, x):
         # x: [batch_size, seq_len, 7] (OHLC + volume + exchange + rate)
-        
-        # 1. 分离Embedding：价格和流动性特征独立处理
-        prices = x[:, :, :4]   # [batch_size, seq_len, 4] OHLC
-        liquidity = x[:, :, 4:7] # [batch_size, seq_len, 3] Volume + Exchange + Rate
-        
-        price_emb = self.price_embedding(prices)          # [batch_size, seq_len, 64]
-        liquidity_emb = self.liquidity_embedding(liquidity)  # [batch_size, seq_len, 16]
-        
-        # 2. 拼接成80维（而不是相加！）
-        # 这样价格和流动性各占据独立的子空间，LayerNorm时干扰最小
-        # 价格占64维(80%)，流动性占16维(20%)，价格主导
-        x = torch.cat([price_emb, liquidity_emb], dim=-1)  # [batch_size, seq_len, 80]
-        
-        # 3. 位置编码
+
+        # 1. 统一Embedding：7个特征一起映射到d_model维
+        x = self.embedding(x)  # [batch_size, seq_len, d_model]
+
+        # 2. 位置编码
         x = self.pos_encoding(x)
         x = self.dropout(x)
-        
-        # 4. Transformer层（Pre-Norm架构）
+
+        # 3. Transformer层（Pre-Norm架构）
         for layer in self.layers:
             x = layer(x)
-        
-        # 5. Pre-Norm架构需要在最后进行归一化
+
+        # 4. Pre-Norm架构需要在最后进行归一化
         #    因为每层的输出没有经过归一化
         x = self.final_norm(x)
         
-        # 6. 取最后时间步 + 输出投影
+        # 5. 取最后时间步 + 输出投影
         last_hidden = x[:, -1, :]  # [batch_size, d_model]
         output = self.output_projection(last_hidden)  # [batch_size, output_dim]
         
@@ -724,6 +716,19 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     if np.any(closes == 0) or np.any(volumes == 0):
         return None
 
+    # 🔥 新增：过滤涨停样本（在计算标签之前）
+    # 检查第60天（最后一天）的涨幅是否>=9.5%
+    last_day_idx = start_idx + context_length - 1
+    prev_day_idx = start_idx + context_length - 2
+    prev_day_close = stock_data[prev_day_idx, 3]
+    last_day_close = stock_data[last_day_idx, 3]
+    
+    if prev_day_close > 0:
+        last_day_return = (last_day_close - prev_day_close) / prev_day_close
+        # 涨停阈值：9.5%
+        if last_day_return >= 0.095:
+            return None  # 过滤掉涨停样本
+
     # 特征标准化：向量化计算
     input_seq = np.empty((context_length, 7), dtype=np.float32)
     
@@ -884,6 +889,7 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
     return np.asarray(all_batch_inputs), np.asarray(all_batch_targets)
 
 def create_fixed_evaluation_dataset(test_stock_info):
+    """创建固定评估数据集（涨停样本已在generate_sample_from_index中过滤）"""
     eval_inputs = []
     eval_targets = []
     eval_cumulative_returns = []
@@ -910,6 +916,7 @@ def create_fixed_evaluation_dataset(test_stock_info):
             eval_inputs.append(input_seq)
             eval_targets.append(target)
 
+            # 计算未来收益率
             original_start_price = stock_data[start_idx + context_length - 1, 3]
             original_end_price = stock_data[start_idx + required_length - 1, 3]
             if original_start_price == 0:
@@ -926,6 +933,7 @@ def create_fixed_evaluation_dataset(test_stock_info):
 def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=100):
     """
     批量评估模型性能（详细版，用于train.py主训练流程）
+    涨停样本已在generate_sample_from_index中过滤，无需再次过滤
 
     返回:
         total: 总样本数
@@ -1005,18 +1013,21 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
         non_negative_in_interval = np.sum(mask & (all_returns >= 0))
         confidence_stats[interval] = (correct_in_interval, total_in_interval, non_negative_in_interval)
 
-    # Top N% 收益统计
+    # Top N% 收益统计（涨停样本已在生成阶段过滤）
     percent = DataConfig.TOP_PERCENT
     top_k = max(1, int(len(all_preds) * percent / 100))
-
     sorted_indices = np.argsort(all_preds)[::-1]
     top_indices = sorted_indices[:top_k]
     top_returns = all_returns[top_indices]
 
+    avg_return = np.mean(top_returns)
+    total_return = np.sum(top_returns)
+
     top_stats = {
         'count': top_k,
-        'avg_return': np.mean(top_returns),
-        'total_return': np.sum(top_returns)
+        'avg_return': avg_return,
+        'total_return': total_return,
+        'filtered_count': 0  # 已在生成阶段过滤，这里为0
     }
 
     return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats
@@ -1026,6 +1037,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
                    device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name=""):
     """
     简化版模型评估函数（用于train_clone.py和train_evolve.py）
+    涨停样本已在generate_sample_from_index中过滤，无需再次过滤
 
     返回统计字典，包含:
         auc: AUC得分
@@ -1036,6 +1048,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         low_conf_count: 低置信(<0.2)样本数
         pred_mean: 预测均值
         pred_std: 预测标准差
+        filtered_count: 被过滤的涨停样本数（始终为0，因已在生成阶段过滤）
     """
     model.eval()
 
@@ -1072,15 +1085,14 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     except ValueError:
         auc = 0.5
 
-    # 计算 Top N% 收益
+    # 计算 Top N% 收益（涨停样本已在生成阶段过滤）
     percent = DataConfig.TOP_PERCENT
     top_k = max(1, int(len(all_preds) * percent / 100))
-
     sorted_indices = np.argsort(all_preds)[::-1]
     top_indices = sorted_indices[:top_k]
     top_returns = all_returns[top_indices]
 
-    # Top K 的最低置信度阈值（用于实盘时判断是否入选Top1%）
+    top_return = np.mean(top_returns)
     top_threshold = all_preds[sorted_indices[top_k - 1]]
 
     # 统计高置信样本
@@ -1089,13 +1101,14 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
 
     stats = {
         'auc': auc,
-        'top_return': np.mean(top_returns),
+        'top_return': top_return,
         'top_count': top_k,
         'top_threshold': top_threshold,
         'high_conf_count': np.sum(high_conf),
         'low_conf_count': np.sum(low_conf),
         'pred_mean': np.mean(all_preds),
         'pred_std': np.std(all_preds),
+        'filtered_count': 0  # 已在生成阶段过滤
     }
 
     return stats
@@ -1412,10 +1425,10 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     if torch.cuda.is_available():
         torch.cuda.manual_seed(DataConfig.RANDOM_SEED)
         torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
-    
+
     # 创建固定的评估数据集（训练开始前创建一次，使用滚动窗口标准化）
     eval_inputs, eval_targets, eval_cumulative_returns = create_fixed_evaluation_dataset(test_stock_info)
-    
+
     # 使用自定义动态加权BCE损失函数
     # 特点：1. 根据batch正负样本比例动态调整负样本权重 2. 对预测偏差大的样本指数级惩罚
     criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
@@ -1649,6 +1662,7 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
             avg_loss = total_loss / batches_per_epoch
 
             print(f'  总体准确率: {overall_acc:.3f}')
+            # Top K% 收益（涨停样本已在训练时过滤）
             print(f'  Top{DataConfig.TOP_PERCENT}%收益: 样本数={top_stats["count"]}, 平均={top_stats["avg_return"]*100:+.2f}%, 累计={top_stats["total_return"]*100:+.2f}%')
             print(f'  AUC得分: {auc_score:.4f}')
             print(f'  训练集损失: {avg_loss:.4f}, 测试集损失: {test_loss:.4f}')

@@ -387,8 +387,16 @@ class EnhancedStockTransformer(nn.Module):
 def process_single_file(args):
     """
     处理单个文件，返回原始数据（不做全局标准化，避免数据泄露）
-    按时间划分训练集和测试集：最近80天作为测试集，其余作为训练集
-    训练集会过滤掉TRAIN_START_YEAR之前的数据（过早的市场风格对未来不具备预测效能）
+    
+    采样边界设计（确保训练集和测试集完全不交叠）：
+    - 测试集：最后 test_days (80) 天，完全冻结
+    - 训练集最后一个样本：需要 REQUIRED_LENGTH (63) 天（60上下文+3预测）
+    - 为了不交叠：训练集末位置 = 总长度 - test_days - REQUIRED_LENGTH = 总长度 - 143
+    - 最低数据长度：至少 REQUIRED_LENGTH + test_days = 143 天
+    
+    指针位置：
+    - 训练集指针初始位置：2021年起始位置（如果还未上市则为数据第一天）
+    - 训练集指针末位置：总长度 - test_days - REQUIRED_LENGTH
     """
     file_path, file_name, test_days, train_start_year = args
     try:
@@ -402,44 +410,59 @@ def process_single_file(args):
         times = df['time'].values  # 日期列，格式为YYYYMMDD整数
         
         data_length = len(data)
+        required_length = DataConfig.REQUIRED_LENGTH  # 63天
         
-        # 按时间划分：最近test_days天作为测试集
-        if data_length > test_days:
-            train_split_point = data_length - test_days
-            
-            # 🔑 训练集时间过滤：只保留train_start_year及之后的数据
-            # 时间格式为YYYYMMDD，如20210101，train_start_year=2021对应的起始值为20210101
-            train_start_date = train_start_year * 10000 + 101  # 如2021 -> 20210101
-            train_times = times[:train_split_point]
-            
-            # 找到第一个>=train_start_date的索引
-            valid_indices = np.where(train_times >= train_start_date)[0]
-            if len(valid_indices) > 0:
-                train_start_idx = valid_indices[0]
-                train_data = data[train_start_idx:train_split_point].copy()
-            else:
-                # 所有训练数据都在起始年份之前，训练集为空
-                train_data = None
-            
-            test_data = data  # 保留全部数据用于测试集（需要前面历史数据作为上下文）
+        # 🔑 边界检查1：最低数据长度
+        # 为了生成至少一个训练样本，需要：
+        # - 测试集：test_days (80天)
+        # - 训练样本：REQUIRED_LENGTH (63天)
+        # - 采样起始需要前一天数据：1天
+        # 总计：80 + 63 + 1 = 144天（保守估计，实际可能需要更多）
+        # 但为了简化，我们使用 test_days + required_length 作为初步筛选
+        min_required_length = required_length + test_days  # 63 + 80 = 143
+        if data_length < min_required_length:
+            return None  # 数据不足143天，直接丢弃
+        
+        # 🔑 训练集末位置 = 总长度 - test_days - REQUIRED_LENGTH
+        # 这样训练集最后一个样本的最后一天不会进入测试集的80天范围
+        train_end_idx = data_length - test_days - required_length
+        
+        # 测试集起始位置（用于评估时的采样）
+        test_split_point = data_length - test_days
+        
+        # 🔑 计算训练集起始位置：2021年起始位置（如果还未上市则为数据第一天）
+        train_start_date = train_start_year * 10000 + 101  # 如2021 -> 20210101
+        valid_indices = np.where(times >= train_start_date)[0]
+        
+        if len(valid_indices) > 0:
+            # 股票在2021年前已上市，从2021年开始
+            train_start_idx = valid_indices[0]
         else:
-            # 数据不足，只能用作训练（同样需要过滤）
-            train_start_date = train_start_year * 10000 + 101
-            valid_indices = np.where(times >= train_start_date)[0]
-            if len(valid_indices) > 0:
-                train_start_idx = valid_indices[0]
-                train_data = data[train_start_idx:].copy()
-            else:
-                train_data = None
-            test_data = None
+            # 股票在2021年后才上市，从第一天开始
+            train_start_idx = 0
+        
+        # 🔑 边界检查2：训练集起始位置必须在末位置之前
+        if train_start_idx >= train_end_idx:
+            return None  # 没有有效的训练数据
+        
+        # 🔑 边界检查3：训练数据长度必须足够生成至少一个样本
+        train_length = train_end_idx - train_start_idx
+        if train_length < required_length:
+            return None  # 训练数据不足，丢弃
+        
+        # 提取训练数据（保留完整数据，记录起止索引供采样器使用）
+        train_data = data.copy()  # 保留完整数据
+        test_data = data.copy()   # 测试集也需要完整数据（用于上下文）
         
         stock_info = {
             'file_name': file_name,
             'data_length': data_length,
             'train_data': train_data,
             'test_data': test_data,
-            'train_length': len(train_data) if train_data is not None else 0,
-            'test_split_point': data_length - test_days if data_length > test_days else data_length
+            'train_start_idx': train_start_idx,  # 训练集采样起始索引
+            'train_end_idx': train_end_idx,      # 训练集采样末索引（不含）
+            'train_length': train_length,
+            'test_split_point': test_split_point  # 测试集起始位置（总长度-80）
         }
         
         return stock_info
@@ -451,15 +474,22 @@ def process_single_file(args):
 def load_and_preprocess_data(data_dir=DataConfig.DATA_DIR, test_days=DataConfig.TEST_DAYS, train_start_year=DataConfig.TRAIN_START_YEAR):
     """
     数据加载和预处理，使用多进程并行加载
-    按时间划分：每只股票的最近test_days天作为测试集，其余作为训练集
+    
+    采样边界设计：
+    - 训练集：从2021年（或上市日）到 总长度-test_days-REQUIRED_LENGTH
+    - 测试集：最近test_days天
+    - 最低数据要求：test_days + REQUIRED_LENGTH = 143天
     """
     from multiprocessing import Pool, cpu_count
     
     all_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
     all_files.sort()
     
-    print(f"总共 {len(all_files)} 只股票")
-    print(f"划分策略: 每只股票的最近 {test_days} 天作为测试集，{train_start_year}年及之后的数据作为训练集")
+    print(f"总共 {len(all_files)} 只股票文件")
+    print(f"划分策略:")
+    print(f"  - 训练集: {train_start_year}年起（或上市日）到 总长度-{test_days}-{DataConfig.REQUIRED_LENGTH}")
+    print(f"  - 测试集: 最近 {test_days} 天")
+    print(f"  - 最低数据要求: {test_days + DataConfig.REQUIRED_LENGTH} 天（测试集{test_days}天 + 训练样本{DataConfig.REQUIRED_LENGTH}天）")
     
     # 处理所有文件
     file_args = [(os.path.join(data_dir, f), f, test_days, train_start_year) for f in all_files]
@@ -468,30 +498,34 @@ def load_and_preprocess_data(data_dir=DataConfig.DATA_DIR, test_days=DataConfig.
     with Pool(num_workers) as pool:
         all_stock_info = [r for r in pool.map(process_single_file, file_args) if r is not None]
     
+    # 统计丢弃数量
+    discarded_count = len(all_files) - len(all_stock_info)
+    print(f"有效股票: {len(all_stock_info)} 只，丢弃: {discarded_count} 只")
+    
     # 分离训练和测试数据
     train_stock_info = []
     test_stock_info = []
     
     for stock_info in all_stock_info:
-        # 所有股票的历史数据都用于训练
-        if stock_info['train_data'] is not None and len(stock_info['train_data']) >= DataConfig.REQUIRED_LENGTH:
-            train_stock_info.append({
-                'file_name': stock_info['file_name'],
-                'data': stock_info['train_data'],
-                'data_length': stock_info['train_length']
-            })
+        # 训练集：保留完整数据和采样边界索引
+        train_stock_info.append({
+            'file_name': stock_info['file_name'],
+            'data': stock_info['train_data'],
+            'data_length': stock_info['data_length'],
+            'train_start_idx': stock_info['train_start_idx'],  # 采样起始索引
+            'train_end_idx': stock_info['train_end_idx'],      # 采样末索引
+        })
         
-        # 有足够数据的股票用于测试
-        if stock_info['test_data'] is not None and len(stock_info['test_data']) >= DataConfig.REQUIRED_LENGTH:
-            test_stock_info.append({
-                'file_name': stock_info['file_name'],
-                'data': stock_info['test_data'],
-                'data_length': len(stock_info['test_data']),
-                'test_split_point': stock_info['test_split_point']  # 测试集起始位置
-            })
+        # 测试集：保留完整数据和测试起始位置
+        test_stock_info.append({
+            'file_name': stock_info['file_name'],
+            'data': stock_info['test_data'],
+            'data_length': stock_info['data_length'],
+            'test_split_point': stock_info['test_split_point']
+        })
     
-    print(f"训练集: {len(train_stock_info)} 只股票的历史数据")
-    print(f"测试集: {len(test_stock_info)} 只股票的最近 {test_days} 天数据")
+    print(f"训练集: {len(train_stock_info)} 只股票")
+    print(f"测试集: {len(test_stock_info)} 只股票")
     
     return train_stock_info, test_stock_info
 
@@ -523,6 +557,11 @@ class TemporalSampler:
     """
     时间顺序采样器：采样头在多个股票上同步向前移动，不回头
     
+    采样边界设计：
+    - 每只股票的指针初始位置 = train_start_idx（2021年起始位置，或上市第一天）
+    - 每只股票的指针末位置 = train_end_idx（总长度-80-63=总长度-143）
+    - 指针到达末尾后该股票不再参与训练
+    
     核心算法：
     1. 计算总样本数和每个epoch需要的样本数
     2. 将总样本数均匀分配到各个epoch
@@ -535,27 +574,44 @@ class TemporalSampler:
         self.num_epochs = num_epochs
         self.samples_per_epoch = samples_per_epoch
 
-        # 每只股票的采样位置指针
-        self.stock_positions = [1] * len(stock_info_list)  # 从索引1开始（需要前一天数据）
-
-        # 每只股票的最大可用位置
+        # 每只股票的采样位置指针（初始化为各自的train_start_idx + 1，因为需要前一天数据）
+        self.stock_positions = []
+        
+        # 每只股票的最大可用位置（train_end_idx - REQUIRED_LENGTH）
         self.stock_max_positions = []
+        
         for stock_info in stock_info_list:
-            data_length = len(stock_info['data'])
-            if data_length >= self.required_length + 1:
-                max_pos = data_length - self.required_length
-            else:
-                max_pos = 0
+            train_start_idx = stock_info.get('train_start_idx', 0)
+            train_end_idx = stock_info.get('train_end_idx', len(stock_info['data']))
+            
+            # 采样起始位置：train_start_idx + 1（需要前一天数据作为基准）
+            start_pos = max(1, train_start_idx + 1)
+            
+            # 采样末位置：train_end_idx - REQUIRED_LENGTH（确保有足够数据生成标签）
+            max_pos = train_end_idx - self.required_length
+            
+            # 确保起始位置不超过末位置
+            if start_pos > max_pos:
+                start_pos = max_pos + 1  # 设置为无效，该股票不参与采样
+            
+            self.stock_positions.append(start_pos)
             self.stock_max_positions.append(max_pos)
 
         # 统计信息
-        total_samples = sum(self.stock_max_positions)
-        valid_stocks = sum(1 for m in self.stock_max_positions if m > 0)
+        valid_stocks = sum(1 for i in range(len(stock_info_list)) 
+                         if self.stock_positions[i] <= self.stock_max_positions[i])
+        total_samples = sum(max(0, self.stock_max_positions[i] - self.stock_positions[i] + 1) 
+                          for i in range(len(stock_info_list)))
+        
+        # 检查是否有有效股票
+        if valid_stocks == 0:
+            raise ValueError(
+                f"没有有效的训练股票！\n"
+                f"  总股票数: {len(stock_info_list)}\n"
+                f"  请检查数据质量或调整参数"
+            )
         
         # 计算每个epoch需要采样的轮数
-        # 总共需要的样本数 = num_epochs * samples_per_epoch
-        # 但我们要确保最后一个epoch恰好用完所有数据
-        # 策略：计算平均每个epoch应该前进多少轮
         total_needed_samples = num_epochs * samples_per_epoch
         
         # 每轮采样约等于有效股票数（因为每只股票取一个）

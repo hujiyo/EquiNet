@@ -124,11 +124,9 @@ class DynamicWeightedBCE(nn.Module):
         inputs: [batch_size, 1] 模型输出的logits (BF16)
         targets: [batch_size] 真实标签 (1.0/0.0) (BF16)
         """
-        # 确保输入形状正确
-        if inputs.dim() == 1:
-            inputs = inputs.unsqueeze(1)
-        
-        inputs = inputs.squeeze()
+        # 确保输入形状正确：如果是 [batch_size, 1] 则 squeeze(-1) 变成 [batch_size]
+        if inputs.dim() == 2 and inputs.size(1) == 1:
+            inputs = inputs.squeeze(-1)
 
         # BF16训练时，这里用FP32计算loss更稳定
         inputs_fp32 = inputs.float()
@@ -271,10 +269,10 @@ class TransformerLayer(nn.Module):
         if self.use_ffn:
             # 前馈网络，用于进一步处理注意力的输出
             self.feed_forward = nn.Sequential(
-                nn.Linear(d_model, d_model * 4),  # 先扩展维度
-                nn.ReLU(),                        # 激活函数
+                nn.Linear(d_model, 160),  # 80 → 160
+                nn.ReLU(),                 # 激活函数
                 nn.Dropout(ModelConfig.DROPOUT_RATE),  # 防过拟合
-                nn.Linear(d_model * 4, d_model),  # 再压缩回原维度
+                nn.Linear(160, d_model),   # 160 → 80
             )
             
             # Pre-Norm: 在前馈网络之前进行归一化（使用RMSNorm保留特征相对关系）
@@ -317,22 +315,16 @@ def init_weights(module):
 
 class EnhancedStockTransformer(nn.Module):
     """
-    改进的 Transformer 模型（Pre-Norm架构 + 统一Embedding + 渐进式FFN）
+    改进的 Transformer 模型（Pre-Norm架构 + 统一Embedding）
 
     核心改进1：统一Embedding - 端到端学习特征融合
     - 7个输入特征(OHLC + Volume + Exchange + Rate) -> 统一映射到 d_model 维
     - 让模型自己学习如何组合和表达不同类型的特征
     - 相比分离embedding，减少了人为的结构假设
 
-    核心改进2：渐进式FFN - 分层学习策略
-    - Layer 1: 只用Attention（专注学习时序依赖和特征关系）
-    - Layer 2-6: Attention + FFN（增加非线性变换能力）
-    - 好处：第1层纯粹学习模式，后续层增强表达能力
-
-    总体优势：
-    1. 统一embedding让特征在第一层就充分混合
-    2. 渐进式学习：第1层纯学模式，后续层增强表达
-    3. 参数量减少约13%（第1层省掉FFN），略微降低过拟合风险
+    核心改进2：统一Transformer层架构
+    - 所有层都使用 Attention + FFN 结构
+    - 简化模型设计，降低结构复杂度
     """
     def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, max_seq_len):
         super(EnhancedStockTransformer, self).__init__()
@@ -347,11 +339,9 @@ class EnhancedStockTransformer(nn.Module):
         # 使用标准位置编码
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
 
-        # 第1层只用Attention（专注学习序列模式）
-        # 第2-5层用Attention+FFN（增加非线性变换能力）
+        # 统一架构：所有层都使用 Attention + FFN
         self.layers = nn.ModuleList([
-            TransformerLayer(d_model, nhead, use_ffn=False) if i == 0
-            else TransformerLayer(d_model, nhead, use_ffn=True)
+            TransformerLayer(d_model, nhead, use_ffn=True)
             for i in range(num_layers)
         ])
 
@@ -930,6 +920,60 @@ def create_fixed_evaluation_dataset(test_stock_info):
     return np.asarray(eval_inputs), np.asarray(eval_targets), np.asarray(eval_cumulative_returns)
 
 
+def create_train_evaluation_dataset(train_stock_info, first_n_days=80):
+    """
+    创建训练集评估数据集，用于检测过拟合
+    使用每个股票的前N个交易日作为训练集评估样本
+
+    Args:
+        train_stock_info: 训练股票信息列表
+        first_n_days: 使用前多少个交易日，默认80
+
+    Returns:
+        eval_inputs, eval_targets, eval_cumulative_returns
+    """
+    eval_inputs = []
+    eval_targets = []
+    eval_cumulative_returns = []
+
+    required_length = DataConfig.REQUIRED_LENGTH
+    context_length = DataConfig.CONTEXT_LENGTH
+
+    for stock_info in train_stock_info:
+        stock_data = stock_info['data']
+        data_length = len(stock_data)
+        train_start_idx = stock_info.get('train_start_idx', 0)
+
+        # 使用每个股票的前80个交易日（从train_start_idx开始）
+        start_min = max(1, train_start_idx + 1)
+        start_max = min(train_start_idx + first_n_days, data_length - required_length)
+        if start_max < start_min:
+            continue
+
+        for start_idx in range(start_min, start_max + 1):
+            sample = generate_sample_from_index([stock_info], 0, start_idx)
+            if sample is None:
+                continue
+
+            input_seq, target = sample
+            eval_inputs.append(input_seq)
+            eval_targets.append(target)
+
+            # 计算未来收益率
+            original_start_price = stock_data[start_idx + context_length - 1, 3]
+            original_end_price = stock_data[start_idx + required_length - 1, 3]
+            if original_start_price == 0:
+                continue
+            cumulative_return = (original_end_price - original_start_price) / original_start_price
+            eval_cumulative_returns.append(float(cumulative_return))
+
+    if len(eval_inputs) == 0:
+        raise ValueError("训练集评估集为空：train_stock_info中没有可用样本")
+
+    print(f"    训练集评估数据集已生成: {len(eval_inputs)}个样本 (每股票前{first_n_days}交易日)")
+    return np.asarray(eval_inputs), np.asarray(eval_targets), np.asarray(eval_cumulative_returns)
+
+
 def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=100):
     """
     批量评估模型性能（详细版，用于train.py主训练流程）
@@ -1253,7 +1297,7 @@ def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, bat
             criterion.update_weights(batch_targets)
 
             outputs = model(batch_inputs)
-            loss = criterion(outputs.squeeze(), batch_targets)
+            loss = criterion(outputs.squeeze(-1), batch_targets)
             total_loss += loss.item() * (end_idx - start_idx)
     
     return total_loss / num_samples
@@ -1427,7 +1471,9 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
         torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
 
     # 创建固定的评估数据集（训练开始前创建一次，使用滚动窗口标准化）
+    print("\n创建评估数据集...")
     eval_inputs, eval_targets, eval_cumulative_returns = create_fixed_evaluation_dataset(test_stock_info)
+    train_eval_inputs, train_eval_targets, train_eval_returns = create_train_evaluation_dataset(train_stock_info, first_n_days=80)
 
     # 使用自定义动态加权BCE损失函数
     # 特点：1. 根据batch正负样本比例动态调整负样本权重 2. 对预测偏差大的样本指数级惩罚
@@ -1624,6 +1670,11 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
                 model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
             )
 
+            # 计算训练集收益率（用于检测过拟合）
+            _, _, _, _, _, _, _, _, train_top_stats = evaluate_model_batch(
+                model, train_eval_inputs, train_eval_targets, train_eval_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
+            )
+
             # 计算测试集损失（使用固定权重的eval_criterion，保证可比性）
             test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
 
@@ -1662,8 +1713,22 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
             avg_loss = total_loss / batches_per_epoch
 
             print(f'  总体准确率: {overall_acc:.3f}')
-            # Top K% 收益（涨停样本已在训练时过滤）
-            print(f'  Top{DataConfig.TOP_PERCENT}%收益: 样本数={top_stats["count"]}, 平均={top_stats["avg_return"]*100:+.2f}%, 累计={top_stats["total_return"]*100:+.2f}%')
+
+            # 收益率对比（训练集 vs 测试集）- 用于检测过拟合
+            train_return_pct = train_top_stats["avg_return"] * 100
+            test_return_pct = top_stats["avg_return"] * 100
+            return_gap = train_return_pct - test_return_pct
+
+            print(f'  【过拟合检测】Top{DataConfig.TOP_PERCENT}%收益率对比:')
+            print(f'    训练集: {train_return_pct:+.2f}% (样本数={train_top_stats["count"]})')
+            print(f'    测试集: {test_return_pct:+.2f}% (样本数={top_stats["count"]})')
+            print(f'    差距: {return_gap:+.2f}% ', end='')
+            if return_gap > 1.0:
+                print('⚠️ 过拟合风险：训练集明显高于测试集')
+            elif return_gap < -0.5:
+                print('⚠️ 欠拟合：测试集高于训练集（罕见）')
+            else:
+                print('✓ 正常')
             print(f'  AUC得分: {auc_score:.4f}')
             print(f'  训练集损失: {avg_loss:.4f}, 测试集损失: {test_loss:.4f}')
 

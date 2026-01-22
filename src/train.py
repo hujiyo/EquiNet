@@ -270,7 +270,7 @@ class TransformerLayer(nn.Module):
             # 前馈网络，用于进一步处理注意力的输出
             self.feed_forward = nn.Sequential(
                 nn.Linear(d_model, 160),  # 80 → 160
-                nn.ReLU(),                 # 激活函数
+                nn.GELU(),                 # GELU激活
                 nn.Dropout(ModelConfig.DROPOUT_RATE),  # 防过拟合
                 nn.Linear(160, d_model),   # 160 → 80
             )
@@ -331,9 +331,9 @@ class EnhancedStockTransformer(nn.Module):
 
         # 统一Embedding：两阶段FFN结构，让特征在进入Transformer前充分混合
         self.embedding = nn.Sequential(
-            nn.Linear(ModelConfig.INPUT_DIM, ModelConfig.EMBED_HIDDEN_DIM),  # 7维 → 160维（扩展）
-            nn.ReLU(),                                                          # 非线性激活
-            nn.Linear(ModelConfig.EMBED_HIDDEN_DIM, d_model)                  # 160维 → 80维（压缩）
+            nn.Linear(ModelConfig.INPUT_DIM, ModelConfig.EMBED_HIDDEN_DIM),  # 7维 → 40维（扩展）
+            nn.GELU(),                                                          # GELU激活，对负值有梯度
+            nn.Linear(ModelConfig.EMBED_HIDDEN_DIM, d_model)                  # 40维 → 80维
         )
 
         # 使用标准位置编码
@@ -352,7 +352,7 @@ class EnhancedStockTransformer(nn.Module):
         # 简化输出层，减少过拟合
         self.output_projection = nn.Sequential(
             nn.Linear(d_model, d_model // 2),  # 降维
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(ModelConfig.DROPOUT_RATE),
             nn.Linear(d_model // 2, output_dim)  # 最终输出
         )

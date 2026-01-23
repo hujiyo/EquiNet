@@ -349,6 +349,11 @@ class EnhancedStockTransformer(nn.Module):
         # 因为Pre-Norm的最后一层没有归一化输出
         self.final_norm = RMSNorm(d_model)
 
+        # 注意力聚合：学习每个时间步的重要性权重
+        # 相比只用最后一个时间步，能更充分利用所有历史信息
+        # 使用缩放初始化，避免点积方差过大导致softmax接近one-hot
+        self.attention_query = nn.Parameter(torch.randn(d_model) / math.sqrt(d_model))
+
         # 简化输出层，减少过拟合
         self.output_projection = nn.Sequential(
             nn.Linear(d_model, d_model // 2),  # 降维
@@ -380,10 +385,14 @@ class EnhancedStockTransformer(nn.Module):
         #    因为每层的输出没有经过归一化
         x = self.final_norm(x)
         
-        # 5. 取最后时间步 + 输出投影
-        last_hidden = x[:, -1, :]  # [batch_size, d_model]
-        output = self.output_projection(last_hidden)  # [batch_size, output_dim]
+        # 5. 注意力聚合：自适应加权所有时间步
+        # attn_scores: [batch_size, seq_len]
+        attn_scores = torch.matmul(x, self.attention_query)  # 每个时间步与query的相似度
+        attn_weights = torch.softmax(attn_scores, dim=1)     # 归一化为权重
+        # aggregated: [batch_size, d_model] - 加权求和所有时间步
+        aggregated = torch.sum(x * attn_weights.unsqueeze(-1), dim=1)
         
+        output = self.output_projection(aggregated)  # [batch_size, output_dim]
         return output
 
 # 单个文件处理函数（用于多进程）
@@ -394,6 +403,7 @@ def process_single_file(args):
     采样边界设计（确保训练集和测试集完全不交叠）：
     - 测试集：最后 test_days (80) 天，完全冻结
     - 训练集最后一个样本：需要 REQUIRED_LENGTH (63) 天（60上下文+3预测）
+    - 指针到达末尾后该股票不再参与训练
     - 为了不交叠：训练集末位置 = 总长度 - test_days - REQUIRED_LENGTH = 总长度 - 143
     - 最低数据长度：至少 REQUIRED_LENGTH + test_days = 143 天
     

@@ -174,23 +174,6 @@ class DynamicWeightedBCE(nn.Module):
         else:
             return loss
 
-class RMSNorm(nn.Module):
-    """
-    RMSNorm: 只做缩放，不减均值
-    相比LayerNorm，保留了特征间的相对大小关系
-    这对于OHLC价格特征很重要，因为 High > Close > Open > Low 的关系需要保持
-    """
-    def __init__(self, dim, eps=1e-6):
-        super(RMSNorm, self).__init__()
-        self.scale = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-    
-    def forward(self, x):
-        # 计算RMS (Root Mean Square)
-        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
-        # 只做缩放，不减均值
-        return x / rms * self.scale
-
 class PositionalEncoding(nn.Module):
     """
     标准的正弦位置编码
@@ -210,7 +193,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
         
     def forward(self, x):
-        # 直接添加位置编码，不使用LayerNorm（会在后续层中使用Pre-Norm）
+        # 直接添加位置编码，LayerNorm在后续层中使用
         seq_len = x.size(1)
         pe_slice = self.pe[:seq_len, :].unsqueeze(0)
         return x + pe_slice
@@ -229,9 +212,9 @@ class MultiHeadAttention(nn.Module):
         
         # 使用标准的MultiheadAttention
         self.attention = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-        
-        # Pre-Norm: 在注意力之前进行归一化（使用RMSNorm保留特征相对关系）
-        self.norm = RMSNorm(d_model)
+
+        # Pre-Norm: 在注意力之前进行归一化
+        self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(ModelConfig.ATTENTION_DROPOUT)
         
     def forward(self, x, attn_mask=None):
@@ -275,8 +258,8 @@ class TransformerLayer(nn.Module):
                 nn.Linear(160, d_model),   # 160 → 80
             )
             
-            # Pre-Norm: 在前馈网络之前进行归一化（使用RMSNorm保留特征相对关系）
-            self.norm = RMSNorm(d_model)
+            # Pre-Norm: 在前馈网络之前进行归一化
+            self.norm = nn.LayerNorm(d_model)
             self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
         
     def forward(self, x):
@@ -310,8 +293,9 @@ def init_weights(module):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
-    elif isinstance(module, RMSNorm):
-        nn.init.ones_(module.scale)
+    elif isinstance(module, nn.LayerNorm):
+        nn.init.ones_(module.weight)
+        nn.init.zeros_(module.bias)
 
 class EnhancedStockTransformer(nn.Module):
     """
@@ -345,9 +329,9 @@ class EnhancedStockTransformer(nn.Module):
             for i in range(num_layers)
         ])
 
-        # Pre-Norm架构：在最后添加一个RMSNorm
+        # Pre-Norm架构：在最后添加一个LayerNorm
         # 因为Pre-Norm的最后一层没有归一化输出
-        self.final_norm = RMSNorm(d_model)
+        self.final_norm = nn.LayerNorm(d_model)
 
         # 注意力聚合：学习每个时间步的重要性权重
         # 相比只用最后一个时间步，能更充分利用所有历史信息
@@ -749,7 +733,8 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     input_seq[:, 6] = input_seq_raw[:, 6] / 10.0
     
     # 数值范围限制（向量化）
-    np.clip(input_seq[:, :4], -0.3, 0.3, out=input_seq[:, :4])
+    # 价格特征：限制在[-0.1, 0.1]，对应±10%涨跌幅
+    np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
     np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
     input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
     np.clip(input_seq[:, 4:7], 0.0, 1.0, out=input_seq[:, 4:7])
@@ -1893,7 +1878,8 @@ def normalize_data_for_prediction(data):
         normalized_data[i, 6] = np.clip(data[i, 6] / 10.0, 0.0, 1.0)  # 量比
     
     # 数值范围限制
-    normalized_data[:, :4] = np.clip(normalized_data[:, :4], -0.3, 0.3)
+    # 价格特征：限制在[-0.1, 0.1]，对应±10%涨跌幅
+    normalized_data[:, :4] = np.clip(normalized_data[:, :4], -0.1, 0.1)
     normalized_data[:, 4] = np.clip(normalized_data[:, 4], -5.0, 5.0)
     normalized_data[:, 4] = np.clip(normalized_data[:, 4] / 10.0 + 0.5, 0.0, 1.0)
     normalized_data[:, 5] = np.clip(normalized_data[:, 5], 0.0, 1.0)

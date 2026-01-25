@@ -39,16 +39,16 @@ class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
     INPUT_DIM = 7                    # 输入特征维度数（OHLC + volume + exchange + rate）
-    D_MODEL = 80                     # 模型维度（Transformer内部维度）
-    EMBED_HIDDEN_DIM = 40           # Embedding中间层维度（两阶段FFN：7→160→80）
-    NHEAD = 4                        # 注意力头数
+    D_MODEL = 28                     # 模型维度（Transformer内部维度）
+    EMBED_HIDDEN_DIM = 40           # Embedding中间层维度（两阶段FFN：7→40→80）
+    NHEAD = 2                        # 注意力头数
     NUM_LAYERS = 6                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）
     MAX_SEQ_LEN = DataConfig.CONTEXT_LENGTH  # 最大序列长度（直接引用CONTEXT_LENGTH，确保一致性）
 
     # 注意力机制参数（为小模型调整）
-    DROPOUT_RATE = 0.1                 # Dropout比率设置为0降低欠拟合
-    ATTENTION_DROPOUT = 0.1            # 注意力Dropout比率设置为0降低欠拟合
+    DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合
+    ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
 
 # ==================== 训练参数 ====================
 class TrainingConfig:

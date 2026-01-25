@@ -44,7 +44,7 @@ class ModelConfig:
     NHEAD = 2                        # 注意力头数
     NUM_LAYERS = 6                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）
-    MAX_SEQ_LEN = DataConfig.CONTEXT_LENGTH  # 最大序列长度（直接引用CONTEXT_LENGTH，确保一致性）
+    SEQ_LEN = DataConfig.CONTEXT_LENGTH  # 最大序列长度（直接引用CONTEXT_LENGTH，确保一致性）
 
     # 注意力机制参数（为小模型调整）
     DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合

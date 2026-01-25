@@ -10,6 +10,8 @@
 import os,torch,torch.nn as nn,torch.optim as optim,pandas as pd,numpy as np
 import random
 import math
+import csv
+from datetime import datetime
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from config import (ModelConfig, TrainingConfig, DataConfig,
@@ -179,12 +181,12 @@ class PositionalEncoding(nn.Module):
     标准的正弦位置编码
     让 Transformer 自己学习时间依赖关系，不加人为规则
     """
-    def __init__(self, d_model, max_seq_len=DataConfig.CONTEXT_LENGTH):
+    def __init__(self, d_model, seq_len=DataConfig.CONTEXT_LENGTH):
         super(PositionalEncoding, self).__init__()
         
         # 创建标准的正弦/余弦位置编码
-        pe = torch.zeros(max_seq_len, d_model)
-        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
+        pe = torch.zeros(seq_len, d_model)
+        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
         
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
@@ -310,7 +312,7 @@ class EnhancedStockTransformer(nn.Module):
     - 所有层都使用 Attention + FFN 结构
     - 简化模型设计，降低结构复杂度
     """
-    def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, max_seq_len):
+    def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, seq_len):
         super(EnhancedStockTransformer, self).__init__()
 
         # 统一Embedding：两阶段FFN结构，让特征在进入Transformer前充分混合
@@ -321,7 +323,7 @@ class EnhancedStockTransformer(nn.Module):
         )
 
         # 使用标准位置编码
-        self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
+        self.pos_encoding = PositionalEncoding(d_model, seq_len)
 
         # 统一架构：所有层都使用 Attention + FFN
         self.layers = nn.ModuleList([
@@ -1526,6 +1528,9 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     # 创建训练用的随机数生成器
     train_rng = random.Random(DataConfig.RANDOM_SEED)
 
+    # 记录每轮收益率
+    epoch_returns = []  # 格式: [{'turn': 1, 'return': 1.62}, ...]
+
     # 创建并注册梯度监控器
     print("\n正在初始化梯度监控器...")
     grad_monitor = GradientMonitor()
@@ -1665,6 +1670,13 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
                 model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
             )
 
+            # 记录当前轮次收益率
+            epoch_return = {
+                'turn': epoch + 1,
+                'return': top_stats['avg_return'] * 100  # 转换为百分比
+            }
+            epoch_returns.append(epoch_return)
+
             # 计算训练集收益率（用于检测过拟合）
             _, _, _, _, _, _, _, _, train_top_stats = evaluate_model_batch(
                 model, train_eval_inputs, train_eval_targets, train_eval_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
@@ -1769,6 +1781,24 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
         print("⚠ 警告：未找到符合条件的最佳模型（AUC要求未达标）")
         print("=" * 50)
 
+    # 保存每轮收益率到CSV（使用时间戳避免多模型训练时覆盖）
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"baseline_epoch_returns_{timestamp}.csv")
+    with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['turn', 'return'])
+        writer.writeheader()
+
+        for epoch_return in epoch_returns:
+            row = {
+                'turn': epoch_return['turn'],
+                'return': f"{epoch_return['return']:.2f}"
+            }
+            writer.writerow(row)
+
+    print(f"✓ 每轮收益率已保存: {os.path.basename(returns_csv_path)}")
+    print(f"  共记录 {len(epoch_returns)} 轮训练数据")
+    print("=" * 50)
+
 if __name__ == "__main__":
     # 设置工作目录
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -1822,7 +1852,7 @@ if __name__ == "__main__":
         nhead=ModelConfig.NHEAD, 
         num_layers=ModelConfig.NUM_LAYERS, 
         output_dim=ModelConfig.OUTPUT_DIM,
-        max_seq_len=ModelConfig.MAX_SEQ_LEN
+        seq_len=ModelConfig.SEQ_LEN
     ).to(device)
     
     # 将模型参数转换为BF16精度
@@ -1928,7 +1958,7 @@ def predict_single_stock(model_path, stock_data, device=None):
             nhead=ModelConfig.NHEAD,
             num_layers=ModelConfig.NUM_LAYERS,
             output_dim=ModelConfig.OUTPUT_DIM,
-            max_seq_len=ModelConfig.MAX_SEQ_LEN
+            seq_len=ModelConfig.SEQ_LEN
         ).to(device)
         
         model = model.to(dtype=torch.bfloat16)
@@ -1976,7 +2006,7 @@ def predict_multiple_stocks(model_path, stock_files_data, device=None):
             nhead=ModelConfig.NHEAD,
             num_layers=ModelConfig.NUM_LAYERS,
             output_dim=ModelConfig.OUTPUT_DIM,
-            max_seq_len=ModelConfig.MAX_SEQ_LEN
+            seq_len=ModelConfig.SEQ_LEN
         ).to(device)
         
         model = model.to(dtype=torch.bfloat16)

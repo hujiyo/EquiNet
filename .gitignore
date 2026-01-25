@@ -16,3 +16,5 @@ today/
 CLAUDE.md
 WARP.md
 *.csv
+*.pyc
+*.json

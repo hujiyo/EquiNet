@@ -17,6 +17,8 @@
 import os, torch, torch.nn as nn, torch.optim as optim, numpy as np
 import copy
 import random
+import csv
+from datetime import datetime
 from config import (ModelConfig, TrainingConfig, DataConfig,
                    DeviceConfig, ModelSaveConfig,
                    print_config_summary)
@@ -135,6 +137,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
     samples_per_epoch = batch_size * batches_per_epoch
     sampler = TemporalSampler(train_stock_info, epochs, samples_per_epoch)
     train_rng = random.Random(DataConfig.RANDOM_SEED)
+
+    # 记录每轮收益率
+    epoch_returns = []  # 格式: [{'turn': 1, 'return_a': 1.62, 'return_b': None}, ...]
 
     for epoch in range(epochs):
         model_a.train()
@@ -268,6 +273,13 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
         print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
         print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_a["top_return"]*100:+.2f}%')
 
+        # 记录当前轮次收益率
+        epoch_return = {
+            'turn': epoch + 1,
+            'return_a': stats_a['top_return'] * 100,  # 转换为百分比
+            'return_b': None  # 模型B尚未创建或未评估
+        }
+
         # 早停检测
         improved = False
 
@@ -318,6 +330,12 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
                 best_threshold_b = stats_b['top_threshold']
                 print(f'          ✓ 新最佳模型B（收益率）！Top1%收益: {best_return_b*100:+.2f}% (第{best_return_epoch_b}轮)')
 
+            # 更新当前轮次收益率（模型B已存在）
+            epoch_return['return_b'] = stats_b['top_return'] * 100  # 转换为百分比
+
+        # 将当前轮次收益率添加到列表
+        epoch_returns.append(epoch_return)
+
         print("-" * 60)
 
         # 早停检查
@@ -356,6 +374,26 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
         print(f"✓ 模型B已保存: {os.path.basename(save_path_b)}")
         print(f"  Top1%阈值: {best_threshold_b:.4f}")
 
+    print("=" * 60)
+
+    # 保存每轮收益率到CSV（使用时间戳避免多模型训练时覆盖）
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"clone_epoch_returns_{timestamp}.csv")
+    with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['turn', 'A', 'B'])
+        writer.writeheader()
+
+        for epoch_return in epoch_returns:
+            # 将None转换为空字符串
+            row = {
+                'turn': epoch_return['turn'],
+                'A': f"{epoch_return['return_a']:.2f}" if epoch_return['return_a'] is not None else "",
+                'B': f"{epoch_return['return_b']:.2f}" if epoch_return['return_b'] is not None else ""
+            }
+            writer.writerow(row)
+
+    print(f"✓ 每轮收益率已保存: {os.path.basename(returns_csv_path)}")
+    print(f"  共记录 {len(epoch_returns)} 轮训练数据")
     print("=" * 60)
 
     return best_return_a, best_return_b
@@ -397,7 +435,7 @@ if __name__ == "__main__":
         nhead=ModelConfig.NHEAD,
         num_layers=ModelConfig.NUM_LAYERS,
         output_dim=ModelConfig.OUTPUT_DIM,
-        max_seq_len=DataConfig.CONTEXT_LENGTH
+        seq_len=DataConfig.CONTEXT_LENGTH
     ).to(device)
 
     model_a = model_a.to(dtype=torch.bfloat16)

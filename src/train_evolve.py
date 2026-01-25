@@ -15,6 +15,7 @@ import os, torch, torch.nn as nn, torch.optim as optim, numpy as np
 import copy
 import argparse
 import random
+import csv
 from datetime import datetime
 from config import (ModelConfig, TrainingConfig, DataConfig,
                    DeviceConfig, ModelSaveConfig,
@@ -105,7 +106,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
             nhead=ModelConfig.NHEAD, 
             num_layers=ModelConfig.NUM_LAYERS, 
             output_dim=ModelConfig.OUTPUT_DIM, 
-            max_seq_len=DataConfig.CONTEXT_LENGTH
+            seq_len=DataConfig.CONTEXT_LENGTH
         ).to(device)
         teacher = teacher.to(dtype=torch.bfloat16)
         
@@ -126,7 +127,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         nhead=ModelConfig.NHEAD, 
         num_layers=ModelConfig.NUM_LAYERS, 
         output_dim=ModelConfig.OUTPUT_DIM, 
-        max_seq_len=DataConfig.CONTEXT_LENGTH
+        seq_len=DataConfig.CONTEXT_LENGTH
     ).to(device)
     model_b = model_b.to(dtype=torch.bfloat16)
     state_dict = torch.load(student_path, map_location=device)
@@ -184,6 +185,9 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     samples_per_epoch = batch_size * batches_per_epoch
     sampler = TemporalSampler(train_stock_info, epochs, samples_per_epoch)
     train_rng = random.Random(seed)
+
+    # 记录每轮收益率
+    epoch_returns = []  # 格式: [{'turn': 1, 'return_b': 1.62}, ...]
 
     for epoch in range(epochs):
         # 所有教师固定不训练
@@ -298,7 +302,14 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         
         # 评估模型B
         stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B")
-        
+
+        # 记录当前轮次收益率
+        epoch_return = {
+            'turn': epoch + 1,
+            'return_b': stats_b['top_return'] * 100  # 转换为百分比
+        }
+        epoch_returns.append(epoch_return)
+
         avg_loss_b = total_loss_b / num_batches
         
         print(f"  [教师数量] {len(teachers)}个")
@@ -346,7 +357,24 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     print(f"初始教师数: {num_teachers} → 最终教师数: {len(teachers)}")
     print(f"总改进次数: {evolution_count}")
     print(f"最佳模型: 第{best_epoch}轮, Top1%收益: {best_return_b*100:+.2f}%, AUC: {best_auc_b:.4f}")
-    
+
+    # 保存每轮收益率到CSV（使用时间戳避免多模型训练时覆盖）
+    timestamp_csv = datetime.now().strftime("%m%d_%H%M%S")
+    returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"evolve_epoch_returns_{timestamp_csv}.csv")
+    with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['turn', 'B'])
+        writer.writeheader()
+
+        for epoch_return in epoch_returns:
+            row = {
+                'turn': epoch_return['turn'],
+                'B': f"{epoch_return['return_b']:.2f}"
+            }
+            writer.writerow(row)
+
+    print(f"✓ 每轮收益率已保存: {os.path.basename(returns_csv_path)}")
+    print(f"  共记录 {len(epoch_returns)} 轮训练数据")
+
     # 保存最佳模型N（使用与train_clone相同的命名风格）
     timestamp = datetime.now().strftime("%m%d_%H%M")
     return_str = f"{best_return_b*100:+.2f}".replace('+', 'p').replace('-', 'n').replace('.', '_')

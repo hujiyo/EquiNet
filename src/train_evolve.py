@@ -182,8 +182,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     no_improve_count = 0
 
     # 创建时间顺序采样器（使用train.py的统一采样机制）
-    samples_per_epoch = batch_size * batches_per_epoch
-    sampler = TemporalSampler(train_stock_info, epochs, samples_per_epoch)
+    sampler = TemporalSampler(train_stock_info)
     train_rng = random.Random(seed)
 
     # 记录每轮收益率

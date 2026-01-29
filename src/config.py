@@ -47,8 +47,8 @@ class ModelConfig:
     SEQ_LEN = DataConfig.CONTEXT_LENGTH  # 最大序列长度（直接引用CONTEXT_LENGTH，确保一致性）
 
     # 注意力机制参数（为小模型调整）
-    DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合
-    ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
+    DROPOUT_RATE = 0.1                 # Dropout比率设置为0降低欠拟合
+    ATTENTION_DROPOUT = 0.1            # 注意力Dropout比率设置为0降低欠拟合
 
 # ==================== 训练参数 ====================
 class TrainingConfig:

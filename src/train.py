@@ -567,11 +567,9 @@ class TemporalSampler:
     3. 每个epoch采样固定数量的"轮次"，确保最后一个epoch恰好到达最新时间
     4. 每轮从所有股票当前位置各取一个样本，然后指针前进
     """
-    def __init__(self, stock_info_list, num_epochs, samples_per_epoch):
+    def __init__(self, stock_info_list):
         self.stock_info_list = stock_info_list
         self.required_length = DataConfig.REQUIRED_LENGTH
-        self.num_epochs = num_epochs
-        self.samples_per_epoch = samples_per_epoch
 
         # 每只股票的采样位置指针（初始化为各自的train_start_idx + 1，因为需要前一天数据）
         self.stock_positions = []
@@ -584,6 +582,9 @@ class TemporalSampler:
         
         # 是否可以循环采样（数据长度 > 600）
         self.can_loop = []
+        
+        # 记录每个股票的循环次数
+        self.loop_counts = [0] * len(stock_info_list)
         
         for stock_info in stock_info_list:
             train_start_idx = stock_info.get('train_start_idx', 0)
@@ -646,6 +647,7 @@ class TemporalSampler:
                 if current_pos > max_pos and self.can_loop[stock_idx]:
                     current_pos = self.stock_start_positions[stock_idx]
                     self.stock_positions[stock_idx] = current_pos
+                    self.loop_counts[stock_idx] += 1
 
                 # 检查是否还有可用样本
                 if current_pos <= max_pos:
@@ -669,6 +671,12 @@ class TemporalSampler:
                 total_samples += max_pos - start_pos + 1
                 current_samples += max(0, min(pos, max_pos + 1) - start_pos)
         return current_samples, total_samples
+
+    def get_loop_stats(self):
+        """获取循环统计信息"""
+        looped_stocks_count = sum(1 for c in self.loop_counts if c > 0)
+        total_loops = sum(self.loop_counts)
+        return looped_stocks_count, total_loops
 
 def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     """
@@ -1458,8 +1466,7 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     
     # 创建时间顺序采样器
     print("正在初始化时间顺序采样器...")
-    samples_per_epoch = batch_size * batches_per_epoch
-    sampler = TemporalSampler(train_stock_info, epochs, samples_per_epoch)
+    sampler = TemporalSampler(train_stock_info)
     
     # 设置训练随机种子
     torch.manual_seed(DataConfig.RANDOM_SEED)

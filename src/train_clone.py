@@ -134,8 +134,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
     best_loss_a = float('inf')
 
     # 创建时间顺序采样器（使用train.py的统一采样机制）
-    samples_per_epoch = batch_size * batches_per_epoch
-    sampler = TemporalSampler(train_stock_info, epochs, samples_per_epoch)
+    sampler = TemporalSampler(train_stock_info)
     train_rng = random.Random(DataConfig.RANDOM_SEED)
 
     # 记录每轮收益率
@@ -180,6 +179,10 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
         epoch_inputs, epoch_targets = sample_with_pools(
             sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
         )
+
+        # 打印循环统计
+        looped_count, total_loops = sampler.get_loop_stats()
+        print(f"  [循环统计] 已循环股票: {looped_count}/{len(train_stock_info)}, 总循环次数: {total_loops}")
 
         # 打印标签分布
         count_positive = np.sum(epoch_targets >= 0.9)

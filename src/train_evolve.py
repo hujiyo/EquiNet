@@ -142,7 +142,10 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     print(f"进化学习率: {evolve_lr:.6f} (原学习率的20%)")
     
     # 模型B的优化器（只训练B）
-    optimizer_b = optim.Adam(model_b.parameters(), lr=evolve_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
+    if TrainingConfig.USE_ADAMW:
+        optimizer_b = optim.AdamW(model_b.parameters(), lr=evolve_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
+    else:
+        optimizer_b = optim.Adam(model_b.parameters(), lr=evolve_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
     
     # 进化训练不使用warmup，直接使用余弦退火
     total_main_epochs = epochs
@@ -178,7 +181,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     evolution_count = 0  # 进化次数（B超越自己的次数）
     
     # 早停机制
-    patience = 15
+    patience = TrainingConfig.EPOCHS*0.25
     no_improve_count = 0
 
     # 创建时间顺序采样器（使用train.py的统一采样机制）
@@ -292,7 +295,11 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
             model_b = copy.deepcopy(teachers[0])
             # 使用更低的学习率重新开始
             recover_lr = evolve_lr * 0.1  # 恢复时使用更低的学习率
-            optimizer_b = optim.Adam(model_b.parameters(), lr=recover_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
+            # 恢复时使用更低的学习率
+            if TrainingConfig.USE_ADAMW:
+                optimizer_b = optim.AdamW(model_b.parameters(), lr=recover_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
+            else:
+                optimizer_b = optim.Adam(model_b.parameters(), lr=recover_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
             print(f"  → B已从教师1重新克隆，学习率降至 {recover_lr:.6f}")
             print("-" * 60)
             continue  # 跳过本轮评估

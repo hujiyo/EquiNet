@@ -2,9 +2,9 @@
 克隆模型训练脚本 v4
 
 核心思想：
-- 前10轮：只训练模型A（原始标签）
-- 第10轮：克隆模型A为模型B（完全独立的参数）
-- 第10轮起：
+- 前25%轮：只训练模型A（原始标签）
+- 第25%轮：克隆模型A为模型B（完全独立的参数）
+- 第25%轮起：
   - 模型A继续用原始标签训练
   - 模型B用A的高置信预测作为伪标签训练：
     - A预测前1% → B的标签 = 1（伪正标签）
@@ -41,7 +41,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
                       device=None,
                       batch_size=TrainingConfig.BATCH_SIZE,
                       batches_per_epoch=TrainingConfig.BATCHES_PER_EPOCH,
-                      clone_epoch=10,
+                      clone_epoch=TrainingConfig.EPOCHS*0.25,
                       pseudo_pos_ratio=0.01,
                       pseudo_neg_ratio=0.05):
     """
@@ -83,7 +83,10 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
     optimizer_b = None
 
     # 模型A的优化器
-    optimizer_a = optim.Adam(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
+    if TrainingConfig.USE_ADAMW:
+        optimizer_a = optim.AdamW(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
+    else:
+        optimizer_a = optim.Adam(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
 
     # 学习率调度（模型A）
     warmup_scheduler_a = WarmupScheduler(
@@ -129,7 +132,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
     best_threshold_b = 0.0
 
     # 早停机制
-    patience = 15
+    patience = TrainingConfig.EPOCHS*0.25
     no_improve_count = 0
     best_loss_a = float('inf')
 
@@ -170,8 +173,13 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
             model_b = copy.deepcopy(model_a)
             model_b = model_b.to(device)
 
-            optimizer_b = optim.Adam(model_b.parameters(), lr=learning_rate * 0.5,
-                                     weight_decay=TrainingConfig.WEIGHT_DECAY)
+            # 模型B使用半学习率，更保守的更新
+            if TrainingConfig.USE_ADAMW:
+                optimizer_b = optim.AdamW(model_b.parameters(), lr=learning_rate * 0.5,
+                                          weight_decay=TrainingConfig.WEIGHT_DECAY)
+            else:
+                optimizer_b = optim.Adam(model_b.parameters(), lr=learning_rate * 0.5,
+                                         weight_decay=TrainingConfig.WEIGHT_DECAY)
             print(f"  模型B已创建，参数数: {sum(p.numel() for p in model_b.parameters()):,}")
             print()
 
@@ -451,7 +459,7 @@ if __name__ == "__main__":
     best_return_a, best_return_b = train_clone_model(
         model_a, train_stock_info, test_stock_info, train_weights,
         device=device,
-        clone_epoch=10,
+        clone_epoch=TrainingConfig.EPOCHS*0.25,
         pseudo_pos_ratio=0.01,
         pseudo_neg_ratio=0.05
     )

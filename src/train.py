@@ -1486,7 +1486,13 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     # 测试集损失同样使用动态加权BCE，保持评估一致性
     eval_criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
     
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
+    # 根据配置选择优化器：AdamW相比Adam有更好的泛化性能
+    if TrainingConfig.USE_ADAMW:
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
+        print(f"优化器: AdamW (weight_decay={TrainingConfig.WEIGHT_DECAY})")
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
+        print(f"优化器: Adam (weight_decay={TrainingConfig.WEIGHT_DECAY})")
     
     # 创建预热调度器
     warmup_scheduler = WarmupScheduler(

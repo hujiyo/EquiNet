@@ -39,9 +39,9 @@ class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
     INPUT_DIM = 7                    # 输入特征维度数（OHLC + volume + exchange + rate）
-    D_MODEL = 28                     # 模型维度（Transformer内部维度）
+    D_MODEL = 56                     # 模型维度（Transformer内部维度）
     EMBED_HIDDEN_DIM = 40           # Embedding中间层维度（两阶段FFN：7→40→80）
-    NHEAD = 2                        # 注意力头数
+    NHEAD = 4                        # 注意力头数
     NUM_LAYERS = 6                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）
     SEQ_LEN = DataConfig.CONTEXT_LENGTH  # 最大序列长度（直接引用CONTEXT_LENGTH，确保一致性）
@@ -55,14 +55,16 @@ class TrainingConfig:
     """训练相关参数"""
 
     # 基础训练参数（优化训练策略）
-    EPOCHS = 40                     # 训练轮数（增加轮数以充分训练小模型）
+    EPOCHS = 400                     # 训练轮数（增加轮数以充分训练小模型）
     LEARNING_RATE = 0.001            # 初始学习率（提高学习率）
 
     # 训练批处理
     BATCH_SIZE = 1024                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 20            # 每轮训练的批次数（调低以适配时间序采样）
+    BATCHES_PER_EPOCH = 2            # 每轮训练的批次数（调低以适配时间序采样）
+    # BATCHES_PER_EPOCH*EPOCHS=800
 
     # 优化器参数
+    USE_ADAMW = True                 # 是否使用AdamW优化器
     WEIGHT_DECAY = 1e-5              # 权重衰减
     GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
 

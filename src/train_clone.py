@@ -282,7 +282,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
         # 打印模型A结果
         print(f'  [模型A] 损失: {avg_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
         print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
-        print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_a["top_return"]*100:+.2f}%')
+        print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_a["top_return"]*100:+.2f}%  |  Top5%收益: {stats_a["top5_return"]*100:+.2f}%')
 
         # 记录当前轮次收益率
         epoch_return = {
@@ -328,7 +328,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
 
             print(f'  [模型B] 损失: {avg_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
-            print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_b["top_return"]*100:+.2f}%')
+            print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_b["top_return"]*100:+.2f}%  |  Top5%收益: {stats_b["top5_return"]*100:+.2f}%')
             print(f'          伪标签来源: 最佳A(第{best_return_epoch_a}轮, 收益{best_return_a*100:+.2f}%)')
             print(f'          伪标签统计: 伪正={total_pseudo_pos}, 伪负={total_pseudo_neg}, 不变={total_unchanged}')
 

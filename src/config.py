@@ -39,9 +39,9 @@ class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
     INPUT_DIM = 7                    # 输入特征维度数（OHLC + volume + exchange + rate）
-    D_MODEL = 56                     # 模型维度（Transformer内部维度）
-    EMBED_HIDDEN_DIM = 40           # Embedding中间层维度（两阶段FFN：7→40→80）
-    NHEAD = 4                        # 注意力头数
+    D_MODEL = 28                     # 模型维度（Transformer内部维度）
+    EMBED_HIDDEN_DIM = 40            # Embedding中间层维度（两阶段FFN：7→40→80）
+    NHEAD = 2                        # 注意力头数
     NUM_LAYERS = 6                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）
     SEQ_LEN = DataConfig.CONTEXT_LENGTH  # 最大序列长度（直接引用CONTEXT_LENGTH，确保一致性）
@@ -49,6 +49,11 @@ class ModelConfig:
     # 注意力机制参数（为小模型调整）
     DROPOUT_RATE = 0.1                 # Dropout比率设置为0降低欠拟合
     ATTENTION_DROPOUT = 0.1            # 注意力Dropout比率设置为0降低欠拟合
+    
+    # Token化参数
+    # 词表大小 = 4*20(OHLC) + 20(volume) + 60(exchange) + 34(rate) = 194
+    VOCAB_SIZE = 194
+    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 7 = 420
 
 # ==================== 训练参数 ====================
 class TrainingConfig:
@@ -64,7 +69,7 @@ class TrainingConfig:
     # BATCHES_PER_EPOCH*EPOCHS=800
 
     # 优化器参数
-    USE_ADAMW = True                 # 是否使用AdamW优化器
+    USE_ADAMW = False                 # 是否使用AdamW优化器
     WEIGHT_DECAY = 1e-5              # 权重衰减
     GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
 

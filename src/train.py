@@ -123,88 +123,154 @@ class DynamicWeightedBCE(nn.Module):
         
     def forward(self, inputs, targets):
         """
-        inputs: [batch_size, 1] 模型输出的logits (BF16)
-        targets: [batch_size] 真实标签 (1.0/0.0) (BF16)
+        inputs: [batch_size, 1] logits
+        targets: [batch_size] 真实标签 (0/1)
         """
-        # 确保输入形状正确：如果是 [batch_size, 1] 则 squeeze(-1) 变成 [batch_size]
         if inputs.dim() == 2 and inputs.size(1) == 1:
             inputs = inputs.squeeze(-1)
 
-        # BF16训练时，这里用FP32计算loss更稳定
-        inputs_fp32 = inputs.float()
-        targets_fp32 = targets.float()
+        inputs = inputs.float()
+        targets = targets.float()
 
-        # 计算BCE loss（带logits）
-        loss = F.binary_cross_entropy_with_logits(inputs_fp32, targets_fp32, reduction='none')
-        
-        # 二分类动态权重：正样本和负样本分别使用动态权重
-        pos_weight = self.pos_weight.to(dtype=loss.dtype, device=loss.device)
-        neg_weight = self.weight_0_0.to(dtype=loss.dtype, device=loss.device)
-        
-        # 根据标签分配权重：正样本用pos_weight，负样本用动态neg_weight
-        weights = torch.where(targets_fp32 >= 0.5, pos_weight, neg_weight)
-        loss = loss * weights
-        
-        # 🔥 新增：对预测偏差较大的样本进行指数级额外惩罚
-        # 计算预测概率值
-        predictions = torch.sigmoid(inputs_fp32)  # 将logits转为概率 [0, 1]
-        
-        # 计算预测值与真实标签之间的绝对差值
-        prediction_error = torch.abs(predictions - targets_fp32)
-        
-        # 当差值 >= 0.15时，应用指数级惩罚（阈值从0.2降低到0.15）
-        # 使用 3^(1.5×差值) 作为额外惩罚因子（底数从2提升到3，指数放大1.5倍）
-        # 例如：差值0.2 -> 3^0.3 ≈ 1.39 (温和惩罚)
-        #       差值0.5 -> 3^0.75 ≈ 2.28 (中等惩罚)
-        #       差值0.8 -> 3^1.2 ≈ 3.74 (强惩罚)
-        #       差值1.0 -> 3^1.5 ≈ 5.20 (损失放大5倍！)
-        penalty_multiplier = torch.where(
-            prediction_error >= 0.15,
-            torch.pow(3.0, prediction_error * 1.5),   # 指数级惩罚：3^(1.5×差值)
-            torch.ones_like(prediction_error)         # 差值<0.15时，惩罚因子为1（不额外惩罚）
+        # Sigmoid + 对数损失，按动态权重区分正负样本
+        predictions = torch.sigmoid(inputs)
+
+        # 避免log 0
+        eps = 1e-7
+        predictions = torch.clamp(predictions, eps, 1 - eps)
+
+        # 正样本损失
+        pos_mask = targets >= 0.5
+        pos_loss = -torch.log(predictions[pos_mask]) if pos_mask.any() else inputs.new_tensor(0.0)
+        if pos_loss.numel() > 0:
+            pos_loss = pos_loss * float(self.pos_weight)
+
+        # 负样本损失（使用动态权重）
+        neg_mask = targets < 0.5
+        neg_loss = -torch.log(1 - predictions[neg_mask]) if neg_mask.any() else inputs.new_tensor(0.0)
+        if neg_loss.numel() > 0:
+            neg_loss = neg_loss * float(self.weight_0_0)
+
+        loss = torch.cat([pos_loss.view(-1), neg_loss.view(-1)]) if pos_loss.numel() and neg_loss.numel() else (
+            pos_loss.view(-1) if pos_loss.numel() else neg_loss.view(-1)
         )
 
-        penalty_multiplier = torch.clamp(penalty_multiplier, max=3.0)
-        
-        # 应用额外惩罚
-        loss = loss * penalty_multiplier
-        
         if self.reduction == 'mean':
-            return loss.mean()
+            return loss.mean() if loss.numel() > 0 else inputs.new_tensor(0.0)
         elif self.reduction == 'sum':
             return loss.sum()
         else:
             return loss
 
+# ==================== Token化模型定义 ====================
+# 将模型代码集成到train.py，只保留tokenizer.py在外部
+
 class PositionalEncoding(nn.Module):
-    """
-    标准的正弦位置编码
-    让 Transformer 自己学习时间依赖关系，不加人为规则
-    """
-    def __init__(self, d_model, seq_len=DataConfig.CONTEXT_LENGTH):
+    """标准的正弦位置编码"""
+    def __init__(self, d_model, max_len=ModelConfig.TOKEN_SEQ_LEN):
         super(PositionalEncoding, self).__init__()
-        
-        # 创建标准的正弦/余弦位置编码
-        pe = torch.zeros(seq_len, d_model)
-        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
-        
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        
+
         self.register_buffer('pe', pe)
-        
+
     def forward(self, x):
-        # 直接添加位置编码，LayerNorm在后续层中使用
         seq_len = x.size(1)
         pe_slice = self.pe[:seq_len, :].unsqueeze(0)
         return x + pe_slice
 
+
+class TwoDimensionalPositionalEncoding(nn.Module):
+    """
+    二维位置编码：时间步 + 特征类型
+
+    设计原理：
+    - 60×7的时间序列被展平成420个token
+    - 每个token有两个结构信息：
+      1. temporal_id: 属于第几个时间步（0-59）
+      2. feature_id: 属于哪个特征（0-6，OHLC+volume+exchange+rate）
+
+    编码方案：
+    - 将d_model分为两半：前一半用于时间步编码，后一半用于特征类型编码
+    - 使用正弦编码，避免学习参数
+    """
+    def __init__(self, d_model, num_timesteps=DataConfig.CONTEXT_LENGTH, num_features=ModelConfig.INPUT_DIM):
+        super(TwoDimensionalPositionalEncoding, self).__init__()
+
+        self.d_model = d_model
+        self.num_timesteps = num_timesteps  # 60
+        self.num_features = num_features     # 7
+
+        # 确保d_model是偶数，可以均分
+        assert d_model % 2 == 0, f"d_model ({d_model}) 必须是偶数以便均分给时间步和特征编码"
+
+        self.temporal_dim = d_model // 2  # 时间步编码维度
+        self.feature_dim = d_model // 2   # 特征类型编码维度
+
+        # 时间步编码：0-59
+        temporal_pe = torch.zeros(num_timesteps, self.temporal_dim)
+        temporal_pos = torch.arange(0, num_timesteps, dtype=torch.float).unsqueeze(1)
+
+        div_term = torch.exp(torch.arange(0, self.temporal_dim, 2).float() *
+                            (-math.log(10000.0) / self.temporal_dim))
+        temporal_pe[:, 0::2] = torch.sin(temporal_pos * div_term)
+        temporal_pe[:, 1::2] = torch.cos(temporal_pos * div_term)
+
+        self.register_buffer('temporal_pe', temporal_pe)
+
+        # 特征类型编码：0-6
+        feature_pe = torch.zeros(num_features, self.feature_dim)
+        feature_pos = torch.arange(0, num_features, dtype=torch.float).unsqueeze(1)
+
+        div_term = torch.exp(torch.arange(0, self.feature_dim, 2).float() *
+                            (-math.log(10000.0) / self.feature_dim))
+        feature_pe[:, 0::2] = torch.sin(feature_pos * div_term)
+        feature_pe[:, 1::2] = torch.cos(feature_pos * div_term)
+
+        self.register_buffer('feature_pe', feature_pe)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [batch_size, seq_len, d_model] 其中 seq_len = 420 (60*7)
+
+        Returns:
+            x + 二维位置编码
+        """
+        batch_size, seq_len, _ = x.shape
+        device = x.device
+
+        # 为每个token计算其时间步ID和特征ID
+        # token位置 0-419
+        token_positions = torch.arange(seq_len, device=device)
+
+        # temporal_id = token_pos // 7 (0-59)
+        temporal_ids = token_positions // self.num_features
+
+        # feature_id = token_pos % 7 (0-6)
+        feature_ids = token_positions % self.num_features
+
+        # 获取对应的位置编码
+        # [seq_len, temporal_dim]
+        temporal_encodings = self.temporal_pe[temporal_ids]
+
+        # [seq_len, feature_dim]
+        feature_encodings = self.feature_pe[feature_ids]
+
+        # 拼接两种编码 [seq_len, d_model]
+        positional_encodings = torch.cat([temporal_encodings, feature_encodings], dim=-1)
+
+        # 添加batch维度并加到输入上
+        return x + positional_encodings.unsqueeze(0)
+
+
 class MultiHeadAttention(nn.Module):
-    """
-    标准的多头注意力机制（Pre-Norm架构）
-    让模型自动学习每个头应该关注什么特征，不人为干预
-    """
+    """标准的多头注意力机制（Pre-Norm架构）"""
     def __init__(self, d_model, nhead):
         super(MultiHeadAttention, self).__init__()
         self.d_model = d_model
@@ -212,140 +278,104 @@ class MultiHeadAttention(nn.Module):
         
         assert d_model % nhead == 0
         
-        # 使用标准的MultiheadAttention
         self.attention = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-
-        # Pre-Norm: 在注意力之前进行归一化
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(ModelConfig.ATTENTION_DROPOUT)
         
     def forward(self, x, attn_mask=None):
-        # Pre-Norm架构：先归一化，再计算注意力，最后残差连接
-        # 输出 = 输入 + Dropout(Attention(LayerNorm(输入)))
-        
         mask = None
         if attn_mask is not None:
             mask = attn_mask.to(dtype=x.dtype, device=x.device)
 
-        # Pre-Norm: 先对输入进行归一化
         normalized_x = self.norm(x)
-        
-        # 计算注意力
         attn_output, _ = self.attention(normalized_x, normalized_x, normalized_x, attn_mask=mask)
-        
-        # 残差连接（注意这里是加到原始输入x上，而不是normalized_x）
         output = x + self.dropout(attn_output)
         return output
 
+
 class TransformerLayer(nn.Module):
-    """
-    标准的 Transformer 层（Pre-Norm架构）
-    设计理念：让模型自动学习应该关注什么特征，不加人为干预
-    Pre-Norm相比Post-Norm有更好的训练稳定性
-    """
-    def __init__(self, d_model, nhead, use_ffn=True):
+    """标准的 Transformer 层（Pre-Norm架构）"""
+    def __init__(self, d_model, nhead, use_ffn=True, dropout_rate=0.1):
         super(TransformerLayer, self).__init__()
         
         self.use_ffn = use_ffn
-        
-        # 使用Pre-Norm多头注意力
         self.attention = MultiHeadAttention(d_model, nhead)
         
         if self.use_ffn:
-            # 前馈网络，用于进一步处理注意力的输出
+            # FFN扩展比例：2x
             self.feed_forward = nn.Sequential(
-                nn.Linear(d_model, 160),  # 80 → 160
-                nn.GELU(),                 # GELU激活
-                nn.Dropout(ModelConfig.DROPOUT_RATE),  # 防过拟合
-                nn.Linear(160, d_model),   # 160 → 80
+                nn.Linear(d_model, d_model * 2),
+                nn.GELU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model * 2, d_model),
             )
             
-            # Pre-Norm: 在前馈网络之前进行归一化
             self.norm = nn.LayerNorm(d_model)
-            self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
+            self.dropout = nn.Dropout(dropout_rate)
         
     def forward(self, x):
-        # x的shape: [batch_size, seq_len, d_model]
-        
-        # Pre-Norm架构的注意力子层（MultiHeadAttention内部已经实现了Pre-Norm）
-        # 输出 = 输入 + Dropout(Attention(LayerNorm(输入)))
         x = self.attention(x, attn_mask=None)
         
         if self.use_ffn:
-            # Pre-Norm架构的前馈网络子层
-            # 输出 = 输入 + Dropout(FFN(LayerNorm(输入)))
             normalized_x = self.norm(x)
             ff_out = self.feed_forward(normalized_x)
             x = x + self.dropout(ff_out)
         
         return x
 
-def init_weights(module):
-    """
-    Xavier (Glorot) 初始化 - 适合 Transformer 模型
 
-    初始化范围:
-    - Linear层权重: uniform[-a, +a], a = sqrt(6 / (fan_in + fan_out))
-    - Linear层偏置: 0
-    - Norm层权重: 1
-    - Norm层偏置: 0
-    """
+def init_weights(module):
+    """Xavier初始化"""
     if isinstance(module, nn.Linear):
-        # Xavier uniform 初始化
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        # 增大std以提供足够的初始区分度
+        nn.init.normal_(module.weight, mean=0.0, std=0.1)
     elif isinstance(module, nn.LayerNorm):
         nn.init.ones_(module.weight)
         nn.init.zeros_(module.bias)
 
-class EnhancedStockTransformer(nn.Module):
+
+class TokenizedStockTransformer(nn.Module):
     """
-    改进的 Transformer 模型（Pre-Norm架构 + 统一Embedding）
+    Token化版本的股票预测Transformer
 
-    核心改进1：统一Embedding - 端到端学习特征融合
-    - 7个输入特征(OHLC + Volume + Exchange + Rate) -> 统一映射到 d_model 维
-    - 让模型自己学习如何组合和表达不同类型的特征
-    - 相比分离embedding，减少了人为的结构假设
-
-    核心改进2：统一Transformer层架构
-    - 所有层都使用 Attention + FFN 结构
-    - 简化模型设计，降低结构复杂度
+    核心设计：
+    1. Token Embedding: 200个token → d_model维向量（查表）
+    2. 二维位置编码: 时间步编码(0-59) + 特征类型编码(0-6)
+    3. Transformer: 学习token间的关系（逐层递减dropout）
+    4. 输出: 聚合所有token信息进行预测
     """
-    def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, seq_len):
-        super(EnhancedStockTransformer, self).__init__()
+    def __init__(self, vocab_size, d_model, nhead, num_layers, output_dim, max_seq_len):
+        super(TokenizedStockTransformer, self).__init__()
 
-        # 统一Embedding：两阶段FFN结构，让特征在进入Transformer前充分混合
-        self.embedding = nn.Sequential(
-            nn.Linear(ModelConfig.INPUT_DIM, ModelConfig.EMBED_HIDDEN_DIM),  # 7维 → 40维（扩展）
-            nn.GELU(),                                                          # GELU激活，对负值有梯度
-            nn.Linear(ModelConfig.EMBED_HIDDEN_DIM, d_model)                  # 40维 → 80维
-        )
+        # Token Embedding层：将离散token ID映射到连续向量空间
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
 
-        # 使用标准位置编码
-        self.pos_encoding = PositionalEncoding(d_model, seq_len)
+        # 二维位置编码：时间步 + 特征类型
+        self.pos_encoding = TwoDimensionalPositionalEncoding(d_model)
 
-        # 统一架构：所有层都使用 Attention + FFN
+        # Transformer层：逐层递减dropout
+        dropout_rates = [max(0.05, 0.1 - i * 0.015) for i in range(num_layers)]
         self.layers = nn.ModuleList([
-            TransformerLayer(d_model, nhead, use_ffn=True)
+            TransformerLayer(d_model, nhead, use_ffn=True, dropout_rate=dropout_rates[i])
             for i in range(num_layers)
         ])
 
-        # Pre-Norm架构：在最后添加一个LayerNorm
-        # 因为Pre-Norm的最后一层没有归一化输出
+        # Pre-Norm架构的最终归一化
         self.final_norm = nn.LayerNorm(d_model)
 
-        # 注意力聚合：学习每个时间步的重要性权重
-        # 相比只用最后一个时间步，能更充分利用所有历史信息
-        # 使用缩放初始化，避免点积方差过大导致softmax接近one-hot
+        # 注意力聚合
         self.attention_query = nn.Parameter(torch.randn(d_model) / math.sqrt(d_model))
 
-        # 简化输出层，减少过拟合
+        # 输出投影层
         self.output_projection = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),  # 降维
+            nn.Linear(d_model, d_model // 2),
             nn.GELU(),
             nn.Dropout(ModelConfig.DROPOUT_RATE),
-            nn.Linear(d_model // 2, output_dim)  # 最终输出
+            nn.Linear(d_model // 2, output_dim)
         )
 
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
@@ -354,32 +384,101 @@ class EnhancedStockTransformer(nn.Module):
         self.apply(init_weights)
         
     def forward(self, x):
-        # x: [batch_size, seq_len, 7] (OHLC + volume + exchange + rate)
-
-        # 1. 统一Embedding：7个特征一起映射到d_model维
-        x = self.embedding(x)  # [batch_size, seq_len, d_model]
-
-        # 2. 位置编码
+        """
+        Args:
+            x: [batch_size, 60, 7] 连续值 或 [batch_size, 420] token ID
+        
+        Returns:
+            output: [batch_size, 1] 预测logits
+        """
+        # 如果输入是连续值，先进行token化
+        if x.dim() == 3 and x.size(-1) == 7:
+            from tokenizer import tokenize_batch_torch
+            x = tokenize_batch_torch(x, flatten=True)
+        
+        # 确保token ID是long类型
+        if x.dtype != torch.long:
+            x = x.long()
+        
+        # Token Embedding查表
+        x = self.token_embedding(x)
+        
+        # 位置编码
         x = self.pos_encoding(x)
         x = self.dropout(x)
-
-        # 3. Transformer层（Pre-Norm架构）
+        
+        # Transformer层
         for layer in self.layers:
             x = layer(x)
-
-        # 4. Pre-Norm架构需要在最后进行归一化
-        #    因为每层的输出没有经过归一化
+        
+        # 最终归一化
         x = self.final_norm(x)
         
-        # 5. 注意力聚合：自适应加权所有时间步
-        # attn_scores: [batch_size, seq_len]
-        attn_scores = torch.matmul(x, self.attention_query)  # 每个时间步与query的相似度
-        attn_weights = torch.softmax(attn_scores, dim=1)     # 归一化为权重
-        # aggregated: [batch_size, d_model] - 加权求和所有时间步
+        # 注意力聚合
+        attn_scores = torch.matmul(x, self.attention_query)
+        attn_weights = torch.softmax(attn_scores, dim=1)
         aggregated = torch.sum(x * attn_weights.unsqueeze(-1), dim=1)
         
-        output = self.output_projection(aggregated)  # [batch_size, output_dim]
+        # 输出投影
+        output = self.output_projection(aggregated)
         return output
+
+
+def create_tokenized_model(
+    vocab_size=ModelConfig.VOCAB_SIZE,
+    d_model=ModelConfig.D_MODEL,
+    nhead=ModelConfig.NHEAD,
+    num_layers=ModelConfig.NUM_LAYERS,
+    output_dim=ModelConfig.OUTPUT_DIM,
+    max_seq_len=ModelConfig.TOKEN_SEQ_LEN
+):
+    """创建Token化模型的工厂函数"""
+    model = TokenizedStockTransformer(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        nhead=nhead,
+        num_layers=num_layers,
+        output_dim=output_dim,
+        max_seq_len=max_seq_len
+    )
+
+    # 打印模型信息
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print(f"\n{'='*50}")
+    print(f"Token化模型架构")
+    print(f"{'='*50}")
+    print(f"词表大小: {vocab_size}")
+    print(f"Token序列长度: {max_seq_len}")
+    print(f"位置编码: 二维 (时间步+特征类型)")
+    print(f"Embedding维度: {d_model}")
+    print(f"注意力头数: {nhead}")
+    print(f"Transformer层数: {num_layers}")
+    print(f"总参数量: {total_params:,}")
+    print(f"可训练参数: {trainable_params:,}")
+    print(f"{'='*50}\n")
+
+    return model
+
+
+# 兼容旧接口的包装函数
+def EnhancedStockTransformer(input_dim, d_model, nhead, num_layers, output_dim, seq_len):
+    """
+    兼容旧接口，创建Token化模型
+
+    旧接口参数：input_dim, d_model, nhead, num_layers, output_dim, seq_len
+    新模型参数：vocab_size, d_model, nhead, num_layers, output_dim, max_seq_len
+    """
+    return TokenizedStockTransformer(
+        vocab_size=ModelConfig.VOCAB_SIZE,
+        d_model=d_model,
+        nhead=nhead,
+        num_layers=num_layers,
+        output_dim=output_dim,
+        max_seq_len=ModelConfig.TOKEN_SEQ_LEN
+    )
+
 
 # 单个文件处理函数（用于多进程）
 def process_single_file(args):
@@ -922,6 +1021,7 @@ def create_fixed_evaluation_dataset(test_stock_info):
     if len(eval_inputs) == 0:
         raise ValueError("固定评估集为空：test_stock_info中没有可用样本")
 
+    print(f"    训练集评估数据集已生成: {len(eval_inputs)}个样本 (每股票前{80}交易日)")
     return np.asarray(eval_inputs), np.asarray(eval_targets), np.asarray(eval_cumulative_returns)
 
 
@@ -977,6 +1077,34 @@ def create_train_evaluation_dataset(train_stock_info, first_n_days=80):
 
     print(f"    训练集评估数据集已生成: {len(eval_inputs)}个样本 (每股票前{first_n_days}交易日)")
     return np.asarray(eval_inputs), np.asarray(eval_targets), np.asarray(eval_cumulative_returns)
+
+
+def _compute_top_stats(all_preds, all_returns, percent):
+    """计算Top-N%收益统计"""
+    total_samples = len(all_preds)
+    if total_samples == 0:
+        return {
+            'count': 0,
+            'avg_return': 0.0,
+            'total_return': 0.0,
+            'threshold': 0.0,
+            'percent': percent
+        }
+
+    top_k = max(1, int(total_samples * percent / 100))
+    top_k = min(total_samples, top_k)
+    sorted_indices = np.argsort(all_preds)[::-1]
+    top_indices = sorted_indices[:top_k]
+    top_returns = all_returns[top_indices]
+    threshold = all_preds[top_indices[-1]] if top_k > 0 else 0.0
+
+    return {
+        'count': top_k,
+        'avg_return': float(np.mean(top_returns)) if top_k > 0 else 0.0,
+        'total_return': float(np.sum(top_returns)) if top_k > 0 else 0.0,
+        'threshold': float(threshold),
+        'percent': percent
+    }
 
 
 def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=100):
@@ -1063,23 +1191,10 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
         confidence_stats[interval] = (correct_in_interval, total_in_interval, non_negative_in_interval)
 
     # Top N% 收益统计（涨停样本已在生成阶段过滤）
-    percent = DataConfig.TOP_PERCENT
-    top_k = max(1, int(len(all_preds) * percent / 100))
-    sorted_indices = np.argsort(all_preds)[::-1]
-    top_indices = sorted_indices[:top_k]
-    top_returns = all_returns[top_indices]
+    top_stats = _compute_top_stats(all_preds, all_returns, DataConfig.TOP_PERCENT)
+    top5_stats = _compute_top_stats(all_preds, all_returns, 5)
 
-    avg_return = np.mean(top_returns)
-    total_return = np.sum(top_returns)
-
-    top_stats = {
-        'count': top_k,
-        'avg_return': avg_return,
-        'total_return': total_return,
-        'filtered_count': 0  # 已在生成阶段过滤，这里为0
-    }
-
-    return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats
+    return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, top5_stats
 
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
@@ -1135,29 +1250,21 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         auc = 0.5
 
     # 计算 Top N% 收益（涨停样本已在生成阶段过滤）
-    percent = DataConfig.TOP_PERCENT
-    top_k = max(1, int(len(all_preds) * percent / 100))
-    sorted_indices = np.argsort(all_preds)[::-1]
-    top_indices = sorted_indices[:top_k]
-    top_returns = all_returns[top_indices]
-
-    top_return = np.mean(top_returns)
-    top_threshold = all_preds[sorted_indices[top_k - 1]]
-
-    # 统计高置信样本
-    high_conf = all_preds > 0.7
-    low_conf = all_preds < 0.2
+    top_stats = _compute_top_stats(all_preds, all_returns, DataConfig.TOP_PERCENT)
+    top5_stats = _compute_top_stats(all_preds, all_returns, 5)
 
     stats = {
         'auc': auc,
-        'top_return': top_return,
-        'top_count': top_k,
-        'top_threshold': top_threshold,
-        'high_conf_count': np.sum(high_conf),
-        'low_conf_count': np.sum(low_conf),
+        'top_return': top_stats['avg_return'],
+        'top_count': top_stats['count'],
+        'top_threshold': top_stats['threshold'],
+        'top5_return': top5_stats['avg_return'],
+        'top5_count': top5_stats['count'],
+        'high_conf_count': np.sum(all_preds >= 0.7),
+        'low_conf_count': np.sum(all_preds <= 0.2),
         'pred_mean': np.mean(all_preds),
         'pred_std': np.std(all_preds),
-        'filtered_count': 0  # 已在生成阶段过滤
+        'filtered_count': 0
     }
 
     return stats
@@ -1298,14 +1405,13 @@ def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, bat
             batch_targets = torch.tensor(eval_targets[start_idx:end_idx],
                                         dtype=torch.bfloat16).to(device)
 
-            # 动态更新权重：根据当前batch的正负样本比例
-            criterion.update_weights(batch_targets)
-
             outputs = model(batch_inputs)
             loss = criterion(outputs.squeeze(-1), batch_targets)
+
             total_loss += loss.item() * (end_idx - start_idx)
     
     return total_loss / num_samples
+
 
 def print_sample_predictions(model, eval_inputs, eval_targets, device, num_samples=5, epoch=1):
     """
@@ -1322,6 +1428,7 @@ def print_sample_predictions(model, eval_inputs, eval_targets, device, num_sampl
             pred = torch.sigmoid(model(input_tensor)).item()
             target = eval_targets[idx]
             print(f"    样本{idx}: 预测={pred:.4f}, 真实={target:.1f}")
+
 
 # ==================== 梯度检测工具 ====================
 
@@ -1480,7 +1587,7 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     train_eval_inputs, train_eval_targets, train_eval_returns = create_train_evaluation_dataset(train_stock_info, first_n_days=80)
 
     # 使用自定义动态加权BCE损失函数
-    # 特点：1. 根据batch正负样本比例动态调整负样本权重 2. 对预测偏差大的样本指数级惩罚
+    # 特点：根据batch正负样本比例动态调整负样本权重
     criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
 
     # 测试集损失同样使用动态加权BCE，保持评估一致性
@@ -1597,11 +1704,9 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
                 batch_inputs = epoch_inputs_tensor[start_idx:end_idx]
                 batch_targets = epoch_targets_tensor[start_idx:end_idx]
 
-                # 动态更新权重：根据当前batch的正负样本比例
-                criterion.update_weights(batch_targets)
-
                 optimizer.zero_grad()
                 output = model(batch_inputs)
+
                 loss = criterion(output.squeeze(), batch_targets)
 
                 loss.backward()

@@ -59,7 +59,6 @@ EquiNet/
   - `end`：收盘价
   - `volume`：股票成交量
   - `exchange`：换手率
-  - `rate`：量比
 
 v2数据找时间发布到huggingface
 

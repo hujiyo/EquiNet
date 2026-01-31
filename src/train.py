@@ -190,10 +190,10 @@ class TwoDimensionalPositionalEncoding(nn.Module):
     二维位置编码：时间步 + 特征类型
 
     设计原理：
-    - 60×7的时间序列被展平成420个token
+    - 60×6的时间序列被展平成360个token
     - 每个token有两个结构信息：
       1. temporal_id: 属于第几个时间步（0-59）
-      2. feature_id: 属于哪个特征（0-6，OHLC+volume+exchange+rate）
+      2. feature_id: 属于哪个特征（0-5，OHLC+volume+exchange）
 
     编码方案：
     - 将d_model分为两半：前一半用于时间步编码，后一半用于特征类型编码
@@ -204,7 +204,7 @@ class TwoDimensionalPositionalEncoding(nn.Module):
 
         self.d_model = d_model
         self.num_timesteps = num_timesteps  # 60
-        self.num_features = num_features     # 7
+        self.num_features = num_features     # 6
 
         # 确保d_model是偶数，可以均分
         assert d_model % 2 == 0, f"d_model ({d_model}) 必须是偶数以便均分给时间步和特征编码"
@@ -223,7 +223,7 @@ class TwoDimensionalPositionalEncoding(nn.Module):
 
         self.register_buffer('temporal_pe', temporal_pe)
 
-        # 特征类型编码：0-6
+        # 特征类型编码：0-5
         feature_pe = torch.zeros(num_features, self.feature_dim)
         feature_pos = torch.arange(0, num_features, dtype=torch.float).unsqueeze(1)
 
@@ -237,7 +237,7 @@ class TwoDimensionalPositionalEncoding(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [batch_size, seq_len, d_model] 其中 seq_len = 420 (60*7)
+            x: [batch_size, seq_len, d_model] 其中 seq_len = 360 (60*6)
 
         Returns:
             x + 二维位置编码
@@ -246,13 +246,13 @@ class TwoDimensionalPositionalEncoding(nn.Module):
         device = x.device
 
         # 为每个token计算其时间步ID和特征ID
-        # token位置 0-419
+        # token位置 0-359
         token_positions = torch.arange(seq_len, device=device)
 
-        # temporal_id = token_pos // 7 (0-59)
+        # temporal_id = token_pos // 6 (0-59)
         temporal_ids = token_positions // self.num_features
 
-        # feature_id = token_pos % 7 (0-6)
+        # feature_id = token_pos % 6 (0-5)
         feature_ids = token_positions % self.num_features
 
         # 获取对应的位置编码
@@ -343,8 +343,8 @@ class TokenizedStockTransformer(nn.Module):
     Token化版本的股票预测Transformer
 
     核心设计：
-    1. Token Embedding: 200个token → d_model维向量（查表）
-    2. 二维位置编码: 时间步编码(0-59) + 特征类型编码(0-6)
+    1. Token Embedding: 176个token → d_model维向量（查表）
+    2. 二维位置编码: 时间步编码(0-59) + 特征类型编码(0-5)
     3. Transformer: 学习token间的关系（逐层递减dropout）
     4. 输出: 聚合所有token信息进行预测
     """
@@ -386,13 +386,13 @@ class TokenizedStockTransformer(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [batch_size, 60, 7] 连续值 或 [batch_size, 420] token ID
+            x: [batch_size, 60, 6] 连续值 或 [batch_size, 360] token ID
         
         Returns:
             output: [batch_size, 1] 预测logits
         """
         # 如果输入是连续值，先进行token化
-        if x.dim() == 3 and x.size(-1) == 7:
+        if x.dim() == 3 and x.size(-1) == 6:
             from tokenizer import tokenize_batch_torch
             x = tokenize_batch_torch(x, flatten=True)
         
@@ -503,8 +503,8 @@ def process_single_file(args):
         # 🔑 关键：数据文件是按时间倒序排列的（最新在前），需要反转为正序（最早在前）
         df = df.iloc[::-1].reset_index(drop=True)
         
-        # 使用7维特征：OHLC + volume + exchange(换手率) + rate(量比)
-        data = df[['start', 'max', 'min', 'end', 'volume', 'exchange', 'rate']].values
+        # 使用6维特征：OHLC + volume + exchange(换手率)
+        data = df[['start', 'max', 'min', 'end', 'volume', 'exchange']].values
         times = df['time'].values  # 日期列，格式为YYYYMMDD整数
         
         data_length = len(data)
@@ -823,7 +823,7 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
             return None  # 过滤掉涨停样本
 
     # 特征标准化：向量化计算
-    input_seq = np.empty((context_length, 7), dtype=np.float32)
+    input_seq = np.empty((context_length, 6), dtype=np.float32)
     
     # 价格特征：相对涨跌幅（向量化）
     # 第1天相对于前一天
@@ -837,16 +837,15 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     if context_length > 1:
         input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
     
-    # 换手率和量比：直接归一化（向量化）
+    # 换手率：直接归一化（向量化）
     input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
-    input_seq[:, 6] = input_seq_raw[:, 6] / 10.0
     
     # 数值范围限制（向量化）
     # 价格特征：限制在[-0.1, 0.1]，对应±10%涨跌幅
     np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
     np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
     input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
-    np.clip(input_seq[:, 4:7], 0.0, 1.0, out=input_seq[:, 4:7])
+    np.clip(input_seq[:, 4:6], 0.0, 1.0, out=input_seq[:, 4:6])
 
     # NaN/Inf检测（向量化）
     if np.any(~np.isfinite(input_seq)):
@@ -1998,10 +1997,10 @@ def normalize_data_for_prediction(data):
     用于所有预测场景，确保与训练时完全一致
     
     Args:
-        data: numpy array, shape [seq_len, 7] (OHLC + volume + exchange + rate)
+        data: numpy array, shape [seq_len, 6] (OHLC + volume + exchange)
         
     Returns:
-        normalized_data: numpy array, shape [seq_len-1, 7] 或 None（如果数据无效）
+        normalized_data: numpy array, shape [seq_len-1, 6] 或 None（如果数据无效）
     """
     if len(data) < 2:
         return None
@@ -2012,8 +2011,6 @@ def normalize_data_for_prediction(data):
     for i in range(1, len(data)):
         yesterday_close = data[i-1, 3]  # 前一天的收盘价
         yesterday_volume = data[i-1, 4]  # 前一天的成交量
-        yesterday_exchange = data[i-1, 5]  # 前一天的换手率
-        yesterday_rate = data[i-1, 6]      # 前一天的量比
         
         if yesterday_close == 0 or yesterday_volume == 0:
             return None  # 数据异常
@@ -2023,7 +2020,6 @@ def normalize_data_for_prediction(data):
         # 流动性特征
         normalized_data[i, 4] = (data[i, 4] - yesterday_volume) / yesterday_volume
         normalized_data[i, 5] = np.clip(data[i, 5] / 100.0, 0.0, 1.0)  # 换手率
-        normalized_data[i, 6] = np.clip(data[i, 6] / 10.0, 0.0, 1.0)  # 量比
     
     # 数值范围限制
     # 价格特征：限制在[-0.1, 0.1]，对应±10%涨跌幅
@@ -2031,7 +2027,6 @@ def normalize_data_for_prediction(data):
     normalized_data[:, 4] = np.clip(normalized_data[:, 4], -5.0, 5.0)
     normalized_data[:, 4] = np.clip(normalized_data[:, 4] / 10.0 + 0.5, 0.0, 1.0)
     normalized_data[:, 5] = np.clip(normalized_data[:, 5], 0.0, 1.0)
-    normalized_data[:, 6] = np.clip(normalized_data[:, 6], 0.0, 1.0)
     
     # NaN/Inf检测
     result = normalized_data[1:]
@@ -2047,7 +2042,7 @@ def predict_single_stock(model_path, stock_data, device=None):
     
     Args:
         model_path: 模型文件路径
-        stock_data: numpy array, shape [seq_len, 7] (OHLC + volume + exchange + rate)，至少需要CONTEXT_LENGTH+1天数据
+        stock_data: numpy array, shape [seq_len, 6] (OHLC + volume + exchange)，至少需要CONTEXT_LENGTH+1天数据
         device: 计算设备
         
     Returns:

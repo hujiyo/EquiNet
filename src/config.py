@@ -38,7 +38,7 @@ class DataConfig:
 class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
-    INPUT_DIM = 7                    # 输入特征维度数（OHLC + volume + exchange + rate）
+    INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
     D_MODEL = 28                     # 模型维度（Transformer内部维度）
     EMBED_HIDDEN_DIM = 40            # Embedding中间层维度（两阶段FFN：7→40→80）
     NHEAD = 2                        # 注意力头数
@@ -51,9 +51,9 @@ class ModelConfig:
     ATTENTION_DROPOUT = 0.1            # 注意力Dropout比率设置为0降低欠拟合
     
     # Token化参数
-    # 词表大小 = 4*20(OHLC) + 36(volume) + 60(exchange) + 24(rate) = 200
-    VOCAB_SIZE = 200
-    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 7 = 420
+    # 词表大小 = 4*20(OHLC) + 36(volume) + 60(exchange) = 176
+    VOCAB_SIZE = 176
+    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
 
 # ==================== 训练参数 ====================
 class TrainingConfig:

@@ -11,17 +11,13 @@ Token化方案（每个特征独立token空间，范围与连续版一致）：
 - volume成交量变化 (特征4): 36个token (ID: 80-115)，范围[0, 1]，非均匀分桶
     - 区间一 [0, 0.6]: 20个桶，步长3%（原始-100%到+100%，步长10%）
     - 区间二 [0.6, 1.0]: 16个桶，步长2.5%（原始+100%到+500%，步长25%）
-- exchange换手率 (特征5): 60个token (ID: 140-199)，范围[0, 1]，非均匀分桶
+- exchange换手率 (特征5): 60个token (ID: 116-175)，范围[0, 1]，非均匀分桶
     - 区间一 [0, 0.2]: 40个桶，步长0.5%（原始值0-20%）
     - 区间二 [0.2, 1.0]: 20个桶，步长4%（原始值20-100%）
-- rate量比 (特征6): 24个token (ID: 176-199)，范围[0, 1]，非均匀分桶
-    - 区间一 [0, 0.12]: 12个桶，步长0.01（原始值0-1.2，步长0.1）
-    - 区间二 [0.12, 0.24]: 4个桶，步长0.03（原始值1.2-2.4，步长0.3）
-    - 区间三 [0.24, 1.0]: 8个桶，步长0.095（原始值2.4-10，步长0.95）
 
-总词表大小: 200个token
-输入: [seq_len, 7] 连续值
-输出: [seq_len * 7] token ID (展平后)
+总词表大小: 176个token
+输入: [seq_len, 6] 连续值
+输出: [seq_len * 6] token ID (展平后)
 """
 
 import numpy as np
@@ -69,28 +65,13 @@ class TokenConfig:
     EXCHANGE_ZONE2_BUCKETS = 20  # 区间二桶数（20-100%，步长4%）
     EXCHANGE_OFFSET = 116  # token 116-175
     
-    # ========== 特征6: rate量比（非均匀分桶，三段式） ==========
-    # 原始值0-10，归一化后0-1，与连续版范围一致
-    # 区间一[0, 0.12]: 12个桶，步长0.01（原始值0-1.2，步长0.1）
-    # 区间二[0.12, 0.24]: 4个桶，步长0.03（原始值1.2-2.4，步长0.3）
-    # 区间三[0.24, 1.0]: 8个桶，步长0.095（原始值2.4-10，步长0.95）
-    RATE_NUM_BUCKETS = 24  # 12 + 4 + 8
-    RATE_MIN = 0.0
-    RATE_MAX = 1.0       # 与连续版一致
-    RATE_ZONE1_MAX = 0.12   # 区间一边界（原始值1.2）
-    RATE_ZONE2_MAX = 0.24   # 区间二边界（原始值2.4）
-    RATE_ZONE1_BUCKETS = 12  # 区间一桶数（0-1.2，步长0.1）
-    RATE_ZONE2_BUCKETS = 4   # 区间二桶数（1.2-2.4，步长0.3）
-    RATE_ZONE3_BUCKETS = 8   # 区间三桶数（2.4-10，步长0.95）
-    RATE_OFFSET = 176    # token 176-199
-    
     # ========== 汇总 ==========
-    # 总词表大小 = 4*20 + 60 + 60 + 34 = 234
+    # 总词表大小 = 4*20 + 36 + 60 = 176
     VOCAB_SIZE = (4 * OHLC_NUM_BUCKETS + VOLUME_NUM_BUCKETS + 
-                  EXCHANGE_NUM_BUCKETS + RATE_NUM_BUCKETS)  # 234个token
+                  EXCHANGE_NUM_BUCKETS)  # 176个token
     
     # token化后的序列长度
-    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * ModelConfig.INPUT_DIM  # 60 * 7 = 420
+    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * ModelConfig.INPUT_DIM  # 60 * 6 = 360
 
 
 def _value_to_bucket(value: float, min_val: float, max_val: float, num_buckets: int) -> int:
@@ -188,49 +169,19 @@ def _nonuniform_bucket_exchange(value: float) -> int:
     return bucket
 
 
-def _nonuniform_bucket_rate(value: float) -> int:
-    """
-    rate量比的非均匀分桶（三段式）
-    范围[0, 1]，与连续版一致
-    - 区间一[0, 0.12]: 12个桶，步长0.01（原始值0-1.2，步长0.1）
-    - 区间二[0.12, 0.24]: 4个桶，步长0.03（原始值1.2-2.4，步长0.3）
-    - 区间三[0.24, 1.0]: 8个桶，步长0.095（原始值2.4-10，步长0.95）
-    """
-    value = max(0.0, min(1.0, value))  # 截断到[0, 1]
-
-    if value <= TokenConfig.RATE_ZONE1_MAX:  # 区间一 [0, 0.12]
-        # 12个桶覆盖[0, 0.12]
-        normalized = value / TokenConfig.RATE_ZONE1_MAX
-        bucket = int(normalized * TokenConfig.RATE_ZONE1_BUCKETS)
-        bucket = min(bucket, TokenConfig.RATE_ZONE1_BUCKETS - 1)
-    elif value <= TokenConfig.RATE_ZONE2_MAX:  # 区间二 [0.12, 0.24]
-        # 4个桶覆盖[0.12, 0.24]
-        normalized = (value - TokenConfig.RATE_ZONE1_MAX) / (TokenConfig.RATE_ZONE2_MAX - TokenConfig.RATE_ZONE1_MAX)
-        bucket = TokenConfig.RATE_ZONE1_BUCKETS + int(normalized * TokenConfig.RATE_ZONE2_BUCKETS)
-        bucket = min(bucket, TokenConfig.RATE_ZONE1_BUCKETS + TokenConfig.RATE_ZONE2_BUCKETS - 1)
-    else:  # 区间三 [0.24, 1.0]
-        # 8个桶覆盖[0.24, 1.0]
-        normalized = (value - TokenConfig.RATE_ZONE2_MAX) / (1.0 - TokenConfig.RATE_ZONE2_MAX)
-        bucket = TokenConfig.RATE_ZONE1_BUCKETS + TokenConfig.RATE_ZONE2_BUCKETS + int(normalized * TokenConfig.RATE_ZONE3_BUCKETS)
-        bucket = min(bucket, TokenConfig.RATE_NUM_BUCKETS - 1)
-
-    return bucket
-
-
 def tokenize_features(input_seq: np.ndarray, flatten: bool = True) -> np.ndarray:
     """
     将连续特征序列转换为token ID序列
     
     Args:
-        input_seq: [seq_len, 7] 连续值数组（已预处理）
+        input_seq: [seq_len, 6] 连续值数组（已预处理）
                    特征0-3: OHLC，范围[-0.1, 0.1]
                    特征4: volume，范围[0, 1]
                    特征5: exchange，范围[0, 1]（非均匀分桶）
-                   特征6: rate，范围[0, 1]（非均匀分桶）
         flatten: 是否展平为一维数组
     
     Returns:
-        token_ids: [seq_len * 7] 或 [seq_len, 7] token ID数组 (int64)
+        token_ids: [seq_len * 6] 或 [seq_len, 6] token ID数组 (int64)
     """
     seq_len, num_features = input_seq.shape
     assert num_features == ModelConfig.INPUT_DIM, f"期望{ModelConfig.INPUT_DIM}个特征，实际{num_features}"
@@ -255,11 +206,6 @@ def tokenize_features(input_seq: np.ndarray, flatten: bool = True) -> np.ndarray
         value = input_seq[t, 5]
         bucket = _nonuniform_bucket_exchange(value)
         token_ids[t, 5] = TokenConfig.EXCHANGE_OFFSET + bucket
-        
-        # 特征6: rate（非均匀分桶）
-        value = input_seq[t, 6]
-        bucket = _nonuniform_bucket_rate(value)
-        token_ids[t, 6] = TokenConfig.RATE_OFFSET + bucket
     
     if flatten:
         return token_ids.reshape(-1)
@@ -271,11 +217,11 @@ def tokenize_features_vectorized(input_seq: np.ndarray, flatten: bool = True) ->
     向量化版本：将连续特征序列转换为token ID序列
     
     Args:
-        input_seq: [seq_len, 7] 连续值数组（已预处理）
+        input_seq: [seq_len, 6] 连续值数组（已预处理）
         flatten: 是否展平为一维数组
     
     Returns:
-        token_ids: [seq_len * 7] 或 [seq_len, 7] token ID数组 (int64)
+        token_ids: [seq_len * 6] 或 [seq_len, 6] token ID数组 (int64)
     """
     seq_len, num_features = input_seq.shape
     token_ids = np.empty((seq_len, num_features), dtype=np.int64)
@@ -328,34 +274,9 @@ def tokenize_features_vectorized(input_seq: np.ndarray, flatten: bool = True) ->
     )
     token_ids[:, 5] = exc_buckets + TokenConfig.EXCHANGE_OFFSET
     
-    # 特征6: rate量比（非均匀分桶，三段式，范围[0, 1]）
-    rate = input_seq[:, 6]
-    rate_clipped = np.clip(rate, 0.0, 1.0)
-    rate_buckets = np.zeros(seq_len, dtype=np.int64)
-    # 区间一 [0, 0.15]: 15个桶
-    zone1_mask = rate_clipped <= TokenConfig.RATE_ZONE1_MAX
-    # 区间二 [0.15, 0.21]: 3个桶
-    zone2_mask = (rate_clipped > TokenConfig.RATE_ZONE1_MAX) & (rate_clipped <= TokenConfig.RATE_ZONE2_MAX)
-    # 区间三 [0.21, 1.0]: 16个桶
-    zone3_mask = rate_clipped > TokenConfig.RATE_ZONE2_MAX
-    
-    rate_buckets[zone1_mask] = np.minimum(
-        (rate_clipped[zone1_mask] / TokenConfig.RATE_ZONE1_MAX * TokenConfig.RATE_ZONE1_BUCKETS).astype(np.int64),
-        TokenConfig.RATE_ZONE1_BUCKETS - 1
-    )
-    rate_buckets[zone2_mask] = TokenConfig.RATE_ZONE1_BUCKETS + np.minimum(
-        ((rate_clipped[zone2_mask] - TokenConfig.RATE_ZONE1_MAX) / (TokenConfig.RATE_ZONE2_MAX - TokenConfig.RATE_ZONE1_MAX) * TokenConfig.RATE_ZONE2_BUCKETS).astype(np.int64),
-        TokenConfig.RATE_ZONE2_BUCKETS - 1
-    )
-    rate_buckets[zone3_mask] = TokenConfig.RATE_ZONE1_BUCKETS + TokenConfig.RATE_ZONE2_BUCKETS + np.minimum(
-        ((rate_clipped[zone3_mask] - TokenConfig.RATE_ZONE2_MAX) / (1.0 - TokenConfig.RATE_ZONE2_MAX) * TokenConfig.RATE_ZONE3_BUCKETS).astype(np.int64),
-        TokenConfig.RATE_ZONE3_BUCKETS - 1
-    )
-    token_ids[:, 6] = rate_buckets + TokenConfig.RATE_OFFSET
-    
     if flatten:
-        return token_ids.reshape(-1)  # [seq_len * 7]
-    return token_ids  # [seq_len, 7]
+        return token_ids.reshape(-1)  # [seq_len * 6]
+    return token_ids  # [seq_len, 6]
 
 
 def tokenize_batch(batch_input: np.ndarray, flatten: bool = True) -> np.ndarray:
@@ -363,11 +284,11 @@ def tokenize_batch(batch_input: np.ndarray, flatten: bool = True) -> np.ndarray:
     批量token化
     
     Args:
-        batch_input: [batch_size, seq_len, 7] 连续值数组
+        batch_input: [batch_size, seq_len, 6] 连续值数组
         flatten: 是否展平最后两维
     
     Returns:
-        token_ids: [batch_size, seq_len * 7] 或 [batch_size, seq_len, 7] token ID数组
+        token_ids: [batch_size, seq_len * 6] 或 [batch_size, seq_len, 6] token ID数组
     """
     batch_size, seq_len, num_features = batch_input.shape
     token_ids = np.empty((batch_size, seq_len, num_features), dtype=np.int64)
@@ -419,34 +340,9 @@ def tokenize_batch(batch_input: np.ndarray, flatten: bool = True) -> np.ndarray:
     )
     token_ids[:, :, 5] = exc_buckets + TokenConfig.EXCHANGE_OFFSET
     
-    # 特征6: rate量比（非均匀分桶，三段式，范围[0, 1]）
-    rate = batch_input[:, :, 6]
-    rate_clipped = np.clip(rate, 0.0, 1.0)
-    rate_buckets = np.zeros((batch_size, seq_len), dtype=np.int64)
-    # 区间一 [0, 0.15]: 15个桶
-    zone1_mask = rate_clipped <= TokenConfig.RATE_ZONE1_MAX
-    # 区间二 [0.15, 0.21]: 3个桶
-    zone2_mask = (rate_clipped > TokenConfig.RATE_ZONE1_MAX) & (rate_clipped <= TokenConfig.RATE_ZONE2_MAX)
-    # 区间三 [0.21, 1.0]: 16个桶
-    zone3_mask = rate_clipped > TokenConfig.RATE_ZONE2_MAX
-    
-    rate_buckets[zone1_mask] = np.minimum(
-        (rate_clipped[zone1_mask] / TokenConfig.RATE_ZONE1_MAX * TokenConfig.RATE_ZONE1_BUCKETS).astype(np.int64),
-        TokenConfig.RATE_ZONE1_BUCKETS - 1
-    )
-    rate_buckets[zone2_mask] = TokenConfig.RATE_ZONE1_BUCKETS + np.minimum(
-        ((rate_clipped[zone2_mask] - TokenConfig.RATE_ZONE1_MAX) / (TokenConfig.RATE_ZONE2_MAX - TokenConfig.RATE_ZONE1_MAX) * TokenConfig.RATE_ZONE2_BUCKETS).astype(np.int64),
-        TokenConfig.RATE_ZONE2_BUCKETS - 1
-    )
-    rate_buckets[zone3_mask] = TokenConfig.RATE_ZONE1_BUCKETS + TokenConfig.RATE_ZONE2_BUCKETS + np.minimum(
-        ((rate_clipped[zone3_mask] - TokenConfig.RATE_ZONE2_MAX) / (1.0 - TokenConfig.RATE_ZONE2_MAX) * TokenConfig.RATE_ZONE3_BUCKETS).astype(np.int64),
-        TokenConfig.RATE_ZONE3_BUCKETS - 1
-    )
-    token_ids[:, :, 6] = rate_buckets + TokenConfig.RATE_OFFSET
-    
     if flatten:
-        return token_ids.reshape(batch_size, -1)  # [batch, seq_len * 7]
-    return token_ids  # [batch, seq_len, 7]
+        return token_ids.reshape(batch_size, -1)  # [batch, seq_len * 6]
+    return token_ids  # [batch, seq_len, 6]
 
 
 def tokenize_batch_torch(batch_input: torch.Tensor, flatten: bool = True) -> torch.Tensor:
@@ -457,11 +353,11 @@ def tokenize_batch_torch(batch_input: torch.Tensor, flatten: bool = True) -> tor
     BF16 只有 7 位有效数字，在桶边界附近的值会因为精度损失随机跳到相邻的 token。
 
     Args:
-        batch_input: [batch_size, seq_len, 7] 连续值张量（任意精度）
+        batch_input: [batch_size, seq_len, 6] 连续值张量（任意精度）
         flatten: 是否展平最后两维
 
     Returns:
-        token_ids: [batch_size, seq_len * 7] 或 [batch_size, seq_len, 7] token ID张量 (long)
+        token_ids: [batch_size, seq_len * 6] 或 [batch_size, seq_len, 6] token ID张量 (long)
     """
     batch_size, seq_len, num_features = batch_input.shape
     device = batch_input.device
@@ -521,35 +417,9 @@ def tokenize_batch_torch(batch_input: torch.Tensor, flatten: bool = True) -> tor
     )
     token_ids[:, :, 5] = exc_buckets + TokenConfig.EXCHANGE_OFFSET
     
-    # 特征6: rate量比（非均匀分桶，三段式，范围[0, 1]）
-    rate = batch_input[:, :, 6]
-    rate_clipped = torch.clamp(rate, 0.0, 1.0)
-    # 区间一 [0, 0.15]: 15个桶
-    zone1_mask = rate_clipped <= TokenConfig.RATE_ZONE1_MAX
-    # 区间二 [0.15, 0.21]: 3个桶
-    zone2_mask = (rate_clipped > TokenConfig.RATE_ZONE1_MAX) & (rate_clipped <= TokenConfig.RATE_ZONE2_MAX)
-    # 区间三 [0.21, 1.0]: 16个桶
-    
-    # 计算各区间的桶索引
-    zone1_buckets = torch.clamp((rate_clipped / TokenConfig.RATE_ZONE1_MAX * TokenConfig.RATE_ZONE1_BUCKETS).long(),
-                                max=TokenConfig.RATE_ZONE1_BUCKETS - 1)
-    zone2_buckets = TokenConfig.RATE_ZONE1_BUCKETS + torch.clamp(
-        ((rate_clipped - TokenConfig.RATE_ZONE1_MAX) / (TokenConfig.RATE_ZONE2_MAX - TokenConfig.RATE_ZONE1_MAX) * TokenConfig.RATE_ZONE2_BUCKETS).long(),
-        max=TokenConfig.RATE_ZONE2_BUCKETS - 1
-    )
-    zone3_buckets = TokenConfig.RATE_ZONE1_BUCKETS + TokenConfig.RATE_ZONE2_BUCKETS + torch.clamp(
-        ((rate_clipped - TokenConfig.RATE_ZONE2_MAX) / (1.0 - TokenConfig.RATE_ZONE2_MAX) * TokenConfig.RATE_ZONE3_BUCKETS).long(),
-        max=TokenConfig.RATE_ZONE3_BUCKETS - 1
-    )
-    
-    # 使用嵌套where选择正确的桶
-    rate_buckets = torch.where(zone1_mask, zone1_buckets,
-                               torch.where(zone2_mask, zone2_buckets, zone3_buckets))
-    token_ids[:, :, 6] = rate_buckets + TokenConfig.RATE_OFFSET
-    
     if flatten:
-        return token_ids.reshape(batch_size, -1)  # [batch, seq_len * 7]
-    return token_ids  # [batch, seq_len, 7]
+        return token_ids.reshape(batch_size, -1)  # [batch, seq_len * 6]
+    return token_ids  # [batch, seq_len, 6]
 
 
 def get_token_info(token_id: int) -> dict:
@@ -562,7 +432,7 @@ def get_token_info(token_id: int) -> dict:
     Returns:
         包含特征索引、桶索引、值范围的字典
     """
-    feature_names = ['open', 'high', 'low', 'close', 'volume', 'exchange', 'rate']
+    feature_names = ['open', 'high', 'low', 'close', 'volume', 'exchange']
     
     # 根据token_id确定特征和桶索引
     if token_id < TokenConfig.HIGH_OFFSET:  # 0-19: open
@@ -617,23 +487,8 @@ def get_token_info(token_id: int) -> dict:
             bucket_width = (1.0 - TokenConfig.EXCHANGE_ZONE1_MAX) / TokenConfig.EXCHANGE_ZONE2_BUCKETS
             bucket_start = TokenConfig.EXCHANGE_ZONE1_MAX + zone2_bucket_idx * bucket_width
             bucket_end = bucket_start + bucket_width
-    else:  # 200-233: rate（非均匀分桶，三段式）
-        feature_idx = 6
-        bucket_idx = token_id - TokenConfig.RATE_OFFSET
-        if bucket_idx < TokenConfig.RATE_ZONE1_BUCKETS:  # 区间一 [0, 0.15]
-            bucket_width = TokenConfig.RATE_ZONE1_MAX / TokenConfig.RATE_ZONE1_BUCKETS
-            bucket_start = bucket_idx * bucket_width
-            bucket_end = bucket_start + bucket_width
-        elif bucket_idx < TokenConfig.RATE_ZONE1_BUCKETS + TokenConfig.RATE_ZONE2_BUCKETS:  # 区间二 [0.15, 0.21]
-            zone2_bucket_idx = bucket_idx - TokenConfig.RATE_ZONE1_BUCKETS
-            bucket_width = (TokenConfig.RATE_ZONE2_MAX - TokenConfig.RATE_ZONE1_MAX) / TokenConfig.RATE_ZONE2_BUCKETS
-            bucket_start = TokenConfig.RATE_ZONE1_MAX + zone2_bucket_idx * bucket_width
-            bucket_end = bucket_start + bucket_width
-        else:  # 区间三 [0.21, 1.0]
-            zone3_bucket_idx = bucket_idx - TokenConfig.RATE_ZONE1_BUCKETS - TokenConfig.RATE_ZONE2_BUCKETS
-            bucket_width = (1.0 - TokenConfig.RATE_ZONE2_MAX) / TokenConfig.RATE_ZONE3_BUCKETS
-            bucket_start = TokenConfig.RATE_ZONE2_MAX + zone3_bucket_idx * bucket_width
-            bucket_end = bucket_start + bucket_width
+    else:  # 无效token
+        raise ValueError(f"无效的token_id: {token_id}，超出词表范围[0, {TokenConfig.VOCAB_SIZE-1}]")
     
     center_value = (bucket_start + bucket_end) / 2
     
@@ -657,7 +512,6 @@ if __name__ == "__main__":
     print(f"  OHLC桶数: {TokenConfig.OHLC_NUM_BUCKETS} (步长1%)")
     print(f"  Volume桶数: {TokenConfig.VOLUME_NUM_BUCKETS} (两段式: -100%到+100%用20桶步长10%, +100%到+500%用16桶步长25%)")
     print(f"  Exchange桶数: {TokenConfig.EXCHANGE_NUM_BUCKETS} (两段式: 0-20%用40桶步长0.5%, 20-100%用20桶步长4%)")
-    print(f"  Rate桶数: {TokenConfig.RATE_NUM_BUCKETS} (三段式: 0-1.2用12桶步长0.1, 1.2-2.4用4桶步长0.3, 2.4-10用8桶步长0.95)")
     print(f"  总词表大小: {TokenConfig.VOCAB_SIZE}")
     print(f"  Token序列长度: {TokenConfig.TOKEN_SEQ_LEN}")
     
@@ -665,17 +519,15 @@ if __name__ == "__main__":
     np.random.seed(42)
     seq_len = DataConfig.CONTEXT_LENGTH
     
-    test_input = np.zeros((seq_len, 7), dtype=np.float32)
+    test_input = np.zeros((seq_len, 6), dtype=np.float32)
     test_input[:, :4] = np.random.uniform(-0.1, 0.1, (seq_len, 4))  # OHLC: [-10%, +10%]
     test_input[:, 4] = np.random.uniform(0, 1, seq_len)  # volume: [0, 1]
     test_input[:, 5] = np.random.uniform(0, 1, seq_len)  # exchange: [0, 1]（与连续版一致）
-    test_input[:, 6] = np.random.uniform(0, 1, seq_len)  # rate: [0, 1]（与连续版一致）
     
     print(f"\n测试输入形状: {test_input.shape}")
     print(f"  OHLC范围: [{test_input[:, :4].min():.4f}, {test_input[:, :4].max():.4f}]")
     print(f"  Volume范围: [{test_input[:, 4].min():.4f}, {test_input[:, 4].max():.4f}]")
     print(f"  Exchange范围: [{test_input[:, 5].min():.4f}, {test_input[:, 5].max():.4f}]")
-    print(f"  Rate范围: [{test_input[:, 6].min():.4f}, {test_input[:, 6].max():.4f}]")
     
     # 测试单样本token化
     token_ids = tokenize_features_vectorized(test_input)
@@ -683,19 +535,18 @@ if __name__ == "__main__":
     print(f"  Token ID范围: [{token_ids.min()}, {token_ids.max()}]")
     
     # 验证token分布
-    print(f"\n前7个token (第1天的7个特征):")
-    for i in range(7):
+    print(f"\n前6个token (第1天的6个特征):")
+    for i in range(6):
         info = get_token_info(token_ids[i])
         print(f"  {info['feature_name']:8s}: token={info['token_id']:3d}, "
               f"bucket={info['bucket_idx']:2d}, range=[{info['bucket_range'][0]:+.4f}, {info['bucket_range'][1]:+.4f}]")
     
     # 测试批量token化
     batch_size = 32
-    batch_input = np.zeros((batch_size, seq_len, 7), dtype=np.float32)
+    batch_input = np.zeros((batch_size, seq_len, 6), dtype=np.float32)
     batch_input[:, :, :4] = np.random.uniform(-0.1, 0.1, (batch_size, seq_len, 4))
     batch_input[:, :, 4] = np.random.uniform(0, 1, (batch_size, seq_len))
     batch_input[:, :, 5] = np.random.uniform(0, 0.1, (batch_size, seq_len))
-    batch_input[:, :, 6] = np.random.uniform(0.05, 0.2, (batch_size, seq_len))
     
     batch_tokens = tokenize_batch(batch_input)
     print(f"\n批量Token化结果形状: {batch_tokens.shape}")

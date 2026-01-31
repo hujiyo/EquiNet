@@ -304,7 +304,7 @@ class EnhancedStockTransformer(nn.Module):
     改进的 Transformer 模型（Pre-Norm架构 + 统一Embedding）
 
     核心改进1：统一Embedding - 端到端学习特征融合
-    - 7个输入特征(OHLC + Volume + Exchange + Rate) -> 统一映射到 d_model 维
+    - 6个输入特征(OHLC + Volume + Exchange) -> 统一映射到 d_model 维
     - 让模型自己学习如何组合和表达不同类型的特征
     - 相比分离embedding，减少了人为的结构假设
 
@@ -317,7 +317,7 @@ class EnhancedStockTransformer(nn.Module):
 
         # 统一Embedding：两阶段FFN结构，让特征在进入Transformer前充分混合
         self.embedding = nn.Sequential(
-            nn.Linear(ModelConfig.INPUT_DIM, ModelConfig.EMBED_HIDDEN_DIM),  # 7维 → 40维（扩展）
+            nn.Linear(ModelConfig.INPUT_DIM, ModelConfig.EMBED_HIDDEN_DIM),  # 6维 → 40维（扩展）
             nn.GELU(),                                                          # GELU激活，对负值有梯度
             nn.Linear(ModelConfig.EMBED_HIDDEN_DIM, d_model)                  # 40维 → 80维
         )
@@ -354,9 +354,9 @@ class EnhancedStockTransformer(nn.Module):
         self.apply(init_weights)
         
     def forward(self, x):
-        # x: [batch_size, seq_len, 7] (OHLC + volume + exchange + rate)
+        # x: [batch_size, seq_len, 6] (OHLC + volume + exchange)
 
-        # 1. 统一Embedding：7个特征一起映射到d_model维
+        # 1. 统一Embedding：6个特征一起映射到d_model维
         x = self.embedding(x)  # [batch_size, seq_len, d_model]
 
         # 2. 位置编码
@@ -404,8 +404,8 @@ def process_single_file(args):
         # 🔑 关键：数据文件是按时间倒序排列的（最新在前），需要反转为正序（最早在前）
         df = df.iloc[::-1].reset_index(drop=True)
         
-        # 使用7维特征：OHLC + volume + exchange(换手率) + rate(量比)
-        data = df[['start', 'max', 'min', 'end', 'volume', 'exchange', 'rate']].values
+        # 使用6维特征：OHLC + volume + exchange(换手率)
+        data = df[['start', 'max', 'min', 'end', 'volume', 'exchange']].values
         times = df['time'].values  # 日期列，格式为YYYYMMDD整数
         
         data_length = len(data)
@@ -724,7 +724,7 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
             return None  # 过滤掉涨停样本
 
     # 特征标准化：向量化计算
-    input_seq = np.empty((context_length, 7), dtype=np.float32)
+    input_seq = np.empty((context_length, 6), dtype=np.float32)
     
     # 价格特征：相对涨跌幅（向量化）
     # 第1天相对于前一天
@@ -738,16 +738,15 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     if context_length > 1:
         input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
     
-    # 换手率和量比：直接归一化（向量化）
+    # 换手率：直接归一化（向量化）
     input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
-    input_seq[:, 6] = input_seq_raw[:, 6] / 10.0
     
     # 数值范围限制（向量化）
     # 价格特征：限制在[-0.1, 0.1]，对应±10%涨跌幅
     np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
     np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
     input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
-    np.clip(input_seq[:, 4:7], 0.0, 1.0, out=input_seq[:, 4:7])
+    np.clip(input_seq[:, 4:6], 0.0, 1.0, out=input_seq[:, 4:6])
 
     # NaN/Inf检测（向量化）
     if np.any(~np.isfinite(input_seq)):
@@ -1893,10 +1892,10 @@ def normalize_data_for_prediction(data):
     用于所有预测场景，确保与训练时完全一致
     
     Args:
-        data: numpy array, shape [seq_len, 7] (OHLC + volume + exchange + rate)
+        data: numpy array, shape [seq_len, 6] (OHLC + volume + exchange)
         
     Returns:
-        normalized_data: numpy array, shape [seq_len-1, 7] 或 None（如果数据无效）
+        normalized_data: numpy array, shape [seq_len-1, 6] 或 None（如果数据无效）
     """
     if len(data) < 2:
         return None
@@ -1907,8 +1906,6 @@ def normalize_data_for_prediction(data):
     for i in range(1, len(data)):
         yesterday_close = data[i-1, 3]  # 前一天的收盘价
         yesterday_volume = data[i-1, 4]  # 前一天的成交量
-        yesterday_exchange = data[i-1, 5]  # 前一天的换手率
-        yesterday_rate = data[i-1, 6]      # 前一天的量比
         
         if yesterday_close == 0 or yesterday_volume == 0:
             return None  # 数据异常
@@ -1918,7 +1915,6 @@ def normalize_data_for_prediction(data):
         # 流动性特征
         normalized_data[i, 4] = (data[i, 4] - yesterday_volume) / yesterday_volume
         normalized_data[i, 5] = np.clip(data[i, 5] / 100.0, 0.0, 1.0)  # 换手率
-        normalized_data[i, 6] = np.clip(data[i, 6] / 10.0, 0.0, 1.0)  # 量比
     
     # 数值范围限制
     # 价格特征：限制在[-0.1, 0.1]，对应±10%涨跌幅
@@ -1926,7 +1922,6 @@ def normalize_data_for_prediction(data):
     normalized_data[:, 4] = np.clip(normalized_data[:, 4], -5.0, 5.0)
     normalized_data[:, 4] = np.clip(normalized_data[:, 4] / 10.0 + 0.5, 0.0, 1.0)
     normalized_data[:, 5] = np.clip(normalized_data[:, 5], 0.0, 1.0)
-    normalized_data[:, 6] = np.clip(normalized_data[:, 6], 0.0, 1.0)
     
     # NaN/Inf检测
     result = normalized_data[1:]
@@ -1942,7 +1937,7 @@ def predict_single_stock(model_path, stock_data, device=None):
     
     Args:
         model_path: 模型文件路径
-        stock_data: numpy array, shape [seq_len, 7] (OHLC + volume + exchange + rate)，至少需要CONTEXT_LENGTH+1天数据
+        stock_data: numpy array, shape [seq_len, 6] (OHLC + volume + exchange)，至少需要CONTEXT_LENGTH+1天数据
         device: 计算设备
         
     Returns:

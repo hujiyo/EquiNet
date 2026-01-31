@@ -38,9 +38,9 @@ class DataConfig:
 class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
-    INPUT_DIM = 7                    # 输入特征维度数（OHLC + volume + exchange + rate）
+    INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
     D_MODEL = 56                     # 模型维度（Transformer内部维度）
-    EMBED_HIDDEN_DIM = 40           # Embedding中间层维度（两阶段FFN：7→40→80）
+    EMBED_HIDDEN_DIM = 40           # Embedding中间层维度（两阶段FFN：6→40→D_MODEL）
     NHEAD = 4                        # 注意力头数
     NUM_LAYERS = 6                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）

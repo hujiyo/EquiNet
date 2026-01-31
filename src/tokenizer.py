@@ -8,16 +8,18 @@ Token化方案（每个特征独立token空间，范围与连续版一致）：
 - high  (特征1): 20个token (ID: 20-39)，范围[-0.1, 0.1]，步长1%
 - low   (特征2): 20个token (ID: 40-59)，范围[-0.1, 0.1]，步长1%
 - close (特征3): 20个token (ID: 60-79)，范围[-0.1, 0.1]，步长1%
-- volume (特征4): 20个token (ID: 80-99)，范围[0, 1]，步长5%
-- exchange换手率 (特征5): 60个token (ID: 100-159)，范围[0, 1]，非均匀分桶
+- volume成交量变化 (特征4): 36个token (ID: 80-115)，范围[0, 1]，非均匀分桶
+    - 区间一 [0, 0.6]: 20个桶，步长3%（原始-100%到+100%，步长10%）
+    - 区间二 [0.6, 1.0]: 16个桶，步长2.5%（原始+100%到+500%，步长25%）
+- exchange换手率 (特征5): 60个token (ID: 140-199)，范围[0, 1]，非均匀分桶
     - 区间一 [0, 0.2]: 40个桶，步长0.5%（原始值0-20%）
     - 区间二 [0.2, 1.0]: 20个桶，步长4%（原始值20-100%）
-- rate量比 (特征6): 34个token (ID: 160-193)，范围[0, 1]，非均匀分桶
-    - 区间一 [0, 0.15]: 15个桶，步长0.01（原始值0-1.5，步长0.1）
-    - 区间二 [0.15, 0.21]: 3个桶，步长0.02（原始值1.5-2.1，步长0.2）
-    - 区间三 [0.21, 1.0]: 16个桶，步长0.05（原始值2.1-10，步长0.5）
+- rate量比 (特征6): 24个token (ID: 176-199)，范围[0, 1]，非均匀分桶
+    - 区间一 [0, 0.12]: 12个桶，步长0.01（原始值0-1.2，步长0.1）
+    - 区间二 [0.12, 0.24]: 4个桶，步长0.03（原始值1.2-2.4，步长0.3）
+    - 区间三 [0.24, 1.0]: 8个桶，步长0.095（原始值2.4-10，步长0.95）
 
-总词表大小: 194个token
+总词表大小: 200个token
 输入: [seq_len, 7] 连续值
 输出: [seq_len * 7] token ID (展平后)
 """
@@ -42,12 +44,18 @@ class TokenConfig:
     LOW_OFFSET = 40      # token 40-59
     CLOSE_OFFSET = 60    # token 60-79
     
-    # ========== 特征4: volume成交量变化 ==========
-    # 范围[0, 1]，20个桶，步长5%
-    VOLUME_NUM_BUCKETS = 20
+    # ========== 特征4: volume成交量变化（非均匀分桶，两段式） ==========
+    # 归一化后范围[0, 1]，其中0.5对应0%变化
+    # 原始相对变化：(V_t - V_{t-1}) / V_{t-1}，clip到[-5, 5]后映射为 x/10+0.5
+    # 区间一[0, 0.6]: 20个桶，步长3%（原始-100%到+100%，步长10%）
+    # 区间二[0.6, 1.0]: 16个桶，步长2.5%（原始+100%到+500%，步长25%）
+    VOLUME_NUM_BUCKETS = 36  # 20 + 16
     VOLUME_MIN = 0.0
     VOLUME_MAX = 1.0
-    VOLUME_OFFSET = 80   # token 80-99
+    VOLUME_ZONE1_MAX = 0.6   # 区间一边界（原始+100%变化）
+    VOLUME_ZONE1_BUCKETS = 20  # 区间一桶数（-100%到+100%，步长10%）
+    VOLUME_ZONE2_BUCKETS = 16  # 区间二桶数（+100%到+500%，步长25%）
+    VOLUME_OFFSET = 80   # token 80-115
     
     # ========== 特征5: exchange换手率（非均匀分桶） ==========
     # 原始值0-100%，归一化后0-1，与连续版范围一致
@@ -59,27 +67,27 @@ class TokenConfig:
     EXCHANGE_ZONE1_MAX = 0.2   # 区间一边界（原始值20%）
     EXCHANGE_ZONE1_BUCKETS = 40  # 区间一桶数（0-20%，步长0.5%）
     EXCHANGE_ZONE2_BUCKETS = 20  # 区间二桶数（20-100%，步长4%）
-    EXCHANGE_OFFSET = 100  # token 100-159
+    EXCHANGE_OFFSET = 116  # token 116-175
     
     # ========== 特征6: rate量比（非均匀分桶，三段式） ==========
     # 原始值0-10，归一化后0-1，与连续版范围一致
-    # 区间一[0, 0.15]: 15个桶，步长0.01（原始值0-1.5，步长0.1）
-    # 区间二[0.15, 0.21]: 3个桶，步长0.02（原始值1.5-2.1，步长0.2）
-    # 区间三[0.21, 1.0]: 16个桶，步长~0.049（原始值2.1-10，步长0.5）
-    RATE_NUM_BUCKETS = 34  # 15 + 3 + 16
+    # 区间一[0, 0.12]: 12个桶，步长0.01（原始值0-1.2，步长0.1）
+    # 区间二[0.12, 0.24]: 4个桶，步长0.03（原始值1.2-2.4，步长0.3）
+    # 区间三[0.24, 1.0]: 8个桶，步长0.095（原始值2.4-10，步长0.95）
+    RATE_NUM_BUCKETS = 24  # 12 + 4 + 8
     RATE_MIN = 0.0
     RATE_MAX = 1.0       # 与连续版一致
-    RATE_ZONE1_MAX = 0.15   # 区间一边界（原始值1.5）
-    RATE_ZONE2_MAX = 0.21   # 区间二边界（原始值2.1）
-    RATE_ZONE1_BUCKETS = 15  # 区间一桶数（0-1.5，步长0.1）
-    RATE_ZONE2_BUCKETS = 3   # 区间二桶数（1.5-2.1，步长0.2）
-    RATE_ZONE3_BUCKETS = 16  # 区间三桶数（2.1-10，步长0.5）
-    RATE_OFFSET = 160    # token 160-193
+    RATE_ZONE1_MAX = 0.12   # 区间一边界（原始值1.2）
+    RATE_ZONE2_MAX = 0.24   # 区间二边界（原始值2.4）
+    RATE_ZONE1_BUCKETS = 12  # 区间一桶数（0-1.2，步长0.1）
+    RATE_ZONE2_BUCKETS = 4   # 区间二桶数（1.2-2.4，步长0.3）
+    RATE_ZONE3_BUCKETS = 8   # 区间三桶数（2.4-10，步长0.95）
+    RATE_OFFSET = 176    # token 176-199
     
     # ========== 汇总 ==========
-    # 总词表大小 = 4*20 + 20 + 60 + 34 = 194
+    # 总词表大小 = 4*20 + 60 + 60 + 34 = 234
     VOCAB_SIZE = (4 * OHLC_NUM_BUCKETS + VOLUME_NUM_BUCKETS + 
-                  EXCHANGE_NUM_BUCKETS + RATE_NUM_BUCKETS)  # 194个token
+                  EXCHANGE_NUM_BUCKETS + RATE_NUM_BUCKETS)  # 234个token
     
     # token化后的序列长度
     TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * ModelConfig.INPUT_DIM  # 60 * 7 = 420
@@ -134,6 +142,29 @@ def _bucket_to_value(bucket: int, min_val: float, max_val: float, num_buckets: i
     return min_val + (bucket + 0.5) * bucket_width
 
 
+def _nonuniform_bucket_volume(value: float) -> int:
+    """
+    volume成交量变化的非均匀分桶（两段式）
+    范围[0, 1]，其中0.5对应0%变化
+    - 区间一[0, 0.6]: 20个桶，步长3%（原始-100%到+100%，步长10%）
+    - 区间二[0.6, 1.0]: 16个桶，步长2.5%（原始+100%到+500%，步长25%）
+    """
+    value = max(0.0, min(1.0, value))  # 截断到[0, 1]
+
+    if value <= TokenConfig.VOLUME_ZONE1_MAX:  # 区间一 [0, 0.6]
+        # 20个桶覆盖[0, 0.6]
+        normalized = value / TokenConfig.VOLUME_ZONE1_MAX
+        bucket = int(normalized * TokenConfig.VOLUME_ZONE1_BUCKETS)
+        bucket = min(bucket, TokenConfig.VOLUME_ZONE1_BUCKETS - 1)
+    else:  # 区间二 [0.6, 1.0]
+        # 16个桶覆盖[0.6, 1.0]
+        normalized = (value - TokenConfig.VOLUME_ZONE1_MAX) / (1.0 - TokenConfig.VOLUME_ZONE1_MAX)
+        bucket = TokenConfig.VOLUME_ZONE1_BUCKETS + int(normalized * TokenConfig.VOLUME_ZONE2_BUCKETS)
+        bucket = min(bucket, TokenConfig.VOLUME_NUM_BUCKETS - 1)
+
+    return bucket
+
+
 def _nonuniform_bucket_exchange(value: float) -> int:
     """
     exchange换手率的非均匀分桶（两段式）
@@ -161,28 +192,28 @@ def _nonuniform_bucket_rate(value: float) -> int:
     """
     rate量比的非均匀分桶（三段式）
     范围[0, 1]，与连续版一致
-    - 区间一[0, 0.15]: 15个桶，步长0.01（原始值0-1.5，步长0.1）
-    - 区间二[0.15, 0.21]: 3个桶，步长0.02（原始值1.5-2.1，步长0.2）
-    - 区间三[0.21, 1.0]: 16个桶，步长~0.049（原始值2.1-10，步长0.5）
+    - 区间一[0, 0.12]: 12个桶，步长0.01（原始值0-1.2，步长0.1）
+    - 区间二[0.12, 0.24]: 4个桶，步长0.03（原始值1.2-2.4，步长0.3）
+    - 区间三[0.24, 1.0]: 8个桶，步长0.095（原始值2.4-10，步长0.95）
     """
     value = max(0.0, min(1.0, value))  # 截断到[0, 1]
-    
-    if value <= TokenConfig.RATE_ZONE1_MAX:  # 区间一 [0, 0.15]
-        # 15个桶覆盖[0, 0.15]
+
+    if value <= TokenConfig.RATE_ZONE1_MAX:  # 区间一 [0, 0.12]
+        # 12个桶覆盖[0, 0.12]
         normalized = value / TokenConfig.RATE_ZONE1_MAX
         bucket = int(normalized * TokenConfig.RATE_ZONE1_BUCKETS)
         bucket = min(bucket, TokenConfig.RATE_ZONE1_BUCKETS - 1)
-    elif value <= TokenConfig.RATE_ZONE2_MAX:  # 区间二 [0.15, 0.21]
-        # 3个桶覆盖[0.15, 0.21]
+    elif value <= TokenConfig.RATE_ZONE2_MAX:  # 区间二 [0.12, 0.24]
+        # 4个桶覆盖[0.12, 0.24]
         normalized = (value - TokenConfig.RATE_ZONE1_MAX) / (TokenConfig.RATE_ZONE2_MAX - TokenConfig.RATE_ZONE1_MAX)
         bucket = TokenConfig.RATE_ZONE1_BUCKETS + int(normalized * TokenConfig.RATE_ZONE2_BUCKETS)
         bucket = min(bucket, TokenConfig.RATE_ZONE1_BUCKETS + TokenConfig.RATE_ZONE2_BUCKETS - 1)
-    else:  # 区间三 [0.21, 1.0]
-        # 16个桶覆盖[0.21, 1.0]
+    else:  # 区间三 [0.24, 1.0]
+        # 8个桶覆盖[0.24, 1.0]
         normalized = (value - TokenConfig.RATE_ZONE2_MAX) / (1.0 - TokenConfig.RATE_ZONE2_MAX)
         bucket = TokenConfig.RATE_ZONE1_BUCKETS + TokenConfig.RATE_ZONE2_BUCKETS + int(normalized * TokenConfig.RATE_ZONE3_BUCKETS)
         bucket = min(bucket, TokenConfig.RATE_NUM_BUCKETS - 1)
-    
+
     return bucket
 
 
@@ -215,9 +246,9 @@ def tokenize_features(input_seq: np.ndarray, flatten: bool = True) -> np.ndarray
             bucket = _value_to_bucket(value, TokenConfig.OHLC_MIN, TokenConfig.OHLC_MAX, TokenConfig.OHLC_NUM_BUCKETS)
             token_ids[t, f] = ohlc_offsets[f] + bucket
         
-        # 特征4: volume（均匀分桶）
+        # 特征4: volume（非均匀分桶）
         value = input_seq[t, 4]
-        bucket = _value_to_bucket(value, TokenConfig.VOLUME_MIN, TokenConfig.VOLUME_MAX, TokenConfig.VOLUME_NUM_BUCKETS)
+        bucket = _nonuniform_bucket_volume(value)
         token_ids[t, 4] = TokenConfig.VOLUME_OFFSET + bucket
         
         # 特征5: exchange（非均匀分桶）
@@ -260,12 +291,23 @@ def tokenize_features_vectorized(input_seq: np.ndarray, flatten: bool = True) ->
                             TokenConfig.OHLC_NUM_BUCKETS - 1)
         token_ids[:, i] = buckets + ohlc_offsets[i]
     
-    # 特征4: volume（均匀分桶）
+    # 特征4: volume成交量变化（非均匀分桶，两段式，范围[0, 1]）
     vol = input_seq[:, 4]
-    vol_clipped = np.clip(vol, TokenConfig.VOLUME_MIN, TokenConfig.VOLUME_MAX)
-    vol_normalized = (vol_clipped - TokenConfig.VOLUME_MIN) / (TokenConfig.VOLUME_MAX - TokenConfig.VOLUME_MIN)
-    vol_buckets = np.minimum((vol_normalized * TokenConfig.VOLUME_NUM_BUCKETS).astype(np.int64),
-                            TokenConfig.VOLUME_NUM_BUCKETS - 1)
+    vol_clipped = np.clip(vol, 0.0, 1.0)
+    vol_buckets = np.zeros(seq_len, dtype=np.int64)
+    # 区间一 [0, 0.6]: 20个桶
+    zone1_mask = vol_clipped <= TokenConfig.VOLUME_ZONE1_MAX
+    # 区间二 [0.6, 1.0]: 16个桶
+    zone2_mask = vol_clipped > TokenConfig.VOLUME_ZONE1_MAX
+
+    vol_buckets[zone1_mask] = np.minimum(
+        (vol_clipped[zone1_mask] / TokenConfig.VOLUME_ZONE1_MAX * TokenConfig.VOLUME_ZONE1_BUCKETS).astype(np.int64),
+        TokenConfig.VOLUME_ZONE1_BUCKETS - 1
+    )
+    vol_buckets[zone2_mask] = TokenConfig.VOLUME_ZONE1_BUCKETS + np.minimum(
+        ((vol_clipped[zone2_mask] - TokenConfig.VOLUME_ZONE1_MAX) / (1.0 - TokenConfig.VOLUME_ZONE1_MAX) * TokenConfig.VOLUME_ZONE2_BUCKETS).astype(np.int64),
+        TokenConfig.VOLUME_ZONE2_BUCKETS - 1
+    )
     token_ids[:, 4] = vol_buckets + TokenConfig.VOLUME_OFFSET
     
     # 特征5: exchange换手率（非均匀分桶，两段式，范围[0, 1]）
@@ -341,12 +383,23 @@ def tokenize_batch(batch_input: np.ndarray, flatten: bool = True) -> np.ndarray:
                             TokenConfig.OHLC_NUM_BUCKETS - 1)
         token_ids[:, :, i] = buckets + ohlc_offsets[i]
     
-    # 特征4: volume
+    # 特征4: volume成交量变化（非均匀分桶，两段式，范围[0, 1]）
     vol = batch_input[:, :, 4]
-    vol_clipped = np.clip(vol, TokenConfig.VOLUME_MIN, TokenConfig.VOLUME_MAX)
-    vol_normalized = (vol_clipped - TokenConfig.VOLUME_MIN) / (TokenConfig.VOLUME_MAX - TokenConfig.VOLUME_MIN)
-    vol_buckets = np.minimum((vol_normalized * TokenConfig.VOLUME_NUM_BUCKETS).astype(np.int64),
-                            TokenConfig.VOLUME_NUM_BUCKETS - 1)
+    vol_clipped = np.clip(vol, 0.0, 1.0)
+    vol_buckets = np.zeros((batch_size, seq_len), dtype=np.int64)
+    # 区间一 [0, 0.6]: 20个桶
+    zone1_mask = vol_clipped <= TokenConfig.VOLUME_ZONE1_MAX
+    # 区间二 [0.6, 1.0]: 16个桶
+    zone2_mask = vol_clipped > TokenConfig.VOLUME_ZONE1_MAX
+
+    vol_buckets[zone1_mask] = np.minimum(
+        (vol_clipped[zone1_mask] / TokenConfig.VOLUME_ZONE1_MAX * TokenConfig.VOLUME_ZONE1_BUCKETS).astype(np.int64),
+        TokenConfig.VOLUME_ZONE1_BUCKETS - 1
+    )
+    vol_buckets[zone2_mask] = TokenConfig.VOLUME_ZONE1_BUCKETS + np.minimum(
+        ((vol_clipped[zone2_mask] - TokenConfig.VOLUME_ZONE1_MAX) / (1.0 - TokenConfig.VOLUME_ZONE1_MAX) * TokenConfig.VOLUME_ZONE2_BUCKETS).astype(np.int64),
+        TokenConfig.VOLUME_ZONE2_BUCKETS - 1
+    )
     token_ids[:, :, 4] = vol_buckets + TokenConfig.VOLUME_OFFSET
     
     # 特征5: exchange换手率（非均匀分桶，两段式，范围[0, 1]）
@@ -432,12 +485,24 @@ def tokenize_batch_torch(batch_input: torch.Tensor, flatten: bool = True) -> tor
                              max=TokenConfig.OHLC_NUM_BUCKETS - 1)
         token_ids[:, :, i] = buckets + ohlc_offsets[i]
     
-    # 特征4: volume
+    # 特征4: volume成交量变化（非均匀分桶，两段式，范围[0, 1]）
     vol = batch_input[:, :, 4]
-    vol_clipped = torch.clamp(vol, TokenConfig.VOLUME_MIN, TokenConfig.VOLUME_MAX)
-    vol_normalized = (vol_clipped - TokenConfig.VOLUME_MIN) / (TokenConfig.VOLUME_MAX - TokenConfig.VOLUME_MIN)
-    vol_buckets = torch.clamp((vol_normalized * TokenConfig.VOLUME_NUM_BUCKETS).long(),
-                             max=TokenConfig.VOLUME_NUM_BUCKETS - 1)
+    vol_clipped = torch.clamp(vol, 0.0, 1.0)
+    # 区间一 [0, 0.6]: 20个桶
+    zone1_mask = vol_clipped <= TokenConfig.VOLUME_ZONE1_MAX
+    # 区间二 [0.6, 1.0]: 16个桶
+    zone2_mask = vol_clipped > TokenConfig.VOLUME_ZONE1_MAX
+
+    # 计算各区间的桶索引
+    zone1_buckets = torch.clamp((vol_clipped / TokenConfig.VOLUME_ZONE1_MAX * TokenConfig.VOLUME_ZONE1_BUCKETS).long(),
+                                max=TokenConfig.VOLUME_ZONE1_BUCKETS - 1)
+    zone2_buckets = TokenConfig.VOLUME_ZONE1_BUCKETS + torch.clamp(
+        ((vol_clipped - TokenConfig.VOLUME_ZONE1_MAX) / (1.0 - TokenConfig.VOLUME_ZONE1_MAX) * TokenConfig.VOLUME_ZONE2_BUCKETS).long(),
+        max=TokenConfig.VOLUME_ZONE2_BUCKETS - 1
+    )
+
+    # 使用where选择正确的桶
+    vol_buckets = torch.where(zone1_mask, zone1_buckets, zone2_buckets)
     token_ids[:, :, 4] = vol_buckets + TokenConfig.VOLUME_OFFSET
     
     # 特征5: exchange换手率（非均匀分桶，两段式，范围[0, 1]）
@@ -528,14 +593,19 @@ def get_token_info(token_id: int) -> dict:
         bucket_width = (max_val - min_val) / num_buckets
         bucket_start = min_val + bucket_idx * bucket_width
         bucket_end = bucket_start + bucket_width
-    elif token_id < TokenConfig.EXCHANGE_OFFSET:  # 80-99: volume
+    elif token_id < TokenConfig.EXCHANGE_OFFSET:  # 80-115: volume（非均匀分桶，两段式）
         feature_idx = 4
         bucket_idx = token_id - TokenConfig.VOLUME_OFFSET
-        min_val, max_val, num_buckets = TokenConfig.VOLUME_MIN, TokenConfig.VOLUME_MAX, TokenConfig.VOLUME_NUM_BUCKETS
-        bucket_width = (max_val - min_val) / num_buckets
-        bucket_start = min_val + bucket_idx * bucket_width
-        bucket_end = bucket_start + bucket_width
-    elif token_id < TokenConfig.RATE_OFFSET:  # 100-159: exchange（非均匀分桶，两段式）
+        if bucket_idx < TokenConfig.VOLUME_ZONE1_BUCKETS:  # 区间一 [0, 0.6]
+            bucket_width = TokenConfig.VOLUME_ZONE1_MAX / TokenConfig.VOLUME_ZONE1_BUCKETS
+            bucket_start = bucket_idx * bucket_width
+            bucket_end = bucket_start + bucket_width
+        else:  # 区间二 [0.6, 1.0]
+            zone2_bucket_idx = bucket_idx - TokenConfig.VOLUME_ZONE1_BUCKETS
+            bucket_width = (1.0 - TokenConfig.VOLUME_ZONE1_MAX) / TokenConfig.VOLUME_ZONE2_BUCKETS
+            bucket_start = TokenConfig.VOLUME_ZONE1_MAX + zone2_bucket_idx * bucket_width
+            bucket_end = bucket_start + bucket_width
+    elif token_id < TokenConfig.RATE_OFFSET:  # 140-199: exchange（非均匀分桶，两段式）
         feature_idx = 5
         bucket_idx = token_id - TokenConfig.EXCHANGE_OFFSET
         if bucket_idx < TokenConfig.EXCHANGE_ZONE1_BUCKETS:  # 区间一 [0, 0.2]
@@ -547,7 +617,7 @@ def get_token_info(token_id: int) -> dict:
             bucket_width = (1.0 - TokenConfig.EXCHANGE_ZONE1_MAX) / TokenConfig.EXCHANGE_ZONE2_BUCKETS
             bucket_start = TokenConfig.EXCHANGE_ZONE1_MAX + zone2_bucket_idx * bucket_width
             bucket_end = bucket_start + bucket_width
-    else:  # 160-193: rate（非均匀分桶，三段式）
+    else:  # 200-233: rate（非均匀分桶，三段式）
         feature_idx = 6
         bucket_idx = token_id - TokenConfig.RATE_OFFSET
         if bucket_idx < TokenConfig.RATE_ZONE1_BUCKETS:  # 区间一 [0, 0.15]
@@ -585,9 +655,9 @@ if __name__ == "__main__":
     
     print(f"\n配置信息:")
     print(f"  OHLC桶数: {TokenConfig.OHLC_NUM_BUCKETS} (步长1%)")
-    print(f"  Volume桶数: {TokenConfig.VOLUME_NUM_BUCKETS} (步长5%)")
+    print(f"  Volume桶数: {TokenConfig.VOLUME_NUM_BUCKETS} (两段式: -100%到+100%用20桶步长10%, +100%到+500%用16桶步长25%)")
     print(f"  Exchange桶数: {TokenConfig.EXCHANGE_NUM_BUCKETS} (两段式: 0-20%用40桶步长0.5%, 20-100%用20桶步长4%)")
-    print(f"  Rate桶数: {TokenConfig.RATE_NUM_BUCKETS} (三段式: 0-1.5用15桶步长0.1, 1.5-2.1用3桶步长0.2, 2.1-10用16桶步长0.5)")
+    print(f"  Rate桶数: {TokenConfig.RATE_NUM_BUCKETS} (三段式: 0-1.2用12桶步长0.1, 1.2-2.4用4桶步长0.3, 2.4-10用8桶步长0.95)")
     print(f"  总词表大小: {TokenConfig.VOCAB_SIZE}")
     print(f"  Token序列长度: {TokenConfig.TOKEN_SEQ_LEN}")
     

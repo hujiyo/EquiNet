@@ -3,6 +3,7 @@ EquiNet 模型配置文件
 统一管理模型参数、训练参数和评估参数
 """
 
+import math
 import torch
 
 # ==================== 数据参数 ====================
@@ -83,7 +84,8 @@ class TrainingConfig:
     COSINE_ETA_MIN = 1e-5            # 余弦退火最小学习率（提高到1e-5，避免学习率过小）
     
     # 学习率预热参数
-    WARMUP_EPOCHS = 5                # 预热轮数（前5轮逐步达到最高学习率）
+    WARMUP_RATIO = 0.1               # 预热轮次占总训练轮数的比例
+    WARMUP_EPOCHS = max(1, math.ceil(EPOCHS * WARMUP_RATIO))
     WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
 
 # ==================== 设备配置 ====================
@@ -149,7 +151,7 @@ def print_config_summary():
     print(f"  学习率: {TrainingConfig.LEARNING_RATE}")
     print(f"  批处理大小: {TrainingConfig.BATCH_SIZE}")
     print(f"  每轮批次数: {TrainingConfig.BATCHES_PER_EPOCH}")
-    print(f"  预热轮数: {TrainingConfig.WARMUP_EPOCHS}")
+    print(f"  预热轮数: {TrainingConfig.WARMUP_EPOCHS} (≈{TrainingConfig.WARMUP_RATIO*100:.0f}% 训练轮数)")
     print(f"  预热起始学习率: {TrainingConfig.WARMUP_START_LR}")
     
     print(f"\n学习率调度:")

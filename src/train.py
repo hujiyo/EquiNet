@@ -1485,8 +1485,19 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     # 测试集损失同样使用动态加权BCE，保持评估一致性
     eval_criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
     
-    # 根据配置选择优化器：AdamW相比Adam有更好的泛化性能
-    if TrainingConfig.USE_ADAMW:
+    # 根据配置选择优化器：AdamW相比Adam有更好的泛化性能，Mano是流形优化器
+    if TrainingConfig.USE_MANO:
+        # 使用HybridManoAdamW混合优化器
+        from optimizers import create_optimizer
+        optimizer = create_optimizer(
+            model, 
+            optimizer_type='mano', 
+            lr=learning_rate,
+            momentum=TrainingConfig.MANO_MOMENTUM,
+            weight_decay=TrainingConfig.WEIGHT_DECAY,
+            betas=TrainingConfig.MANO_ADAMW_BETAS
+        )
+    elif TrainingConfig.USE_ADAMW:
         optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
         print(f"优化器: AdamW (weight_decay={TrainingConfig.WEIGHT_DECAY})")
     else:

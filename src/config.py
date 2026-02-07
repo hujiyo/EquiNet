@@ -65,8 +65,13 @@ class TrainingConfig:
 
     # 优化器参数
     USE_ADAMW = True                 # 是否使用AdamW优化器
+    USE_MANO = True                  # 是否使用Mano优化器（与AdamW/Adam互斥，优先级最高）
     WEIGHT_DECAY = 1e-5              # 权重衰减
     GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
+
+    # Mano优化器参数（当USE_MANO=True时生效）
+    MANO_MOMENTUM = 0.95             # Mano动量系数
+    MANO_ADAMW_BETAS = (0.9, 0.95)   # 混合优化器中AdamW部分的beta参数
 
     # 学习率调度器参数
     SCHEDULER_STEP_SIZE = 10         # 学习率调度步长

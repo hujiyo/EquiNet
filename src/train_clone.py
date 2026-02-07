@@ -82,8 +82,18 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
     model_b = None
     optimizer_b = None
 
-    # 模型A的优化器
-    if TrainingConfig.USE_ADAMW:
+    # 根据配置选择优化器
+    if TrainingConfig.USE_MANO:
+        from optimizers import create_optimizer
+        optimizer_a = create_optimizer(
+            model_a,
+            optimizer_type='mano',
+            lr=learning_rate,
+            momentum=TrainingConfig.MANO_MOMENTUM,
+            weight_decay=TrainingConfig.WEIGHT_DECAY,
+            betas=TrainingConfig.MANO_ADAMW_BETAS
+        )
+    elif TrainingConfig.USE_ADAMW:
         optimizer_a = optim.AdamW(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
     else:
         optimizer_a = optim.Adam(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
@@ -174,7 +184,17 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
             model_b = model_b.to(device)
 
             # 模型B使用半学习率，更保守的更新
-            if TrainingConfig.USE_ADAMW:
+            if TrainingConfig.USE_MANO:
+                from optimizers import create_optimizer
+                optimizer_b = create_optimizer(
+                    model_b,
+                    optimizer_type='mano',
+                    lr=learning_rate * 0.5,
+                    momentum=TrainingConfig.MANO_MOMENTUM,
+                    weight_decay=TrainingConfig.WEIGHT_DECAY,
+                    betas=TrainingConfig.MANO_ADAMW_BETAS
+                )
+            elif TrainingConfig.USE_ADAMW:
                 optimizer_b = optim.AdamW(model_b.parameters(), lr=learning_rate * 0.5,
                                           weight_decay=TrainingConfig.WEIGHT_DECAY)
             else:

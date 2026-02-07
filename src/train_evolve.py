@@ -142,7 +142,17 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     print(f"进化学习率: {evolve_lr:.6f} (原学习率的20%)")
     
     # 模型B的优化器（只训练B）
-    if TrainingConfig.USE_ADAMW:
+    if TrainingConfig.USE_MANO:
+        from optimizers import create_optimizer
+        optimizer_b = create_optimizer(
+            model_b,
+            optimizer_type='mano',
+            lr=evolve_lr,
+            momentum=TrainingConfig.MANO_MOMENTUM,
+            weight_decay=TrainingConfig.WEIGHT_DECAY,
+            betas=TrainingConfig.MANO_ADAMW_BETAS
+        )
+    elif TrainingConfig.USE_ADAMW:
         optimizer_b = optim.AdamW(model_b.parameters(), lr=evolve_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
     else:
         optimizer_b = optim.Adam(model_b.parameters(), lr=evolve_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
@@ -293,10 +303,19 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         # 如果检测到NaN，从教师1重新克隆B并重置优化器
         if nan_detected:
             model_b = copy.deepcopy(teachers[0])
-            # 使用更低的学习率重新开始
-            recover_lr = evolve_lr * 0.1  # 恢复时使用更低的学习率
             # 恢复时使用更低的学习率
-            if TrainingConfig.USE_ADAMW:
+            recover_lr = evolve_lr * 0.1  # 恢复时使用更低的学习率
+            if TrainingConfig.USE_MANO:
+                from optimizers import create_optimizer
+                optimizer_b = create_optimizer(
+                    model_b,
+                    optimizer_type='mano',
+                    lr=recover_lr,
+                    momentum=TrainingConfig.MANO_MOMENTUM,
+                    weight_decay=TrainingConfig.WEIGHT_DECAY,
+                    betas=TrainingConfig.MANO_ADAMW_BETAS
+                )
+            elif TrainingConfig.USE_ADAMW:
                 optimizer_b = optim.AdamW(model_b.parameters(), lr=recover_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
             else:
                 optimizer_b = optim.Adam(model_b.parameters(), lr=recover_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)

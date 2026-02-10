@@ -1070,11 +1070,13 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
 
     avg_return = np.mean(top_returns)
     total_return = np.sum(top_returns)
+    compound_return = np.prod(1 + top_returns) ** (1 / len(top_returns)) - 1  # 几何平均复利收益率
 
     top_stats = {
         'count': top_k,
         'avg_return': avg_return,
         'total_return': total_return,
+        'compound_return': compound_return,
         'filtered_count': 0  # 已在生成阶段过滤，这里为0
     }
 
@@ -1087,16 +1089,16 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     简化版模型评估函数（用于train_clone.py和train_evolve.py）
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
 
-    返回统计字典，包含:
-        auc: AUC得分
-        top_return: Top1%收益率
-        top_count: Top1%样本数
-        top_threshold: Top1%最低置信度
-        high_conf_count: 高置信(>0.7)样本数
-        low_conf_count: 低置信(<0.2)样本数
-        pred_mean: 预测均值
-        pred_std: 预测标准差
-        filtered_count: 被过滤的涨停样本数（始终为0，因已在生成阶段过滤）
+    返回统计字典，包含：
+        auc：AUC得分
+        top_return：Top1%收益率
+        top_count：Top1%样本数
+        top_threshold：Top1%最低置信度
+        high_conf_count：高置信(>0.7)样本数
+        low_conf_count：低置信(<0.2)样本数
+        pred_mean：预测均值
+        pred_std：预测标准差
+        filtered_count：被过滤的涨停样本数（始终为0，因已在生成阶段过滤）
     """
     model.eval()
 
@@ -1141,6 +1143,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     top_returns = all_returns[top_indices]
 
     top_return = np.mean(top_returns)
+    top_return_compound = np.prod(1 + top_returns) ** (1 / len(top_returns)) - 1  # 几何平均复利收益率
     top_threshold = all_preds[sorted_indices[top_k - 1]]
 
     # 统计高置信样本
@@ -1150,6 +1153,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     stats = {
         'auc': auc,
         'top_return': top_return,
+        'top_return_compound': top_return_compound,
         'top_count': top_k,
         'top_threshold': top_threshold,
         'high_conf_count': np.sum(high_conf),
@@ -1696,7 +1700,8 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
             # 记录当前轮次收益率
             epoch_return = {
                 'turn': epoch + 1,
-                'return': top_stats['avg_return'] * 100  # 转换为百分比
+                'return': top_stats['avg_return'] * 100,  # 转换为百分比
+                'return_compound': top_stats['compound_return'] * 100  # 复利收益率百分比
             }
             epoch_returns.append(epoch_return)
 
@@ -1747,11 +1752,13 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
             # 收益率对比（训练集 vs 测试集）- 用于检测过拟合
             train_return_pct = train_top_stats["avg_return"] * 100
             test_return_pct = top_stats["avg_return"] * 100
+            train_compound_pct = train_top_stats["compound_return"] * 100
+            test_compound_pct = top_stats["compound_return"] * 100
             return_gap = train_return_pct - test_return_pct
 
             print(f'  【过拟合检测】Top{DataConfig.TOP_PERCENT}%收益率对比:')
-            print(f'    训练集: {train_return_pct:+.2f}% (样本数={train_top_stats["count"]})')
-            print(f'    测试集: {test_return_pct:+.2f}% (样本数={top_stats["count"]})')
+            print(f'    训练集: {train_return_pct:+.2f}% | 复利: {train_compound_pct:+.2f}% (样本数={train_top_stats["count"]})')
+            print(f'    测试集: {test_return_pct:+.2f}% | 复利: {test_compound_pct:+.2f}% (样本数={top_stats["count"]})')
             print(f'    差距: {return_gap:+.2f}% ', end='')
             if return_gap > 1.0:
                 print('⚠️ 过拟合风险：训练集明显高于测试集')
@@ -1782,7 +1789,7 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
                 import copy
                 best_model_state = copy.deepcopy(model.state_dict())
                 print(f'  ✓ 发现更好的模型！{save_reason}（已缓存到内存）')
-                print(f'    详情: AUC={auc_score:.4f}, Top{DataConfig.TOP_PERCENT}%收益: 平均={top_stats["avg_return"]*100:+.2f}%, 累计={top_stats["total_return"]*100:+.2f}%')
+                print(f'    详情: AUC={auc_score:.4f}, Top{DataConfig.TOP_PERCENT}%收益: 平均={top_stats["avg_return"]*100:+.2f}% | 复利={top_stats["compound_return"]*100:+.2f}%, 累计={top_stats["total_return"]*100:+.2f}%')
 
             print("-" * 50)
 
@@ -1808,13 +1815,14 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"baseline_epoch_returns_{timestamp}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'return'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'return_compound'])
         writer.writeheader()
 
         for epoch_return in epoch_returns:
             row = {
                 'turn': epoch_return['turn'],
-                'return': f"{epoch_return['return']:.2f}"
+                'return': f"{epoch_return['return']:.2f}",
+                'return_compound': f"{epoch_return['return_compound']:.2f}"
             }
             writer.writerow(row)
 

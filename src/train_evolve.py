@@ -117,7 +117,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         
         # 评估教师模型
         stats = evaluate_model(teacher, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name=f"教师{i+1}")
-        print(f"  教师{i+1}: AUC={stats['auc']:.4f}, Top1%收益={stats['top_return']*100:+.2f}%")
+        print(f"  教师{i+1}: AUC={stats['auc']:.4f}, Top1%收益={stats['top_return']*100:+.2f}% | 复利={stats['top_return_compound']*100:+.2f}%")
     
     # 加载学生模型B
     print(f"正在加载学生模型B: {student_path}")
@@ -135,7 +135,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     
     # 评估初始学生B
     stats_b_init = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B(初始)")
-    print(f"  学生B: AUC={stats_b_init['auc']:.4f}, Top1%收益={stats_b_init['top_return']*100:+.2f}%")
+    print(f"  学生B: AUC={stats_b_init['auc']:.4f}, Top1%收益={stats_b_init['top_return']*100:+.2f}% | 复利={stats_b_init['top_return_compound']*100:+.2f}%")
     
     # 进化训练使用更低的学习率（已训练模型需要更小的学习率避免破坏已学特征）
     evolve_lr = learning_rate * 0.2  # 使用原学习率的20%
@@ -331,7 +331,8 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         # 记录当前轮次收益率
         epoch_return = {
             'turn': epoch + 1,
-            'return_b': stats_b['top_return'] * 100  # 转换为百分比
+            'return_b': stats_b['top_return'] * 100,  # 转换为百分比
+            'return_b_compound': stats_b['top_return_compound'] * 100  # 复利收益率百分比
         }
         epoch_returns.append(epoch_return)
 
@@ -341,7 +342,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         print(f"  [B最佳] Top1%收益: {best_return_b*100:+.2f}%")
         print(f"  [模型B] 损失: {avg_loss_b:.4f}, AUC: {stats_b['auc']:.4f}")
         print(f"          预测均值: {stats_b['pred_mean']:.3f}, 高置信(>0.7): {stats_b['high_conf_count']}, 低置信(<0.2): {stats_b['low_conf_count']}")
-        print(f"          Top1%收益: {stats_b['top_return']*100:+.2f}%")
+        print(f"          Top1%收益: {stats_b['top_return']*100:+.2f}% | 复利: {stats_b['top_return_compound']*100:+.2f}%")
         print(f"          伪标签统计: 伪正={total_pseudo_pos}, 伪负={total_pseudo_neg}, 不变={total_unchanged}")
         
         # 检查是否进化：B收益率 > B自己之前的最佳收益率
@@ -387,13 +388,14 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     timestamp_csv = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"evolve_epoch_returns_{timestamp_csv}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'B'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'B', 'B_compound'])
         writer.writeheader()
 
         for epoch_return in epoch_returns:
             row = {
                 'turn': epoch_return['turn'],
-                'B': f"{epoch_return['return_b']:.2f}"
+                'B': f"{epoch_return['return_b']:.2f}",
+                'B_compound': f"{epoch_return['return_b_compound']:.2f}"
             }
             writer.writerow(row)
 

@@ -17,7 +17,7 @@ class DataConfig:
     RANDOM_SEED = 42                 # 随机种子
     
     # 训练集时间范围限制
-    TRAIN_START_YEAR = 2021          # 训练集起始年份（2020年及以前的数据不参与训练）
+    TRAIN_START_YEAR = 2019          # 训练集起始年份（2020年及以前的数据不参与训练）
     
     # 样本生成参数
     CONTEXT_LENGTH = 60              # 历史数据长度（这是核心参数，其他地方应引用这个值）
@@ -39,7 +39,7 @@ class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
     INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
-    D_MODEL = 56                     # 模型维度（Transformer内部维度）
+    D_MODEL = 48                     # 模型维度（Transformer内部维度）
     EMBED_HIDDEN_DIM = 40           # Embedding中间层维度（两阶段FFN：6→40→D_MODEL）
     NHEAD = 4                        # 注意力头数
     NUM_LAYERS = 6                   # Transformer层数
@@ -65,7 +65,7 @@ class TrainingConfig:
 
     # 优化器参数
     USE_ADAMW = True                 # 是否使用AdamW优化器
-    USE_MANO = True                  # 是否使用Mano优化器（与AdamW/Adam互斥，优先级最高）
+    USE_MANO = False                  # 是否使用Mano优化器（与AdamW/Adam互斥，优先级最高）
     WEIGHT_DECAY = 1e-5              # 权重衰减
     GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
 

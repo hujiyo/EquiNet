@@ -1517,6 +1517,10 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
                 avg_loss = total_loss / (step + 1)
                 print(f'\r  训练进度: {progress:.1f}% ({step + 1}/{actual_batches}), 平均损失: {avg_loss:.4f}', end='', flush=True)
 
+            # 训练循环结束，计算最终的训练集平均损失
+            # 使用 actual_batches 确保与训练循环中的 avg_loss 一致
+            train_loss_epoch = total_loss / actual_batches
+
             print()  # 换行
             print()  # 空行
 
@@ -1585,14 +1589,6 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
                 model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
             )
 
-            # 记录当前轮次收益率
-            epoch_return = {
-                'turn': epoch + 1,
-                'return': top_stats['avg_return'] * 100,  # 转换为百分比
-                'return_compound': top_stats['compound_return'] * 100  # 复利收益率百分比
-            }
-            epoch_returns.append(epoch_return)
-
             # 计算训练集收益率（用于检测过拟合）
             _, _, _, _, _, _, _, _, train_top_stats = evaluate_model_batch(
                 model, train_eval_inputs, train_eval_targets, train_eval_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
@@ -1600,6 +1596,16 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
 
             # 计算测试集损失（使用固定权重的eval_criterion，保证可比性）
             test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
+
+            # 记录当前轮次收益率（必须在test_loss计算之后）
+            epoch_return = {
+                'turn': epoch + 1,
+                'return': top_stats['avg_return'] * 100,  # 转换为百分比
+                'return_compound': top_stats['compound_return'] * 100,  # 复利收益率百分比
+                'train_loss': train_loss_epoch,  # 训练集损失（基于实际batch数）
+                'test_loss': test_loss  # 测试集损失
+            }
+            epoch_returns.append(epoch_return)
 
             # 随机挑选5组样本打印模型输出值
             print_sample_predictions(model, eval_inputs, eval_targets, device, num_samples=5, epoch=epoch+1)
@@ -1633,7 +1639,6 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
                     print(f'    {interval}: 无预测')
 
             overall_acc = sum(class_correct) / sum(class_total) if sum(class_total) > 0 else 0
-            avg_loss = total_loss / batches_per_epoch
 
             print(f'  总体准确率: {overall_acc:.3f}')
 
@@ -1655,7 +1660,7 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
             else:
                 print('✓ 正常')
             print(f'  AUC得分: {auc_score:.4f}')
-            print(f'  训练集损失: {avg_loss:.4f}, 测试集损失: {test_loss:.4f}')
+            print(f'  训练集损失: {train_loss_epoch:.4f}, 测试集损失: {test_loss:.4f}')
 
             # 早停检测
             improved, improve_reason = early_stopping.check_improve(
@@ -1723,14 +1728,16 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"baseline_epoch_returns_{timestamp}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'return_compound'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'return_compound', 'train_loss', 'test_loss'])
         writer.writeheader()
 
         for epoch_return in epoch_returns:
             row = {
                 'turn': epoch_return['turn'],
                 'return': f"{epoch_return['return']:.2f}",
-                'return_compound': f"{epoch_return['return_compound']:.2f}"
+                'return_compound': f"{epoch_return['return_compound']:.2f}",
+                'train_loss': f"{epoch_return['train_loss']:.4f}",
+                'test_loss': f"{epoch_return['test_loss']:.4f}"
             }
             writer.writerow(row)
 

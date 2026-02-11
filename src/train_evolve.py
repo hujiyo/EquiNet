@@ -29,7 +29,8 @@ from train import (
     create_fixed_evaluation_dataset,
     TemporalSampler, sample_with_pools,
     evaluate_model,           # 统一的评估函数
-    generate_pseudo_labels    # 统一的top-k伪标签生成
+    generate_pseudo_labels,   # 统一的top-k伪标签生成
+    calculate_test_loss        # 测试集损失计算
 )
 
 
@@ -181,6 +182,10 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         per_sample = (-target * torch.log(pred_clamp) - (1 - target) * torch.log(1 - pred_clamp))
         weighted = per_sample * sample_weight
         return weighted.mean()
+
+    # 创建评估用的损失函数（用于计算test_loss）
+    from train import DynamicWeightedBCE
+    eval_criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
     
     # 记录最佳状态（以学生B的初始收益率为基准）
     best_return_b = stats_b_init['top_return']  # 初始基准为B自己的收益率
@@ -328,15 +333,20 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         # 评估模型B
         stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B")
 
+        avg_loss_b = total_loss_b / num_batches
+
+        # 计算测试集损失
+        test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, eval_criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
+
         # 记录当前轮次收益率
         epoch_return = {
             'turn': epoch + 1,
             'return_b': stats_b['top_return'] * 100,  # 转换为百分比
-            'return_b_compound': stats_b['top_return_compound'] * 100  # 复利收益率百分比
+            'return_b_compound': stats_b['top_return_compound'] * 100,  # 复利收益率百分比
+            'train_loss': avg_loss_b,  # 训练集损失
+            'test_loss': test_loss_b  # 测试集损失
         }
         epoch_returns.append(epoch_return)
-
-        avg_loss_b = total_loss_b / num_batches
         
         print(f"  [教师数量] {len(teachers)}个")
         print(f"  [B最佳] Top1%收益: {best_return_b*100:+.2f}%")
@@ -388,14 +398,16 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     timestamp_csv = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"evolve_epoch_returns_{timestamp_csv}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'B', 'B_compound'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'B', 'B_compound', 'train_loss', 'test_loss'])
         writer.writeheader()
 
         for epoch_return in epoch_returns:
             row = {
                 'turn': epoch_return['turn'],
                 'B': f"{epoch_return['return_b']:.2f}",
-                'B_compound': f"{epoch_return['return_b_compound']:.2f}"
+                'B_compound': f"{epoch_return['return_b_compound']:.2f}",
+                'train_loss': f"{epoch_return['train_loss']:.4f}",
+                'test_loss': f"{epoch_return['test_loss']:.4f}"
             }
             writer.writerow(row)
 

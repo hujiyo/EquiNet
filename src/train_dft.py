@@ -331,7 +331,11 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
             'return_a': stats_a['top_return'] * 100,  # 转换为百分比
             'return_a_compound': stats_a['top_return_compound'] * 100,  # 复利收益率百分比
             'return_b': None,  # 模型B尚未创建或未评估
-            'return_b_compound': None
+            'return_b_compound': None,
+            'train_loss_a': avg_loss_a,  # 训练集损失A
+            'test_loss_a': test_loss_a,  # 测试集损失A
+            'train_loss_b': None,  # 模型B尚未创建
+            'test_loss_b': None
         }
 
         # 早停检测（使用测试集loss）
@@ -364,7 +368,10 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
 
             avg_loss_b = total_loss_b / actual_batches if actual_batches > 0 else 0
 
-            print(f'  [模型B(DFT)] 损失: {avg_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
+            # 计算测试集损失B
+            test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
+
+            print(f'  [模型B(DFT)] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
             print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_b["top_return"]*100:+.2f}% | 复利: {stats_b["top_return_compound"]*100:+.2f}%')
 
@@ -380,6 +387,8 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
             # 更新当前轮次收益率（模型B已存在）
             epoch_return['return_b'] = stats_b['top_return'] * 100  # 转换为百分比
             epoch_return['return_b_compound'] = stats_b['top_return_compound'] * 100  # 复利收益率百分比
+            epoch_return['train_loss_b'] = avg_loss_b  # 训练集损失B
+            epoch_return['test_loss_b'] = test_loss_b  # 测试集损失B
 
         # 将当前轮次收益率添加到列表
         epoch_returns.append(epoch_return)
@@ -428,7 +437,7 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"dft_epoch_returns_{timestamp}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'A', 'A_compound', 'B_DFT', 'B_DFT_compound'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'A', 'A_compound', 'B_DFT', 'B_DFT_compound', 'train_loss_A', 'test_loss_A', 'train_loss_B', 'test_loss_B'])
         writer.writeheader()
 
         for epoch_return in epoch_returns:
@@ -438,7 +447,11 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
                 'A': f"{epoch_return['return_a']:.2f}" if epoch_return['return_a'] is not None else "",
                 'A_compound': f"{epoch_return['return_a_compound']:.2f}" if epoch_return['return_a_compound'] is not None else "",
                 'B_DFT': f"{epoch_return['return_b']:.2f}" if epoch_return['return_b'] is not None else "",
-                'B_DFT_compound': f"{epoch_return['return_b_compound']:.2f}" if epoch_return['return_b_compound'] is not None else ""
+                'B_DFT_compound': f"{epoch_return['return_b_compound']:.2f}" if epoch_return['return_b_compound'] is not None else "",
+                'train_loss_A': f"{epoch_return['train_loss_a']:.4f}" if epoch_return.get('train_loss_a') is not None else "",
+                'test_loss_A': f"{epoch_return['test_loss_a']:.4f}" if epoch_return.get('test_loss_a') is not None else "",
+                'train_loss_B': f"{epoch_return['train_loss_b']:.4f}" if epoch_return.get('train_loss_b') is not None else "",
+                'test_loss_B': f"{epoch_return['test_loss_b']:.4f}" if epoch_return.get('test_loss_b') is not None else ""
             }
             writer.writerow(row)
 

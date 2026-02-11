@@ -115,12 +115,13 @@ class TransformerLayer(nn.Module):
         self.attention = MultiHeadAttention(d_model, nhead)
 
         if self.use_ffn:
-            # 前馈网络，用于进一步处理注意力的输出
+            # 前馈网络，使用配置的扩展比例
+            ffn_hidden_dim = int(d_model * ModelConfig.FFN_EXPAND_RATIO)
             self.feed_forward = nn.Sequential(
-                nn.Linear(d_model, 160),  # 80 → 160
-                nn.GELU(),                 # GELU激活
-                nn.Dropout(ModelConfig.DROPOUT_RATE),  # 防过拟合
-                nn.Linear(160, d_model),   # 160 → 80
+                nn.Linear(d_model, ffn_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(ModelConfig.DROPOUT_RATE),
+                nn.Linear(ffn_hidden_dim, d_model),
             )
 
             # Pre-Norm: 在前馈网络之前进行归一化
@@ -322,12 +323,13 @@ class TokenizedTransformerLayer(nn.Module):
         self.attention = MultiHeadAttention(d_model, nhead)
 
         if self.use_ffn:
-            # FFN扩展比例：2x
+            # FFN扩展比例：使用配置的扩展比例
+            ffn_hidden_dim = int(d_model * ModelConfig.FFN_EXPAND_RATIO)
             self.feed_forward = nn.Sequential(
-                nn.Linear(d_model, d_model * 2),
+                nn.Linear(d_model, ffn_hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout_rate),
-                nn.Linear(d_model * 2, d_model),
+                nn.Linear(ffn_hidden_dim, d_model),
             )
 
             self.norm = nn.LayerNorm(d_model)

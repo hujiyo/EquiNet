@@ -140,35 +140,11 @@ class DynamicWeightedBCE(nn.Module):
         # 二分类动态权重：正样本和负样本分别使用动态权重
         pos_weight = self.pos_weight.to(dtype=loss.dtype, device=loss.device)
         neg_weight = self.weight_0_0.to(dtype=loss.dtype, device=loss.device)
-        
+
         # 根据标签分配权重：正样本用pos_weight，负样本用动态neg_weight
         weights = torch.where(targets_fp32 >= 0.5, pos_weight, neg_weight)
         loss = loss * weights
-        
-        # 🔥 新增：对预测偏差较大的样本进行指数级额外惩罚
-        # 计算预测概率值
-        predictions = torch.sigmoid(inputs_fp32)  # 将logits转为概率 [0, 1]
-        
-        # 计算预测值与真实标签之间的绝对差值
-        prediction_error = torch.abs(predictions - targets_fp32)
-        
-        # 当差值 >= 0.15时，应用指数级惩罚（阈值从0.2降低到0.15）
-        # 使用 3^(1.5×差值) 作为额外惩罚因子（底数从2提升到3，指数放大1.5倍）
-        # 例如：差值0.2 -> 3^0.3 ≈ 1.39 (温和惩罚)
-        #       差值0.5 -> 3^0.75 ≈ 2.28 (中等惩罚)
-        #       差值0.8 -> 3^1.2 ≈ 3.74 (强惩罚)
-        #       差值1.0 -> 3^1.5 ≈ 5.20 (损失放大5倍！)
-        penalty_multiplier = torch.where(
-            prediction_error >= 0.15,
-            torch.pow(3.0, prediction_error * 1.5),   # 指数级惩罚：3^(1.5×差值)
-            torch.ones_like(prediction_error)         # 差值<0.15时，惩罚因子为1（不额外惩罚）
-        )
 
-        penalty_multiplier = torch.clamp(penalty_multiplier, max=3.0)
-        
-        # 应用额外惩罚
-        loss = loss * penalty_multiplier
-        
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':
@@ -710,13 +686,33 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     if np.any(closes == 0) or np.any(volumes == 0):
         return None
 
-    # 🔥 新增：过滤涨停样本（在计算标签之前）
+    # 🔥 新增（第一阶段）：过滤非10%涨跌幅限制的股票样本
+    # 检查整个样本窗口（CONTEXT_LENGTH + FUTURE_DAYS）内的任意一天涨跌幅是否超过11%
+    # 如果超过，说明该股票可能是科创板/创业板/北交所等（20%或30%涨跌幅限制），踢除整个样本
+    # 使用11%作为阈值（留1%余量，避免误判正常10%股票的微小波动）
+    sample_window_start = start_idx - 1  # 包含前一天（用于计算第1天涨跌幅）
+    sample_window_end = start_idx + required_length  # 包含未来FUTURE_DAYS
+    sample_data = stock_data[sample_window_start:sample_window_end]
+
+    limit_threshold = 0.11  # 11%阈值
+
+    for day_idx in range(1, len(sample_data)):
+        today_close = sample_data[day_idx, 3]
+        yesterday_close = sample_data[day_idx - 1, 3]
+
+        if yesterday_close > 0:
+            daily_return = (today_close - yesterday_close) / yesterday_close
+            # 检查是否超过涨跌幅限制（涨幅或跌幅）
+            if abs(daily_return) > limit_threshold:
+                return None  # 过滤掉非10%涨跌幅限制的股票样本
+
+    # 🔥 新增（第二阶段）：过滤涨停样本（在计算标签之前）
     # 检查第60天（最后一天）的涨幅是否>=9.5%
     last_day_idx = start_idx + context_length - 1
     prev_day_idx = start_idx + context_length - 2
     prev_day_close = stock_data[prev_day_idx, 3]
     last_day_close = stock_data[last_day_idx, 3]
-    
+
     if prev_day_close > 0:
         last_day_return = (last_day_close - prev_day_close) / prev_day_close
         # 涨停阈值：9.5%

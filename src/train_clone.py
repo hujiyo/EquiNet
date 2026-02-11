@@ -31,8 +31,15 @@ from train import (
     EnhancedStockTransformer,
     evaluate_model,           # 统一的评估函数
     generate_pseudo_labels,   # 统一的伪标签生成
-    save_model_with_metadata  # 统一的模型保存
+    save_model_with_metadata, # 统一的模型保存
+    DynamicWeightedBCE        # 动态加权BCE损失函数
 )
+
+# ==================== 损失函数选择开关 ====================
+# 设置为 True 使用 DynamicWeightedBCE（正样本权重4.0，负样本动态调整）
+# 设置为 False 使用简单 BCE（无样本权重）
+USE_DYNAMIC_WEIGHTED_BCE = True
+# ========================================================
 
 
 def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
@@ -119,12 +126,55 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
     for param_group in optimizer_a.param_groups:
         param_group['lr'] = TrainingConfig.WARMUP_START_LR
 
-    # 损失函数
-    def bce_loss(pred, target):
-        pred = pred.squeeze()
-        eps = 1e-7
-        pred_clamp = torch.clamp(pred, eps, 1 - eps)
-        return (-target * torch.log(pred_clamp) - (1 - target) * torch.log(1 - pred_clamp)).mean()
+    # 损失函数选择
+    if USE_DYNAMIC_WEIGHTED_BCE:
+        print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
+        criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
+
+        def bce_loss(pred_logits, target, pred_sigmoided=None):
+            """
+            DynamicWeightedBCE需要使用logits（未经过sigmoid的输出）
+
+            Args:
+                pred_logits: 模型原始输出（logits）
+                target: 目标标签
+                pred_sigmoided: sigmoid后的概率（仅用于简单BCE模式，此模式下忽略）
+            """
+            criterion.update_weights(target)
+            return criterion(pred_logits, target)
+
+        def get_model_prediction(model, inputs):
+            """获取模型预测的logits（不经过sigmoid）"""
+            return model(inputs)
+
+        def apply_sigmoid(logits):
+            """对logits应用sigmoid"""
+            return torch.sigmoid(logits)
+
+    else:
+        print("损失函数: 简单BCE (无样本权重)")
+
+        def bce_loss(pred_logits, target, pred_sigmoided):
+            """
+            简单BCE使用sigmoid后的概率
+
+            Args:
+                pred_logits: 模型原始输出（此模式下忽略）
+                target: 目标标签
+                pred_sigmoided: sigmoid后的概率
+            """
+            pred = pred_sigmoided.squeeze()
+            eps = 1e-7
+            pred_clamp = torch.clamp(pred, eps, 1 - eps)
+            return (-target * torch.log(pred_clamp) - (1 - target) * torch.log(1 - pred_clamp)).mean()
+
+        def get_model_prediction(model, inputs):
+            """获取模型预测的sigmoid概率"""
+            return torch.sigmoid(model(inputs))
+
+        def apply_sigmoid(logits):
+            """已经应用了sigmoid，直接返回"""
+            return logits
 
     # 最佳模型A缓存（按Top1%收益率判断）
     best_return_a = -float('inf')
@@ -238,8 +288,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
 
             # ========== 训练模型A ==========
             optimizer_a.zero_grad()
-            pred_a = torch.sigmoid(model_a(batch_inputs))
-            loss_a = bce_loss(pred_a, batch_targets)
+            output_a = model_a(batch_inputs)
+            pred_a = apply_sigmoid(output_a)
+            loss_a = bce_loss(output_a, batch_targets, pred_a)
             loss_a.backward()
             torch.nn.utils.clip_grad_norm_(model_a.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
             optimizer_a.step()
@@ -251,7 +302,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
 
                 # 用【最佳模型A】的预测生成伪标签
                 with torch.no_grad():
-                    pred_a_for_pseudo = torch.sigmoid(best_model_a_for_pseudo(batch_inputs)).squeeze()
+                    output_a_for_pseudo = best_model_a_for_pseudo(batch_inputs)
+                    pred_a_for_pseudo = apply_sigmoid(output_a_for_pseudo).squeeze()
 
                 # 使用统一的伪标签生成函数
                 pseudo_targets_numpy, pseudo_stats = generate_pseudo_labels(
@@ -266,8 +318,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
                 total_unchanged += pseudo_stats['unchanged_count']
 
                 # 训练模型B
-                pred_b = torch.sigmoid(model_b(batch_inputs))
-                loss_b = bce_loss(pred_b, pseudo_targets)
+                output_b = model_b(batch_inputs)
+                pred_b = apply_sigmoid(output_b)
+                loss_b = bce_loss(output_b, pseudo_targets, pred_b)
                 loss_b.backward()
                 torch.nn.utils.clip_grad_norm_(model_b.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
                 optimizer_b.step()

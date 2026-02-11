@@ -23,12 +23,13 @@ from config import (ModelConfig, TrainingConfig, DataConfig,
                    DeviceConfig, ModelSaveConfig,
                    print_config_summary)
 
+from model import EnhancedStockTransformer
+
 from train import (
     WarmupScheduler,
     load_and_preprocess_data, calculate_stock_weights,
     create_fixed_evaluation_dataset,
     TemporalSampler, sample_with_pools,
-    EnhancedStockTransformer,
     evaluate_model,           # 统一的评估函数
     generate_pseudo_labels,   # 统一的伪标签生成
     save_model_with_metadata, # 统一的模型保存

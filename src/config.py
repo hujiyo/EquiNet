@@ -37,6 +37,12 @@ class DataConfig:
 # ==================== 模型架构参数 ====================
 class ModelConfig:
     """模型架构相关参数"""
+
+    # ========== 模型类型选择 ==========
+    # 'continuous': 连续值模型 (master分支，使用6维连续输入)
+    # 'tokenized': Token化模型 (test分支，将输入离散化为token ID)
+    MODEL_TYPE = 'continuous'  # 可选: 'continuous' 或 'tokenized'
+
     # 基础模型参数
     INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
     D_MODEL = 24                     # 模型维度（Transformer内部维度）
@@ -49,6 +55,11 @@ class ModelConfig:
     # 注意力机制参数（为小模型调整）
     DROPOUT_RATE = 0.1                 # Dropout比率设置为0降低欠拟合
     ATTENTION_DROPOUT = 0.1            # 注意力Dropout比率设置为0降低欠拟合
+
+    # Token化参数（仅当 MODEL_TYPE='tokenized' 时使用）
+    # 词表大小 = 4*20(OHLC) + 36(volume) + 60(exchange) = 176
+    VOCAB_SIZE = 176
+    TOKEN_SEQ_LEN = CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
 
 # ==================== 训练参数 ====================
 class TrainingConfig:

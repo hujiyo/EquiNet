@@ -3,9 +3,12 @@ EquiNet 模型定义文件
 
 包含所有模型架构相关的类：
 - PositionalEncoding: 位置编码
+- TwoDimensionalPositionalEncoding: 二维位置编码（用于Token化模型）
 - MultiHeadAttention: 多头注意力机制
 - TransformerLayer: Transformer层
-- EnhancedStockTransformer: 主模型类
+- EnhancedStockTransformer: 连续值模型（原始模型）
+- TokenizedStockTransformer: Token化模型（离散化输入）
+- create_model(): 工厂函数，根据配置创建对应模型
 """
 
 import torch
@@ -222,3 +225,295 @@ class EnhancedStockTransformer(nn.Module):
 
         output = self.output_projection(aggregated)  # [batch_size, output_dim]
         return output
+
+
+# ==================== Token化模型 ====================
+
+class TwoDimensionalPositionalEncoding(nn.Module):
+    """
+    二维位置编码：时间步 + 特征类型
+
+    设计原理：
+    - 60×6的时间序列被展平成360个token
+    - 每个token有两个结构信息：
+      1. temporal_id: 属于第几个时间步（0-59）
+      2. feature_id: 属于哪个特征（0-5，OHLC+volume+exchange）
+
+    编码方案：
+    - 将d_model分为两半：前一半用于时间步编码，后一半用于特征类型编码
+    - 使用正弦编码，避免学习参数
+    """
+    def __init__(self, d_model, num_timesteps=DataConfig.CONTEXT_LENGTH, num_features=ModelConfig.INPUT_DIM):
+        super(TwoDimensionalPositionalEncoding, self).__init__()
+
+        self.d_model = d_model
+        self.num_timesteps = num_timesteps  # 60
+        self.num_features = num_features     # 6
+
+        # 确保d_model是偶数，可以均分
+        assert d_model % 2 == 0, f"d_model ({d_model}) 必须是偶数以便均分给时间步和特征编码"
+
+        self.temporal_dim = d_model // 2  # 时间步编码维度
+        self.feature_dim = d_model // 2   # 特征类型编码维度
+
+        # 时间步编码：0-59
+        temporal_pe = torch.zeros(num_timesteps, self.temporal_dim)
+        temporal_pos = torch.arange(0, num_timesteps, dtype=torch.float).unsqueeze(1)
+
+        div_term = torch.exp(torch.arange(0, self.temporal_dim, 2).float() *
+                            (-math.log(10000.0) / self.temporal_dim))
+        temporal_pe[:, 0::2] = torch.sin(temporal_pos * div_term)
+        temporal_pe[:, 1::2] = torch.cos(temporal_pos * div_term)
+
+        self.register_buffer('temporal_pe', temporal_pe)
+
+        # 特征类型编码：0-5
+        feature_pe = torch.zeros(num_features, self.feature_dim)
+        feature_pos = torch.arange(0, num_features, dtype=torch.float).unsqueeze(1)
+
+        div_term = torch.exp(torch.arange(0, self.feature_dim, 2).float() *
+                            (-math.log(10000.0) / self.feature_dim))
+        feature_pe[:, 0::2] = torch.sin(feature_pos * div_term)
+        feature_pe[:, 1::2] = torch.cos(feature_pos * div_term)
+
+        self.register_buffer('feature_pe', feature_pe)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [batch_size, seq_len, d_model] 其中 seq_len = 360 (60*6)
+
+        Returns:
+            x + 二维位置编码
+        """
+        batch_size, seq_len, _ = x.shape
+        device = x.device
+
+        # 为每个token计算其时间步ID和特征ID
+        # token位置 0-359
+        token_positions = torch.arange(seq_len, device=device)
+
+        # temporal_id = token_pos // 6 (0-59)
+        temporal_ids = token_positions // self.num_features
+
+        # feature_id = token_pos % 6 (0-5)
+        feature_ids = token_positions % self.num_features
+
+        # 获取对应的位置编码
+        # [seq_len, temporal_dim]
+        temporal_encodings = self.temporal_pe[temporal_ids]
+
+        # [seq_len, feature_dim]
+        feature_encodings = self.feature_pe[feature_ids]
+
+        # 拼接两种编码 [seq_len, d_model]
+        positional_encodings = torch.cat([temporal_encodings, feature_encodings], dim=-1)
+
+        # 添加batch维度并加到输入上
+        return x + positional_encodings.unsqueeze(0)
+
+
+class TokenizedTransformerLayer(nn.Module):
+    """Token化模型的 Transformer 层（Pre-Norm架构）"""
+    def __init__(self, d_model, nhead, use_ffn=True, dropout_rate=0.1):
+        super(TokenizedTransformerLayer, self).__init__()
+
+        self.use_ffn = use_ffn
+        self.attention = MultiHeadAttention(d_model, nhead)
+
+        if self.use_ffn:
+            # FFN扩展比例：2x
+            self.feed_forward = nn.Sequential(
+                nn.Linear(d_model, d_model * 2),
+                nn.GELU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model * 2, d_model),
+            )
+
+            self.norm = nn.LayerNorm(d_model)
+            self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x):
+        x = self.attention(x, attn_mask=None)
+
+        if self.use_ffn:
+            normalized_x = self.norm(x)
+            ff_out = self.feed_forward(normalized_x)
+            x = x + self.dropout(ff_out)
+
+        return x
+
+
+class TokenizedStockTransformer(nn.Module):
+    """
+    Token化版本的股票预测Transformer
+
+    核心设计：
+    1. Token Embedding: 176个token → d_model维向量（查表）
+    2. 二维位置编码: 时间步编码(0-59) + 特征类型编码(0-5)
+    3. Transformer: 学习token间的关系（逐层递减dropout）
+    4. 输出: 聚合所有token信息进行预测
+    """
+    def __init__(self, vocab_size, d_model, nhead, num_layers, output_dim, max_seq_len):
+        super(TokenizedStockTransformer, self).__init__()
+
+        # Token Embedding层：将离散token ID映射到连续向量空间
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+
+        # 二维位置编码：时间步 + 特征类型
+        self.pos_encoding = TwoDimensionalPositionalEncoding(d_model)
+
+        # Transformer层：逐层递减dropout
+        dropout_rates = [max(0.05, 0.1 - i * 0.015) for i in range(num_layers)]
+        self.layers = nn.ModuleList([
+            TokenizedTransformerLayer(d_model, nhead, use_ffn=True, dropout_rate=dropout_rates[i])
+            for i in range(num_layers)
+        ])
+
+        # Pre-Norm架构的最终归一化
+        self.final_norm = nn.LayerNorm(d_model)
+
+        # 注意力聚合
+        self.attention_query = nn.Parameter(torch.randn(d_model) / math.sqrt(d_model))
+
+        # 输出投影层
+        self.output_projection = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(ModelConfig.DROPOUT_RATE),
+            nn.Linear(d_model // 2, output_dim)
+        )
+
+        self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
+
+        # 应用初始化
+        self.apply(init_weights)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [batch_size, 60, 6] 连续值 或 [batch_size, 360] token ID
+
+        Returns:
+            output: [batch_size, 1] 预测logits
+        """
+        # 如果输入是连续值，先进行token化
+        if x.dim() == 3 and x.size(-1) == ModelConfig.INPUT_DIM:
+            from tokenizer import tokenize_batch_torch
+            x = tokenize_batch_torch(x, flatten=True)
+
+        # 确保token ID是long类型
+        if x.dtype != torch.long:
+            x = x.long()
+
+        # Token Embedding查表
+        x = self.token_embedding(x)
+
+        # 位置编码
+        x = self.pos_encoding(x)
+        x = self.dropout(x)
+
+        # Transformer层
+        for layer in self.layers:
+            x = layer(x)
+
+        # 最终归一化
+        x = self.final_norm(x)
+
+        # 注意力聚合
+        attn_scores = torch.matmul(x, self.attention_query)
+        attn_weights = torch.softmax(attn_scores, dim=1)
+        aggregated = torch.sum(x * attn_weights.unsqueeze(-1), dim=1)
+
+        # 输出投影
+        output = self.output_projection(aggregated)
+        return output
+
+
+# ==================== 工厂函数 ====================
+
+def create_model(input_dim=None, d_model=None, nhead=None, num_layers=None,
+                 output_dim=None, seq_len=None):
+    """
+    根据配置创建模型（工厂函数）
+
+    根据 ModelConfig.MODEL_TYPE 自动选择：
+    - 'continuous': EnhancedStockTransformer（连续值模型）
+    - 'tokenized': TokenizedStockTransformer（Token化模型）
+
+    Args:
+        参数均为可选，如果不提供则使用 ModelConfig 中的默认值
+
+    Returns:
+        model: 对应类型的模型实例
+    """
+    # 使用配置中的默认值
+    input_dim = input_dim or ModelConfig.INPUT_DIM
+    d_model = d_model or ModelConfig.D_MODEL
+    nhead = nhead or ModelConfig.NHEAD
+    num_layers = num_layers or ModelConfig.NUM_LAYERS
+    output_dim = output_dim or ModelConfig.OUTPUT_DIM
+    seq_len = seq_len or DataConfig.CONTEXT_LENGTH
+
+    model_type = ModelConfig.MODEL_TYPE.lower()
+
+    if model_type == 'continuous':
+        # 创建连续值模型
+        model = EnhancedStockTransformer(
+            input_dim=input_dim,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            output_dim=output_dim,
+            seq_len=seq_len
+        )
+
+        # 打印模型信息
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        print(f"\n{'='*50}")
+        print(f"连续值模型架构 (EnhancedStockTransformer)")
+        print(f"{'='*50}")
+        print(f"输入维度: {input_dim}")
+        print(f"序列长度: {seq_len}")
+        print(f"Embedding维度: {d_model}")
+        print(f"注意力头数: {nhead}")
+        print(f"Transformer层数: {num_layers}")
+        print(f"总参数量: {total_params:,}")
+        print(f"可训练参数: {trainable_params:,}")
+        print(f"{'='*50}\n")
+
+    elif model_type == 'tokenized':
+        # 创建Token化模型
+        model = TokenizedStockTransformer(
+            vocab_size=ModelConfig.VOCAB_SIZE,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            output_dim=output_dim,
+            max_seq_len=ModelConfig.TOKEN_SEQ_LEN
+        )
+
+        # 打印模型信息
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        print(f"\n{'='*50}")
+        print(f"Token化模型架构 (TokenizedStockTransformer)")
+        print(f"{'='*50}")
+        print(f"词表大小: {ModelConfig.VOCAB_SIZE}")
+        print(f"Token序列长度: {ModelConfig.TOKEN_SEQ_LEN}")
+        print(f"位置编码: 二维 (时间步+特征类型)")
+        print(f"Embedding维度: {d_model}")
+        print(f"注意力头数: {nhead}")
+        print(f"Transformer层数: {num_layers}")
+        print(f"总参数量: {total_params:,}")
+        print(f"可训练参数: {trainable_params:,}")
+        print(f"{'='*50}\n")
+
+    else:
+        raise ValueError(f"未知的模型类型: {ModelConfig.MODEL_TYPE}。"
+                        f"请选择 'continuous' 或 'tokenized'")
+
+    return model

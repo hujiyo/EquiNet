@@ -183,8 +183,8 @@ class EnhancedStockTransformer(nn.Module):
 
         # 注意力聚合：学习每个时间步的重要性权重
         # 相比只用最后一个时间步，能更充分利用所有历史信息
-        # 使用缩放初始化，避免点积方差过大导致softmax接近one-hot
-        self.attention_query = nn.Parameter(torch.randn(d_model) / math.sqrt(d_model))
+        self.attention_query = nn.Parameter(torch.empty(d_model))
+        self.attention_scale = math.sqrt(d_model)
 
         # 简化输出层，减少过拟合
         self.output_projection = nn.Sequential(
@@ -198,6 +198,8 @@ class EnhancedStockTransformer(nn.Module):
 
         # 应用初始化
         self.apply(init_weights)
+        # attention_query 使用 Xavier uniform 等效初始化（fan_in=d_model, fan_out=1）
+        nn.init.xavier_uniform_(self.attention_query.data.unsqueeze(0), gain=1.0)
 
     def forward(self, x):
         # x: [batch_size, seq_len, 6] (OHLC + volume + exchange)
@@ -217,9 +219,9 @@ class EnhancedStockTransformer(nn.Module):
         #    因为每层的输出没有经过归一化
         x = self.final_norm(x)
 
-        # 5. 注意力聚合：自适应加权所有时间步
+        # 5. 注意力聚合：自适应加权所有时间步（scaled dot-product）
         # attn_scores: [batch_size, seq_len]
-        attn_scores = torch.matmul(x, self.attention_query)  # 每个时间步与query的相似度
+        attn_scores = torch.matmul(x, self.attention_query) / self.attention_scale
         attn_weights = torch.softmax(attn_scores, dim=1)     # 归一化为权重
         # aggregated: [batch_size, d_model] - 加权求和所有时间步
         aggregated = torch.sum(x * attn_weights.unsqueeze(-1), dim=1)
@@ -376,7 +378,8 @@ class TokenizedStockTransformer(nn.Module):
         self.final_norm = nn.LayerNorm(d_model)
 
         # 注意力聚合
-        self.attention_query = nn.Parameter(torch.randn(d_model) / math.sqrt(d_model))
+        self.attention_query = nn.Parameter(torch.empty(d_model))
+        self.attention_scale = math.sqrt(d_model)
 
         # 输出投影层
         self.output_projection = nn.Sequential(
@@ -390,6 +393,8 @@ class TokenizedStockTransformer(nn.Module):
 
         # 应用初始化
         self.apply(init_weights)
+        # attention_query 使用 Xavier uniform 等效初始化（fan_in=d_model, fan_out=1）
+        nn.init.xavier_uniform_(self.attention_query.data.unsqueeze(0), gain=1.0)
 
     def forward(self, x):
         """
@@ -422,8 +427,8 @@ class TokenizedStockTransformer(nn.Module):
         # 最终归一化
         x = self.final_norm(x)
 
-        # 注意力聚合
-        attn_scores = torch.matmul(x, self.attention_query)
+        # 注意力聚合（scaled dot-product）
+        attn_scores = torch.matmul(x, self.attention_query) / self.attention_scale
         attn_weights = torch.softmax(attn_scores, dim=1)
         aggregated = torch.sum(x * attn_weights.unsqueeze(-1), dim=1)
 

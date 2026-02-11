@@ -18,7 +18,7 @@ from config import (ModelConfig, TrainingConfig, DataConfig,
                    print_config_summary)
 
 # 从 model.py 导入模型定义
-from model import EnhancedStockTransformer
+from model import create_model
 
 # 学习率预热调度器
 class WarmupScheduler:
@@ -491,7 +491,7 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     if np.any(closes == 0) or np.any(volumes == 0):
         return None
 
-    # 🔥 新增（第一阶段）：过滤非10%涨跌幅限制的股票样本
+    # 第一阶段：过滤非10%涨跌幅限制的股票样本
     # 检查整个样本窗口（CONTEXT_LENGTH + FUTURE_DAYS）内的任意一天涨跌幅是否超过11%
     # 如果超过，说明该股票可能是科创板/创业板/北交所等（20%或30%涨跌幅限制），踢除整个样本
     # 使用11%作为阈值（留1%余量，避免误判正常10%股票的微小波动）
@@ -511,7 +511,7 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
             if abs(daily_return) > limit_threshold:
                 return None  # 过滤掉非10%涨跌幅限制的股票样本
 
-    # 🔥 新增（第二阶段）：过滤涨停样本（在计算标签之前）
+    # 第二阶段：过滤涨停样本（在计算标签之前）
     # 检查第60天（最后一天）的涨幅是否>=9.5%
     last_day_idx = start_idx + context_length - 1
     prev_day_idx = start_idx + context_length - 2
@@ -961,7 +961,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         'low_conf_count': np.sum(low_conf),
         'pred_mean': np.mean(all_preds),
         'pred_std': np.std(all_preds),
-        'filtered_count': 0  # 已在生成阶段过滤
+        'filtered_count': 0
     }
 
     return stats
@@ -1367,7 +1367,7 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     train_eval_inputs, train_eval_targets, train_eval_returns = create_train_evaluation_dataset(train_stock_info, first_n_days=80)
 
     # 使用自定义动态加权BCE损失函数
-    # 特点：1. 根据batch正负样本比例动态调整负样本权重 2. 对预测偏差大的样本指数级惩罚
+    # 特点：根据batch正负样本比例动态调整负样本权重
     criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
 
     # 测试集损失同样使用动态加权BCE，保持评估一致性
@@ -1795,14 +1795,7 @@ if __name__ == "__main__":
     print("="*60)
 
     print("正在创建 Transformer 模型 (BF16精度)...")
-    model = EnhancedStockTransformer(
-        input_dim=ModelConfig.INPUT_DIM, 
-        d_model=ModelConfig.D_MODEL, 
-        nhead=ModelConfig.NHEAD, 
-        num_layers=ModelConfig.NUM_LAYERS, 
-        output_dim=ModelConfig.OUTPUT_DIM,
-        seq_len=ModelConfig.SEQ_LEN
-    ).to(device)
+    model = create_model().to(device)
     
     # 将模型参数转换为BF16精度
     model = model.to(dtype=torch.bfloat16)
@@ -1897,14 +1890,7 @@ def predict_single_stock(model_path, stock_data, device=None):
     
     # 加载模型
     try:
-        model = EnhancedStockTransformer(
-            input_dim=ModelConfig.INPUT_DIM,
-            d_model=ModelConfig.D_MODEL,
-            nhead=ModelConfig.NHEAD,
-            num_layers=ModelConfig.NUM_LAYERS,
-            output_dim=ModelConfig.OUTPUT_DIM,
-            seq_len=ModelConfig.SEQ_LEN
-        ).to(device)
+        model = create_model().to(device)
         
         model = model.to(dtype=torch.bfloat16)
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -1945,14 +1931,7 @@ def predict_multiple_stocks(model_path, stock_files_data, device=None):
     
     # 加载模型（只加载一次）
     try:
-        model = EnhancedStockTransformer(
-            input_dim=ModelConfig.INPUT_DIM,
-            d_model=ModelConfig.D_MODEL,
-            nhead=ModelConfig.NHEAD,
-            num_layers=ModelConfig.NUM_LAYERS,
-            output_dim=ModelConfig.OUTPUT_DIM,
-            seq_len=ModelConfig.SEQ_LEN
-        ).to(device)
+        model = create_model().to(device)
         
         model = model.to(dtype=torch.bfloat16)
         model.load_state_dict(torch.load(model_path, map_location=device))

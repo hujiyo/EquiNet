@@ -21,7 +21,7 @@ from config import (ModelConfig, TrainingConfig, DataConfig,
                    DeviceConfig, ModelSaveConfig,
                    print_config_summary)
 
-from model import EnhancedStockTransformer
+from model import create_model
 
 from train import (
     WarmupScheduler,
@@ -101,14 +101,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     teachers = []
     print(f"正在加载{num_teachers}个教师模型...")
     for i, model_path in enumerate(teacher_paths):
-        teacher = EnhancedStockTransformer(
-            input_dim=ModelConfig.INPUT_DIM, 
-            d_model=ModelConfig.D_MODEL, 
-            nhead=ModelConfig.NHEAD, 
-            num_layers=ModelConfig.NUM_LAYERS, 
-            output_dim=ModelConfig.OUTPUT_DIM, 
-            seq_len=DataConfig.CONTEXT_LENGTH
-        ).to(device)
+        teacher = create_model().to(device)
         teacher = teacher.to(dtype=torch.bfloat16)
         
         state_dict = torch.load(model_path, map_location=device)
@@ -122,14 +115,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     
     # 加载学生模型B
     print(f"正在加载学生模型B: {student_path}")
-    model_b = EnhancedStockTransformer(
-        input_dim=ModelConfig.INPUT_DIM, 
-        d_model=ModelConfig.D_MODEL, 
-        nhead=ModelConfig.NHEAD, 
-        num_layers=ModelConfig.NUM_LAYERS, 
-        output_dim=ModelConfig.OUTPUT_DIM, 
-        seq_len=DataConfig.CONTEXT_LENGTH
-    ).to(device)
+    model_b = create_model().to(device)
     model_b = model_b.to(dtype=torch.bfloat16)
     state_dict = torch.load(student_path, map_location=device)
     model_b.load_state_dict(state_dict)

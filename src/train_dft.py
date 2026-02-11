@@ -28,7 +28,7 @@ from config import (ModelConfig, TrainingConfig, DataConfig,
                    DeviceConfig, ModelSaveConfig,
                    print_config_summary)
 
-from model import EnhancedStockTransformer
+from model import create_model
 
 from train import (
     WarmupScheduler,
@@ -493,16 +493,9 @@ if __name__ == "__main__":
     print(f"测试集: {len(test_stock_info)} 只股票")
     print("="*60)
 
-    # 创建模型A
+    # 创建模型A（使用工厂函数根据MODEL_TYPE自动选择模型类型）
     print("\n正在创建模型A (BF16精度)...")
-    model_a = EnhancedStockTransformer(
-        input_dim=ModelConfig.INPUT_DIM,
-        d_model=ModelConfig.D_MODEL,
-        nhead=ModelConfig.NHEAD,
-        num_layers=ModelConfig.NUM_LAYERS,
-        output_dim=ModelConfig.OUTPUT_DIM,
-        seq_len=DataConfig.CONTEXT_LENGTH
-    ).to(device)
+    model_a = create_model().to(device)
 
     model_a = model_a.to(dtype=torch.bfloat16)
 

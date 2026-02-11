@@ -56,7 +56,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # 直接添加位置编码，LayerNorm在后续层中使用
+        #添加位置编码，LayerNorm在后续层中可能使用
         seq_len = x.size(1)
         pe_slice = self.pe[:seq_len, :].unsqueeze(0)
         return x + pe_slice

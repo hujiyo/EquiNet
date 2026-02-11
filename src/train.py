@@ -1392,26 +1392,29 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
         optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
         print(f"优化器: Adam (weight_decay={TrainingConfig.WEIGHT_DECAY})")
     
+    # 计算动态预热轮次（总轮数的10%）
+    warmup_epochs = max(1, int(epochs * TrainingConfig.WARMUP_RATIO))
+
     # 创建预热调度器
     warmup_scheduler = WarmupScheduler(
-        optimizer, 
-        warmup_epochs=TrainingConfig.WARMUP_EPOCHS,
+        optimizer,
+        warmup_epochs=warmup_epochs,
         target_lr=learning_rate,
         start_lr=TrainingConfig.WARMUP_START_LR
     )
-    
+
     # 创建主调度器
     # 注意：虽然warmup_scheduler已经将optimizer的学习率设置为start_lr，
     # 但主调度器应该基于target_lr来工作。
     # 我们在创建主调度器前先临时设置为target_lr，这样主调度器就会以正确的学习率为基准
     for param_group in optimizer.param_groups:
         param_group['lr'] = learning_rate
-    
+
     # 根据配置选择主调度器
     if TrainingConfig.USE_COSINE_ANNEALING:
         # 修复：使用总轮数-预热轮数作为T_max，确保余弦退火覆盖整个训练过程
         # 避免在训练后期学习率再次上升
-        total_main_epochs = epochs - TrainingConfig.WARMUP_EPOCHS
+        total_main_epochs = epochs - warmup_epochs
         main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, 
             T_max=total_main_epochs,  # 使用实际的主训练轮数
@@ -1464,7 +1467,7 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
             if warmup_scheduler.is_warmup_phase():
                 # 预热阶段：使用预热调度器
                 current_lr = warmup_scheduler.step(epoch)
-                lr_status = f"预热阶段 ({epoch + 1}/{TrainingConfig.WARMUP_EPOCHS})"
+                lr_status = f"预热阶段 ({epoch + 1}/{warmup_epochs})"
             else:
                 # 预热结束后：使用主调度器获取当前学习率
                 current_lr = main_scheduler.get_last_lr()[0]

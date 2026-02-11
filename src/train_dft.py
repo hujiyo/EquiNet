@@ -104,10 +104,13 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
     else:
         optimizer_a = optim.Adam(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
 
+    # 计算动态预热轮次（总轮数的10%）
+    warmup_epochs = max(1, int(epochs * TrainingConfig.WARMUP_RATIO))
+
     # 学习率调度（模型A）
     warmup_scheduler_a = WarmupScheduler(
         optimizer_a,
-        warmup_epochs=TrainingConfig.WARMUP_EPOCHS,
+        warmup_epochs=warmup_epochs,
         target_lr=learning_rate,
         start_lr=TrainingConfig.WARMUP_START_LR
     )
@@ -115,7 +118,7 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
     for param_group in optimizer_a.param_groups:
         param_group['lr'] = learning_rate
 
-    total_main_epochs = epochs - TrainingConfig.WARMUP_EPOCHS
+    total_main_epochs = epochs - warmup_epochs
     main_scheduler_a = optim.lr_scheduler.CosineAnnealingLR(
         optimizer_a,
         T_max=total_main_epochs,
@@ -196,7 +199,7 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
         # 学习率更新
         if warmup_scheduler_a.is_warmup_phase():
             current_lr = warmup_scheduler_a.step(epoch)
-            lr_status = f"预热阶段 ({epoch + 1}/{TrainingConfig.WARMUP_EPOCHS})"
+            lr_status = f"预热阶段 ({epoch + 1}/{warmup_epochs})"
         else:
             current_lr = main_scheduler_a.get_last_lr()[0]
             lr_status = "正常训练"

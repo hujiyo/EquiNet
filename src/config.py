@@ -94,7 +94,7 @@ class TrainingConfig:
     COSINE_ETA_MIN = 1e-5            # 余弦退火最小学习率（提高到1e-5，避免学习率过小）
     
     # 学习率预热参数
-    WARMUP_EPOCHS = 5                # 预热轮数（前5轮逐步达到最高学习率）
+    WARMUP_RATIO = 0.1               # 预热轮数占比（总轮数的10%）
     WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
 
 # ==================== 设备配置 ====================
@@ -160,7 +160,8 @@ def print_config_summary():
     print(f"  学习率: {TrainingConfig.LEARNING_RATE}")
     print(f"  批处理大小: {TrainingConfig.BATCH_SIZE}")
     print(f"  每轮批次数: {TrainingConfig.BATCHES_PER_EPOCH}")
-    print(f"  预热轮数: {TrainingConfig.WARMUP_EPOCHS}")
+    warmup_epochs = max(1, int(TrainingConfig.EPOCHS * TrainingConfig.WARMUP_RATIO))
+    print(f"  预热轮数: {warmup_epochs} (总轮数的{TrainingConfig.WARMUP_RATIO*100:.0f}%)")
     print(f"  预热起始学习率: {TrainingConfig.WARMUP_START_LR}")
     
     print(f"\n学习率调度:")

@@ -169,9 +169,8 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         weighted = per_sample * sample_weight
         return weighted.mean()
 
-    # 创建评估用的损失函数（用于计算test_loss）
-    from train import DynamicWeightedBCE
-    eval_criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
+    # 创建评估用的损失函数（与训练损失函数一致：简单BCE，无加权）
+    eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
     
     # 记录最佳状态（以学生B的初始收益率为基准）
     best_return_b = stats_b_init['top_return']  # 初始基准为B自己的收益率

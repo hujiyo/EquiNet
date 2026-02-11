@@ -38,8 +38,7 @@ from train import (
     evaluate_model,           # 统一的评估函数
     save_model_with_metadata, # 统一的模型保存
     EarlyStopping,            # 早停机制
-    calculate_test_loss,      # 测试集损失计算
-    DynamicWeightedBCE        # 动态加权BCE损失函数（用于测试集loss计算）
+    calculate_test_loss       # 测试集损失计算
 )
 
 
@@ -143,8 +142,8 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
         per_sample_loss = -target * torch.log(pred_clamp) - (1 - target) * torch.log(1 - pred_clamp)
         return (per_sample_loss * weights).mean()
 
-    # 创建criterion用于测试集loss计算
-    criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
+    # 创建criterion用于测试集loss计算（与训练损失函数一致：简单BCE，无加权）
+    criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
     # DFT权重计算函数：基于A的预测排名分位数
     def compute_dft_weights(pred_a, w_min=dft_w_min, w_max=dft_w_max):

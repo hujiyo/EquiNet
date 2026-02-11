@@ -160,8 +160,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
     else:
         print("损失函数: 简单BCE (无样本权重)")
 
-        # 创建criterion用于测试集loss计算（简单BCE模式）
-        criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
+        # 创建criterion用于测试集loss计算（与训练损失函数一致：简单BCE，无加权）
+        criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
         def bce_loss(pred_logits, target, pred_sigmoided):
             """

@@ -1109,8 +1109,9 @@ def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, bat
             batch_targets = torch.tensor(eval_targets[start_idx:end_idx],
                                         dtype=torch.bfloat16).to(device)
 
-            # 动态更新权重：根据当前batch的正负样本比例
-            criterion.update_weights(batch_targets)
+            # 动态更新权重：根据当前batch的正负样本比例（仅DynamicWeightedBCE需要）
+            if hasattr(criterion, 'update_weights'):
+                criterion.update_weights(batch_targets)
 
             outputs = model(batch_inputs)
             loss = criterion(outputs.squeeze(-1), batch_targets)

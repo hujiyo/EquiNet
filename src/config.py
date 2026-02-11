@@ -49,7 +49,7 @@ class ModelConfig:
     D_MODEL = 24                     # 模型维度（Transformer内部维度）
     EMBED_HIDDEN_DIM = 36            # Embedding中间层维度（两阶段FFN：6→40→D_MODEL）
     FFN_EXPAND_RATIO = 2             # FFN隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
-    NHEAD = 4                        # 注意力头数
+    NHEAD = 2                        # 注意力头数
     NUM_LAYERS = 6                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）
     SEQ_LEN = DataConfig.CONTEXT_LENGTH  # 最大序列长度（直接引用CONTEXT_LENGTH，确保一致性）
@@ -92,8 +92,7 @@ class TrainingConfig:
     
     # 余弦退火调度器参数
     USE_COSINE_ANNEALING = True      # 是否使用余弦退火调度器
-    COSINE_T_MAX = 30                # 余弦退火周期（30轮完成衰减，更快收敛）
-    COSINE_ETA_MIN = 1e-5            # 余弦退火最小学习率（提高到1e-5，避免学习率过小）
+    COSINE_ETA_MIN = 5e-6            # 余弦退火最小学习率（训练末期的精细微调学习率）
     
     # 学习率预热参数
     WARMUP_RATIO = 0.1               # 预热轮数占比（总轮数的10%）
@@ -168,8 +167,10 @@ def print_config_summary():
     
     print(f"\n学习率调度:")
     if TrainingConfig.USE_COSINE_ANNEALING:
+        total_main_epochs = TrainingConfig.EPOCHS * (1 - TrainingConfig.WARMUP_RATIO)
         print(f"  调度策略: 余弦退火")
-        print(f"  退火周期: {TrainingConfig.COSINE_T_MAX}轮")
+        print(f"  预热阶段: 第1-{int(TrainingConfig.EPOCHS * TrainingConfig.WARMUP_RATIO)}轮")
+        print(f"  退火周期: {int(total_main_epochs)}轮 (主训练全程)")
         print(f"  最小学习率: {TrainingConfig.COSINE_ETA_MIN}")
     else:
         print(f"  调度策略: 阶梯衰减")

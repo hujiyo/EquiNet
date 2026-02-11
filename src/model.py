@@ -6,6 +6,7 @@ EquiNet 模型定义文件
 - TwoDimensionalPositionalEncoding: 二维位置编码（用于Token化模型）
 - MultiHeadAttention: 多头注意力机制
 - TransformerLayer: Transformer层
+- AttentionPooling: 多头注意力聚合（可学习query token + cross-attention）
 - EnhancedStockTransformer: 连续值模型（原始模型）
 - TokenizedStockTransformer: Token化模型（离散化输入）
 - create_model(): 工厂函数，根据配置创建对应模型
@@ -145,6 +146,60 @@ class TransformerLayer(nn.Module):
         return x
 
 
+class AttentionPooling(nn.Module):
+    """
+    多头注意力聚合（Multi-Head Attention Pooling）
+
+    使用一个可学习的 query token 通过多头 cross-attention 聚合序列信息。
+    相比单向量点积聚合，每个注意力头可以学到不同的时间聚合模式，
+    表达能力更强，且与 Transformer 架构风格一致。
+
+    参考: Set Transformer (Lee et al., 2019), Perceiver (Jaegle et al., 2021)
+    """
+    def __init__(self, d_model, nhead):
+        super(AttentionPooling, self).__init__()
+
+        # 可学习的 query token: [1, 1, d_model]
+        self.query = nn.Parameter(torch.empty(1, 1, d_model))
+
+        # Pre-Norm: 分别对 query 和 key-value 进行归一化
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+
+        # 多头 cross-attention: query 关注序列所有位置
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
+
+        # 初始化 query token
+        nn.init.xavier_uniform_(self.query)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [batch_size, seq_len, d_model] - Transformer 编码后的序列
+
+        Returns:
+            pooled: [batch_size, d_model] - 聚合后的表示向量
+        """
+        batch_size = x.size(0)
+
+        # 将 query 扩展到 batch 维度: [1, 1, d_model] -> [batch_size, 1, d_model]
+        query = self.query.expand(batch_size, -1, -1)
+
+        # Pre-Norm
+        query_normed = self.norm_q(query)
+        kv_normed = self.norm_kv(x)
+
+        # Cross-attention: query 关注序列所有位置
+        # attn_output: [batch_size, 1, d_model]
+        attn_output, _ = self.cross_attn(query_normed, kv_normed, kv_normed)
+
+        # 残差连接 + 去掉 seq_len=1 的维度
+        pooled = (query + self.dropout(attn_output)).squeeze(1)  # [batch_size, d_model]
+
+        return pooled
+
+
 class EnhancedStockTransformer(nn.Module):
     """
     改进的 Transformer 模型（Pre-Norm架构 + 统一Embedding）
@@ -181,10 +236,9 @@ class EnhancedStockTransformer(nn.Module):
         # 因为Pre-Norm的最后一层没有归一化输出
         self.final_norm = nn.LayerNorm(d_model)
 
-        # 注意力聚合：学习每个时间步的重要性权重
-        # 相比只用最后一个时间步，能更充分利用所有历史信息
-        self.attention_query = nn.Parameter(torch.empty(d_model))
-        self.attention_scale = math.sqrt(d_model)
+        # 多头注意力聚合：通过 cross-attention 聚合序列信息
+        # 相比单向量点积，每个注意力头可以学到不同的时间聚合模式
+        self.attention_pooling = AttentionPooling(d_model, nhead)
 
         # 简化输出层，减少过拟合
         self.output_projection = nn.Sequential(
@@ -198,8 +252,6 @@ class EnhancedStockTransformer(nn.Module):
 
         # 应用初始化
         self.apply(init_weights)
-        # attention_query 使用 Xavier uniform 等效初始化（fan_in=d_model, fan_out=1）
-        nn.init.xavier_uniform_(self.attention_query.data.unsqueeze(0), gain=1.0)
 
     def forward(self, x):
         # x: [batch_size, seq_len, 6] (OHLC + volume + exchange)
@@ -219,12 +271,8 @@ class EnhancedStockTransformer(nn.Module):
         #    因为每层的输出没有经过归一化
         x = self.final_norm(x)
 
-        # 5. 注意力聚合：自适应加权所有时间步（scaled dot-product）
-        # attn_scores: [batch_size, seq_len]
-        attn_scores = torch.matmul(x, self.attention_query) / self.attention_scale
-        attn_weights = torch.softmax(attn_scores, dim=1)     # 归一化为权重
-        # aggregated: [batch_size, d_model] - 加权求和所有时间步
-        aggregated = torch.sum(x * attn_weights.unsqueeze(-1), dim=1)
+        # 5. 多头注意力聚合
+        aggregated = self.attention_pooling(x)  # [batch_size, d_model]
 
         output = self.output_projection(aggregated)  # [batch_size, output_dim]
         return output
@@ -377,9 +425,8 @@ class TokenizedStockTransformer(nn.Module):
         # Pre-Norm架构的最终归一化
         self.final_norm = nn.LayerNorm(d_model)
 
-        # 注意力聚合
-        self.attention_query = nn.Parameter(torch.empty(d_model))
-        self.attention_scale = math.sqrt(d_model)
+        # 多头注意力聚合
+        self.attention_pooling = AttentionPooling(d_model, nhead)
 
         # 输出投影层
         self.output_projection = nn.Sequential(
@@ -393,8 +440,6 @@ class TokenizedStockTransformer(nn.Module):
 
         # 应用初始化
         self.apply(init_weights)
-        # attention_query 使用 Xavier uniform 等效初始化（fan_in=d_model, fan_out=1）
-        nn.init.xavier_uniform_(self.attention_query.data.unsqueeze(0), gain=1.0)
 
     def forward(self, x):
         """
@@ -427,10 +472,8 @@ class TokenizedStockTransformer(nn.Module):
         # 最终归一化
         x = self.final_norm(x)
 
-        # 注意力聚合（scaled dot-product）
-        attn_scores = torch.matmul(x, self.attention_query) / self.attention_scale
-        attn_weights = torch.softmax(attn_scores, dim=1)
-        aggregated = torch.sum(x * attn_weights.unsqueeze(-1), dim=1)
+        # 多头注意力聚合
+        aggregated = self.attention_pooling(x)  # [batch_size, d_model]
 
         # 输出投影
         output = self.output_projection(aggregated)

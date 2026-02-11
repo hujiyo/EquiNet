@@ -32,7 +32,9 @@ from train import (
     evaluate_model,           # 统一的评估函数
     generate_pseudo_labels,   # 统一的伪标签生成
     save_model_with_metadata, # 统一的模型保存
-    DynamicWeightedBCE        # 动态加权BCE损失函数
+    DynamicWeightedBCE,       # 动态加权BCE损失函数
+    EarlyStopping,            # 早停机制
+    calculate_test_loss       # 测试集损失计算
 )
 
 # ==================== 损失函数选择开关 ====================
@@ -154,6 +156,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
     else:
         print("损失函数: 简单BCE (无样本权重)")
 
+        # 创建criterion用于测试集loss计算（简单BCE模式）
+        criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
+
         def bce_loss(pred_logits, target, pred_sigmoided):
             """
             简单BCE使用sigmoid后的概率
@@ -191,10 +196,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
     best_threshold_a = 0.0
     best_threshold_b = 0.0
 
-    # 早停机制
-    patience = TrainingConfig.EPOCHS*0.25
-    no_improve_count = 0
-    best_loss_a = float('inf')
+    # 早停机制（patience = EPOCHS * 0.25）
+    patience = int(epochs * 0.25)
+    early_stopping = EarlyStopping(patience=patience)
 
     # 创建时间顺序采样器（使用train.py的统一采样机制）
     sampler = TemporalSampler(train_stock_info)
@@ -350,10 +354,14 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
         # 评估模型A（使用统一的评估函数）
         stats_a = evaluate_model(model_a, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="A")
 
+        # 计算训练集平均损失（仅用于显示）
         avg_loss_a = total_loss_a / actual_batches if actual_batches > 0 else 0
 
+        # 计算测试集损失（用于早停检测）
+        test_loss_a = calculate_test_loss(model_a, eval_inputs, eval_targets, criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
+
         # 打印模型A结果
-        print(f'  [模型A] 损失: {avg_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
+        print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
         print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
         print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_a["top_return"]*100:+.2f}% | 复利: {stats_a["top_return_compound"]*100:+.2f}%')
 
@@ -366,13 +374,20 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
             'return_b_compound': None
         }
 
-        # 早停检测
-        improved = False
+        # 早停检测（使用测试集loss）
+        improved, improve_reason = early_stopping.check_improve(
+            avg_loss=test_loss_a,
+            top_return=stats_a['top_return'],
+            auc=stats_a['auc'],
+            threshold=stats_a['top_threshold']
+        )
 
-        if avg_loss_a < best_loss_a:
-            best_loss_a = avg_loss_a
-            improved = True
-            print(f'          ✓ 损失改善: {best_loss_a:.4f}')
+        if improved:
+            no_improve_count, patience_limit = early_stopping.get_progress()
+            print(f'          ✓ {improve_reason} (进度: {no_improve_count}/{patience_limit})')
+        else:
+            no_improve_count, patience_limit = early_stopping.get_progress()
+            print(f'          ⚠ 无改善 ({no_improve_count}/{patience_limit})')
 
         # 更新用于生成伪标签的最佳模型A（按Top1%收益率判断）
         if stats_a['top_return'] > best_return_a:
@@ -383,17 +398,10 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
             else:
                 best_model_a_for_pseudo.load_state_dict(copy.deepcopy(model_a.state_dict()))
             best_model_a_for_pseudo.eval()
-            improved = True
-            print(f'          ✓ 新最佳模型A（收益率）！Top1%收益: {best_return_a*100:+.2f}% (第{best_return_epoch_a}轮)')
             best_model_a_by_return = copy.deepcopy(model_a.state_dict())
             best_auc_a_at_best_return = stats_a['auc']
             best_threshold_a = stats_a['top_threshold']
-
-        if improved:
-            no_improve_count = 0
-        else:
-            no_improve_count += 1
-            print(f'          ⚠ 无改善 ({no_improve_count}/{patience})')
+            print(f'          ✓ 新最佳模型A（收益率）！Top1%收益: {best_return_a*100:+.2f}% (第{best_return_epoch_a}轮)')
 
         # 评估模型B（如果存在）
         if model_b is not None:
@@ -426,7 +434,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
         print("-" * 60)
 
         # 早停检查
-        if no_improve_count >= patience:
+        if early_stopping.should_stop():
             print(f"\n⚠ 早停触发：连续{patience}轮无改善，停止训练")
             break
 

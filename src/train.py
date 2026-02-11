@@ -1286,12 +1286,12 @@ def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, bat
     total_loss = 0.0
     num_samples = len(eval_inputs)
     num_batches = (num_samples + batch_size - 1) // batch_size
-    
+
     with torch.no_grad():
         for i in range(num_batches):
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, num_samples)
-            
+
             batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx],
                                        dtype=torch.bfloat16).to(device)
             batch_targets = torch.tensor(eval_targets[start_idx:end_idx],
@@ -1303,8 +1303,91 @@ def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, bat
             outputs = model(batch_inputs)
             loss = criterion(outputs.squeeze(-1), batch_targets)
             total_loss += loss.item() * (end_idx - start_idx)
-    
+
     return total_loss / num_samples
+
+
+class EarlyStopping:
+    """
+    早停机制类
+
+    监控指标：
+    - avg_loss: 平均损失（越低越好）
+    - top_return: Top1%收益率（越高越好）
+
+    任意一个指标改善即重置计数器
+    """
+    def __init__(self, patience=10):
+        """
+        Args:
+            patience: 容忍无改善的轮数
+        """
+        self.patience = patience
+        self.no_improve_count = 0
+
+        # 用于min模式（如loss）
+        self.best_loss = float('inf')
+        # 用于max模式（如return）
+        self.best_return = -float('inf')
+        self.best_return_auc = 0.0
+        self.best_return_threshold = 0.0
+
+    def check_improve(self, avg_loss=None, top_return=None, auc=None, threshold=None):
+        """
+        检查是否有改善
+
+        Args:
+            avg_loss: 平均损失
+            top_return: Top1%收益率
+            auc: AUC得分（仅当收益率改善时更新）
+            threshold: Top阈值（仅当收益率改善时更新）
+
+        Returns:
+            improved: 是否有改善
+            reason: 改善原因字符串
+        """
+        improved = False
+        reasons = []
+
+        # 检查loss改善（min模式）
+        if avg_loss is not None and avg_loss < self.best_loss:
+            self.best_loss = avg_loss
+            improved = True
+            reasons.append(f'损失改善: {avg_loss:.4f}')
+
+        # 检查收益率改善（max模式）
+        if top_return is not None and top_return > self.best_return:
+            self.best_return = top_return
+            improved = True
+            if auc is not None:
+                self.best_return_auc = auc
+            if threshold is not None:
+                self.best_return_threshold = threshold
+            reasons.append(f'收益率改善: {top_return*100:+.2f}%')
+
+        if improved:
+            self.no_improve_count = 0
+            return True, ' & '.join(reasons)
+        else:
+            self.no_improve_count += 1
+            return False, None
+
+    def should_stop(self):
+        """是否应该停止训练"""
+        return self.no_improve_count >= self.patience
+
+    def get_progress(self):
+        """获取当前进度"""
+        return self.no_improve_count, self.patience
+
+    def get_best_metrics(self):
+        """获取最佳指标"""
+        return {
+            'best_loss': self.best_loss,
+            'best_return': self.best_return,
+            'best_return_auc': self.best_return_auc,
+            'best_return_threshold': self.best_return_threshold
+        }
 
 def print_sample_predictions(model, eval_inputs, eval_targets, device, num_samples=5, epoch=1):
     """
@@ -1547,7 +1630,11 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     best_loss = float('inf')  # 使用测试集loss作为保存标准（越低越好）
     best_model_state = None  # 缓存最佳模型状态（内存中）
     best_epoch = 0  # 记录最佳模型所在轮次
-    
+
+    # 早停机制（patience = EPOCHS * 0.25）
+    patience = int(epochs * 0.25)
+    early_stopping = EarlyStopping(patience=patience)
+
     # 创建训练用的随机数生成器
     train_rng = random.Random(DataConfig.RANDOM_SEED)
 
@@ -1765,6 +1852,21 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
             print(f'  AUC得分: {auc_score:.4f}')
             print(f'  训练集损失: {avg_loss:.4f}, 测试集损失: {test_loss:.4f}')
 
+            # 早停检测
+            improved, improve_reason = early_stopping.check_improve(
+                avg_loss=test_loss,
+                top_return=top_stats['avg_return'],
+                auc=auc_score,
+                threshold=top_stats.get('threshold', 0.0)
+            )
+
+            if improved:
+                no_improve_count, patience_limit = early_stopping.get_progress()
+                print(f'  ✓ {improve_reason} (进度: {no_improve_count}/{patience_limit})')
+            else:
+                no_improve_count, patience_limit = early_stopping.get_progress()
+                print(f'  ⚠ 无改善 ({no_improve_count}/{patience_limit})')
+
             # 保存最佳模型（使用测试集loss作为主要标准，同时监控AUC）
             MIN_AUC = DataConfig.MIN_AUC
 
@@ -1786,6 +1888,11 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
                 best_model_state = copy.deepcopy(model.state_dict())
                 print(f'  ✓ 发现更好的模型！{save_reason}（已缓存到内存）')
                 print(f'    详情: AUC={auc_score:.4f}, Top{DataConfig.TOP_PERCENT}%收益: 平均={top_stats["avg_return"]*100:+.2f}% | 复利={top_stats["compound_return"]*100:+.2f}%, 累计={top_stats["total_return"]*100:+.2f}%')
+
+            # 早停检查
+            if early_stopping.should_stop():
+                print(f"\n⚠ 早停触发：连续{patience}轮无改善，停止训练")
+                break
 
             print("-" * 50)
 

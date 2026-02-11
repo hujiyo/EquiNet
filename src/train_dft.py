@@ -273,7 +273,8 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
             loss_a.backward()
             torch.nn.utils.clip_grad_norm_(model_a.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
             optimizer_a.step()
-            total_loss_a += loss_a.item()
+            # 累加loss时乘以batch_size，得到该batch的总损失
+            total_loss_a += loss_a.item() * (end_idx - start_idx)
 
             # ========== 训练模型B（自引导DFT：用自己的预测排名算权重）==========
             if model_b is not None:
@@ -291,13 +292,16 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
                 loss_b.backward()
                 torch.nn.utils.clip_grad_norm_(model_b.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
                 optimizer_b.step()
-                total_loss_b += loss_b.item()
+                # 累加loss时乘以batch_size，得到该batch的总损失
+                total_loss_b += loss_b.item() * (end_idx - start_idx)
 
             # 进度显示
             progress = (step + 1) / actual_batches * 100
-            avg_loss_a = total_loss_a / (step + 1)
+            # 使用已处理的样本数计算当前平均损失
+            processed_samples = (step + 1) * batch_size
+            avg_loss_a = total_loss_a / processed_samples
             if model_b is not None:
-                avg_loss_b = total_loss_b / (step + 1)
+                avg_loss_b = total_loss_b / processed_samples
                 print(f'\r  训练进度: {progress:.1f}%, Loss_A: {avg_loss_a:.4f}, Loss_B(DFT): {avg_loss_b:.4f}', end='', flush=True)
             else:
                 print(f'\r  训练进度: {progress:.1f}%, Loss_A: {avg_loss_a:.4f}', end='', flush=True)
@@ -317,8 +321,10 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
         # 评估模型A（使用统一的评估函数）
         stats_a = evaluate_model(model_a, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="A")
 
-        # 计算训练集平均损失（仅用于显示）
-        avg_loss_a = total_loss_a / actual_batches if actual_batches > 0 else 0
+        # 计算训练集平均损失（除以样本数，与测试损失保持一致）
+        # total_loss_a已经是所有样本的总损失（累加时乘以了batch_size）
+        total_samples_a = len(epoch_inputs)
+        avg_loss_a = total_loss_a / total_samples_a if total_samples_a > 0 else 0
 
         # 计算测试集损失（用于早停检测）
         test_loss_a = calculate_test_loss(model_a, eval_inputs, eval_targets, criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
@@ -369,7 +375,10 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
         if model_b is not None:
             stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B")
 
-            avg_loss_b = total_loss_b / actual_batches if actual_batches > 0 else 0
+            # 计算训练集平均损失（除以样本数，与测试损失保持一致）
+            # total_loss_b已经是所有样本的总损失（累加时乘以了batch_size）
+            total_samples_b = len(epoch_inputs)
+            avg_loss_b = total_loss_b / total_samples_b if total_samples_b > 0 else 0
 
             # 计算测试集损失B
             test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)

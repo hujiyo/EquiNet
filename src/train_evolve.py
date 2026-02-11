@@ -278,18 +278,21 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
                 nan_detected = True
                 print(f"\n  ⚠ 检测到NaN/Inf，跳过本轮并重置模型B")
                 break
-            
+
             loss_b.backward()
-            
+
             torch.nn.utils.clip_grad_norm_(model_b.parameters(), max_norm=1.0)
             optimizer_b.step()
-            
-            total_loss_b += loss_b.item()
-            
+
+            # 累加loss时乘以batch_size，得到该batch的总损失
+            total_loss_b += loss_b.item() * (end_idx - start_idx)
+
             # 打印进度
             if (batch_idx + 1) % 10 == 0 or batch_idx == num_batches - 1:
                 progress = (batch_idx + 1) / num_batches * 100
-                print(f"\r  训练进度: {progress:.1f}%, Loss_B: {total_loss_b/(batch_idx+1):.4f}", end="")
+                # 使用已处理的样本数计算当前平均损失
+                processed_samples = (batch_idx + 1) * batch_size
+                print(f"\r  训练进度: {progress:.1f}%, Loss_B: {total_loss_b/processed_samples:.4f}", end="")
         
         # 如果检测到NaN，从教师1重新克隆B并重置优化器
         if nan_detected:
@@ -319,7 +322,10 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         # 评估模型B
         stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B")
 
-        avg_loss_b = total_loss_b / num_batches
+        # 计算训练集平均损失（除以样本数，与测试损失保持一致）
+        # total_loss_b已经是所有样本的总损失（累加时乘以了batch_size）
+        total_samples = len(train_inputs)
+        avg_loss_b = total_loss_b / total_samples if total_samples > 0 else 0
 
         # 计算测试集损失
         test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, eval_criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)

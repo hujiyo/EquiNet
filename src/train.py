@@ -1085,7 +1085,14 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
 
 def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, batch_size=100):
     """
-    计算测试集损失
+    计算测试集损失（官方标准：除以样本数）
+
+    计算方式：
+    - 每个batch的loss.item()是该batch内每样本的平均损失（reduction='mean'）
+    - 累加时乘以batch_size，得到所有样本的总损失
+    - 最终除以总样本数，得到每样本平均损失
+
+    这样与训练损失的计算方式保持一致，两者具有可比性
     """
     model.eval()
     total_loss = 0.0
@@ -1107,8 +1114,10 @@ def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, bat
 
             outputs = model(batch_inputs)
             loss = criterion(outputs.squeeze(-1), batch_targets)
+            # loss.item()是该batch内每样本的平均损失，乘以batch_size得到该batch总损失
             total_loss += loss.item() * (end_idx - start_idx)
 
+    # 返回每样本平均损失（官方标准）
     return total_loss / num_samples
 
 
@@ -1513,16 +1522,20 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
                 optimizer.step()
 
-                total_loss += loss.item()
+                # 累加loss时乘以batch_size，得到该batch的总损失
+                total_loss += loss.item() * (end_idx - start_idx)
 
                 # 实时更新进度显示
                 progress = (step + 1) / actual_batches * 100
-                avg_loss = total_loss / (step + 1)
+                # 使用已处理的样本数计算当前平均损失
+                processed_samples = (step + 1) * batch_size
+                avg_loss = total_loss / processed_samples
                 print(f'\r  训练进度: {progress:.1f}% ({step + 1}/{actual_batches}), 平均损失: {avg_loss:.4f}', end='', flush=True)
 
             # 训练循环结束，计算最终的训练集平均损失
-            # 使用 actual_batches 确保与训练循环中的 avg_loss 一致
-            train_loss_epoch = total_loss / actual_batches
+            # 除以总样本数（官方标准），与测试损失计算方式保持一致
+            # total_loss已经是所有样本的总损失（累加时乘以了batch_size）
+            train_loss_epoch = total_loss / num_samples
 
             print()  # 换行
             print()  # 空行

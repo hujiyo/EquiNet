@@ -60,7 +60,7 @@ class ModelConfig:
     # Token化参数（仅当 MODEL_TYPE='tokenized' 时使用）
     # 词表大小 = 4*20(OHLC) + 36(volume) + 60(exchange) = 176
     VOCAB_SIZE = 176
-    TOKEN_SEQ_LEN = CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
+    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
 
 # ==================== 训练参数 ====================
 class TrainingConfig:

@@ -14,7 +14,7 @@ from datetime import datetime
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from config import (ModelConfig, TrainingConfig, DataConfig,
-                   DeviceConfig, ModelSaveConfig,
+                   DeviceConfig, ModelSaveConfig, LossConfig,
                    print_config_summary)
 
 # 从 model.py 导入模型定义
@@ -242,7 +242,7 @@ def process_single_file(args):
             'train_start_idx': train_start_idx,  # 训练集采样起始索引
             'train_end_idx': train_end_idx,      # 训练集采样末索引（不含）
             'train_length': train_length,
-            'test_split_point': test_split_point  # 测试集起始位置（总长度-80）
+            'test_split_point': test_split_point
         }
         
         return stock_info
@@ -1376,12 +1376,15 @@ def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=
     eval_inputs, eval_targets, eval_cumulative_returns = create_fixed_evaluation_dataset(test_stock_info)
     train_eval_inputs, train_eval_targets, train_eval_returns = create_train_evaluation_dataset(train_stock_info, first_n_days=80)
 
-    # 使用自定义动态加权BCE损失函数
-    # 特点：根据batch正负样本比例动态调整负样本权重
-    criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
-
-    # 测试集损失同样使用动态加权BCE，保持评估一致性
-    eval_criterion = DynamicWeightedBCE(pos_weight=4.0, reduction='mean')
+    # 损失函数：由全局配置控制
+    if LossConfig.use_dynamic_bce():
+        print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
+        criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+    else:
+        print("损失函数: 简单BCE (BCEWithLogitsLoss)")
+        criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
     
     # 根据配置选择优化器：AdamW相比Adam有更好的泛化性能，Mano是流形优化器
     if TrainingConfig.USE_MANO:

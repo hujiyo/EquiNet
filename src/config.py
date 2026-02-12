@@ -98,6 +98,20 @@ class TrainingConfig:
     WARMUP_RATIO = 0.1               # 预热轮数占比（总轮数的10%）
     WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
 
+# ==================== 损失函数配置 ====================
+class LossConfig:
+    """损失函数相关配置"""
+
+    # 可选值: 'dynamic_bce'（使用DynamicWeightedBCE）或 'standard_bce'（使用BCEWithLogitsLoss）
+    LOSS_TYPE = 'dynamic_bce'
+
+    # DynamicWeightedBCE 的正样本权重
+    POS_WEIGHT = 4.0
+
+    @staticmethod
+    def use_dynamic_bce():
+        return LossConfig.LOSS_TYPE.lower() == 'dynamic_bce'
+
 # ==================== 设备配置 ====================
 class DeviceConfig:
     """设备相关配置"""

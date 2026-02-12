@@ -19,14 +19,14 @@ DFT模型训练脚本
   - 权重随训练动态演化：随着B学习进步，"不确定"的样本会变化，权重自然跟着调整
 '''
 
-import os, torch, torch.nn as nn, torch.optim as optim, numpy as np
+import os, torch, torch.nn as nn, torch.optim as optim, torch.nn.functional as F, numpy as np
 import copy
 import random
 import csv
 from datetime import datetime
 from config import (ModelConfig, TrainingConfig, DataConfig,
                    DeviceConfig, ModelSaveConfig,
-                   print_config_summary)
+                   print_config_summary, LossConfig)
 
 from model import create_model
 
@@ -38,7 +38,8 @@ from train import (
     evaluate_model,           # 统一的评估函数
     save_model_with_metadata, # 统一的模型保存
     EarlyStopping,            # 早停机制
-    calculate_test_loss       # 测试集损失计算
+    calculate_test_loss,
+    DynamicWeightedBCE        # 动态加权BCE损失函数
 )
 
 
@@ -127,23 +128,23 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
     for param_group in optimizer_a.param_groups:
         param_group['lr'] = TrainingConfig.WARMUP_START_LR
 
-    # 损失函数
-    def bce_loss(pred, target):
-        pred = pred.squeeze()
-        eps = 1e-7
-        pred_clamp = torch.clamp(pred, eps, 1 - eps)
-        return (-target * torch.log(pred_clamp) - (1 - target) * torch.log(1 - pred_clamp)).mean()
+    # 损失函数：由全局配置控制
+    if LossConfig.use_dynamic_bce():
+        print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
+        criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+    else:
+        print("损失函数: 简单BCE (BCEWithLogitsLoss)")
+        criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
-    # 加权损失函数（用于DFT模型B）
-    def weighted_bce_loss(pred, target, weights):
-        pred = pred.squeeze()
-        eps = 1e-7
-        pred_clamp = torch.clamp(pred, eps, 1 - eps)
-        per_sample_loss = -target * torch.log(pred_clamp) - (1 - target) * torch.log(1 - pred_clamp)
-        return (per_sample_loss * weights).mean()
+    def weighted_bce_with_logits(inputs, targets, weights):
+        """DFT加权损失，输入为logits，权重在batch内动态调节。"""
+        inputs = inputs.squeeze(-1)
+        targets = targets.squeeze()
+        weights = weights.squeeze()
 
-    # 创建criterion用于测试集loss计算（与训练损失函数一致：简单BCE，无加权）
-    criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        loss = F.binary_cross_entropy_with_logits(inputs.float(), targets.float(), reduction='none')
+        weights = weights.to(dtype=loss.dtype)
+        return (loss * weights).mean()
 
     # DFT权重计算函数：基于A的预测排名分位数
     def compute_dft_weights(pred_a, w_min=dft_w_min, w_max=dft_w_max):
@@ -267,8 +268,10 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
 
             # ========== 训练模型A ==========
             optimizer_a.zero_grad()
-            pred_a = torch.sigmoid(model_a(batch_inputs))
-            loss_a = bce_loss(pred_a, batch_targets)
+            output_a = model_a(batch_inputs)
+            if hasattr(criterion, 'update_weights'):
+                criterion.update_weights(batch_targets)
+            loss_a = criterion(output_a.squeeze(-1), batch_targets)
             loss_a.backward()
             torch.nn.utils.clip_grad_norm_(model_a.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
             optimizer_a.step()
@@ -280,14 +283,15 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
                 optimizer_b.zero_grad()
 
                 # B先做一次前向推理，拿到自己的预测值
-                pred_b = torch.sigmoid(model_b(batch_inputs))
+                output_b = model_b(batch_inputs)
 
                 # 用B自己的预测排名计算样本权重（中间排名高权值，头尾低权值）
                 with torch.no_grad():
-                    dft_weights = compute_dft_weights(pred_b)
+                    pred_b_prob = torch.sigmoid(output_b)
+                    dft_weights = compute_dft_weights(pred_b_prob)
 
                 # DFT：用原始标签 + 自引导权重训练
-                loss_b = weighted_bce_loss(pred_b, batch_targets, dft_weights)
+                loss_b = weighted_bce_with_logits(output_b, batch_targets, dft_weights)
                 loss_b.backward()
                 torch.nn.utils.clip_grad_norm_(model_b.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
                 optimizer_b.step()

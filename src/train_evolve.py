@@ -11,7 +11,7 @@
 这样就实现了模型的集成进化：M1, M2, ... → N
 '''
 
-import os, torch, torch.nn as nn, torch.optim as optim, numpy as np
+import os, torch, torch.nn as nn, torch.optim as optim, torch.nn.functional as F, numpy as np
 import copy
 import argparse
 import random
@@ -19,7 +19,7 @@ import csv
 from datetime import datetime
 from config import (ModelConfig, TrainingConfig, DataConfig,
                    DeviceConfig, ModelSaveConfig,
-                   print_config_summary)
+                   print_config_summary, LossConfig)
 
 from model import create_model
 
@@ -30,7 +30,8 @@ from train import (
     TemporalSampler, sample_with_pools,
     evaluate_model,           # 统一的评估函数
     generate_pseudo_labels,   # 统一的top-k伪标签生成
-    calculate_test_loss        # 测试集损失计算
+    calculate_test_loss,
+    DynamicWeightedBCE        # 动态加权BCE损失函数
 )
 
 
@@ -152,26 +153,30 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         eta_min=evolve_lr * 0.01  # 最小学习率
     )
     
-    # 损失函数
-    def bce_loss(pred, target):
-        pred = pred.squeeze()
-        eps = 1e-7
-        pred_clamp = torch.clamp(pred, eps, 1 - eps)
-        return (-target * torch.log(pred_clamp) - (1 - target) * torch.log(1 - pred_clamp)).mean()
+    # 损失函数：由全局配置控制
+    if LossConfig.use_dynamic_bce():
+        print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
+        criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+    else:
+        print("损失函数: 简单BCE (BCEWithLogitsLoss)")
+        criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
-    def bce_loss_weighted(pred, target, sample_weight):
-        pred = pred.squeeze()
-        target = target.squeeze()
-        sample_weight = sample_weight.squeeze()
-        eps = 1e-7
-        pred_clamp = torch.clamp(pred, eps, 1 - eps)
-        per_sample = (-target * torch.log(pred_clamp) - (1 - target) * torch.log(1 - pred_clamp))
-        weighted = per_sample * sample_weight
-        return weighted.mean()
+    def compute_loss(logits, targets, sample_weight=None):
+        logits = logits.squeeze(-1)
+        targets = targets.squeeze()
 
-    # 创建评估用的损失函数（与训练损失函数一致：简单BCE，无加权）
-    eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
-    
+        if LossConfig.use_dynamic_bce():
+            criterion.update_weights(targets)
+            return criterion(logits, targets)
+
+        loss = F.binary_cross_entropy_with_logits(logits.float(), targets.float(), reduction='none')
+        if sample_weight is not None:
+            weights = sample_weight.squeeze().to(dtype=loss.dtype)
+            loss = loss * weights
+        return loss.mean()
+
     # 记录最佳状态（以学生B的初始收益率为基准）
     best_return_b = stats_b_init['top_return']  # 初始基准为B自己的收益率
     best_auc_b = stats_b_init['auc']
@@ -266,11 +271,8 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
                 batch_weight = batch_weight.to(dtype=torch.bfloat16)
             
             optimizer_b.zero_grad()
-            preds_b = torch.sigmoid(model_b(batch_inputs))
-            if use_return_weight:
-                loss_b = bce_loss_weighted(preds_b, batch_targets, batch_weight)
-            else:
-                loss_b = bce_loss(preds_b, batch_targets)
+            logits_b = model_b(batch_inputs)
+            loss_b = compute_loss(logits_b, batch_targets, batch_weight if use_return_weight else None)
             
             # NaN检测
             if torch.isnan(loss_b) or torch.isinf(loss_b):

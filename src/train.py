@@ -914,8 +914,9 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
                 batch_inputs = epoch_inputs_tensor[start_idx:end_idx]
                 batch_targets = epoch_targets_tensor[start_idx:end_idx]
 
-                # 动态更新权重：根据当前batch的正负样本比例
-                criterion.update_weights(batch_targets)
+                # 动态更新权重：根据当前batch的正负样本比例（仅DynamicWeightedBCE需要）
+                if hasattr(criterion, 'update_weights'):
+                    criterion.update_weights(batch_targets)
 
                 optimizer.zero_grad()
                 output = model(batch_inputs)

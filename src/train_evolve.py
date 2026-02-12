@@ -31,7 +31,8 @@ from train import (
     evaluate_model,           # 统一的评估函数
     generate_pseudo_labels,   # 统一的top-k伪标签生成
     calculate_test_loss,
-    DynamicWeightedBCE        # 动态加权BCE损失函数
+    DynamicWeightedBCE,       # 动态加权BCE损失函数
+    save_model_with_metadata  # 统一的模型保存
 )
 
 
@@ -408,15 +409,19 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     print(f"  共记录 {len(epoch_returns)} 轮训练数据")
 
     # 保存最佳模型N（使用与train_clone相同的命名风格）
-    timestamp = datetime.now().strftime("%m%d_%H%M")
-    return_str = f"{best_return_b*100:+.2f}".replace('+', 'p').replace('-', 'n').replace('.', '_')
-    thr_str = f"{best_threshold_b:.3f}".replace('.', '_')
-    auc_str = f"{best_auc_b:.4f}".replace('.', '_')
-    
     final_teacher_count = len(teachers)
-    filename_n = f"evolved_top{DataConfig.TOP_PERCENT}_{return_str}pct_thr{thr_str}_auc{auc_str}_ep{best_epoch}_t{final_teacher_count}_{timestamp}.pth"
-    save_path_n = os.path.join(DataConfig.OUTPUT_DIR, filename_n)
-    torch.save(best_model_state, save_path_n)
+    extra_info = f"t{final_teacher_count}"
+    save_path_n = save_model_with_metadata(
+        best_model_state,
+        best_return_b,
+        best_threshold_b,
+        best_auc_b,
+        best_epoch,
+        model_prefix="evolved",
+        extra_info=extra_info,
+        output_dir=DataConfig.OUTPUT_DIR
+    )
+    filename_n = os.path.basename(save_path_n)
     print(f"✓ 进化模型N已保存: {filename_n}")
     print(f"  Top1%阈值: {best_threshold_b:.4f} (预测值≥此值即入选Top1%)")
     print("=" * 60)

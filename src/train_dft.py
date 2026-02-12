@@ -2,24 +2,22 @@
 DFT模型训练脚本
 
 核心思想：
-- 前30%轮：只训练模型A（原始标签）
-- 第30%轮：克隆模型A为模型B（完全独立的参数）
-- 第30%轮起：
-  - 模型A继续用原始标签训练（普通BCE）
-  - 模型B使用自引导DFT（Self-Guided Direct Fine-Tuning）机制：
-    用原始标签 + 基于自身预测排名的样本权重继续微调
+- 从out/目录加载已有模型权重
+- 使用自引导DFT（Self-Guided Direct Fine-Tuning）机制继续微调
+- 只训练这一个模型（B链路）
 
 自引导DFT权重机制（基于B自身的预测排名分位数）：
-  - 将B对batch内所有样本的预测值排序，得到每个样本的分位数 rank ∈ [0, 1]
-  - B预测排名最高的样本（rank→1）：B已经很确定是好的 → 低权值（已学会，无需多学）
-  - B预测排名最低的样本（rank→0）：B已经很确定是差的 → 低权值（已学会，无需多学）
-  - B预测排名在中间的样本（rank≈0.5）：B还没分清楚的 → 高权值（最有学习价值）
-  - 权重公式：w = w_min + (w_max - w_min) * 4 * rank * (1 - rank)
-    这是一个开口朝下的抛物线，在 rank=0.5 处取最大值 w_max，在 rank=0/1 处取最小值 w_min
-  - 权重随训练动态演化：随着B学习进步，"不确定"的样本会变化，权重自然跟着调整
+- 将B对batch内所有样本的预测值排序，得到每个样本的分位数 rank ∈ [0, 1]
+- B预测排名最高的样本（rank→1）：B已经很确定是好的 → 低权值（已学会，无需多学）
+- B预测排名最低的样本（rank→0）：B已经很确定是差的 → 低权值（已学会，无需多学）
+- B预测排名在中间的样本（rank≈0.5）：B还没分清楚的 → 高权值（最有学习价值）
+- 权重公式：w = w_min + (w_max - w_min) * 4 * rank * (1 - rank)
+  这是一个开口朝下的抛物线，在 rank=0.5 处取最大值 w_max，在 rank=0/1 处取最小值 w_min
+- 权重随训练动态演化：随着B学习进步，"不确定"的样本会变化，权重自然跟着调整
 '''
 
 import os, torch, torch.nn as nn, torch.optim as optim, torch.nn.functional as F, numpy as np
+import argparse
 import copy
 import random
 import csv
@@ -35,106 +33,84 @@ from train import (
     load_and_preprocess_data, calculate_stock_weights,
     create_fixed_evaluation_dataset,
     TemporalSampler, sample_with_pools,
-    evaluate_model,           # 统一的评估函数
-    save_model_with_metadata, # 统一的模型保存
-    EarlyStopping,            # 早停机制
+    evaluate_model,
+    save_model_with_metadata,
+    EarlyStopping,
     calculate_test_loss,
-    DynamicWeightedBCE        # 动态加权BCE损失函数
+    DynamicWeightedBCE
 )
 
 
-def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
+def train_dft_model(model, train_stock_info, test_stock_info, train_weights,
                     epochs=TrainingConfig.EPOCHS,
                     learning_rate=TrainingConfig.LEARNING_RATE,
                     device=None,
                     batch_size=TrainingConfig.BATCH_SIZE,
                     batches_per_epoch=TrainingConfig.BATCHES_PER_EPOCH,
-                    dft_epoch=TrainingConfig.EPOCHS*0.3,
                     dft_w_min=0.1,
-                    dft_w_max=1.0):
+                    dft_w_max=1.0,
+                    seed=DataConfig.RANDOM_SEED):
     """
-    DFT模型训练函数
+    DFT模型训练函数（自引导模式）
 
     训练策略：
-    - 前 dft_epoch 轮：只训练模型A
-    - 第 dft_epoch 轮：克隆模型A为模型B
-    - 之后：A继续原始训练，B使用DFT用原始标签+样本权重继续微调
-      - 样本权重基于A的预测排名分位数：中间排名高权值，头尾低权值
-      - w = w_min + (w_max - w_min) * 4 * rank * (1 - rank)
+    - 加载已有模型，使用自引导DFT继续微调
+    - 样本权重基于模型自身的预测排名分位数：中间排名高权值，头尾低权值
+    - w = w_min + (w_max - w_min) * 4 * rank * (1 - rank)
     """
     print("\n" + "="*60)
-    print("DFT模型训练")
+    print("DFT自引导微调训练")
     print("="*60)
     print(f"训练策略：")
-    print(f"  - 前{dft_epoch}轮：只训练模型A（原始标签）")
-    print(f"  - 第{dft_epoch}轮：克隆模型A为模型B")
-    print(f"  - 之后：")
-    print(f"    - 模型A：继续用原始标签训练")
-    print(f"    - 模型B：DFT用原始标签+排名分位数权重微调")
-    print(f"      - 权重范围: [{dft_w_min}, {dft_w_max}]")
-    print(f"      - 中间排名(rank≈0.5)权重最高，头尾(rank→0/1)权重最低")
+    print(f"  - 加载已有模型，使用自引导DFT继续微调")
+    print(f"  - 样本权重基于自身预测排名分位数")
+    print(f"  - 权重范围: [{dft_w_min}, {dft_w_max}]")
+    print(f"  - 中间排名(rank≈0.5)权重最高，头尾(rank→0/1)权重最低")
     print("="*60 + "\n")
 
-    # 设置随机种子
-    torch.manual_seed(DataConfig.RANDOM_SEED)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(DataConfig.RANDOM_SEED)
-        torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
-    # 创建评估数据集
     eval_inputs, eval_targets, eval_cumulative_returns = create_fixed_evaluation_dataset(test_stock_info)
 
-    # 模型B初始化为None
-    model_b = None
-    optimizer_b = None
+    stats_init = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="初始模型")
+    print(f"初始模型评估: AUC={stats_init['auc']:.4f}, Top1%收益={stats_init['top_return']*100:+.2f}% | 复利={stats_init['top_return_compound']*100:+.2f}%")
 
-    # 根据配置选择优化器
+    dft_lr = learning_rate * 0.2
+    print(f"DFT学习率: {dft_lr:.6f} (原学习率的20%)")
+
     if TrainingConfig.USE_MANO:
         from optimizers import create_optimizer
-        optimizer_a = create_optimizer(
-            model_a,
+        optimizer = create_optimizer(
+            model,
             optimizer_type='mano',
-            lr=learning_rate,
+            lr=dft_lr,
             momentum=TrainingConfig.MANO_MOMENTUM,
             weight_decay=TrainingConfig.WEIGHT_DECAY,
             betas=TrainingConfig.MANO_ADAMW_BETAS
         )
     elif TrainingConfig.USE_ADAMW:
-        optimizer_a = optim.AdamW(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
+        optimizer = optim.AdamW(model.parameters(), lr=dft_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
     else:
-        optimizer_a = optim.Adam(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
+        optimizer = optim.Adam(model.parameters(), lr=dft_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
 
-    # 计算动态预热轮次（总轮数的10%）
-    warmup_epochs = max(1, int(epochs * TrainingConfig.WARMUP_RATIO))
-
-    # 学习率调度（模型A）
-    warmup_scheduler_a = WarmupScheduler(
-        optimizer_a,
-        warmup_epochs=warmup_epochs,
-        target_lr=learning_rate,
-        start_lr=TrainingConfig.WARMUP_START_LR
-    )
-
-    for param_group in optimizer_a.param_groups:
-        param_group['lr'] = learning_rate
-
-    total_main_epochs = epochs - warmup_epochs
-    main_scheduler_a = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_a,
+    total_main_epochs = epochs
+    main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
         T_max=total_main_epochs,
-        eta_min=TrainingConfig.COSINE_ETA_MIN
+        eta_min=dft_lr * 0.01
     )
 
-    for param_group in optimizer_a.param_groups:
-        param_group['lr'] = TrainingConfig.WARMUP_START_LR
-
-    # 损失函数：由全局配置控制
     if LossConfig.use_dynamic_bce():
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
     else:
         print("损失函数: 简单BCE (BCEWithLogitsLoss)")
         criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
     def weighted_bce_with_logits(inputs, targets, weights):
         """DFT加权损失，输入为logits，权重在batch内动态调节。"""
@@ -146,358 +122,214 @@ def train_dft_model(model_a, train_stock_info, test_stock_info, train_weights,
         weights = weights.to(dtype=loss.dtype)
         return (loss * weights).mean()
 
-    # DFT权重计算函数：基于A的预测排名分位数
-    def compute_dft_weights(pred_a, w_min=dft_w_min, w_max=dft_w_max):
+    def compute_dft_weights(pred, w_min=dft_w_min, w_max=dft_w_max):
         """
-        根据A的预测值在batch内的排名分位数计算样本权重。
+        根据预测值在batch内的排名分位数计算样本权重。
         rank=0.5(中间排名)权重最高，rank=0/1(头尾)权重最低。
-        招物线公式：w = w_min + (w_max - w_min) * 4 * rank * (1 - rank)
+        抛物线公式：w = w_min + (w_max - w_min) * 4 * rank * (1 - rank)
         """
-        pred_a_squeezed = pred_a.squeeze().detach()
-        n = pred_a_squeezed.shape[0]
-        # argsort两次得到排名，归一化到[0,1]
-        ranks = pred_a_squeezed.argsort().argsort().float() / (n - 1) if n > 1 else torch.full_like(pred_a_squeezed, 0.5)
-        # 抛物线权重：在rank=0.5处取最大值
+        pred_squeezed = pred.squeeze().detach()
+        n = pred_squeezed.shape[0]
+        ranks = pred_squeezed.argsort().argsort().float() / (n - 1) if n > 1 else torch.full_like(pred_squeezed, 0.5)
         weights = w_min + (w_max - w_min) * 4.0 * ranks * (1.0 - ranks)
         return weights
 
-    # 最佳模型A缓存（按Top1%收益率判断）
-    best_return_a = -float('inf')
-    best_return_epoch_a = 0
+    best_return = stats_init['top_return']
+    best_auc = stats_init['auc']
+    best_threshold = stats_init['top_threshold']
+    best_model_state = copy.deepcopy(model.state_dict())
+    best_epoch = 0
 
-    # 按收益率保存的最佳模型（真正要用的模型）
-    best_return_b = -float('inf')
-    best_return_epoch_b = 0
-    best_model_a_by_return = None
-    best_model_b_by_return = None
-    best_auc_a_at_best_return = 0.0
-    best_auc_b_at_best_return = 0.0
-    best_threshold_a = 0.0
-    best_threshold_b = 0.0
-
-    # 早停机制（patience = EPOCHS * 0.25）
     patience = int(epochs * 0.25)
     early_stopping = EarlyStopping(patience=patience)
 
-    # 创建时间顺序采样器（使用train.py的统一采样机制）
     sampler = TemporalSampler(train_stock_info)
-    train_rng = random.Random(DataConfig.RANDOM_SEED)
+    train_rng = random.Random(seed)
 
-    # 记录每轮收益率
-    epoch_returns = []  # 格式: [{'turn': 1, 'return_a': 1.62, 'return_b': None}, ...]
+    epoch_returns = []
 
     for epoch in range(epochs):
-        model_a.train()
-        if model_b is not None:
-            model_b.train()
+        model.train()
 
-        total_loss_a = 0
-        total_loss_b = 0
+        total_loss = 0
+        total_samples = 0
 
-        has_model_b = (epoch + 1) >= dft_epoch
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f'Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f} (DFT微调)')
 
-        # 学习率更新
-        if warmup_scheduler_a.is_warmup_phase():
-            current_lr = warmup_scheduler_a.step(epoch)
-            lr_status = f"预热阶段 ({epoch + 1}/{warmup_epochs})"
-        else:
-            current_lr = main_scheduler_a.get_last_lr()[0]
-            lr_status = "正常训练"
-
-        status = "A+B训练(DFT)" if has_model_b else "只训练A"
-        print(f'Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f} ({lr_status}) [{status}]')
-
-        # 第dft_epoch轮时克隆模型B
-        if (epoch + 1) == dft_epoch and model_b is None:
-            print(f"\n  >>> 第{dft_epoch}轮：克隆模型A为模型B（DFT模式） <<<")
-            model_b = copy.deepcopy(model_a)
-            model_b = model_b.to(device)
-
-            # 模型B使用半学习率，更保守的更新
-            if TrainingConfig.USE_MANO:
-                from optimizers import create_optimizer
-                optimizer_b = create_optimizer(
-                    model_b,
-                    optimizer_type='mano',
-                    lr=learning_rate * 0.5,
-                    momentum=TrainingConfig.MANO_MOMENTUM,
-                    weight_decay=TrainingConfig.WEIGHT_DECAY,
-                    betas=TrainingConfig.MANO_ADAMW_BETAS
-                )
-            elif TrainingConfig.USE_ADAMW:
-                optimizer_b = optim.AdamW(model_b.parameters(), lr=learning_rate * 0.5,
-                                          weight_decay=TrainingConfig.WEIGHT_DECAY)
-            else:
-                optimizer_b = optim.Adam(model_b.parameters(), lr=learning_rate * 0.5,
-                                         weight_decay=TrainingConfig.WEIGHT_DECAY)
-            print(f"  模型B已创建（DFT模式：直接用原始标签微调），参数数: {sum(p.numel() for p in model_b.parameters()):,}")
-            print()
-
-        # 使用时间顺序采样器生成训练数据（与train.py统一）
         epoch_inputs, epoch_targets = sample_with_pools(
             sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
         )
 
-        # 打印循环统计
         looped_count, total_loops = sampler.get_loop_stats()
         print(f"  [循环统计] 已循环股票: {looped_count}/{len(train_stock_info)}, 总循环次数: {total_loops}")
 
-        # 打印标签分布
         count_positive = np.sum(epoch_targets >= 0.9)
         count_boundary = np.sum((epoch_targets > 0.1) & (epoch_targets < 0.9))
         count_negative = np.sum(epoch_targets <= 0.1)
         total_count = len(epoch_targets)
         print(f'  标签分布: 上涨={count_positive}({count_positive/total_count:.1%}), 边界={count_boundary}({count_boundary/total_count:.1%}), 不涨={count_negative}({count_negative/total_count:.1%})')
 
-        # 转换为tensor
         epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.bfloat16).to(device)
         epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.bfloat16).to(device)
 
-        # 计算实际可用的batch数量（防止索引越界）
         actual_batches = len(epoch_inputs_tensor) // batch_size
         if actual_batches < batches_per_epoch:
             print(f'  ⚠ 警告：实际batch数({actual_batches}) < 期望batch数({batches_per_epoch})，将使用实际数量')
 
-        # 训练循环：使用实际的batch数量，而不是固定的batches_per_epoch
         for step in range(actual_batches):
             start_idx = step * batch_size
-            end_idx = (step + 1) * batch_size  # 不需要min，因为actual_batches已经保证了不越界
+            end_idx = (step + 1) * batch_size
 
             batch_inputs = epoch_inputs_tensor[start_idx:end_idx]
             batch_targets = epoch_targets_tensor[start_idx:end_idx]
 
-            # ========== 训练模型A ==========
-            optimizer_a.zero_grad()
-            output_a = model_a(batch_inputs)
-            if hasattr(criterion, 'update_weights'):
-                criterion.update_weights(batch_targets)
-            loss_a = criterion(output_a.squeeze(-1), batch_targets)
-            loss_a.backward()
-            torch.nn.utils.clip_grad_norm_(model_a.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
-            optimizer_a.step()
-            # 累加loss时乘以batch_size，得到该batch的总损失
-            total_loss_a += loss_a.item() * (end_idx - start_idx)
+            optimizer.zero_grad()
 
-            # ========== 训练模型B（自引导DFT：用自己的预测排名算权重）==========
-            if model_b is not None:
-                optimizer_b.zero_grad()
+            output = model(batch_inputs)
 
-                # B先做一次前向推理，拿到自己的预测值
-                output_b = model_b(batch_inputs)
+            with torch.no_grad():
+                pred_prob = torch.sigmoid(output)
+                dft_weights = compute_dft_weights(pred_prob)
 
-                # 用B自己的预测排名计算样本权重（中间排名高权值，头尾低权值）
-                with torch.no_grad():
-                    pred_b_prob = torch.sigmoid(output_b)
-                    dft_weights = compute_dft_weights(pred_b_prob)
+            loss = weighted_bce_with_logits(output, batch_targets, dft_weights)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
+            optimizer.step()
 
-                # DFT：用原始标签 + 自引导权重训练
-                loss_b = weighted_bce_with_logits(output_b, batch_targets, dft_weights)
-                loss_b.backward()
-                torch.nn.utils.clip_grad_norm_(model_b.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
-                optimizer_b.step()
-                # 累加loss时乘以batch_size，得到该batch的总损失
-                total_loss_b += loss_b.item() * (end_idx - start_idx)
+            total_loss += loss.item() * (end_idx - start_idx)
+            total_samples += (end_idx - start_idx)
 
-            # 进度显示
             progress = (step + 1) / actual_batches * 100
-            # 使用已处理的样本数计算当前平均损失
-            processed_samples = (step + 1) * batch_size
-            avg_loss_a = total_loss_a / processed_samples
-            if model_b is not None:
-                avg_loss_b = total_loss_b / processed_samples
-                print(f'\r  训练进度: {progress:.1f}%, Loss_A: {avg_loss_a:.4f}, Loss_B(DFT): {avg_loss_b:.4f}', end='', flush=True)
-            else:
-                print(f'\r  训练进度: {progress:.1f}%, Loss_A: {avg_loss_a:.4f}', end='', flush=True)
+            avg_loss = total_loss / total_samples
+            print(f'\r  训练进度: {progress:.1f}%, Loss(DFT): {avg_loss:.4f}', end='', flush=True)
 
         print()
         print()
 
-        # 清理内存
         del epoch_inputs_tensor, epoch_targets_tensor
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # 更新学习率
-        if not warmup_scheduler_a.is_warmup_phase():
-            main_scheduler_a.step()
+        main_scheduler.step()
 
-        # 评估模型A（使用统一的评估函数）
-        stats_a = evaluate_model(model_a, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="A")
+        stats = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="DFT")
 
-        # 计算训练集平均损失（除以样本数，与测试损失保持一致）
-        # total_loss_a已经是所有样本的总损失（累加时乘以了batch_size）
-        total_samples_a = len(epoch_inputs)
-        avg_loss_a = total_loss_a / total_samples_a if total_samples_a > 0 else 0
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0
+        test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
 
-        # 计算测试集损失（用于早停检测）
-        test_loss_a = calculate_test_loss(model_a, eval_inputs, eval_targets, criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
+        print(f'  [DFT模型] 训练损失: {avg_loss:.4f}, 测试损失: {test_loss:.4f}, AUC: {stats["auc"]:.4f}')
+        print(f'            预测均值: {stats["pred_mean"]:.3f}, 高置信(>0.7): {stats["high_conf_count"]}, 低置信(<0.2): {stats["low_conf_count"]}')
+        print(f'            Top{DataConfig.TOP_PERCENT}%收益: {stats["top_return"]*100:+.2f}% | 复利: {stats["top_return_compound"]*100:+.2f}%')
 
-        # 打印模型A结果
-        print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
-        print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
-        print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_a["top_return"]*100:+.2f}% | 复利: {stats_a["top_return_compound"]*100:+.2f}%')
-
-        # 记录当前轮次收益率
         epoch_return = {
             'turn': epoch + 1,
-            'return_a': stats_a['top_return'] * 100,  # 转换为百分比
-            'return_a_compound': stats_a['top_return_compound'] * 100,  # 复利收益率百分比
-            'return_b': None,  # 模型B尚未创建或未评估
-            'return_b_compound': None,
-            'train_loss_a': avg_loss_a,  # 训练集损失A
-            'test_loss_a': test_loss_a,  # 测试集损失A
-            'train_loss_b': None,  # 模型B尚未创建
-            'test_loss_b': None
+            'return': stats['top_return'] * 100,
+            'return_compound': stats['top_return_compound'] * 100,
+            'train_loss': avg_loss,
+            'test_loss': test_loss
         }
+        epoch_returns.append(epoch_return)
 
-        # 早停检测（使用测试集loss）
         improved, improve_reason = early_stopping.check_improve(
-            avg_loss=test_loss_a,
-            top_return=stats_a['top_return'],
-            auc=stats_a['auc'],
-            threshold=stats_a['top_threshold']
+            avg_loss=test_loss,
+            top_return=stats['top_return'],
+            auc=stats['auc'],
+            threshold=stats['top_threshold']
         )
 
         if improved:
             no_improve_count, patience_limit = early_stopping.get_progress()
-            print(f'          ✓ {improve_reason} (进度: {no_improve_count}/{patience_limit})')
+            print(f'            ✓ {improve_reason} (进度: {no_improve_count}/{patience_limit})')
         else:
             no_improve_count, patience_limit = early_stopping.get_progress()
-            print(f'          ⚠ 无改善 ({no_improve_count}/{patience_limit})')
+            print(f'            ⚠ 无改善 ({no_improve_count}/{patience_limit})')
 
-        # 更新最佳模型A（按Top1%收益率判断）
-        if stats_a['top_return'] > best_return_a:
-            best_return_a = stats_a['top_return']
-            best_return_epoch_a = epoch + 1
-            best_model_a_by_return = copy.deepcopy(model_a.state_dict())
-            best_auc_a_at_best_return = stats_a['auc']
-            best_threshold_a = stats_a['top_threshold']
-            print(f'          ✓ 新最佳模型A（收益率）！Top1%收益: {best_return_a*100:+.2f}% (第{best_return_epoch_a}轮)')
-
-        # 评估模型B（如果存在）
-        if model_b is not None:
-            stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B")
-
-            # 计算训练集平均损失（除以样本数，与测试损失保持一致）
-            # total_loss_b已经是所有样本的总损失（累加时乘以了batch_size）
-            total_samples_b = len(epoch_inputs)
-            avg_loss_b = total_loss_b / total_samples_b if total_samples_b > 0 else 0
-
-            # 计算测试集损失B
-            test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
-
-            print(f'  [模型B(DFT)] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
-            print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
-            print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_b["top_return"]*100:+.2f}% | 复利: {stats_b["top_return_compound"]*100:+.2f}%')
-
-            # 保存最佳模型B（按收益率）
-            if stats_b['top_return'] > best_return_b:
-                best_return_b = stats_b['top_return']
-                best_return_epoch_b = epoch + 1
-                best_model_b_by_return = copy.deepcopy(model_b.state_dict())
-                best_auc_b_at_best_return = stats_b['auc']
-                best_threshold_b = stats_b['top_threshold']
-                print(f'          ✓ 新最佳模型B(DFT)（收益率）！Top1%收益: {best_return_b*100:+.2f}% (第{best_return_epoch_b}轮)')
-
-            # 更新当前轮次收益率（模型B已存在）
-            epoch_return['return_b'] = stats_b['top_return'] * 100  # 转换为百分比
-            epoch_return['return_b_compound'] = stats_b['top_return_compound'] * 100  # 复利收益率百分比
-            epoch_return['train_loss_b'] = avg_loss_b  # 训练集损失B
-            epoch_return['test_loss_b'] = test_loss_b  # 测试集损失B
-
-        # 将当前轮次收益率添加到列表
-        epoch_returns.append(epoch_return)
+        if stats['top_return'] > best_return:
+            best_return = stats['top_return']
+            best_auc = stats['auc']
+            best_threshold = stats['top_threshold']
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch + 1
+            print(f'            ✓ 新最佳模型！Top1%收益: {best_return*100:+.2f}% (第{best_epoch}轮)')
 
         print("-" * 60)
 
-        # 早停检查
         if early_stopping.should_stop():
             print(f"\n⚠ 早停触发：连续{patience}轮无改善，停止训练")
             break
 
-    # 保存最佳模型（使用统一的保存函数）
     print("\n" + "=" * 60)
     print(f"训练完成！")
-    print(f"最佳模型A（按收益率）: 第{best_return_epoch_a}轮, Top1%收益: {best_return_a*100:+.2f}%")
-    if best_model_b_by_return is not None:
-        print(f"最佳模型B-DFT（按收益率）: 第{best_return_epoch_b}轮, Top1%收益: {best_return_b*100:+.2f}%")
+    print(f"最佳模型: 第{best_epoch}轮, Top1%收益: {best_return*100:+.2f}%, AUC: {best_auc:.4f}")
 
-    # 保存模型A
-    if best_model_a_by_return is not None:
-        save_path_a = save_model_with_metadata(
-            best_model_a_by_return,
-            best_return_a, best_threshold_a, best_auc_a_at_best_return,
-            best_return_epoch_a,
-            model_prefix="modelA",
-            output_dir=DataConfig.OUTPUT_DIR
-        )
-        print(f"✓ 模型A已保存: {os.path.basename(save_path_a)}")
-        print(f"  Top1%阈值: {best_threshold_a:.4f}")
-
-    # 保存模型B
-    if best_model_b_by_return is not None:
-        save_path_b = save_model_with_metadata(
-            best_model_b_by_return,
-            best_return_b, best_threshold_b, best_auc_b_at_best_return,
-            best_return_epoch_b,
-            model_prefix="modelB_dft",
-            output_dir=DataConfig.OUTPUT_DIR
-        )
-        print(f"✓ 模型B(DFT)已保存: {os.path.basename(save_path_b)}")
-        print(f"  Top1%阈值: {best_threshold_b:.4f}")
-
-    print("=" * 60)
-
-    # 保存每轮收益率到CSV（使用时间戳避免多模型训练时覆盖）
-    timestamp = datetime.now().strftime("%m%d_%H%M%S")
-    returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"dft_epoch_returns_{timestamp}.csv")
+    timestamp_csv = datetime.now().strftime("%m%d_%H%M%S")
+    returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"dft_epoch_returns_{timestamp_csv}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'A', 'A_compound', 'B_DFT', 'B_DFT_compound', 'train_loss_A', 'test_loss_A', 'train_loss_B', 'test_loss_B'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'return_compound', 'train_loss', 'test_loss'])
         writer.writeheader()
 
         for epoch_return in epoch_returns:
-            # 将None转换为空字符串
             row = {
                 'turn': epoch_return['turn'],
-                'A': f"{epoch_return['return_a']:.2f}" if epoch_return['return_a'] is not None else "",
-                'A_compound': f"{epoch_return['return_a_compound']:.2f}" if epoch_return['return_a_compound'] is not None else "",
-                'B_DFT': f"{epoch_return['return_b']:.2f}" if epoch_return['return_b'] is not None else "",
-                'B_DFT_compound': f"{epoch_return['return_b_compound']:.2f}" if epoch_return['return_b_compound'] is not None else "",
-                'train_loss_A': f"{epoch_return['train_loss_a']:.4f}" if epoch_return.get('train_loss_a') is not None else "",
-                'test_loss_A': f"{epoch_return['test_loss_a']:.4f}" if epoch_return.get('test_loss_a') is not None else "",
-                'train_loss_B': f"{epoch_return['train_loss_b']:.4f}" if epoch_return.get('train_loss_b') is not None else "",
-                'test_loss_B': f"{epoch_return['test_loss_b']:.4f}" if epoch_return.get('test_loss_b') is not None else ""
+                'return': f"{epoch_return['return']:.2f}",
+                'return_compound': f"{epoch_return['return_compound']:.2f}",
+                'train_loss': f"{epoch_return['train_loss']:.4f}",
+                'test_loss': f"{epoch_return['test_loss']:.4f}"
             }
             writer.writerow(row)
 
     print(f"✓ 每轮收益率已保存: {os.path.basename(returns_csv_path)}")
     print(f"  共记录 {len(epoch_returns)} 轮训练数据")
+
+    save_path = save_model_with_metadata(
+        best_model_state,
+        best_return,
+        best_threshold,
+        best_auc,
+        best_epoch,
+        model_prefix="modelB_dft",
+        output_dir=DataConfig.OUTPUT_DIR
+    )
+    filename = os.path.basename(save_path)
+    print(f"✓ DFT模型已保存: {filename}")
+    print(f"  Top1%阈值: {best_threshold:.4f}")
     print("=" * 60)
 
-    return best_return_a, best_return_b
+    return best_return, best_auc
 
 
 if __name__ == "__main__":
-    # 设置工作目录
+    parser = argparse.ArgumentParser(description='DFT自引导微调：从已有模型加载，使用自引导权重继续微调')
+    parser.add_argument('--model', '-m', type=str, required=True,
+                        help='要微调的模型权重路径')
+    parser.add_argument('--epochs', '-e', type=int, default=TrainingConfig.EPOCHS,
+                        help=f'训练轮数（默认: {TrainingConfig.EPOCHS}）')
+    parser.add_argument('--w_min', type=float, default=0.1,
+                        help='DFT最小权重（默认: 0.1）')
+    parser.add_argument('--w_max', type=float, default=1.0,
+                        help='DFT最大权重（默认: 1.0）')
+    parser.add_argument('--seed', type=int, default=DataConfig.RANDOM_SEED,
+                        help=f'随机种子（默认: {DataConfig.RANDOM_SEED}）')
+    args = parser.parse_args()
+
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-    # 打印配置摘要
+    if not os.path.exists(args.model):
+        print(f"错误：模型文件不存在: {args.model}")
+        exit(1)
+
     print_config_summary()
 
-    # 获取设备
     device = DeviceConfig.print_device_info()
 
-    # 创建输出目录
     os.makedirs(DataConfig.OUTPUT_DIR, exist_ok=True)
 
-    # 加载数据
     print("正在加载和预处理数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
-    # 计算权重
     train_weights = calculate_stock_weights(train_stock_info)
 
-    # 打印数据集统计
     print("\n" + "="*60)
     print("数据集统计")
     print("="*60)
@@ -505,23 +337,25 @@ if __name__ == "__main__":
     print(f"测试集: {len(test_stock_info)} 只股票")
     print("="*60)
 
-    # 创建模型A（使用工厂函数根据MODEL_TYPE自动选择模型类型）
-    print("\n正在创建模型A (BF16精度)...")
-    model_a = create_model().to(device)
+    print(f"\n正在加载模型: {args.model}")
+    model = create_model().to(device)
+    model = model.to(dtype=torch.bfloat16)
+    state_dict = torch.load(args.model, map_location=device)
+    model.load_state_dict(state_dict)
 
-    model_a = model_a.to(dtype=torch.bfloat16)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"模型参数数: {total_params:,}")
 
-    total_params = sum(p.numel() for p in model_a.parameters())
-    print(f"模型A参数数: {total_params:,}")
-
-    # 开始训练
-    print("\n开始DFT模型训练...")
-    best_return_a, best_return_b = train_dft_model(
-        model_a, train_stock_info, test_stock_info, train_weights,
+    print("\n开始DFT自引导微调训练...")
+    best_return, best_auc = train_dft_model(
+        model, train_stock_info, test_stock_info, train_weights,
         device=device,
-        dft_epoch=TrainingConfig.EPOCHS*0.3
+        epochs=args.epochs,
+        dft_w_min=args.w_min,
+        dft_w_max=args.w_max,
+        seed=args.seed
     )
 
     print(f"\n最终结果:")
-    print(f"  模型A: 最佳Top1%收益={best_return_a*100:+.2f}%")
-    print(f"  模型B(DFT): 最佳Top1%收益={best_return_b*100:+.2f}%")
+    print(f"  最佳Top1%收益: {best_return*100:+.2f}%")
+    print(f"  最佳AUC: {best_auc:.4f}")

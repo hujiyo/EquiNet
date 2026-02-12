@@ -30,7 +30,7 @@ from model import create_model
 
 from train import (
     WarmupScheduler,
-    load_and_preprocess_data, calculate_stock_weights,
+    load_and_preprocess_data,
     create_fixed_evaluation_dataset,
     TemporalSampler, sample_with_pools,
     evaluate_model,
@@ -41,7 +41,7 @@ from train import (
 )
 
 
-def train_dft_model(model, train_stock_info, test_stock_info, train_weights,
+def train_dft_model(model, train_stock_info, test_stock_info,
                     epochs=TrainingConfig.EPOCHS,
                     learning_rate=TrainingConfig.LEARNING_RATE,
                     device=None,
@@ -328,8 +328,6 @@ if __name__ == "__main__":
     print("正在加载和预处理数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
-    train_weights = calculate_stock_weights(train_stock_info)
-
     print("\n" + "="*60)
     print("数据集统计")
     print("="*60)
@@ -348,7 +346,7 @@ if __name__ == "__main__":
 
     print("\n开始DFT自引导微调训练...")
     best_return, best_auc = train_dft_model(
-        model, train_stock_info, test_stock_info, train_weights,
+        model, train_stock_info, test_stock_info,
         device=device,
         epochs=args.epochs,
         dft_w_min=args.w_min,

@@ -309,28 +309,6 @@ def load_and_preprocess_data(data_dir=DataConfig.DATA_DIR, test_days=DataConfig.
     
     return train_stock_info, test_stock_info
 
-# 计算股票选择权重
-def calculate_stock_weights(stock_info_list):
-    """
-    计算每只股票的采样权重
-    数据量越大的股票权重越大，但最大不超过平均值的1.5倍
-    """
-    data_lengths = [info['data_length'] for info in stock_info_list]
-    avg_length = np.mean(data_lengths)
-    
-    # 计算权重：数据长度 / 平均长度，但限制在1.0到1.5之间
-    weights = []
-    for length in data_lengths:
-        weight = length / avg_length
-        weight = max(1.0, min(1.5, weight))  # 限制在1.0到1.5之间
-        weights.append(weight)
-    
-    # 归一化权重，使其总和为1.0（np.random.choice要求）
-    total_weight = sum(weights)
-    normalized_weights = [w / total_weight for w in weights]
-    
-    return normalized_weights
-
 # 解决样本交叠导致的数据泄露问题：时间只向前推进，不回头
 
 class TemporalSampler:
@@ -1340,7 +1318,7 @@ class GradientMonitor:
 # ==================== 训练函数 ====================
 
 # 改进的训练函数
-def train_model(model, train_stock_info, test_stock_info, train_weights, epochs=TrainingConfig.EPOCHS,
+def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.EPOCHS,
                learning_rate=TrainingConfig.LEARNING_RATE, device=None,
                batch_size=TrainingConfig.BATCH_SIZE, batches_per_epoch=TrainingConfig.BATCHES_PER_EPOCH):
     """
@@ -1782,10 +1760,6 @@ if __name__ == "__main__":
     print("正在加载和预处理数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
-    # 计算股票选择权重
-    train_weights = calculate_stock_weights(train_stock_info)
-    test_weights = calculate_stock_weights(test_stock_info)
-    
     # 打印数据集统计信息
     print("\n" + "="*60)
     print("数据集划分统计")
@@ -1797,18 +1771,17 @@ if __name__ == "__main__":
     print(f"训练集:")
     print(f"  股票数量: {len(train_stock_info)}")
     print(f"  数据长度: 最小={min(train_lengths)}, 最大={max(train_lengths)}, 平均={np.mean(train_lengths):.1f}")
-    print(f"  采样权重: {min(train_weights):.3f} - {max(train_weights):.3f}")
-    
+
     print(f"\n测试集:")
     print(f"  股票数量: {len(test_stock_info)}")
     print(f"  数据长度: 最小={min(test_lengths)}, 最大={max(test_lengths)}, 平均={np.mean(test_lengths):.1f}")
     print(f"  时间范围: 每只股票的最近 {DataConfig.TEST_DAYS} 天")
-    
+
     print(f"\n前3只股票示例:")
     for i in range(min(3, len(train_stock_info))):
         train_info = train_stock_info[i]
-        print(f"  {train_info['file_name']}: 训练集长度={train_info['data_length']}, 权重={train_weights[i]:.3f}")
-    
+        print(f"  {train_info['file_name']}: 训练集长度={train_info['data_length']}")
+
     print("="*60)
 
     print("正在创建 Transformer 模型 (BF16精度)...")
@@ -1825,7 +1798,7 @@ if __name__ == "__main__":
 
     print("开始训练...")
     # 使用带固定评估集的训练函数（使用滚动窗口标准化）
-    train_model(model, train_stock_info, test_stock_info, train_weights, device=device)
+    train_model(model, train_stock_info, test_stock_info, device=device)
     
     # 保存最终模型（训练结束时的状态）
     final_model_path = ModelSaveConfig.get_final_model_path(ModelConfig.D_MODEL)

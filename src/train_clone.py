@@ -27,7 +27,7 @@ from model import create_model
 
 from train import (
     WarmupScheduler,
-    load_and_preprocess_data, calculate_stock_weights,
+    load_and_preprocess_data,
     create_fixed_evaluation_dataset,
     TemporalSampler, sample_with_pools,
     evaluate_model,           # 统一的评估函数
@@ -38,7 +38,7 @@ from train import (
     calculate_test_loss       # 测试集损失计算
 )
 
-def train_clone_model(model_a, train_stock_info, test_stock_info, train_weights,
+def train_clone_model(model_a, train_stock_info, test_stock_info,
                       epochs=TrainingConfig.EPOCHS,
                       learning_rate=TrainingConfig.LEARNING_RATE,
                       device=None,
@@ -489,9 +489,6 @@ if __name__ == "__main__":
     print("正在加载和预处理数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
-    # 计算权重
-    train_weights = calculate_stock_weights(train_stock_info)
-
     # 打印数据集统计
     print("\n" + "="*60)
     print("数据集统计")
@@ -512,7 +509,7 @@ if __name__ == "__main__":
     # 开始训练
     print("\n开始克隆模型训练...")
     best_return_a, best_return_b = train_clone_model(
-        model_a, train_stock_info, test_stock_info, train_weights,
+        model_a, train_stock_info, test_stock_info,
         device=device,
         clone_epoch=TrainingConfig.EPOCHS*0.25,
         pseudo_pos_ratio=0.01,

@@ -25,7 +25,7 @@ from model import create_model
 
 from train import (
     WarmupScheduler,
-    load_and_preprocess_data, calculate_stock_weights,
+    load_and_preprocess_data,
     create_fixed_evaluation_dataset,
     TemporalSampler, sample_with_pools,
     evaluate_model,           # 统一的评估函数
@@ -36,7 +36,7 @@ from train import (
 )
 
 
-def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock_info, train_weights, 
+def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock_info,
                        epochs=TrainingConfig.EPOCHS, 
                        learning_rate=TrainingConfig.LEARNING_RATE, 
                        device=None, 
@@ -477,9 +477,6 @@ if __name__ == "__main__":
     print("正在加载和预处理数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
     
-    # 计算权重
-    train_weights = calculate_stock_weights(train_stock_info)
-    
     # 打印数据集统计
     print("\n" + "="*60)
     print("数据集统计")
@@ -491,7 +488,7 @@ if __name__ == "__main__":
     # 开始进化训练
     print(f"\n开始进化训练（{len(args.teachers)}个教师模型）...")
     best_return, best_auc, evolution_count = train_evolve_model(
-        args.teachers, args.student, train_stock_info, test_stock_info, train_weights, 
+        args.teachers, args.student, train_stock_info, test_stock_info,
         device=device,
         epochs=args.epochs,
         pseudo_pos_ratio=args.pseudo_pos,

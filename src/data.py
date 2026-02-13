@@ -301,7 +301,14 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
         stock_idx: 股票索引
         start_idx: 样本起始索引
 
-    返回: (input_seq, target) 或 None（如果样本无效）
+    返回: (input_seq, target, cumulative_return) 或 None（如果样本无效）
+    
+    收益率计算（实战视角）:
+        T日晚上运行模型 → T+1日开盘买入
+        Day1收益率 = (T+1收盘 - T+1开盘) / T+1开盘  (日内涨幅)
+        Day2收益率 = (T+2收盘 - T+1收盘) / T+1收盘
+        Day3收益率 = (T+3收盘 - T+2收盘) / T+2收盘
+        累计收益率 = (T+3收盘 - T+1开盘) / T+1开盘
     """
     stock_info = stock_info_list[stock_idx]
     stock_data = stock_info['data']
@@ -366,17 +373,19 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     if np.any(~np.isfinite(input_seq)):
         return None
 
-    original_start_price = closes[-1]
-    original_end_price = stock_data[start_idx + required_length - 1, 3]
+    t1_open = stock_data[start_idx + context_length, 0]
+    t1_close = stock_data[start_idx + context_length, 3]
+    t2_close = stock_data[start_idx + context_length + 1, 3]
+    t3_close = stock_data[start_idx + context_length + 2, 3]
 
-    if original_start_price == 0:
+    if t1_open == 0:
         return None
 
-    cumulative_return = (original_end_price - original_start_price) / original_start_price
+    cumulative_return = (t3_close - t1_open) / t1_open
 
     future_closes = stock_data[start_idx + context_length:start_idx + required_length, 3]
     daily_returns = []
-    prev_close_for_future = original_start_price
+    prev_close_for_future = closes[-1]
     for future_close in future_closes:
         if prev_close_for_future > 0:
             daily_ret = (future_close - prev_close_for_future) / prev_close_for_future
@@ -385,7 +394,7 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     
     target = float(check_strong_signal(daily_returns))
 
-    return input_seq, target
+    return input_seq, target, cumulative_return
 
 
 def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng):
@@ -436,7 +445,7 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
             if sample is None:
                 continue
 
-            input_seq, target = sample
+            input_seq, target, _ = sample
 
             if target >= 0.5:
                 pos_pool_inputs.append(input_seq)
@@ -491,13 +500,19 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
 
 
 def create_fixed_evaluation_dataset(test_stock_info):
-    """创建固定评估数据集（涨停样本已在generate_sample_from_index中过滤）"""
+    """
+    创建固定评估数据集（涨停样本已在generate_sample_from_index中过滤）
+    
+    返回:
+        eval_inputs: 输入序列
+        eval_targets: 标签
+        eval_cumulative_returns: 累计收益率
+        eval_day_indices: 每个样本对应的预测日在测试集中的相对天数（0-based）
+    """
     eval_inputs = []
     eval_targets = []
     eval_cumulative_returns = []
-
-    required_length = DataConfig.REQUIRED_LENGTH
-    context_length = DataConfig.CONTEXT_LENGTH
+    eval_day_indices = []
 
     for stock_info in test_stock_info:
         stock_data = stock_info['data']
@@ -505,7 +520,7 @@ def create_fixed_evaluation_dataset(test_stock_info):
         test_split_point = stock_info.get('test_split_point', max(0, data_length - DataConfig.TEST_DAYS))
 
         start_min = max(1, test_split_point)
-        start_max = data_length - required_length
+        start_max = data_length - DataConfig.REQUIRED_LENGTH
         if start_max < start_min:
             continue
 
@@ -514,21 +529,19 @@ def create_fixed_evaluation_dataset(test_stock_info):
             if sample is None:
                 continue
 
-            input_seq, target = sample
+            input_seq, target, cumulative_return = sample
             eval_inputs.append(input_seq)
             eval_targets.append(target)
-
-            original_start_price = stock_data[start_idx + context_length - 1, 3]
-            original_end_price = stock_data[start_idx + required_length - 1, 3]
-            if original_start_price == 0:
-                continue
-            cumulative_return = (original_end_price - original_start_price) / original_start_price
             eval_cumulative_returns.append(float(cumulative_return))
+            
+            day_index = (start_idx + DataConfig.CONTEXT_LENGTH) - test_split_point
+            eval_day_indices.append(day_index)
 
     if len(eval_inputs) == 0:
         raise ValueError("固定评估集为空：test_stock_info中没有可用样本")
 
-    return np.asarray(eval_inputs), np.asarray(eval_targets), np.asarray(eval_cumulative_returns)
+    return (np.asarray(eval_inputs), np.asarray(eval_targets), 
+            np.asarray(eval_cumulative_returns), np.asarray(eval_day_indices))
 
 
 def create_train_evaluation_dataset(train_stock_info, first_n_days=80):
@@ -547,16 +560,13 @@ def create_train_evaluation_dataset(train_stock_info, first_n_days=80):
     eval_targets = []
     eval_cumulative_returns = []
 
-    required_length = DataConfig.REQUIRED_LENGTH
-    context_length = DataConfig.CONTEXT_LENGTH
-
     for stock_info in train_stock_info:
         stock_data = stock_info['data']
         data_length = len(stock_data)
         train_start_idx = stock_info.get('train_start_idx', 0)
 
         start_min = max(1, train_start_idx + 1)
-        start_max = min(train_start_idx + first_n_days, data_length - required_length)
+        start_max = min(train_start_idx + first_n_days, data_length - DataConfig.REQUIRED_LENGTH)
         if start_max < start_min:
             continue
 
@@ -565,15 +575,9 @@ def create_train_evaluation_dataset(train_stock_info, first_n_days=80):
             if sample is None:
                 continue
 
-            input_seq, target = sample
+            input_seq, target, cumulative_return = sample
             eval_inputs.append(input_seq)
             eval_targets.append(target)
-
-            original_start_price = stock_data[start_idx + context_length - 1, 3]
-            original_end_price = stock_data[start_idx + required_length - 1, 3]
-            if original_start_price == 0:
-                continue
-            cumulative_return = (original_end_price - original_start_price) / original_start_price
             eval_cumulative_returns.append(float(cumulative_return))
 
     if len(eval_inputs) == 0:

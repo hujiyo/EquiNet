@@ -100,7 +100,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
     
     # 创建评估数据集
-    eval_inputs, eval_targets, eval_cumulative_returns = create_fixed_evaluation_dataset(test_stock_info)
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices = create_fixed_evaluation_dataset(test_stock_info)
     
     # 加载所有教师模型
     teachers = []
@@ -115,8 +115,11 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         teachers.append(teacher)
         
         # 评估教师模型
-        stats = evaluate_model(teacher, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name=f"教师{i+1}")
+        stats = evaluate_model(teacher, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name=f"教师{i+1}", eval_day_indices=eval_day_indices)
         print(f"  教师{i+1}: AUC={stats['auc']:.4f}, Top1%收益={stats['top_return']*100:+.2f}% | 复利={stats['top_return_compound']*100:+.2f}%")
+        if stats['realistic_stats'] is not None:
+            rs = stats['realistic_stats']
+            print(f"         【实战收益率】平均: {rs['avg_realistic_return']*100:.1f}%")
     
     # 加载学生模型B
     print(f"正在加载学生模型B: {student_path}")
@@ -126,8 +129,11 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     model_b.load_state_dict(state_dict)
     
     # 评估初始学生B
-    stats_b_init = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B(初始)")
+    stats_b_init = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B(初始)", eval_day_indices=eval_day_indices)
     print(f"  学生B: AUC={stats_b_init['auc']:.4f}, Top1%收益={stats_b_init['top_return']*100:+.2f}% | 复利={stats_b_init['top_return_compound']*100:+.2f}%")
+    if stats_b_init['realistic_stats'] is not None:
+        rs = stats_b_init['realistic_stats']
+        print(f"         【实战收益率】平均: {rs['avg_realistic_return']*100:.1f}%")
     
     # 进化训练使用更低的学习率（已训练模型需要更小的学习率避免破坏已学特征）
     evolve_lr = learning_rate * 0.2  # 使用原学习率的20%
@@ -325,7 +331,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         print()  # 换行
         
         # 评估模型B
-        stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B")
+        stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B", eval_day_indices=eval_day_indices)
 
         # 计算训练集平均损失（除以样本数，与测试损失保持一致）
         # total_loss_b已经是所有样本的总损失（累加时乘以了batch_size）
@@ -350,6 +356,14 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         print(f"  [模型B] 损失: {avg_loss_b:.4f}, AUC: {stats_b['auc']:.4f}")
         print(f"          预测均值: {stats_b['pred_mean']:.3f}, 高置信(>0.7): {stats_b['high_conf_count']}, 低置信(<0.2): {stats_b['low_conf_count']}")
         print(f"          Top1%收益: {stats_b['top_return']*100:+.2f}% | 复利: {stats_b['top_return_compound']*100:+.2f}%")
+        
+        # 实战收益率统计
+        if stats_b['realistic_stats'] is not None:
+            rs = stats_b['realistic_stats']
+            daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
+            print(f'          【实战收益率】每日统计: {{{daily_stats_str}}}')
+            print(f'          【实战收益率】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
+        
         print(f"          伪标签统计: 伪正={total_pseudo_pos}, 伪负={total_pseudo_neg}, 不变={total_unchanged}")
         
         # 检查是否进化：B收益率 > B自己之前的最佳收益率

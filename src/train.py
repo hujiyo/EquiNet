@@ -178,7 +178,8 @@ class DynamicWeightedBCE(nn.Module):
 # - predict_multiple_stocks
 
 
-def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=100):
+def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_returns, device, 
+                         batch_size=100, eval_day_indices=None):
     """
     批量评估模型性能（详细版，用于train.py主训练流程）
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
@@ -193,6 +194,7 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
         auc_score: AUC得分
         confidence_stats: 置信度区间统计
         top_stats: Top N% 收益统计
+        realistic_stats: 实战收益率统计（如果提供了eval_day_indices）
     """
     model.eval()
 
@@ -225,7 +227,6 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
 
     total = len(all_preds)
 
-    # 计算分类准确率
     pred_labels = (all_preds >= 0.5).astype(int)
     true_labels = (all_targets >= 0.5).astype(int)
 
@@ -237,19 +238,16 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
         class_total[i] = np.sum(mask)
         class_correct[i] = np.sum((pred_labels == i) & mask)
 
-    # 预测上涨的统计
     pred_positive_mask = pred_labels == 1
     pred_positive_total = np.sum(pred_positive_mask)
     pred_positive_correct = np.sum(pred_positive_mask & (true_labels == 1))
     pred_non_negative = np.sum(pred_positive_mask & (all_returns >= 0))
 
-    # 计算 AUC
     try:
         auc_score = roc_auc_score(true_labels, all_preds)
     except ValueError:
         auc_score = 0.5
 
-    # 置信度区间统计
     confidence_intervals = ['0.50-0.55', '0.55-0.58', '0.58-0.60', '0.60-0.70', '0.70-1.00']
     confidence_bounds = [(0.50, 0.55), (0.55, 0.58), (0.58, 0.60), (0.60, 0.70), (0.70, 1.00)]
     confidence_stats = {}
@@ -261,7 +259,6 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
         non_negative_in_interval = np.sum(mask & (all_returns >= 0))
         confidence_stats[interval] = (correct_in_interval, total_in_interval, non_negative_in_interval)
 
-    # Top N% 收益统计（涨停样本已在生成阶段过滤）
     percent = DataConfig.TOP_PERCENT
     top_k = max(1, int(len(all_preds) * percent / 100))
     sorted_indices = np.argsort(all_preds)[::-1]
@@ -270,21 +267,25 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
 
     avg_return = np.mean(top_returns)
     total_return = np.sum(top_returns)
-    compound_return = np.prod(1 + top_returns) ** (1 / len(top_returns)) - 1  # 几何平均复利收益率
+    compound_return = np.prod(1 + top_returns) ** (1 / len(top_returns)) - 1
 
     top_stats = {
         'count': top_k,
         'avg_return': avg_return,
         'total_return': total_return,
         'compound_return': compound_return,
-        'filtered_count': 0  # 已在生成阶段过滤，这里为0
+        'filtered_count': 0
     }
 
-    return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats
+    realistic_stats = None
+    if eval_day_indices is not None:
+        realistic_stats = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent)
+
+    return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats
 
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
-                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name=""):
+                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None):
     """
     简化版模型评估函数（用于train_clone.py和train_evolve.py）
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
@@ -299,6 +300,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         pred_mean：预测均值
         pred_std：预测标准差
         filtered_count：被过滤的涨停样本数（始终为0，因已在生成阶段过滤）
+        realistic_stats：实战收益率统计（如果提供了eval_day_indices）
     """
     model.eval()
 
@@ -329,13 +331,11 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     all_targets = np.array(all_targets)
     all_returns = np.array(all_returns)
 
-    # 计算 AUC
     try:
         auc = roc_auc_score(all_targets, all_preds)
     except ValueError:
         auc = 0.5
 
-    # 计算 Top N% 收益（涨停样本已在生成阶段过滤）
     percent = DataConfig.TOP_PERCENT
     top_k = max(1, int(len(all_preds) * percent / 100))
     sorted_indices = np.argsort(all_preds)[::-1]
@@ -343,10 +343,9 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     top_returns = all_returns[top_indices]
 
     top_return = np.mean(top_returns)
-    top_return_compound = np.prod(1 + top_returns) ** (1 / len(top_returns)) - 1  # 几何平均复利收益率
+    top_return_compound = np.prod(1 + top_returns) ** (1 / len(top_returns)) - 1
     top_threshold = all_preds[sorted_indices[top_k - 1]]
 
-    # 统计高置信样本
     high_conf = all_preds > 0.7
     low_conf = all_preds < 0.2
 
@@ -363,7 +362,67 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         'filtered_count': 0
     }
 
+    if eval_day_indices is not None:
+        stats['realistic_stats'] = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent)
+    else:
+        stats['realistic_stats'] = None
+
     return stats
+
+
+def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_percent=1.0):
+    """
+    计算实战收益率（高仿实战）
+    
+    流程:
+    1. 先按预测分数排序，取前top_percent%的样本，确定阈值
+    2. 按天统计：每天超过阈值的股票数量和平均收益率（等权分配资金）
+    3. 计算平均实战收益率
+    
+    Args:
+        all_preds: 所有样本的预测分数
+        all_returns: 所有样本的收益率
+        all_day_indices: 每个样本对应的预测日在测试集中的相对天数
+        top_percent: Top百分比，默认1%
+    
+    Returns:
+        realistic_stats: 包含每日统计和平均实战收益率的字典
+    """
+    top_k = max(1, int(len(all_preds) * top_percent / 100))
+    sorted_indices = np.argsort(all_preds)[::-1]
+    threshold = all_preds[sorted_indices[top_k - 1]]
+    
+    above_threshold_mask = all_preds > threshold
+    
+    unique_days = np.unique(all_day_indices)
+    unique_days = np.sort(unique_days)
+    
+    daily_stats = []
+    total_return = 0.0
+    valid_days = 0
+    
+    for day in unique_days:
+        day_mask = all_day_indices == day
+        day_above_threshold = above_threshold_mask & day_mask
+        
+        count = np.sum(day_above_threshold)
+        if count > 0:
+            day_return = np.mean(all_returns[day_above_threshold])
+            total_return += day_return
+            valid_days += 1
+            daily_stats.append((count, day_return))
+        else:
+            daily_stats.append((0, 0.0))
+    
+    avg_realistic_return = total_return / valid_days if valid_days > 0 else 0.0
+    
+    return {
+        'threshold': threshold,
+        'daily_stats': daily_stats,
+        'total_return': total_return,
+        'valid_days': valid_days,
+        'avg_realistic_return': avg_realistic_return
+    }
 
 
 def generate_pseudo_labels(pred_scores, original_targets,
@@ -772,7 +831,7 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
 
     # 创建固定的评估数据集（训练开始前创建一次，使用滚动窗口标准化）
     print("\n创建评估数据集...")
-    eval_inputs, eval_targets, eval_cumulative_returns = create_fixed_evaluation_dataset(test_stock_info)
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices = create_fixed_evaluation_dataset(test_stock_info)
     train_eval_inputs, train_eval_targets, train_eval_returns = create_train_evaluation_dataset(train_stock_info, first_n_days=80)
 
     # 损失函数：由全局配置控制
@@ -1005,12 +1064,12 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
             # ===================================================
 
             # 固定评估集评估
-            total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats = evaluate_model_batch(
-                model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
+            total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats = evaluate_model_batch(
+                model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE, eval_day_indices=eval_day_indices
             )
 
             # 计算训练集收益率（用于检测过拟合）
-            _, _, _, _, _, _, _, _, train_top_stats = evaluate_model_batch(
+            _, _, _, _, _, _, _, _, train_top_stats, _ = evaluate_model_batch(
                 model, train_eval_inputs, train_eval_targets, train_eval_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
             )
 
@@ -1079,6 +1138,13 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
                 print('⚠️ 欠拟合：测试集高于训练集（罕见）')
             else:
                 print('✓ 正常')
+            
+            # 实战收益率统计
+            if realistic_stats is not None:
+                daily_stats_str = ', '.join([f'({count},{day_ret*100:.1f}%)' for count, day_ret in realistic_stats['daily_stats']])
+                print(f'  【实战收益率】每日统计: {{{daily_stats_str}}}')
+                print(f'  【实战收益率】平均实战收益率: {realistic_stats["avg_realistic_return"]*100:.1f}%')
+            
             print(f'  AUC得分: {auc_score:.4f}')
             print(f'  训练集损失: {train_loss_epoch:.4f}, 测试集损失: {test_loss:.4f}')
 

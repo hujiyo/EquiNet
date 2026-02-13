@@ -76,10 +76,13 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    eval_inputs, eval_targets, eval_cumulative_returns = create_fixed_evaluation_dataset(test_stock_info)
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices = create_fixed_evaluation_dataset(test_stock_info)
 
-    stats_init = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="初始模型")
+    stats_init = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="初始模型", eval_day_indices=eval_day_indices)
     print(f"初始模型评估: AUC={stats_init['auc']:.4f}, Top1%收益={stats_init['top_return']*100:+.2f}% | 复利={stats_init['top_return_compound']*100:+.2f}%")
+    if stats_init['realistic_stats'] is not None:
+        rs = stats_init['realistic_stats']
+        print(f"              【实战收益率】平均: {rs['avg_realistic_return']*100:.1f}%")
 
     dft_lr = learning_rate * 0.2
     print(f"DFT学习率: {dft_lr:.6f} (原学习率的20%)")
@@ -216,7 +219,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
 
         main_scheduler.step()
 
-        stats = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="DFT")
+        stats = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="DFT", eval_day_indices=eval_day_indices)
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
         test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
@@ -224,6 +227,13 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         print(f'  [DFT模型] 训练损失: {avg_loss:.4f}, 测试损失: {test_loss:.4f}, AUC: {stats["auc"]:.4f}')
         print(f'            预测均值: {stats["pred_mean"]:.3f}, 高置信(>0.7): {stats["high_conf_count"]}, 低置信(<0.2): {stats["low_conf_count"]}')
         print(f'            Top{DataConfig.TOP_PERCENT}%收益: {stats["top_return"]*100:+.2f}% | 复利: {stats["top_return_compound"]*100:+.2f}%')
+        
+        # 实战收益率统计
+        if stats['realistic_stats'] is not None:
+            rs = stats['realistic_stats']
+            daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
+            print(f'            【实战收益率】每日统计: {{{daily_stats_str}}}')
+            print(f'            【实战收益率】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
 
         epoch_return = {
             'turn': epoch + 1,

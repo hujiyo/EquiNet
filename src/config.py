@@ -55,8 +55,8 @@ class ModelConfig:
     # 基础模型参数
     INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
     D_MODEL = 24                     # 模型维度（Transformer内部维度）
-    EMBED_HIDDEN_DIM = 36            # Embedding中间层维度（两阶段FFN：6→40→D_MODEL）
-    FFN_EXPAND_RATIO = 2             # FFN隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
+    EMBED_HIDDEN_DIM = 48            # Embedding中间层维度（两阶段FFN：6→40→D_MODEL）
+    FFN_EXPAND_RATIO = 3             # FFN隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 2                        # 注意力头数
     NUM_LAYERS = 6                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）

@@ -82,7 +82,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
 
     # 创建评估数据集
-    eval_inputs, eval_targets, eval_cumulative_returns = create_fixed_evaluation_dataset(test_stock_info)
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices = create_fixed_evaluation_dataset(test_stock_info)
 
     # 模型B初始化为None
     model_b = None
@@ -313,7 +313,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             main_scheduler_a.step()
 
         # 评估模型A（使用统一的评估函数）
-        stats_a = evaluate_model(model_a, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="A")
+        stats_a = evaluate_model(model_a, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="A", eval_day_indices=eval_day_indices)
 
         # 计算训练集平均损失（除以样本数，与测试损失保持一致）
         # total_loss_a已经是所有样本的总损失（累加时乘以了batch_size）
@@ -327,7 +327,14 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
         print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
         print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_a["top_return"]*100:+.2f}% | 复利: {stats_a["top_return_compound"]*100:+.2f}%')
-
+        
+        # 实战收益率统计
+        if stats_a['realistic_stats'] is not None:
+            rs = stats_a['realistic_stats']
+            daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
+            print(f'          【实战收益率】每日统计: {{{daily_stats_str}}}')
+            print(f'          【实战收益率】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
+        
         # 记录当前轮次收益率
         epoch_return = {
             'turn': epoch + 1,
@@ -372,7 +379,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
 
         # 评估模型B（如果存在）
         if model_b is not None:
-            stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B")
+            stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B", eval_day_indices=eval_day_indices)
 
             # 计算训练集平均损失（除以样本数，与测试损失保持一致）
             # total_loss_b已经是所有样本的总损失（累加时乘以了batch_size）
@@ -382,6 +389,14 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             print(f'  [模型B] 损失: {avg_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
             print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_b["top_return"]*100:+.2f}% | 复利: {stats_b["top_return_compound"]*100:+.2f}%')
+            
+            # 实战收益率统计
+            if stats_b['realistic_stats'] is not None:
+                rs = stats_b['realistic_stats']
+                daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
+                print(f'          【实战收益率】每日统计: {{{daily_stats_str}}}')
+                print(f'          【实战收益率】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
+            
             print(f'          伪标签来源: 最佳A(第{best_return_epoch_a}轮, 收益{best_return_a*100:+.2f}%)')
             print(f'          伪标签统计: 伪正={total_pseudo_pos}, 伪负={total_pseudo_neg}, 不变={total_unchanged}')
 

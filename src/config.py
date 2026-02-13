@@ -28,6 +28,14 @@ class DataConfig:
     # 上涨阈值（二分类）
     UPRISE_THRESHOLD = 0.08          # 上涨阈值（8%，涨幅≥8%视为上涨）
 
+    # 强势信号检测参数
+    SIGNAL_DAY1_BURST = 0.05         # 单日爆发阈值：Day1涨幅≥5%
+    SIGNAL_TWO_DAY_CUM = 0.06        # 双日累计阈值：Day1+Day2≥6%
+    SIGNAL_DAY_MIN = 0.01            # 单日最小涨幅：≥1%
+    SIGNAL_THREE_DAY_CUM = 0.05      # 三日累计阈值：Day1+Day2+Day3≥5%
+    SIGNAL_ANY_BURST = 0.08          # 任意一天爆发阈值：≥8%
+    SIGNAL_BURST_CUM = 0.06          # 爆发后累计阈值：累计≥6%
+
     # 评估参数
     EVAL_BATCH_SIZE = 100             # 评估批处理大小
     TOP_PERCENT = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
@@ -197,9 +205,11 @@ def print_config_summary():
     print(f"  测试集天数: {DataConfig.TEST_DAYS}天")
     print(f"  上下文长度: {DataConfig.CONTEXT_LENGTH}")
     print(f"  上涨阈值: {DataConfig.UPRISE_THRESHOLD*100}%")
-    print(f"\n标签机制: 二分类（{DataConfig.UPRISE_THRESHOLD*100:.0f}%为阈值）")
-    print(f"  涨幅≥{DataConfig.UPRISE_THRESHOLD*100:.0f}% → 标签1.0 (上涨)")
-    print(f"  涨幅<{DataConfig.UPRISE_THRESHOLD*100:.0f}% → 标签0.0 (不上涨)")
+    print(f"\n标签机制: 强势信号检测（0/1二分类）")
+    print(f"  1. 单日爆发: Day1涨幅 ≥ {DataConfig.SIGNAL_DAY1_BURST*100:.0f}%")
+    print(f"  2. 双日接力: Day1+Day2 ≥ {DataConfig.SIGNAL_TWO_DAY_CUM*100:.0f}% 且 Day1,Day2 > {DataConfig.SIGNAL_DAY_MIN*100:.0f}%")
+    print(f"  3. 稳健上涨: Day1,Day2,Day3 ≥ {DataConfig.SIGNAL_DAY_MIN*100:.0f}% 且 累计 ≥ {DataConfig.SIGNAL_THREE_DAY_CUM*100:.0f}%")
+    print(f"  4. 爆发后延续: 任意一天 ≥ {DataConfig.SIGNAL_ANY_BURST*100:.0f}% 且 累计 ≥ {DataConfig.SIGNAL_BURST_CUM*100:.0f}% 且 Day1 > 0%")
 
     print(f"\n评估参数:")
     print(f"  评估批处理大小: {DataConfig.EVAL_BATCH_SIZE}")

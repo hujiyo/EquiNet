@@ -246,6 +246,48 @@ class TemporalSampler:
         return looped_stocks_count, total_loops
 
 
+def check_strong_signal(daily_returns):
+    """
+    强势信号检测：判断是否存在强势买入信号
+    
+    标签=1的条件（满足任一即可）：
+    1. 单日爆发：Day1涨幅 ≥ 5%
+    2. 双日接力：Day1+Day2累计 ≥ 6% 且 Day1>1%, Day2>1%
+    3. 稳健上涨：Day1 ≥ 1% 且 Day2 ≥ 1% 且 Day3 ≥ 1% 且 累计 ≥ 5%
+    4. 爆发后延续：任意一天 ≥ 8% 且 累计 ≥ 6% 且 Day1 > 0%
+    
+    Args:
+        daily_returns: list或np.array, 3天的日收益率 [Day1, Day2, Day3]
+        
+    Returns:
+        int: 1表示存在强势信号，0表示无信号
+    """
+    if len(daily_returns) < 3:
+        return 0
+    
+    r1, r2, r3 = daily_returns[0], daily_returns[1], daily_returns[2]
+    cum_2day = r1 + r2
+    cum_3day = r1 + r2 + r3
+    
+    if r1 >= DataConfig.SIGNAL_DAY1_BURST:
+        return 1
+    
+    if cum_2day >= DataConfig.SIGNAL_TWO_DAY_CUM and r1 > DataConfig.SIGNAL_DAY_MIN and r2 > DataConfig.SIGNAL_DAY_MIN:
+        return 1
+    
+    if (r1 >= DataConfig.SIGNAL_DAY_MIN and 
+        r2 >= DataConfig.SIGNAL_DAY_MIN and 
+        r3 >= DataConfig.SIGNAL_DAY_MIN and 
+        cum_3day >= DataConfig.SIGNAL_THREE_DAY_CUM):
+        return 1
+    
+    max_day = max(r1, r2, r3)
+    if max_day >= DataConfig.SIGNAL_ANY_BURST and cum_3day >= DataConfig.SIGNAL_BURST_CUM and r1 > 0:
+        return 1
+    
+    return 0
+
+
 def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     """
     根据预生成的索引生成单个样本（向量化优化版）
@@ -328,7 +370,16 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
 
     cumulative_return = (original_end_price - original_start_price) / original_start_price
 
-    target = 1.0 if cumulative_return >= DataConfig.UPRISE_THRESHOLD else 0.0
+    future_closes = stock_data[start_idx + context_length:start_idx + required_length, 3]
+    daily_returns = []
+    prev_close_for_future = original_start_price
+    for future_close in future_closes:
+        if prev_close_for_future > 0:
+            daily_ret = (future_close - prev_close_for_future) / prev_close_for_future
+            daily_returns.append(daily_ret)
+        prev_close_for_future = future_close
+    
+    target = float(check_strong_signal(daily_returns))
 
     return input_seq, target
 

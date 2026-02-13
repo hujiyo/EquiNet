@@ -254,7 +254,8 @@ def check_strong_signal(daily_returns):
     1. 单日爆发：Day1涨幅 ≥ 5%
     2. 双日接力：Day1+Day2累计 ≥ 6% 且 Day1>1%, Day2>1%
     3. 稳健上涨：Day1 ≥ 1% 且 Day2 ≥ 1% 且 Day3 ≥ 1% 且 累计 ≥ 5%
-    4. 爆发后延续：任意一天 ≥ 8% 且 累计 ≥ 6% 且 Day1 > 0%
+    4. 爆发后延续：任意一天 ≥ 8% 且 累计 ≥ 6%
+    5. 累计达标：3天累计涨幅 ≥ 8%（基础条件）
     
     Args:
         daily_returns: list或np.array, 3天的日收益率 [Day1, Day2, Day3]
@@ -282,7 +283,10 @@ def check_strong_signal(daily_returns):
         return 1
     
     max_day = max(r1, r2, r3)
-    if max_day >= DataConfig.SIGNAL_ANY_BURST and cum_3day >= DataConfig.SIGNAL_BURST_CUM and r1 > 0:
+    if max_day >= DataConfig.SIGNAL_ANY_BURST and cum_3day >= DataConfig.SIGNAL_BURST_CUM:
+        return 1
+    
+    if cum_3day >= DataConfig.UPRISE_THRESHOLD:
         return 1
     
     return 0

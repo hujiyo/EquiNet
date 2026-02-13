@@ -209,7 +209,8 @@ def print_config_summary():
     print(f"  1. 单日爆发: Day1涨幅 ≥ {DataConfig.SIGNAL_DAY1_BURST*100:.0f}%")
     print(f"  2. 双日接力: Day1+Day2 ≥ {DataConfig.SIGNAL_TWO_DAY_CUM*100:.0f}% 且 Day1,Day2 > {DataConfig.SIGNAL_DAY_MIN*100:.0f}%")
     print(f"  3. 稳健上涨: Day1,Day2,Day3 ≥ {DataConfig.SIGNAL_DAY_MIN*100:.0f}% 且 累计 ≥ {DataConfig.SIGNAL_THREE_DAY_CUM*100:.0f}%")
-    print(f"  4. 爆发后延续: 任意一天 ≥ {DataConfig.SIGNAL_ANY_BURST*100:.0f}% 且 累计 ≥ {DataConfig.SIGNAL_BURST_CUM*100:.0f}% 且 Day1 > 0%")
+    print(f"  4. 爆发后延续: 任意一天 ≥ {DataConfig.SIGNAL_ANY_BURST*100:.0f}% 且 累计 ≥ {DataConfig.SIGNAL_BURST_CUM*100:.0f}%")
+    print(f"  5. 累计达标: 3天累计涨幅 ≥ {DataConfig.UPRISE_THRESHOLD*100:.0f}%（基础条件）")
 
     print(f"\n评估参数:")
     print(f"  评估批处理大小: {DataConfig.EVAL_BATCH_SIZE}")

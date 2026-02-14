@@ -168,6 +168,19 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        
+        # 测试集权重：开局算一次，整个训练过程复用
+        test_targets = np.array(eval_targets)
+        test_pos_count = np.sum(test_targets >= 0.5)
+        test_neg_count = np.sum(test_targets < 0.5)
+        if test_pos_count > 0 and test_neg_count > 0:
+            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
+        elif test_pos_count == 0:
+            test_neg_weight = float(LossConfig.POS_WEIGHT)
+        else:
+            test_neg_weight = 0.1
+        eval_criterion.weight_0_0.fill_(test_neg_weight)
+        print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
     else:
         print("损失函数: 简单BCE (BCEWithLogitsLoss)")
         criterion = nn.BCEWithLogitsLoss(reduction='mean')
@@ -345,7 +358,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         avg_loss_b = total_loss_b / total_samples if total_samples > 0 else 0
 
         # 计算测试集损失
-        test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, eval_criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
+        test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, eval_criterion, device)
 
         # 记录当前轮次收益率
         epoch_return = {

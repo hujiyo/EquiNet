@@ -37,9 +37,9 @@ class DataConfig:
     SIGNAL_BURST_CUM = 0.06          # 爆发后累计阈值：累计≥6%
 
     # 评估参数
-    EVAL_BATCH_SIZE = 100             # 评估批处理大小
+    EVAL_BATCH_SIZE = 256            # 评估批处理大小（分批处理，减少显存占用）
     TOP_PERCENT = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
-    TOP_N_PER_DAY = 4                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
+    TOP_N_PER_DAY = 3                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
     
     # 模型保存条件
     MIN_AUC = 0.65                    # 最低AUC要求（按时间划分后的真实性能基线）

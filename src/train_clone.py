@@ -132,9 +132,24 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     if LossConfig.use_dynamic_bce():
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        
+        # 测试集权重：开局算一次，整个训练过程复用
+        test_targets = np.array(eval_targets)
+        test_pos_count = np.sum(test_targets >= 0.5)
+        test_neg_count = np.sum(test_targets < 0.5)
+        if test_pos_count > 0 and test_neg_count > 0:
+            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
+        elif test_pos_count == 0:
+            test_neg_weight = float(LossConfig.POS_WEIGHT)
+        else:
+            test_neg_weight = 0.1
+        eval_criterion.weight_0_0.fill_(test_neg_weight)
+        print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
     else:
         print("损失函数: 简单BCE (BCEWithLogitsLoss)")
         criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
     # 最佳模型A缓存（按Top1%收益率判断）
     best_return_a = -float('inf')
@@ -321,7 +336,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         avg_loss_a = total_loss_a / total_samples_a if total_samples_a > 0 else 0
 
         # 计算测试集损失（用于早停检测）
-        test_loss_a = calculate_test_loss(model_a, eval_inputs, eval_targets, criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
+        test_loss_a = calculate_test_loss(model_a, eval_inputs, eval_targets, eval_criterion, device)
 
         # 打印模型A结果
         print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
@@ -407,7 +422,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
 
             epoch_return['return_b'] = stats_b['top_return'] * 100
 
-            test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
+            test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, eval_criterion, device)
             epoch_return['train_loss_b'] = avg_loss_b
             epoch_return['test_loss_b'] = test_loss_b
 

@@ -113,6 +113,19 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        
+        # 测试集权重：开局算一次，整个训练过程复用
+        test_targets = np.array(eval_targets)
+        test_pos_count = np.sum(test_targets >= 0.5)
+        test_neg_count = np.sum(test_targets < 0.5)
+        if test_pos_count > 0 and test_neg_count > 0:
+            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
+        elif test_pos_count == 0:
+            test_neg_weight = float(LossConfig.POS_WEIGHT)
+        else:
+            test_neg_weight = 0.1
+        eval_criterion.weight_0_0.fill_(test_neg_weight)
+        print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
     else:
         print("损失函数: 简单BCE (BCEWithLogitsLoss)")
         criterion = nn.BCEWithLogitsLoss(reduction='mean')
@@ -222,7 +235,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         stats = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="DFT", eval_day_indices=eval_day_indices)
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
-        test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
+        test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device)
 
         print(f'  [DFT模型] 训练损失: {avg_loss:.4f}, 测试损失: {test_loss:.4f}, AUC: {stats["auc"]:.4f}')
         print(f'            预测均值: {stats["pred_mean"]:.3f}, 高置信(>0.7): {stats["high_conf_count"]}, 低置信(<0.2): {stats["low_conf_count"]}')

@@ -179,10 +179,12 @@ class DynamicWeightedBCE(nn.Module):
 
 
 def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_returns, device, 
-                         batch_size=100, eval_day_indices=None, top_n_per_day=None):
+                         batch_size=1024, eval_day_indices=None, top_n_per_day=None):
     """
     批量评估模型性能（详细版，用于train.py主训练流程）
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
+
+    优化版本：预先将所有数据传输到GPU，减少CPU-GPU数据传输开销
 
     返回:
         total: 总样本数
@@ -198,37 +200,24 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
     """
     model.eval()
 
-    all_preds = []
-    all_targets = []
-    all_returns = []
-
     num_samples = len(eval_inputs)
-    num_batches = (num_samples + batch_size - 1) // batch_size
+    if num_samples == 0:
+        return 0, [0, 0], [0, 0], 0, 0, 0, 0.5, {}, {'count': 0, 'avg_return': 0, 'total_return': 0, 'filtered_count': 0}, None
 
     original_dtype = next(model.parameters()).dtype
     use_fp32_eval = original_dtype == torch.bfloat16
     if use_fp32_eval:
         model = model.float()
     
+    all_inputs_tensor = torch.tensor(eval_inputs, dtype=torch.float32, device=device)
+    
     with torch.no_grad():
-        for i in range(num_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, num_samples)
-
-            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx],
-                                       dtype=torch.float32).to(device)
-            batch_targets = eval_targets[start_idx:end_idx]
-            batch_returns = eval_cumulative_returns[start_idx:end_idx]
-
-            preds = torch.sigmoid(model(batch_inputs))
-
-            all_preds.extend(preds.float().cpu().numpy().flatten())
-            all_targets.extend(batch_targets)
-            all_returns.extend(batch_returns)
-
-    all_preds = np.array(all_preds)
-    all_targets = np.array(all_targets)
-    all_returns = np.array(all_returns)
+        all_preds_tensor = torch.sigmoid(model(all_inputs_tensor))
+        all_preds = all_preds_tensor.float().cpu().numpy().flatten()
+    
+    del all_inputs_tensor
+    all_targets = np.array(eval_targets)
+    all_returns = np.array(eval_cumulative_returns)
 
     total = len(all_preds)
 
@@ -299,6 +288,8 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     简化版模型评估函数（用于train_clone.py和train_evolve.py）
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
 
+    优化版本：预先将所有数据传输到GPU，减少CPU-GPU数据传输开销
+
     返回统计字典，包含：
         auc：AUC得分
         top_return：Top1%收益率
@@ -313,37 +304,28 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     """
     model.eval()
 
-    all_preds = []
-    all_targets = []
-    all_returns = []
-
     num_samples = len(eval_inputs)
-    num_batches = (num_samples + batch_size - 1) // batch_size
+    if num_samples == 0:
+        return {
+            'auc': 0.5, 'top_return': 0.0, 'top_count': 0, 'top_threshold': 0.0,
+            'high_conf_count': 0, 'low_conf_count': 0, 'pred_mean': 0.0, 
+            'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None
+        }
 
     original_dtype = next(model.parameters()).dtype
     use_fp32_eval = original_dtype == torch.bfloat16
     if use_fp32_eval:
         model = model.float()
 
+    all_inputs_tensor = torch.tensor(eval_inputs, dtype=torch.float32, device=device)
+    
     with torch.no_grad():
-        for i in range(num_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, num_samples)
-
-            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx],
-                                       dtype=torch.float32).to(device)
-            batch_targets = eval_targets[start_idx:end_idx]
-            batch_returns = eval_cumulative_returns[start_idx:end_idx]
-
-            preds = torch.sigmoid(model(batch_inputs))
-
-            all_preds.extend(preds.float().cpu().numpy().flatten())
-            all_targets.extend(batch_targets)
-            all_returns.extend(batch_returns)
-
-    all_preds = np.array(all_preds)
-    all_targets = np.array(all_targets)
-    all_returns = np.array(all_returns)
+        all_preds_tensor = torch.sigmoid(model(all_inputs_tensor))
+        all_preds = all_preds_tensor.float().cpu().numpy().flatten()
+    
+    del all_inputs_tensor
+    all_targets = np.array(eval_targets)
+    all_returns = np.array(eval_cumulative_returns)
 
     try:
         auc = roc_auc_score(all_targets, all_preds)
@@ -585,20 +567,26 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
 
     return save_path
 
-def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, batch_size=100):
+def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, batch_size=1024):
     """
     计算测试集损失（官方标准：除以样本数）
+
+    优化版本：
+    - 权重在训练开始时已设置，此处直接使用
+    - 支持大batch_size，提高GPU利用率
 
     计算方式：
     - 每个batch的loss.item()是该batch内每样本的平均损失（reduction='mean'）
     - 累加时乘以batch_size，得到所有样本的总损失
     - 最终除以总样本数，得到每样本平均损失
-
-    这样与训练损失的计算方式保持一致，两者具有可比性
     """
     model.eval()
     total_loss = 0.0
     num_samples = len(eval_inputs)
+    
+    if num_samples == 0:
+        return 0.0
+    
     num_batches = (num_samples + batch_size - 1) // batch_size
 
     with torch.no_grad():
@@ -611,16 +599,10 @@ def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, bat
             batch_targets = torch.tensor(eval_targets[start_idx:end_idx],
                                         dtype=torch.bfloat16).to(device)
 
-            # 动态更新权重：根据当前batch的正负样本比例（仅DynamicWeightedBCE需要）
-            if hasattr(criterion, 'update_weights'):
-                criterion.update_weights(batch_targets)
-
             outputs = model(batch_inputs)
             loss = criterion(outputs.squeeze(-1), batch_targets)
-            # loss.item()是该batch内每样本的平均损失，乘以batch_size得到该batch总损失
             total_loss += loss.item() * (end_idx - start_idx)
 
-    # 返回每样本平均损失（官方标准）
     return total_loss / num_samples
 
 
@@ -883,6 +865,19 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        
+        # 测试集权重：开局算一次，整个训练过程复用（保证测试loss稳定可比）
+        test_targets = np.array(eval_targets)
+        test_pos_count = np.sum(test_targets >= 0.5)
+        test_neg_count = np.sum(test_targets < 0.5)
+        if test_pos_count > 0 and test_neg_count > 0:
+            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
+        elif test_pos_count == 0:
+            test_neg_weight = float(LossConfig.POS_WEIGHT)
+        else:
+            test_neg_weight = 0.1
+        eval_criterion.weight_0_0.fill_(test_neg_weight)
+        print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
     else:
         print("损失函数: 简单BCE (BCEWithLogitsLoss)")
         criterion = nn.BCEWithLogitsLoss(reduction='mean')
@@ -1117,8 +1112,8 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
                 model, train_eval_inputs, train_eval_targets, train_eval_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
             )
 
-            # 计算测试集损失（使用固定权重的eval_criterion，保证可比性）
-            test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
+            # 计算测试集损失（使用全局权重，batch_size=1024）
+            test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device)
 
             # 记录当前轮次收益率（必须在test_loss计算之后）
             epoch_return = {

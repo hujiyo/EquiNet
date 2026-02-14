@@ -267,13 +267,11 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
 
     avg_return = np.mean(top_returns)
     total_return = np.sum(top_returns)
-    compound_return = np.prod(1 + top_returns) ** (1 / len(top_returns)) - 1
 
     top_stats = {
         'count': top_k,
         'avg_return': avg_return,
         'total_return': total_return,
-        'compound_return': compound_return,
         'filtered_count': 0
     }
 
@@ -343,7 +341,6 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     top_returns = all_returns[top_indices]
 
     top_return = np.mean(top_returns)
-    top_return_compound = np.prod(1 + top_returns) ** (1 / len(top_returns)) - 1
     top_threshold = all_preds[sorted_indices[top_k - 1]]
 
     high_conf = all_preds > 0.7
@@ -352,7 +349,6 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     stats = {
         'auc': auc,
         'top_return': top_return,
-        'top_return_compound': top_return_compound,
         'top_count': top_k,
         'top_threshold': top_threshold,
         'high_conf_count': np.sum(high_conf),
@@ -1079,10 +1075,9 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
             # 记录当前轮次收益率（必须在test_loss计算之后）
             epoch_return = {
                 'turn': epoch + 1,
-                'return': top_stats['avg_return'] * 100,  # 转换为百分比
-                'return_compound': top_stats['compound_return'] * 100,  # 复利收益率百分比
-                'train_loss': train_loss_epoch,  # 训练集损失（基于实际batch数）
-                'test_loss': test_loss  # 测试集损失
+                'return': top_stats['avg_return'] * 100,
+                'train_loss': train_loss_epoch,
+                'test_loss': test_loss
             }
             epoch_returns.append(epoch_return)
 
@@ -1124,13 +1119,11 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
             # 收益率对比（训练集 vs 测试集）- 用于检测过拟合
             train_return_pct = train_top_stats["avg_return"] * 100
             test_return_pct = top_stats["avg_return"] * 100
-            train_compound_pct = train_top_stats["compound_return"] * 100
-            test_compound_pct = top_stats["compound_return"] * 100
             return_gap = train_return_pct - test_return_pct
 
             print(f'  【过拟合检测】Top{DataConfig.TOP_PERCENT}%收益率对比:')
-            print(f'    训练集: {train_return_pct:+.2f}% | 复利: {train_compound_pct:+.2f}% (样本数={train_top_stats["count"]})')
-            print(f'    测试集: {test_return_pct:+.2f}% | 复利: {test_compound_pct:+.2f}% (样本数={top_stats["count"]})')
+            print(f'    训练集: {train_return_pct:+.2f}% (样本数={train_top_stats["count"]})')
+            print(f'    测试集: {test_return_pct:+.2f}% (样本数={top_stats["count"]})')
             print(f'    差距: {return_gap:+.2f}% ', end='')
             if return_gap > 1.0:
                 print('⚠️ 过拟合风险：训练集明显高于测试集')
@@ -1183,7 +1176,7 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
                 import copy
                 best_model_state = copy.deepcopy(model.state_dict())
                 print(f'  ✓ 发现更好的模型！{save_reason}（已缓存到内存）')
-                print(f'    详情: AUC={auc_score:.4f}, Top{DataConfig.TOP_PERCENT}%收益: 平均={top_stats["avg_return"]*100:+.2f}% | 复利={top_stats["compound_return"]*100:+.2f}%, 累计={top_stats["total_return"]*100:+.2f}%')
+                print(f'    详情: AUC={auc_score:.4f}, Top{DataConfig.TOP_PERCENT}%收益: 平均={top_stats["avg_return"]*100:+.2f}%, 累计={top_stats["total_return"]*100:+.2f}%')
 
             # 早停检查
             if early_stopping.should_stop():
@@ -1214,14 +1207,13 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"baseline_epoch_returns_{timestamp}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'return_compound', 'train_loss', 'test_loss'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'train_loss', 'test_loss'])
         writer.writeheader()
 
         for epoch_return in epoch_returns:
             row = {
                 'turn': epoch_return['turn'],
                 'return': f"{epoch_return['return']:.2f}",
-                'return_compound': f"{epoch_return['return_compound']:.2f}",
                 'train_loss': f"{epoch_return['train_loss']:.4f}",
                 'test_loss': f"{epoch_return['test_loss']:.4f}"
             }

@@ -116,7 +116,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         
         # 评估教师模型
         stats = evaluate_model(teacher, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name=f"教师{i+1}", eval_day_indices=eval_day_indices)
-        print(f"  教师{i+1}: AUC={stats['auc']:.4f}, Top1%收益={stats['top_return']*100:+.2f}% | 复利={stats['top_return_compound']*100:+.2f}%")
+        print(f"  教师{i+1}: AUC={stats['auc']:.4f}, Top1%收益={stats['top_return']*100:+.2f}%")
         if stats['realistic_stats'] is not None:
             rs = stats['realistic_stats']
             print(f"         【实战收益率】平均: {rs['avg_realistic_return']*100:.1f}%")
@@ -130,7 +130,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     
     # 评估初始学生B
     stats_b_init = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B(初始)", eval_day_indices=eval_day_indices)
-    print(f"  学生B: AUC={stats_b_init['auc']:.4f}, Top1%收益={stats_b_init['top_return']*100:+.2f}% | 复利={stats_b_init['top_return_compound']*100:+.2f}%")
+    print(f"  学生B: AUC={stats_b_init['auc']:.4f}, Top1%收益={stats_b_init['top_return']*100:+.2f}%")
     if stats_b_init['realistic_stats'] is not None:
         rs = stats_b_init['realistic_stats']
         print(f"         【实战收益率】平均: {rs['avg_realistic_return']*100:.1f}%")
@@ -344,10 +344,9 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         # 记录当前轮次收益率
         epoch_return = {
             'turn': epoch + 1,
-            'return_b': stats_b['top_return'] * 100,  # 转换为百分比
-            'return_b_compound': stats_b['top_return_compound'] * 100,  # 复利收益率百分比
-            'train_loss': avg_loss_b,  # 训练集损失
-            'test_loss': test_loss_b  # 测试集损失
+            'return_b': stats_b['top_return'] * 100,
+            'train_loss': avg_loss_b,
+            'test_loss': test_loss_b
         }
         epoch_returns.append(epoch_return)
         
@@ -355,9 +354,8 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         print(f"  [B最佳] Top1%收益: {best_return_b*100:+.2f}%")
         print(f"  [模型B] 损失: {avg_loss_b:.4f}, AUC: {stats_b['auc']:.4f}")
         print(f"          预测均值: {stats_b['pred_mean']:.3f}, 高置信(>0.7): {stats_b['high_conf_count']}, 低置信(<0.2): {stats_b['low_conf_count']}")
-        print(f"          Top1%收益: {stats_b['top_return']*100:+.2f}% | 复利: {stats_b['top_return_compound']*100:+.2f}%")
+        print(f"          Top1%收益: {stats_b['top_return']*100:+.2f}%")
         
-        # 实战收益率统计
         if stats_b['realistic_stats'] is not None:
             rs = stats_b['realistic_stats']
             daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
@@ -409,14 +407,13 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     timestamp_csv = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"evolve_epoch_returns_{timestamp_csv}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'B', 'B_compound', 'train_loss', 'test_loss'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'B', 'train_loss', 'test_loss'])
         writer.writeheader()
 
         for epoch_return in epoch_returns:
             row = {
                 'turn': epoch_return['turn'],
                 'B': f"{epoch_return['return_b']:.2f}",
-                'B_compound': f"{epoch_return['return_b_compound']:.2f}",
                 'train_loss': f"{epoch_return['train_loss']:.4f}",
                 'test_loss': f"{epoch_return['test_loss']:.4f}"
             }

@@ -79,7 +79,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
     eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices = create_fixed_evaluation_dataset(test_stock_info)
 
     stats_init = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="初始模型", eval_day_indices=eval_day_indices)
-    print(f"初始模型评估: AUC={stats_init['auc']:.4f}, Top1%收益={stats_init['top_return']*100:+.2f}% | 复利={stats_init['top_return_compound']*100:+.2f}%")
+    print(f"初始模型评估: AUC={stats_init['auc']:.4f}, Top1%收益={stats_init['top_return']*100:+.2f}%")
     if stats_init['realistic_stats'] is not None:
         rs = stats_init['realistic_stats']
         print(f"              【实战收益率】平均: {rs['avg_realistic_return']*100:.1f}%")
@@ -226,9 +226,8 @@ def train_dft_model(model, train_stock_info, test_stock_info,
 
         print(f'  [DFT模型] 训练损失: {avg_loss:.4f}, 测试损失: {test_loss:.4f}, AUC: {stats["auc"]:.4f}')
         print(f'            预测均值: {stats["pred_mean"]:.3f}, 高置信(>0.7): {stats["high_conf_count"]}, 低置信(<0.2): {stats["low_conf_count"]}')
-        print(f'            Top{DataConfig.TOP_PERCENT}%收益: {stats["top_return"]*100:+.2f}% | 复利: {stats["top_return_compound"]*100:+.2f}%')
+        print(f'            Top{DataConfig.TOP_PERCENT}%收益: {stats["top_return"]*100:+.2f}%')
         
-        # 实战收益率统计
         if stats['realistic_stats'] is not None:
             rs = stats['realistic_stats']
             daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
@@ -238,7 +237,6 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         epoch_return = {
             'turn': epoch + 1,
             'return': stats['top_return'] * 100,
-            'return_compound': stats['top_return_compound'] * 100,
             'train_loss': avg_loss,
             'test_loss': test_loss
         }
@@ -279,14 +277,13 @@ def train_dft_model(model, train_stock_info, test_stock_info,
     timestamp_csv = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"dft_epoch_returns_{timestamp_csv}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'return_compound', 'train_loss', 'test_loss'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'train_loss', 'test_loss'])
         writer.writeheader()
 
         for epoch_return in epoch_returns:
             row = {
                 'turn': epoch_return['turn'],
                 'return': f"{epoch_return['return']:.2f}",
-                'return_compound': f"{epoch_return['return_compound']:.2f}",
                 'train_loss': f"{epoch_return['train_loss']:.4f}",
                 'test_loss': f"{epoch_return['test_loss']:.4f}"
             }

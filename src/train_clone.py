@@ -326,25 +326,21 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         # 打印模型A结果
         print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
         print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
-        print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_a["top_return"]*100:+.2f}% | 复利: {stats_a["top_return_compound"]*100:+.2f}%')
+        print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_a["top_return"]*100:+.2f}%')
         
-        # 实战收益率统计
         if stats_a['realistic_stats'] is not None:
             rs = stats_a['realistic_stats']
             daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
             print(f'          【实战收益率】每日统计: {{{daily_stats_str}}}')
             print(f'          【实战收益率】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
         
-        # 记录当前轮次收益率
         epoch_return = {
             'turn': epoch + 1,
-            'return_a': stats_a['top_return'] * 100,  # 转换为百分比
-            'return_a_compound': stats_a['top_return_compound'] * 100,  # 复利收益率百分比
-            'return_b': None,  # 模型B尚未创建或未评估
-            'return_b_compound': None,
-            'train_loss_a': avg_loss_a,  # 训练集损失A
-            'test_loss_a': test_loss_a,  # 测试集损失A
-            'train_loss_b': None,  # 模型B尚未创建
+            'return_a': stats_a['top_return'] * 100,
+            'return_b': None,
+            'train_loss_a': avg_loss_a,
+            'test_loss_a': test_loss_a,
+            'train_loss_b': None,
             'test_loss_b': None
         }
 
@@ -388,9 +384,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
 
             print(f'  [模型B] 损失: {avg_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
-            print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_b["top_return"]*100:+.2f}% | 复利: {stats_b["top_return_compound"]*100:+.2f}%')
+            print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_b["top_return"]*100:+.2f}%')
             
-            # 实战收益率统计
             if stats_b['realistic_stats'] is not None:
                 rs = stats_b['realistic_stats']
                 daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
@@ -400,7 +395,6 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             print(f'          伪标签来源: 最佳A(第{best_return_epoch_a}轮, 收益{best_return_a*100:+.2f}%)')
             print(f'          伪标签统计: 伪正={total_pseudo_pos}, 伪负={total_pseudo_neg}, 不变={total_unchanged}')
 
-            # 保存最佳模型B（按收益率）
             if stats_b['top_return'] > best_return_b:
                 best_return_b = stats_b['top_return']
                 best_return_epoch_b = epoch + 1
@@ -409,14 +403,11 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 best_threshold_b = stats_b['top_threshold']
                 print(f'          ✓ 新最佳模型B（收益率）！Top1%收益: {best_return_b*100:+.2f}% (第{best_return_epoch_b}轮)')
 
-            # 更新当前轮次收益率（模型B已存在）
-            epoch_return['return_b'] = stats_b['top_return'] * 100  # 转换为百分比
-            epoch_return['return_b_compound'] = stats_b['top_return_compound'] * 100  # 复利收益率百分比
+            epoch_return['return_b'] = stats_b['top_return'] * 100
 
-            # 计算测试集损失B
             test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, criterion, device, batch_size=DataConfig.EVAL_BATCH_SIZE)
-            epoch_return['train_loss_b'] = avg_loss_b  # 训练集损失B
-            epoch_return['test_loss_b'] = test_loss_b  # 测试集损失B
+            epoch_return['train_loss_b'] = avg_loss_b
+            epoch_return['test_loss_b'] = test_loss_b
 
         # 将当前轮次收益率添加到列表
         epoch_returns.append(epoch_return)
@@ -465,17 +456,14 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"clone_epoch_returns_{timestamp}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'A', 'A_compound', 'B', 'B_compound', 'train_loss_A', 'test_loss_A', 'train_loss_B', 'test_loss_B'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'A', 'B', 'train_loss_A', 'test_loss_A', 'train_loss_B', 'test_loss_B'])
         writer.writeheader()
 
         for epoch_return in epoch_returns:
-            # 将None转换为空字符串
             row = {
                 'turn': epoch_return['turn'],
                 'A': f"{epoch_return['return_a']:.2f}" if epoch_return['return_a'] is not None else "",
-                'A_compound': f"{epoch_return['return_a_compound']:.2f}" if epoch_return['return_a_compound'] is not None else "",
                 'B': f"{epoch_return['return_b']:.2f}" if epoch_return['return_b'] is not None else "",
-                'B_compound': f"{epoch_return['return_b_compound']:.2f}" if epoch_return['return_b_compound'] is not None else "",
                 'train_loss_A': f"{epoch_return['train_loss_a']:.4f}" if epoch_return.get('train_loss_a') is not None else "",
                 'test_loss_A': f"{epoch_return['test_loss_a']:.4f}" if epoch_return.get('test_loss_a') is not None else "",
                 'train_loss_B': f"{epoch_return['train_loss_b']:.4f}" if epoch_return.get('train_loss_b') is not None else "",

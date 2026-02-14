@@ -469,8 +469,8 @@ def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_perc
                 daily_stats.append((0, 0.0))
     
     if len(daily_returns) > 0:
-        cumulative_return = np.prod(np.array(daily_returns) + 1.0) - 1.0
-        avg_realistic_return = (cumulative_return + 1.0) ** (1.0 / len(daily_returns)) - 1.0
+        avg_realistic_return = np.mean(daily_returns)
+        cumulative_return = np.sum(daily_returns)
     else:
         avg_realistic_return = 0.0
         cumulative_return = 0.0
@@ -583,8 +583,8 @@ def calculate_smart_exit_return(all_preds, all_daily_returns, all_day_indices, t
         daily_stats.append((select_count, avg_day_return, exit_type))
     
     if len(daily_returns) > 0:
-        cumulative_return = np.prod(np.array(daily_returns) + 1.0) - 1.0
-        avg_realistic_return = (cumulative_return + 1.0) ** (1.0 / len(daily_returns)) - 1.0
+        avg_realistic_return = np.mean(daily_returns)
+        cumulative_return = np.sum(daily_returns)
     else:
         avg_realistic_return = 0.0
         cumulative_return = 0.0

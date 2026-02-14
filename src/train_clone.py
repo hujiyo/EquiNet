@@ -82,7 +82,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
 
     # 创建评估数据集
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices = create_fixed_evaluation_dataset(test_stock_info)
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info)
 
     # 模型B初始化为None
     model_b = None
@@ -328,7 +328,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             main_scheduler_a.step()
 
         # 评估模型A（使用统一的评估函数）
-        stats_a = evaluate_model(model_a, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="A", eval_day_indices=eval_day_indices)
+        stats_a = evaluate_model(model_a, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="A", eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns)
 
         # 计算训练集平均损失（除以样本数，与测试损失保持一致）
         # total_loss_a已经是所有样本的总损失（累加时乘以了batch_size）
@@ -349,6 +349,10 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if rs.get('mode') == 'top_n_per_day' else "全局阈值"
             print(f'          【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
             print(f'          【实战收益率({mode_str})】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
+        
+        if stats_a.get('smart_exit_stats') is not None:
+            se = stats_a['smart_exit_stats']
+            print(f'          【智能止损】收益率: {se["avg_realistic_return"]*100:.1f}%, Day1止损: {se["stop_loss_day1_count"]}次, 累计止损: {se["stop_loss_cum_count"]}次, 止盈: {se["take_profit_count"]}次')
         
         epoch_return = {
             'turn': epoch + 1,
@@ -391,7 +395,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
 
         # 评估模型B（如果存在）
         if model_b is not None:
-            stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B", eval_day_indices=eval_day_indices)
+            stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B", eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns)
 
             # 计算训练集平均损失（除以样本数，与测试损失保持一致）
             # total_loss_b已经是所有样本的总损失（累加时乘以了batch_size）
@@ -408,6 +412,10 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if rs.get('mode') == 'top_n_per_day' else "全局阈值"
                 print(f'          【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
                 print(f'          【实战收益率({mode_str})】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
+            
+            if stats_b.get('smart_exit_stats') is not None:
+                se = stats_b['smart_exit_stats']
+                print(f'          【智能止损】收益率: {se["avg_realistic_return"]*100:.1f}%, Day1止损: {se["stop_loss_day1_count"]}次, 累计止损: {se["stop_loss_cum_count"]}次, 止盈: {se["take_profit_count"]}次')
             
             print(f'          伪标签来源: 最佳A(第{best_return_epoch_a}轮, 收益{best_return_a*100:+.2f}%)')
             print(f'          伪标签统计: 伪正={total_pseudo_pos}, 伪负={total_pseudo_neg}, 不变={total_unchanged}')

@@ -76,9 +76,9 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices = create_fixed_evaluation_dataset(test_stock_info)
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info)
 
-    stats_init = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="初始模型", eval_day_indices=eval_day_indices)
+    stats_init = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="初始模型", eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns)
     print(f"初始模型评估: AUC={stats_init['auc']:.4f}, Top1%收益={stats_init['top_return']*100:+.2f}%")
     if stats_init['realistic_stats'] is not None:
         rs = stats_init['realistic_stats']
@@ -232,7 +232,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
 
         main_scheduler.step()
 
-        stats = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="DFT", eval_day_indices=eval_day_indices)
+        stats = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="DFT", eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns)
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
         test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device)
@@ -247,6 +247,10 @@ def train_dft_model(model, train_stock_info, test_stock_info,
             mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if rs.get('mode') == 'top_n_per_day' else "全局阈值"
             print(f'            【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
             print(f'            【实战收益率({mode_str})】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
+        
+        if stats.get('smart_exit_stats') is not None:
+            se = stats['smart_exit_stats']
+            print(f'            【智能止损】收益率: {se["avg_realistic_return"]*100:.1f}%, Day1止损: {se["stop_loss_day1_count"]}次, 累计止损: {se["stop_loss_cum_count"]}次, 止盈: {se["take_profit_count"]}次')
 
         epoch_return = {
             'turn': epoch + 1,

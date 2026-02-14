@@ -100,7 +100,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
     
     # 创建评估数据集
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices = create_fixed_evaluation_dataset(test_stock_info)
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info)
     
     # 加载所有教师模型
     teachers = []
@@ -115,7 +115,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         teachers.append(teacher)
         
         # 评估教师模型
-        stats = evaluate_model(teacher, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name=f"教师{i+1}", eval_day_indices=eval_day_indices)
+        stats = evaluate_model(teacher, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name=f"教师{i+1}", eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns)
         print(f"  教师{i+1}: AUC={stats['auc']:.4f}, Top1%收益={stats['top_return']*100:+.2f}%")
         if stats['realistic_stats'] is not None:
             rs = stats['realistic_stats']
@@ -129,7 +129,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     model_b.load_state_dict(state_dict)
     
     # 评估初始学生B
-    stats_b_init = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B(初始)", eval_day_indices=eval_day_indices)
+    stats_b_init = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B(初始)", eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns)
     print(f"  学生B: AUC={stats_b_init['auc']:.4f}, Top1%收益={stats_b_init['top_return']*100:+.2f}%")
     if stats_b_init['realistic_stats'] is not None:
         rs = stats_b_init['realistic_stats']
@@ -350,7 +350,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         print()  # 换行
         
         # 评估模型B
-        stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B", eval_day_indices=eval_day_indices)
+        stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B", eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns)
 
         # 计算训练集平均损失（除以样本数，与测试损失保持一致）
         # total_loss_b已经是所有样本的总损失（累加时乘以了batch_size）
@@ -381,6 +381,10 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
             mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if rs.get('mode') == 'top_n_per_day' else "全局阈值"
             print(f'          【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
             print(f'          【实战收益率({mode_str})】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
+        
+        if stats_b.get('smart_exit_stats') is not None:
+            se = stats_b['smart_exit_stats']
+            print(f'          【智能止损】收益率: {se["avg_realistic_return"]*100:.1f}%, Day1止损: {se["stop_loss_day1_count"]}次, 累计止损: {se["stop_loss_cum_count"]}次, 止盈: {se["take_profit_count"]}次')
         
         print(f"          伪标签统计: 伪正={total_pseudo_pos}, 伪负={total_pseudo_neg}, 不变={total_unchanged}")
         

@@ -14,14 +14,14 @@ class DataConfig:
     OUTPUT_DIR = './out'             # 输出目录
 
     # 数据分割参数（按时间划分）
-    TEST_DAYS = 140                   # 测试集天数（每只股票的最近N天作为测试集）
+    TEST_DAYS = 110                   # 测试集天数（每只股票的最近N天作为测试集）
     RANDOM_SEED = 42                 # 随机种子
     
     # 训练集时间范围限制
     TRAIN_START_YEAR = 2019          # 训练集起始年份（2020年及以前的数据不参与训练）
     
     # 样本生成参数
-    CONTEXT_LENGTH = 60              # 历史数据长度（这是核心参数，其他地方应引用这个值）
+    CONTEXT_LENGTH = 30              # 历史数据长度（这是核心参数，其他地方应引用这个值）
     FUTURE_DAYS = 3                  # 未来预测天数
     REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS  # 总需求长度（上下文 + 未来天数）
 

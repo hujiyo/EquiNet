@@ -394,7 +394,7 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     
     target = float(check_strong_signal(daily_returns))
 
-    return input_seq, target, cumulative_return
+    return input_seq, target, cumulative_return, daily_returns
 
 
 def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng):
@@ -445,7 +445,7 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
             if sample is None:
                 continue
 
-            input_seq, target, _ = sample
+            input_seq, target, _, _ = sample
 
             if target >= 0.5:
                 pos_pool_inputs.append(input_seq)
@@ -508,11 +508,13 @@ def create_fixed_evaluation_dataset(test_stock_info):
         eval_targets: 标签
         eval_cumulative_returns: 累计收益率
         eval_day_indices: 每个样本对应的预测日在测试集中的相对偏移量（用于实战收益率按天分组）
+        eval_daily_returns: 每日收益列表 [[r1, r2, r3], ...]
     """
     eval_inputs = []
     eval_targets = []
     eval_cumulative_returns = []
     eval_day_indices = []
+    eval_daily_returns = []
 
     for stock_info in test_stock_info:
         stock_data = stock_info['data']
@@ -529,10 +531,11 @@ def create_fixed_evaluation_dataset(test_stock_info):
             if sample is None:
                 continue
 
-            input_seq, target, cumulative_return = sample
+            input_seq, target, cumulative_return, daily_returns = sample
             eval_inputs.append(input_seq)
             eval_targets.append(target)
             eval_cumulative_returns.append(float(cumulative_return))
+            eval_daily_returns.append(daily_returns)
             
             predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
             day_index = predict_day_idx - test_split_point
@@ -542,7 +545,8 @@ def create_fixed_evaluation_dataset(test_stock_info):
         raise ValueError("固定评估集为空：test_stock_info中没有可用样本")
 
     return (np.asarray(eval_inputs), np.asarray(eval_targets), 
-            np.asarray(eval_cumulative_returns), np.asarray(eval_day_indices))
+            np.asarray(eval_cumulative_returns), np.asarray(eval_day_indices),
+            eval_daily_returns)
 
 
 def create_train_evaluation_dataset(train_stock_info, first_n_days=80):
@@ -560,6 +564,7 @@ def create_train_evaluation_dataset(train_stock_info, first_n_days=80):
     eval_inputs = []
     eval_targets = []
     eval_cumulative_returns = []
+    eval_daily_returns = []
 
     for stock_info in train_stock_info:
         stock_data = stock_info['data']
@@ -576,16 +581,17 @@ def create_train_evaluation_dataset(train_stock_info, first_n_days=80):
             if sample is None:
                 continue
 
-            input_seq, target, cumulative_return = sample
+            input_seq, target, cumulative_return, daily_returns = sample
             eval_inputs.append(input_seq)
             eval_targets.append(target)
             eval_cumulative_returns.append(float(cumulative_return))
+            eval_daily_returns.append(daily_returns)
 
     if len(eval_inputs) == 0:
         raise ValueError("训练集评估集为空：train_stock_info中没有可用样本")
 
     print(f"    训练集评估数据集已生成: {len(eval_inputs)}个样本 (每股票前{first_n_days}交易日)")
-    return np.asarray(eval_inputs), np.asarray(eval_targets), np.asarray(eval_cumulative_returns)
+    return np.asarray(eval_inputs), np.asarray(eval_targets), np.asarray(eval_cumulative_returns), eval_daily_returns
 
 
 def normalize_data_for_prediction(data):

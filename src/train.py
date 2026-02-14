@@ -179,12 +179,12 @@ class DynamicWeightedBCE(nn.Module):
 
 
 def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_returns, device, 
-                         batch_size=1024, eval_day_indices=None, top_n_per_day=None):
+                         batch_size=256, eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None):
     """
     批量评估模型性能（详细版，用于train.py主训练流程）
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
 
-    优化版本：预先将所有数据传输到GPU，减少CPU-GPU数据传输开销
+    优化版本：分批处理，减少显存占用
 
     返回:
         total: 总样本数
@@ -209,13 +209,20 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
     if use_fp32_eval:
         model = model.float()
     
-    all_inputs_tensor = torch.tensor(eval_inputs, dtype=torch.float32, device=device)
+    all_preds = []
+    num_batches = (num_samples + batch_size - 1) // batch_size
     
     with torch.no_grad():
-        all_preds_tensor = torch.sigmoid(model(all_inputs_tensor))
-        all_preds = all_preds_tensor.float().cpu().numpy().flatten()
+        for i in range(num_batches):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, num_samples)
+            
+            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], dtype=torch.float32, device=device)
+            batch_preds = torch.sigmoid(model(batch_inputs))
+            all_preds.append(batch_preds.float().cpu().numpy().flatten())
+            del batch_inputs
     
-    del all_inputs_tensor
+    all_preds = np.concatenate(all_preds)
     all_targets = np.array(eval_targets)
     all_returns = np.array(eval_cumulative_returns)
 
@@ -270,25 +277,29 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
     }
 
     realistic_stats = None
+    smart_exit_stats = None
     if eval_day_indices is not None:
         actual_top_n = top_n_per_day if top_n_per_day is not None else DataConfig.TOP_N_PER_DAY
         if actual_top_n == 0:
             actual_top_n = None
         realistic_stats = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent, actual_top_n)
+        
+        if eval_daily_returns is not None and actual_top_n is not None:
+            smart_exit_stats = calculate_smart_exit_return(all_preds, eval_daily_returns, eval_day_indices, actual_top_n)
 
     if use_fp32_eval:
         model = model.to(original_dtype)
 
-    return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats
+    return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats, smart_exit_stats
 
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
-                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None):
+                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None):
     """
     简化版模型评估函数（用于train_clone.py和train_evolve.py）
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
 
-    优化版本：预先将所有数据传输到GPU，减少CPU-GPU数据传输开销
+    优化版本：分批处理，减少显存占用
 
     返回统计字典，包含：
         auc：AUC得分
@@ -301,6 +312,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         pred_std：预测标准差
         filtered_count：被过滤的涨停样本数（始终为0，因已在生成阶段过滤）
         realistic_stats：实战收益率统计（如果提供了eval_day_indices）
+        smart_exit_stats：智能止损策略统计（如果提供了eval_daily_returns）
     """
     model.eval()
 
@@ -309,7 +321,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         return {
             'auc': 0.5, 'top_return': 0.0, 'top_count': 0, 'top_threshold': 0.0,
             'high_conf_count': 0, 'low_conf_count': 0, 'pred_mean': 0.0, 
-            'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None
+            'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None, 'smart_exit_stats': None
         }
 
     original_dtype = next(model.parameters()).dtype
@@ -317,13 +329,20 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     if use_fp32_eval:
         model = model.float()
 
-    all_inputs_tensor = torch.tensor(eval_inputs, dtype=torch.float32, device=device)
+    all_preds = []
+    num_batches = (num_samples + batch_size - 1) // batch_size
     
     with torch.no_grad():
-        all_preds_tensor = torch.sigmoid(model(all_inputs_tensor))
-        all_preds = all_preds_tensor.float().cpu().numpy().flatten()
+        for i in range(num_batches):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, num_samples)
+            
+            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], dtype=torch.float32, device=device)
+            batch_preds = torch.sigmoid(model(batch_inputs))
+            all_preds.append(batch_preds.float().cpu().numpy().flatten())
+            del batch_inputs
     
-    del all_inputs_tensor
+    all_preds = np.concatenate(all_preds)
     all_targets = np.array(eval_targets)
     all_returns = np.array(eval_cumulative_returns)
 
@@ -361,8 +380,14 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         if actual_top_n == 0:
             actual_top_n = None
         stats['realistic_stats'] = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent, actual_top_n)
+        
+        if eval_daily_returns is not None and actual_top_n is not None:
+            stats['smart_exit_stats'] = calculate_smart_exit_return(all_preds, eval_daily_returns, eval_day_indices, actual_top_n)
+        else:
+            stats['smart_exit_stats'] = None
     else:
         stats['realistic_stats'] = None
+        stats['smart_exit_stats'] = None
 
     if use_fp32_eval:
         model = model.to(original_dtype)
@@ -448,6 +473,127 @@ def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_perc
         'valid_days': len(daily_returns),
         'avg_realistic_return': avg_realistic_return,
         'mode': 'top_n_per_day' if top_n_per_day else 'global_threshold'
+    }
+
+
+def calculate_smart_exit_return(all_preds, all_daily_returns, all_day_indices, top_n_per_day=4,
+                                 stop_loss_day1=-0.05, stop_loss_cum=-0.05, take_profit=0.08,
+                                 sell_at_day2_close=True):
+    """
+    智能止损策略收益率计算（A股T+1规则）
+    
+    交易规则：
+    - T日晚预测 → T+1日开盘买入
+    - Day1（T+1）：买入后持有，无法卖出（A股T+1）
+    - Day2（T+2）：可以卖出
+    - Day3（T+3）：可以卖出
+    
+    策略规则：
+    1. Day1大跌止损：如果Day1收益 < stop_loss_day1（如-5%），Day2卖出
+       - sell_at_day2_close=True: Day2收盘卖出，收益=r1+r2
+       - sell_at_day2_close=False: Day2开盘卖出，收益≈r1
+    2. 累计止损：如果Day1+Day2累计 < stop_loss_cum（如-5%），Day3卖出
+    3. 止盈：如果累计收益 >= take_profit（如8%），Day3卖出
+    4. 正常持有：否则持有到Day3收盘
+    
+    Args:
+        all_preds: 所有样本的预测分数
+        all_daily_returns: 每日收益列表 [[r1, r2, r3], ...]
+        all_day_indices: 每个样本对应的预测日索引
+        top_n_per_day: 每天选股数量
+        stop_loss_day1: Day1大跌止损阈值（默认-5%，Day1跌超这个值Day2卖出）
+        stop_loss_cum: 累计止损阈值（默认-5%）
+        take_profit: 止盈阈值（默认8%）
+        sell_at_day2_close: Day1大跌后是否在Day2收盘卖出（True=收盘卖，False=开盘卖）
+    
+    Returns:
+        stats: 包含策略统计的字典
+    """
+    unique_days = np.unique(all_day_indices)
+    unique_days = np.sort(unique_days)
+    
+    daily_stats = []
+    daily_returns = []
+    
+    total_trades = 0
+    stop_loss_day1_count = 0
+    stop_loss_cum_count = 0
+    take_profit_count = 0
+    normal_exit_count = 0
+    
+    for day in unique_days:
+        day_mask = all_day_indices == day
+        day_indices = np.where(day_mask)[0]
+        
+        if len(day_indices) == 0:
+            daily_stats.append((0, 0.0, 'none'))
+            continue
+        
+        day_preds = all_preds[day_indices]
+        day_daily_returns = [all_daily_returns[i] for i in day_indices]
+        
+        sorted_local_indices = np.argsort(day_preds)[::-1]
+        select_count = min(top_n_per_day, len(day_indices))
+        top_local_indices = sorted_local_indices[:select_count]
+        
+        day_trade_returns = []
+        day_exit_types = {'stop_day1': 0, 'stop_cum': 0, 'profit': 0, 'normal': 0}
+        
+        for idx in top_local_indices:
+            daily_ret = day_daily_returns[idx]
+            r1, r2, r3 = daily_ret[0], daily_ret[1], daily_ret[2]
+            
+            total_trades += 1
+            
+            if r1 < stop_loss_day1:
+                if sell_at_day2_close:
+                    final_ret = r1 + r2
+                else:
+                    final_ret = r1
+                stop_loss_day1_count += 1
+                day_exit_types['stop_day1'] += 1
+            elif r1 + r2 < stop_loss_cum:
+                final_ret = r1 + r2
+                stop_loss_cum_count += 1
+                day_exit_types['stop_cum'] += 1
+            elif r1 + r2 + r3 >= take_profit:
+                final_ret = r1 + r2 + r3
+                take_profit_count += 1
+                day_exit_types['profit'] += 1
+            else:
+                final_ret = r1 + r2 + r3
+                normal_exit_count += 1
+                day_exit_types['normal'] += 1
+            
+            day_trade_returns.append(final_ret)
+        
+        avg_day_return = np.mean(day_trade_returns)
+        daily_returns.append(avg_day_return)
+        
+        exit_type = max(day_exit_types, key=day_exit_types.get)
+        daily_stats.append((select_count, avg_day_return, exit_type))
+    
+    if len(daily_returns) > 0:
+        cumulative_return = np.prod(np.array(daily_returns) + 1.0) - 1.0
+        avg_realistic_return = (cumulative_return + 1.0) ** (1.0 / len(daily_returns)) - 1.0
+    else:
+        avg_realistic_return = 0.0
+        cumulative_return = 0.0
+    
+    return {
+        'daily_stats': daily_stats,
+        'cumulative_return': cumulative_return,
+        'valid_days': len(daily_returns),
+        'avg_realistic_return': avg_realistic_return,
+        'total_trades': total_trades,
+        'stop_loss_day1_count': stop_loss_day1_count,
+        'stop_loss_cum_count': stop_loss_cum_count,
+        'take_profit_count': take_profit_count,
+        'normal_exit_count': normal_exit_count,
+        'stop_loss_day1_ratio': stop_loss_day1_count / total_trades if total_trades > 0 else 0,
+        'stop_loss_cum_ratio': stop_loss_cum_count / total_trades if total_trades > 0 else 0,
+        'take_profit_ratio': take_profit_count / total_trades if total_trades > 0 else 0,
+        'strategy': f'smart_exit(stop_day1={stop_loss_day1*100:.1f}%, stop_cum={stop_loss_cum*100:.1f}%, profit={take_profit*100:.1f}%)'
     }
 
 
@@ -857,8 +1003,8 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
 
     # 创建固定的评估数据集（训练开始前创建一次，使用滚动窗口标准化）
     print("\n创建评估数据集...")
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices = create_fixed_evaluation_dataset(test_stock_info)
-    train_eval_inputs, train_eval_targets, train_eval_returns = create_train_evaluation_dataset(train_stock_info, first_n_days=80)
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info)
+    train_eval_inputs, train_eval_targets, train_eval_returns, _ = create_train_evaluation_dataset(train_stock_info, first_n_days=80)
 
     # 损失函数：由全局配置控制
     if LossConfig.use_dynamic_bce():
@@ -1103,12 +1249,12 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
             # ===================================================
 
             # 固定评估集评估
-            total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats = evaluate_model_batch(
-                model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE, eval_day_indices=eval_day_indices
+            total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats, smart_exit_stats = evaluate_model_batch(
+                model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE, eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns
             )
 
             # 计算训练集收益率（用于检测过拟合）
-            _, _, _, _, _, _, _, _, train_top_stats, _ = evaluate_model_batch(
+            _, _, _, _, _, _, _, _, train_top_stats, _, _ = evaluate_model_batch(
                 model, train_eval_inputs, train_eval_targets, train_eval_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
             )
 
@@ -1181,6 +1327,14 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
                 mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if realistic_stats.get('mode') == 'top_n_per_day' else "全局阈值"
                 print(f'  【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
                 print(f'  【实战收益率({mode_str})】平均实战收益率: {realistic_stats["avg_realistic_return"]*100:.1f}%')
+            
+            # 智能止损策略统计
+            if smart_exit_stats is not None:
+                print(f'  【智能止损策略】平均收益率: {smart_exit_stats["avg_realistic_return"]*100:.1f}%')
+                print(f'  【智能止损策略】总交易: {smart_exit_stats["total_trades"]}次')
+                print(f'  【智能止损策略】Day1止损: {smart_exit_stats["stop_loss_day1_count"]}次({smart_exit_stats["stop_loss_day1_ratio"]*100:.1f}%)')
+                print(f'  【智能止损策略】累计止损: {smart_exit_stats["stop_loss_cum_count"]}次({smart_exit_stats["stop_loss_cum_ratio"]*100:.1f}%)')
+                print(f'  【智能止损策略】止盈: {smart_exit_stats["take_profit_count"]}次({smart_exit_stats["take_profit_ratio"]*100:.1f}%)')
             
             print(f'  AUC得分: {auc_score:.4f}')
             print(f'  训练集损失: {train_loss_epoch:.4f}, 测试集损失: {test_loss:.4f}')

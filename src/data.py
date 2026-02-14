@@ -79,7 +79,8 @@ def process_single_file(args):
             'train_start_idx': train_start_idx,
             'train_end_idx': train_end_idx,
             'train_length': train_length,
-            'test_split_point': test_split_point
+            'test_split_point': test_split_point,
+            'times': times
         }
         
         return stock_info
@@ -507,7 +508,7 @@ def create_fixed_evaluation_dataset(test_stock_info):
         eval_inputs: 输入序列
         eval_targets: 标签
         eval_cumulative_returns: 累计收益率
-        eval_day_indices: 每个样本对应的预测日在测试集中的相对天数（0-based）
+        eval_day_indices: 每个样本对应的预测日实际日期（如20241201）
     """
     eval_inputs = []
     eval_targets = []
@@ -516,6 +517,7 @@ def create_fixed_evaluation_dataset(test_stock_info):
 
     for stock_info in test_stock_info:
         stock_data = stock_info['data']
+        times = stock_info.get('times', None)
         data_length = len(stock_data)
         test_split_point = stock_info.get('test_split_point', max(0, data_length - DataConfig.TEST_DAYS))
 
@@ -534,7 +536,11 @@ def create_fixed_evaluation_dataset(test_stock_info):
             eval_targets.append(target)
             eval_cumulative_returns.append(float(cumulative_return))
             
-            day_index = (start_idx + DataConfig.CONTEXT_LENGTH) - test_split_point
+            predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
+            if times is not None and predict_day_idx < len(times):
+                day_index = times[predict_day_idx]
+            else:
+                day_index = predict_day_idx - test_split_point
             eval_day_indices.append(day_index)
 
     if len(eval_inputs) == 0:

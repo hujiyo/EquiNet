@@ -14,7 +14,7 @@ class DataConfig:
     OUTPUT_DIR = './out'             # 输出目录
 
     # 数据分割参数（按时间划分）
-    TEST_DAYS = 80                   # 测试集天数（每只股票的最近N天作为测试集）
+    TEST_DAYS = 140                   # 测试集天数（每只股票的最近N天作为测试集）
     RANDOM_SEED = 42                 # 随机种子
     
     # 训练集时间范围限制

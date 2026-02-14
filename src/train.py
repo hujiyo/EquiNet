@@ -205,13 +205,18 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
     num_samples = len(eval_inputs)
     num_batches = (num_samples + batch_size - 1) // batch_size
 
+    original_dtype = next(model.parameters()).dtype
+    use_fp32_eval = original_dtype == torch.bfloat16
+    if use_fp32_eval:
+        model = model.float()
+    
     with torch.no_grad():
         for i in range(num_batches):
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, num_samples)
 
             batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx],
-                                       dtype=torch.bfloat16).to(device)
+                                       dtype=torch.float32).to(device)
             batch_targets = eval_targets[start_idx:end_idx]
             batch_returns = eval_cumulative_returns[start_idx:end_idx]
 
@@ -279,6 +284,9 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
     if eval_day_indices is not None:
         realistic_stats = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent)
 
+    if use_fp32_eval:
+        model = model.to(original_dtype)
+
     return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats
 
 
@@ -309,13 +317,18 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     num_samples = len(eval_inputs)
     num_batches = (num_samples + batch_size - 1) // batch_size
 
+    original_dtype = next(model.parameters()).dtype
+    use_fp32_eval = original_dtype == torch.bfloat16
+    if use_fp32_eval:
+        model = model.float()
+
     with torch.no_grad():
         for i in range(num_batches):
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, num_samples)
 
             batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx],
-                                       dtype=torch.bfloat16).to(device)
+                                       dtype=torch.float32).to(device)
             batch_targets = eval_targets[start_idx:end_idx]
             batch_returns = eval_cumulative_returns[start_idx:end_idx]
 
@@ -362,6 +375,9 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         stats['realistic_stats'] = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent)
     else:
         stats['realistic_stats'] = None
+
+    if use_fp32_eval:
+        model = model.to(original_dtype)
 
     return stats
 

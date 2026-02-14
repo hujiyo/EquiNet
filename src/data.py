@@ -664,12 +664,13 @@ def predict_single_stock(model_path, stock_data, device=None):
         model = model.to(dtype=torch.bfloat16)
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.eval()
+        model = model.float()
     except Exception as e:
         print(f"模型加载失败: {e}")
         return None
     
     try:
-        input_tensor = torch.tensor(normalized_data, dtype=torch.bfloat16).unsqueeze(0).to(device)
+        input_tensor = torch.tensor(normalized_data, dtype=torch.float32).unsqueeze(0).to(device)
         
         with torch.no_grad():
             output = model(input_tensor)
@@ -706,6 +707,7 @@ def predict_multiple_stocks(model_path, stock_files_data, device=None):
         model = model.to(dtype=torch.bfloat16)
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.eval()
+        model = model.float()
     except Exception as e:
         print(f"模型加载失败: {e}")
         return predictions
@@ -721,7 +723,7 @@ def predict_multiple_stocks(model_path, stock_files_data, device=None):
                 continue
             
             try:
-                input_tensor = torch.tensor(normalized_data, dtype=torch.bfloat16).unsqueeze(0).to(device)
+                input_tensor = torch.tensor(normalized_data, dtype=torch.float32).unsqueeze(0).to(device)
                 output = model(input_tensor)
                 probability = torch.sigmoid(output).float().cpu().item()
                 

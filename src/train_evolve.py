@@ -237,15 +237,21 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         all_teacher_preds = []
         for teacher in teachers:
             teacher.eval()
+            original_dtype = next(teacher.parameters()).dtype
+            use_fp32_eval = original_dtype == torch.bfloat16
+            if use_fp32_eval:
+                teacher = teacher.float()
             with torch.no_grad():
                 teacher_preds = []
                 for i in range(0, len(train_inputs), batch_size):
                     batch_inputs = torch.tensor(train_inputs[i:i+batch_size], 
-                                               dtype=torch.bfloat16).to(device)
+                                               dtype=torch.float32).to(device)
                     preds = torch.sigmoid(teacher(batch_inputs))
                     teacher_preds.append(preds.float().cpu().numpy())
                 teacher_preds = np.concatenate(teacher_preds).flatten()
                 all_teacher_preds.append(teacher_preds)
+            if use_fp32_eval:
+                teacher = teacher.to(original_dtype)
         
         # 计算教师平均预测
         avg_preds = np.mean(all_teacher_preds, axis=0)

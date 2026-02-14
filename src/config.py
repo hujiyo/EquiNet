@@ -39,6 +39,7 @@ class DataConfig:
     # 评估参数
     EVAL_BATCH_SIZE = 100             # 评估批处理大小
     TOP_PERCENT = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
+    TOP_N_PER_DAY = 4                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
     
     # 模型保存条件
     MIN_AUC = 0.65                    # 最低AUC要求（按时间划分后的真实性能基线）
@@ -56,7 +57,7 @@ class ModelConfig:
     INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
     D_MODEL = 24                     # 模型维度（Transformer内部维度）
     EMBED_HIDDEN_DIM = 48            # Embedding中间层维度（两阶段FFN：6→40→D_MODEL）
-    FFN_EXPAND_RATIO = 3             # FFN隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
+    FFN_EXPAND_RATIO = 4             # FFN隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 2                        # 注意力头数
     NUM_LAYERS = 6                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）

@@ -231,8 +231,9 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         if stats['realistic_stats'] is not None:
             rs = stats['realistic_stats']
             daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
-            print(f'            【实战收益率】每日统计: {{{daily_stats_str}}}')
-            print(f'            【实战收益率】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
+            mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if rs.get('mode') == 'top_n_per_day' else "全局阈值"
+            print(f'            【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
+            print(f'            【实战收益率({mode_str})】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
 
         epoch_return = {
             'turn': epoch + 1,

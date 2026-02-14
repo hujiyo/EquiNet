@@ -179,7 +179,7 @@ class DynamicWeightedBCE(nn.Module):
 
 
 def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_returns, device, 
-                         batch_size=100, eval_day_indices=None):
+                         batch_size=100, eval_day_indices=None, top_n_per_day=None):
     """
     批量评估模型性能（详细版，用于train.py主训练流程）
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
@@ -282,7 +282,10 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
 
     realistic_stats = None
     if eval_day_indices is not None:
-        realistic_stats = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent)
+        actual_top_n = top_n_per_day if top_n_per_day is not None else DataConfig.TOP_N_PER_DAY
+        if actual_top_n == 0:
+            actual_top_n = None
+        realistic_stats = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent, actual_top_n)
 
     if use_fp32_eval:
         model = model.to(original_dtype)
@@ -291,7 +294,7 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
 
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
-                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None):
+                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None):
     """
     简化版模型评估函数（用于train_clone.py和train_evolve.py）
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
@@ -372,7 +375,10 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     }
 
     if eval_day_indices is not None:
-        stats['realistic_stats'] = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent)
+        actual_top_n = top_n_per_day if top_n_per_day is not None else DataConfig.TOP_N_PER_DAY
+        if actual_top_n == 0:
+            actual_top_n = None
+        stats['realistic_stats'] = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent, actual_top_n)
     else:
         stats['realistic_stats'] = None
 
@@ -382,58 +388,84 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     return stats
 
 
-def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_percent=1.0):
+def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_percent=1.0, top_n_per_day=None):
     """
     计算实战收益率（高仿实战）
     
-    流程:
-    1. 先按预测分数排序，取前top_percent%的样本，确定阈值
-    2. 按天统计：每天超过阈值的股票数量和平均收益率（等权分配资金）
-    3. 计算平均实战收益率
+    支持两种模式:
+    1. 全局阈值模式（top_n_per_day=None）: 按全局Top%确定阈值，每天选超过阈值的股票
+    2. 每日Top N模式（top_n_per_day指定）: 每天选预测分数最高的前N只股票
     
     Args:
         all_preds: 所有样本的预测分数
         all_returns: 所有样本的收益率
         all_day_indices: 每个样本对应的预测日在测试集中的相对偏移量
-        top_percent: Top百分比，默认1%
+        top_percent: Top百分比，默认1%（仅全局阈值模式使用）
+        top_n_per_day: 每天选股数量，如4表示每天选前4只（优先于top_percent）
     
     Returns:
         realistic_stats: 包含每日统计和平均实战收益率的字典
     """
-    top_k = max(1, int(len(all_preds) * top_percent / 100))
-    sorted_indices = np.argsort(all_preds)[::-1]
-    threshold = all_preds[sorted_indices[top_k - 1]]
-    
-    above_threshold_mask = all_preds > threshold
-    
     unique_days = np.unique(all_day_indices)
     unique_days = np.sort(unique_days)
     
     daily_stats = []
-    total_return = 0.0
-    valid_days = 0
+    daily_returns = []
     
-    for day in unique_days:
-        day_mask = all_day_indices == day
-        day_above_threshold = above_threshold_mask & day_mask
+    if top_n_per_day is not None:
+        for day in unique_days:
+            day_mask = all_day_indices == day
+            day_indices = np.where(day_mask)[0]
+            
+            if len(day_indices) == 0:
+                daily_stats.append((0, 0.0))
+                continue
+            
+            day_preds = all_preds[day_indices]
+            day_returns = all_returns[day_indices]
+            
+            sorted_local_indices = np.argsort(day_preds)[::-1]
+            select_count = min(top_n_per_day, len(day_indices))
+            top_local_indices = sorted_local_indices[:select_count]
+            
+            day_return = np.mean(day_returns[top_local_indices])
+            daily_returns.append(day_return)
+            daily_stats.append((select_count, day_return))
         
-        count = np.sum(day_above_threshold)
-        if count > 0:
-            day_return = np.mean(all_returns[day_above_threshold])
-            total_return += day_return
-            valid_days += 1
-            daily_stats.append((count, day_return))
-        else:
-            daily_stats.append((0, 0.0))
+        threshold = None
+    else:
+        top_k = max(1, int(len(all_preds) * top_percent / 100))
+        sorted_indices = np.argsort(all_preds)[::-1]
+        threshold = all_preds[sorted_indices[top_k - 1]]
+        
+        above_threshold_mask = all_preds > threshold
+        
+        for day in unique_days:
+            day_mask = all_day_indices == day
+            day_above_threshold = above_threshold_mask & day_mask
+            
+            count = np.sum(day_above_threshold)
+            if count > 0:
+                day_return = np.mean(all_returns[day_above_threshold])
+                daily_returns.append(day_return)
+                daily_stats.append((count, day_return))
+            else:
+                daily_stats.append((0, 0.0))
     
-    avg_realistic_return = total_return / valid_days if valid_days > 0 else 0.0
+    if len(daily_returns) > 0:
+        cumulative_return = np.prod(np.array(daily_returns) + 1.0) - 1.0
+        avg_realistic_return = (cumulative_return + 1.0) ** (1.0 / len(daily_returns)) - 1.0
+    else:
+        avg_realistic_return = 0.0
+        cumulative_return = 0.0
     
     return {
         'threshold': threshold,
         'daily_stats': daily_stats,
-        'total_return': total_return,
-        'valid_days': valid_days,
-        'avg_realistic_return': avg_realistic_return
+        'cumulative_return': cumulative_return,
+        'valid_days': len(daily_returns),
+        'avg_realistic_return': avg_realistic_return,
+        'mode': 'top_n_per_day' if top_n_per_day else 'global_threshold'
     }
 
 
@@ -1151,8 +1183,9 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
             # 实战收益率统计
             if realistic_stats is not None:
                 daily_stats_str = ', '.join([f'({count},{day_ret*100:.1f}%)' for count, day_ret in realistic_stats['daily_stats']])
-                print(f'  【实战收益率】每日统计: {{{daily_stats_str}}}')
-                print(f'  【实战收益率】平均实战收益率: {realistic_stats["avg_realistic_return"]*100:.1f}%')
+                mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if realistic_stats.get('mode') == 'top_n_per_day' else "全局阈值"
+                print(f'  【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
+                print(f'  【实战收益率({mode_str})】平均实战收益率: {realistic_stats["avg_realistic_return"]*100:.1f}%')
             
             print(f'  AUC得分: {auc_score:.4f}')
             print(f'  训练集损失: {train_loss_epoch:.4f}, 测试集损失: {test_loss:.4f}')

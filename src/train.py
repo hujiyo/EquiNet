@@ -446,14 +446,23 @@ def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_perc
         threshold = all_preds[sorted_indices[top_k - 1]]
         
         above_threshold_mask = all_preds > threshold
+        max_select = DataConfig.MAX_SELECT_PER_DAY
         
         for day in unique_days:
             day_mask = all_day_indices == day
             day_above_threshold = above_threshold_mask & day_mask
+            day_indices = np.where(day_above_threshold)[0]
             
-            count = np.sum(day_above_threshold)
+            count = len(day_indices)
             if count > 0:
-                day_return = np.mean(all_returns[day_above_threshold])
+                if max_select > 0 and count > max_select:
+                    day_preds = all_preds[day_indices]
+                    top_local = np.argsort(day_preds)[::-1][:max_select]
+                    selected_indices = day_indices[top_local]
+                    count = max_select
+                else:
+                    selected_indices = day_indices
+                day_return = np.mean(all_returns[selected_indices])
                 daily_returns.append(day_return)
                 daily_stats.append((count, day_return))
             else:
@@ -1324,7 +1333,7 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
             # 实战收益率统计
             if realistic_stats is not None:
                 daily_stats_str = ', '.join([f'({count},{day_ret*100:.1f}%)' for count, day_ret in realistic_stats['daily_stats']])
-                mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if realistic_stats.get('mode') == 'top_n_per_day' else "全局阈值"
+                mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if realistic_stats.get('mode') == 'top_n_per_day' else f"全局阈值,每日上限{DataConfig.MAX_SELECT_PER_DAY}" if DataConfig.MAX_SELECT_PER_DAY > 0 else "全局阈值,不限数量"
                 print(f'  【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
                 print(f'  【实战收益率({mode_str})】平均实战收益率: {realistic_stats["avg_realistic_return"]*100:.1f}%')
             

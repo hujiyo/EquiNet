@@ -378,7 +378,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         if stats_b['realistic_stats'] is not None:
             rs = stats_b['realistic_stats']
             daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
-            mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if rs.get('mode') == 'top_n_per_day' else "全局阈值"
+            mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if rs.get('mode') == 'top_n_per_day' else f"全局阈值,每日上限{DataConfig.MAX_SELECT_PER_DAY}" if DataConfig.MAX_SELECT_PER_DAY > 0 else "全局阈值,不限数量"
             print(f'          【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
             print(f'          【实战收益率({mode_str})】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
         

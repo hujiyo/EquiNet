@@ -40,6 +40,7 @@ class DataConfig:
     EVAL_BATCH_SIZE = 256            # 评估批处理大小（分批处理，减少显存占用）
     TOP_PERCENT = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
     TOP_N_PER_DAY = 0                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
+    MAX_SELECT_PER_DAY = 4             # 全局阈值模式下每天最多选股数量（0表示不限制）
     
     # 模型保存条件
     MIN_AUC = 0.65                    # 最低AUC要求（按时间划分后的真实性能基线）
@@ -59,7 +60,7 @@ class ModelConfig:
     EMBED_HIDDEN_DIM = 48            # Embedding中间层维度（两阶段FFN：6→40→D_MODEL）
     FFN_EXPAND_RATIO = 4             # FFN隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数
-    NUM_LAYERS = 4                   # Transformer层数
+    NUM_LAYERS = 5                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）
     SEQ_LEN = DataConfig.CONTEXT_LENGTH  # 最大序列长度（直接引用CONTEXT_LENGTH，确保一致性）
 

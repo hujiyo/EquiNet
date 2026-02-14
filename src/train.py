@@ -394,7 +394,7 @@ def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_perc
     Args:
         all_preds: 所有样本的预测分数
         all_returns: 所有样本的收益率
-        all_day_indices: 每个样本对应的预测日在测试集中的相对天数
+        all_day_indices: 每个样本对应的预测日在测试集中的相对偏移量
         top_percent: Top百分比，默认1%
     
     Returns:

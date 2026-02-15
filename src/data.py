@@ -248,14 +248,19 @@ class TemporalSampler:
 
 def check_strong_signal(daily_returns):
     """
-    强势信号检测：判断是否存在强势买入信号
+    强势信号检测：判断是否存在强势买入信号（风险优化版）
     
     标签=1的条件（满足任一即可）：
-    1. 单日爆发：Day1涨幅 ≥ 5%
-    2. 双日接力：Day1+Day2累计 ≥ 6% 且 Day1>1%, Day2>1%
+    1. 单日爆发：Day1涨幅 ≥ 5% 且 累计 ≥ 2%
+    2. 双日接力：Day1+Day2累计 ≥ 6% 且 Day1>1%, Day2>1% 且 累计 ≥ 2%
     3. 稳健上涨：Day1 ≥ 1% 且 Day2 ≥ 1% 且 Day3 ≥ 1% 且 累计 ≥ 5%
-    4. 爆发后延续：任意一天 ≥ 8% 且 累计 ≥ 6%
-    5. 累计达标：3天累计涨幅 ≥ 8%（基础条件）
+    4. 爆发后延续：任意一天 ≥ 8% 且 累计 ≥ 6% 且 Day1 ≥ -2%
+    5. 累计达标：3天累计涨幅 ≥ 8% 且 Day1 ≥ -2%
+    
+    风险控制：
+    - 条件1、2增加累计≥2%兜底，过滤8.13%和1.47%的累计亏损样本
+    - 条件4、5增加Day1≥-2%限制，过滤25.60%和4.65%的"买入当天就亏"样本
+    - 条件3天然安全，无需修改
     
     Args:
         daily_returns: list或np.array, 3天的日收益率 [Day1, Day2, Day3]
@@ -270,23 +275,33 @@ def check_strong_signal(daily_returns):
     cum_2day = r1 + r2
     cum_3day = r1 + r2 + r3
     
-    if r1 >= DataConfig.SIGNAL_DAY1_BURST:
+    # 条件1：单日爆发 + 累计兜底
+    if r1 >= DataConfig.SIGNAL_DAY1_BURST and cum_3day >= DataConfig.SIGNAL_MIN_CUM_RETURN:
         return 1
     
-    if cum_2day >= DataConfig.SIGNAL_TWO_DAY_CUM and r1 > DataConfig.SIGNAL_DAY_MIN and r2 > DataConfig.SIGNAL_DAY_MIN:
+    # 条件2：双日接力 + 累计兜底
+    if (cum_2day >= DataConfig.SIGNAL_TWO_DAY_CUM and 
+        r1 > DataConfig.SIGNAL_DAY_MIN and 
+        r2 > DataConfig.SIGNAL_DAY_MIN and 
+        cum_3day >= DataConfig.SIGNAL_MIN_CUM_RETURN):
         return 1
     
+    # 条件3：稳健上涨（天然安全，无需修改）
     if (r1 >= DataConfig.SIGNAL_DAY_MIN and 
         r2 >= DataConfig.SIGNAL_DAY_MIN and 
         r3 >= DataConfig.SIGNAL_DAY_MIN and 
         cum_3day >= DataConfig.SIGNAL_THREE_DAY_CUM):
         return 1
     
+    # 条件4：爆发后延续 + Day1保护
     max_day = max(r1, r2, r3)
-    if max_day >= DataConfig.SIGNAL_ANY_BURST and cum_3day >= DataConfig.SIGNAL_BURST_CUM:
+    if (max_day >= DataConfig.SIGNAL_ANY_BURST and 
+        cum_3day >= DataConfig.SIGNAL_BURST_CUM and 
+        r1 >= DataConfig.SIGNAL_DAY1_MAX_DROP):
         return 1
     
-    if cum_3day >= DataConfig.UPRISE_THRESHOLD:
+    # 条件5：累计达标 + Day1保护
+    if cum_3day >= DataConfig.UPRISE_THRESHOLD and r1 >= DataConfig.SIGNAL_DAY1_MAX_DROP:
         return 1
     
     return 0

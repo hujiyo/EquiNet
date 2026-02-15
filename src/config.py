@@ -35,6 +35,10 @@ class DataConfig:
     SIGNAL_THREE_DAY_CUM = 0.05      # 三日累计阈值：Day1+Day2+Day3≥5%
     SIGNAL_ANY_BURST = 0.08          # 任意一天爆发阈值：≥8%
     SIGNAL_BURST_CUM = 0.06          # 爆发后累计阈值：累计≥6%
+    
+    # 风险控制参数（新增）
+    SIGNAL_MIN_CUM_RETURN = 0.02     # 最低累计收益：≥2%（过滤累计亏损或微利样本）
+    SIGNAL_DAY1_MAX_DROP = -0.02     # Day1最大跌幅：≥-2%（避免买入当天就亏）
 
     # 评估参数
     EVAL_BATCH_SIZE = 256            # 评估批处理大小（分批处理，减少显存占用）
@@ -52,7 +56,7 @@ class ModelConfig:
     # ========== 模型类型选择 ==========
     # 'continuous': 连续值模型 (master分支，使用6维连续输入)
     # 'tokenized': Token化模型 (test分支，将输入离散化为token ID)
-    MODEL_TYPE = 'continuous'  # 可选: 'continuous' 或 'tokenized'
+    MODEL_TYPE = 'tokenized'  # 可选: 'continuous' 或 'tokenized'
 
     # 基础模型参数
     INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
@@ -60,7 +64,7 @@ class ModelConfig:
     EMBED_HIDDEN_DIM = 48            # Embedding中间层维度（两阶段FFN：6→40→D_MODEL）
     FFN_EXPAND_RATIO = 4             # FFN隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数
-    NUM_LAYERS = 5                   # Transformer层数
+    NUM_LAYERS = 4                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）
     SEQ_LEN = DataConfig.CONTEXT_LENGTH  # 最大序列长度（直接引用CONTEXT_LENGTH，确保一致性）
 
@@ -83,7 +87,7 @@ class TrainingConfig:
 
     # 训练批处理
     BATCH_SIZE = 512                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 4            # 每轮训练的批次数（调低以适配时间序采样）
+    BATCHES_PER_EPOCH = 1            # 每轮训练的批次数（调低以适配时间序采样）
     # BATCHES_PER_EPOCH*EPOCHS=800
 
     # 优化器参数

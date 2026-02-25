@@ -87,6 +87,59 @@ class WarmupScheduler:
         """判断是否还在预热阶段"""
         return self.current_epoch < self.warmup_epochs
 
+def print_dispersion_sparkline(all_preds, epoch_returns_history=None):
+    """
+    打印预测值在0-1区间上的分布直方图（终端字符可视化）
+    
+    Args:
+        all_preds: 所有样本的预测值数组
+        epoch_returns_history: 历史epoch记录列表（用于显示趋势）
+    """
+    print(f'  【预测值分布直方图】')
+    
+    all_preds = np.array(all_preds)
+    
+    num_bins = 20
+    counts, _ = np.histogram(all_preds, bins=num_bins, range=(0, 1))
+    max_count = max(counts) if max(counts) > 0 else 1
+    
+    chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
+    
+    hist_line = ""
+    for count in counts:
+        idx = int(count / max_count * (len(chars) - 1))
+        idx = min(max(idx, 0), len(chars) - 1)
+        hist_line += chars[idx]
+    
+    print(f'    0.0  {hist_line}  1.0')
+    print(f'         ├────────────────────┤')
+    
+    std = float(np.std(all_preds))
+    mean = float(np.mean(all_preds))
+    min_val = float(np.min(all_preds))
+    max_val = float(np.max(all_preds))
+    pos_ratio = float(np.mean(all_preds >= 0.5)) * 100
+    high_conf_ratio = float(np.mean(all_preds >= 0.7)) * 100
+    
+    print(f'    均值={mean:.3f}, 标准差={std:.4f}, 范围=[{min_val:.3f}, {max_val:.3f}]')
+    print(f'    >0.5: {pos_ratio:.1f}%, >0.7: {high_conf_ratio:.1f}%')
+    
+    if epoch_returns_history and len(epoch_returns_history) >= 3:
+        stds = [e.get('dispersion_std', 0) for e in epoch_returns_history]
+        returns = [e.get('return', 0) for e in epoch_returns_history]
+        
+        std_change = (stds[-1] - stds[0]) / stds[0] * 100 if stds[0] > 0 else 0
+        return_change = (returns[-1] - returns[0]) / abs(returns[0]) * 100 if returns[0] != 0 else 0
+        
+        if std_change < -20:
+            status = "⚠️ 分散度下降"
+        elif std_change > 10:
+            status = "📈 分散度上升"
+        else:
+            status = "➡️ 分散度稳定"
+        
+        print(f'    趋势: {status} ({std_change:+.1f}%) | 收益率变化: ({return_change:+.1f}%)')
+
 # 动态加权BCE损失函数实现
 class DynamicWeightedBCE(nn.Module):
     """
@@ -202,7 +255,7 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
 
     num_samples = len(eval_inputs)
     if num_samples == 0:
-        return 0, [0, 0], [0, 0], 0, 0, 0, 0.5, {}, {'count': 0, 'avg_return': 0, 'total_return': 0, 'filtered_count': 0}, None
+        return 0, [0, 0], [0, 0], 0, 0, 0, 0.5, {}, {'count': 0, 'avg_return': 0, 'total_return': 0, 'filtered_count': 0}, None, None, {}
 
     original_dtype = next(model.parameters()).dtype
     use_fp32_eval = original_dtype == torch.bfloat16
@@ -276,6 +329,21 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
         'filtered_count': 0
     }
 
+    dispersion_stats = {
+        'std': float(np.std(all_preds)),
+        'mean': float(np.mean(all_preds)),
+        'min': float(np.min(all_preds)),
+        'max': float(np.max(all_preds)),
+        'range': float(np.max(all_preds) - np.min(all_preds)),
+        'iqr': float(np.percentile(all_preds, 75) - np.percentile(all_preds, 25)),
+        'q25': float(np.percentile(all_preds, 25)),
+        'q50': float(np.percentile(all_preds, 50)),
+        'q75': float(np.percentile(all_preds, 75)),
+        'pos_ratio': float(np.mean(all_preds >= 0.5)),
+        'high_conf_ratio': float(np.mean(all_preds >= 0.7)),
+        'low_conf_ratio': float(np.mean(all_preds < 0.3)),
+    }
+
     realistic_stats = None
     smart_exit_stats = None
     if eval_day_indices is not None:
@@ -290,7 +358,7 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
     if use_fp32_eval:
         model = model.to(original_dtype)
 
-    return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats, smart_exit_stats
+    return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats, smart_exit_stats, dispersion_stats, all_preds
 
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
@@ -372,7 +440,10 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         'low_conf_count': np.sum(low_conf),
         'pred_mean': np.mean(all_preds),
         'pred_std': np.std(all_preds),
-        'filtered_count': 0
+        'filtered_count': 0,
+        'dispersion_std': float(np.std(all_preds)),
+        'dispersion_range': float(np.max(all_preds) - np.min(all_preds)),
+        'dispersion_iqr': float(np.percentile(all_preds, 75) - np.percentile(all_preds, 25)),
     }
 
     if eval_day_indices is not None:
@@ -392,6 +463,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     if use_fp32_eval:
         model = model.to(original_dtype)
 
+    stats['all_preds'] = all_preds
     return stats
 
 
@@ -1258,12 +1330,12 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
             # ===================================================
 
             # 固定评估集评估
-            total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats, smart_exit_stats = evaluate_model_batch(
+            total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats, smart_exit_stats, dispersion_stats, all_preds = evaluate_model_batch(
                 model, eval_inputs, eval_targets, eval_cumulative_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE, eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns
             )
 
             # 计算训练集收益率（用于检测过拟合）
-            _, _, _, _, _, _, _, _, train_top_stats, _, _ = evaluate_model_batch(
+            _, _, _, _, _, _, _, _, train_top_stats, _, _, _, _ = evaluate_model_batch(
                 model, train_eval_inputs, train_eval_targets, train_eval_returns, device, batch_size=DataConfig.EVAL_BATCH_SIZE
             )
 
@@ -1275,7 +1347,12 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
                 'turn': epoch + 1,
                 'return': top_stats['avg_return'] * 100,
                 'train_loss': train_loss_epoch,
-                'test_loss': test_loss
+                'test_loss': test_loss,
+                'dispersion_std': dispersion_stats['std'],
+                'dispersion_range': dispersion_stats['range'],
+                'dispersion_iqr': dispersion_stats['iqr'],
+                'pos_ratio': dispersion_stats['pos_ratio'],
+                'high_conf_ratio': dispersion_stats['high_conf_ratio'],
             }
             epoch_returns.append(epoch_return)
 
@@ -1347,6 +1424,8 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
             
             print(f'  AUC得分: {auc_score:.4f}')
             print(f'  训练集损失: {train_loss_epoch:.4f}, 测试集损失: {test_loss:.4f}')
+            
+            print_dispersion_sparkline(all_preds, epoch_returns)
 
             # 早停检测
             improved, improve_reason = early_stopping.check_improve(
@@ -1414,7 +1493,7 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"baseline_epoch_returns_{timestamp}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'train_loss', 'test_loss'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'train_loss', 'test_loss', 'dispersion_std', 'dispersion_range', 'dispersion_iqr', 'pos_ratio', 'high_conf_ratio'])
         writer.writeheader()
 
         for epoch_return in epoch_returns:
@@ -1422,7 +1501,12 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
                 'turn': epoch_return['turn'],
                 'return': f"{epoch_return['return']:.2f}",
                 'train_loss': f"{epoch_return['train_loss']:.4f}",
-                'test_loss': f"{epoch_return['test_loss']:.4f}"
+                'test_loss': f"{epoch_return['test_loss']:.4f}",
+                'dispersion_std': f"{epoch_return['dispersion_std']:.4f}",
+                'dispersion_range': f"{epoch_return['dispersion_range']:.4f}",
+                'dispersion_iqr': f"{epoch_return['dispersion_iqr']:.4f}",
+                'pos_ratio': f"{epoch_return['pos_ratio']:.4f}",
+                'high_conf_ratio': f"{epoch_return['high_conf_ratio']:.4f}",
             }
             writer.writerow(row)
 

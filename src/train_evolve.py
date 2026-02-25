@@ -35,7 +35,8 @@ from train import (
     generate_pseudo_labels,
     calculate_test_loss,
     DynamicWeightedBCE,
-    save_model_with_metadata
+    save_model_with_metadata,
+    print_dispersion_sparkline
 )
 
 
@@ -363,11 +364,18 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         # 记录当前轮次收益率
         epoch_return = {
             'turn': epoch + 1,
-            'return_b': stats_b['top_return'] * 100,
+            'return': stats_b['top_return'] * 100,
             'train_loss': avg_loss_b,
-            'test_loss': test_loss_b
+            'test_loss': test_loss_b,
+            'dispersion_std': stats_b.get('dispersion_std', 0),
+            'dispersion_range': stats_b.get('dispersion_range', 0),
+            'dispersion_iqr': stats_b.get('dispersion_iqr', 0),
+            'pos_ratio': stats_b.get('pred_mean', 0),
+            'high_conf_ratio': stats_b.get('high_conf_count', 0) / len(eval_targets) if eval_targets is not None else 0,
         }
         epoch_returns.append(epoch_return)
+        
+        print_dispersion_sparkline(stats_b.get('all_preds', []), epoch_returns)
         
         print(f"  [教师数量] {len(teachers)}个")
         print(f"  [B最佳] Top1%收益: {best_return_b*100:+.2f}%")

@@ -38,7 +38,8 @@ from train import (
     save_model_with_metadata,
     DynamicWeightedBCE,
     EarlyStopping,
-    calculate_test_loss
+    calculate_test_loss,
+    print_dispersion_sparkline
 )
 
 def train_clone_model(model_a, train_stock_info, test_stock_info,
@@ -356,13 +357,18 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         
         epoch_return = {
             'turn': epoch + 1,
-            'return_a': stats_a['top_return'] * 100,
-            'return_b': None,
-            'train_loss_a': avg_loss_a,
-            'test_loss_a': test_loss_a,
-            'train_loss_b': None,
-            'test_loss_b': None
+            'return': stats_a['top_return'] * 100,
+            'train_loss': avg_loss_a,
+            'test_loss': test_loss_a,
+            'dispersion_std': stats_a.get('dispersion_std', 0),
+            'dispersion_range': stats_a.get('dispersion_range', 0),
+            'dispersion_iqr': stats_a.get('dispersion_iqr', 0),
+            'pos_ratio': stats_a.get('pred_mean', 0),
+            'high_conf_ratio': stats_a.get('high_conf_count', 0) / len(eval_targets) if eval_targets is not None else 0,
         }
+        epoch_returns.append(epoch_return)
+        
+        print_dispersion_sparkline(stats_a.get('all_preds', []), epoch_returns)
 
         # 早停检测（使用测试集loss）
         improved, improve_reason = early_stopping.check_improve(

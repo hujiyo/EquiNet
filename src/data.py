@@ -246,16 +246,20 @@ class TemporalSampler:
         return looped_stocks_count, total_loops
 
 
-def check_strong_signal(daily_returns):
+def check_strong_signal(daily_price_changes):
     """
     强势信号检测：判断是否存在强势买入信号（风险优化版）
     
+    注意：此函数使用"涨跌幅"而非"收益率"
+    - 涨跌幅：基准是前一日收盘价，用于判断股票走势强弱
+    - 收益率：基准是买入价，用于计算投资回报
+    
     标签=1的条件（满足任一即可）：
-    1. 单日爆发：Day1涨幅 ≥ 5% 且 累计 ≥ 2%
-    2. 双日接力：Day1+Day2累计 ≥ 6% 且 Day1>1%, Day2>1% 且 累计 ≥ 2%
+    1. 单日爆发：Day1涨跌幅 ≥ 5% 且 累计 ≥ 2%
+    2. 双日接力：Day1+Day2累计涨跌幅 ≥ 6% 且 Day1>1%, Day2>1% 且 累计 ≥ 2%
     3. 稳健上涨：Day1 ≥ 1% 且 Day2 ≥ 1% 且 Day3 ≥ 1% 且 累计 ≥ 5%
-    4. 爆发后延续：任意一天 ≥ 8% 且 累计 ≥ 6% 且 Day1 ≥ -2%
-    5. 累计达标：3天累计涨幅 ≥ 8% 且 Day1 ≥ -2%
+    4. 爆发后延续：任意一天涨跌幅 ≥ 8% 且 累计 ≥ 6% 且 Day1 ≥ -2%
+    5. 累计达标：3天累计涨跌幅 ≥ 8% 且 Day1 ≥ -2%
     
     风险控制：
     - 条件1、2增加累计≥2%兜底，过滤8.13%和1.47%的累计亏损样本
@@ -263,15 +267,18 @@ def check_strong_signal(daily_returns):
     - 条件3天然安全，无需修改
     
     Args:
-        daily_returns: list或np.array, 3天的日收益率 [Day1, Day2, Day3]
+        daily_price_changes: list或np.array, 3天的涨跌幅 [Day1, Day2, Day3]
+            Day1涨跌幅 = (T+1收盘 - T日收盘) / T日收盘
+            Day2涨跌幅 = (T+2收盘 - T+1收盘) / T+1收盘
+            Day3涨跌幅 = (T+3收盘 - T+2收盘) / T+2收盘
         
     Returns:
         int: 1表示存在强势信号，0表示无信号
     """
-    if len(daily_returns) < 3:
+    if len(daily_price_changes) < 3:
         return 0
     
-    r1, r2, r3 = daily_returns[0], daily_returns[1], daily_returns[2]
+    r1, r2, r3 = daily_price_changes[0], daily_price_changes[1], daily_price_changes[2]
     cum_2day = r1 + r2
     cum_3day = r1 + r2 + r3
     
@@ -316,14 +323,21 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
         stock_idx: 股票索引
         start_idx: 样本起始索引
 
-    返回: (input_seq, target, cumulative_return) 或 None（如果样本无效）
+    返回: (input_seq, target, cumulative_return, daily_returns) 或 None（如果样本无效）
     
-    收益率计算（实战视角）:
-        T日晚上运行模型 → T+1日开盘买入
-        Day1收益率 = (T+1收盘 - T+1开盘) / T+1开盘  (日内涨幅)
-        Day2收益率 = (T+2收盘 - T+1收盘) / T+1收盘
-        Day3收益率 = (T+3收盘 - T+2收盘) / T+2收盘
-        累计收益率 = (T+3收盘 - T+1开盘) / T+1开盘
+    核心概念区分：
+        【涨跌幅】用于标签生成，判断股票走势强弱
+            - 基准是前一日收盘价
+            - Day1涨跌幅 = (T+1收盘 - T日收盘) / T日收盘
+            - Day2涨跌幅 = (T+2收盘 - T+1收盘) / T+1收盘
+            - Day3涨跌幅 = (T+3收盘 - T+2收盘) / T+2收盘
+        
+        【收益率】用于计算投资回报，评估模型表现
+            - 基准是买入价（T+1开盘价）
+            - Day1收益率 = (T+1收盘 - T+1开盘) / T+1开盘（日内收益）
+            - Day2收益率贡献 = (T+2收盘 - T+1收盘) / T+1开盘
+            - Day3收益率贡献 = (T+3收盘 - T+2收盘) / T+1开盘
+            - 累计收益率 = Day1 + Day2 + Day3 = (T+3收盘 - T+1开盘) / T+1开盘
     """
     stock_info = stock_info_list[stock_idx]
     stock_data = stock_info['data']
@@ -398,16 +412,28 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
 
     cumulative_return = (t3_close - t1_open) / t1_open
 
-    future_closes = stock_data[start_idx + context_length:start_idx + required_length, 3]
-    daily_returns = []
-    prev_close_for_future = closes[-1]
-    for future_close in future_closes:
-        if prev_close_for_future > 0:
-            daily_ret = (future_close - prev_close_for_future) / prev_close_for_future
-            daily_returns.append(daily_ret)
-        prev_close_for_future = future_close
+    # ========== 涨跌幅计算（用于标签生成）==========
+    # 基准是前一日收盘价，用于判断股票走势强弱
+    daily_price_changes = []
+    day1_price_change = (t1_close - closes[-1]) / closes[-1]  # (T+1收盘 - T日收盘) / T日收盘
+    daily_price_changes.append(day1_price_change)
+    day2_price_change = (t2_close - t1_close) / t1_close      # (T+2收盘 - T+1收盘) / T+1收盘
+    daily_price_changes.append(day2_price_change)
+    day3_price_change = (t3_close - t2_close) / t2_close      # (T+3收盘 - T+2收盘) / T+2收盘
+    daily_price_changes.append(day3_price_change)
     
-    target = float(check_strong_signal(daily_returns))
+    # ========== 收益率计算（用于评估模型表现）==========
+    # 基准是买入价（T+1开盘价），用于计算投资回报
+    daily_returns = []
+    day1_return = (t1_close - t1_open) / t1_open              # Day1日内收益
+    daily_returns.append(day1_return)
+    day2_return = (t2_close - t1_close) / t1_open             # Day2收益贡献
+    daily_returns.append(day2_return)
+    day3_return = (t3_close - t2_close) / t1_open             # Day3收益贡献
+    daily_returns.append(day3_return)
+    
+    # 标签生成使用涨跌幅
+    target = float(check_strong_signal(daily_price_changes))
 
     return input_seq, target, cumulative_return, daily_returns
 
@@ -521,9 +547,14 @@ def create_fixed_evaluation_dataset(test_stock_info):
     返回:
         eval_inputs: 输入序列
         eval_targets: 标签
-        eval_cumulative_returns: 累计收益率
+        eval_cumulative_returns: 累计收益率 = (T+3收盘 - T+1开盘) / T+1开盘
         eval_day_indices: 每个样本对应的预测日在测试集中的相对偏移量（用于实战收益率按天分组）
-        eval_daily_returns: 每日收益列表 [[r1, r2, r3], ...]
+        eval_daily_returns: 每日收益率列表 [[r1, r2, r3], ...]
+            - 基准是买入价（T+1开盘价），用于计算投资回报
+            - r1 = (T+1收盘 - T+1开盘) / T+1开盘（Day1日内收益）
+            - r2 = (T+2收盘 - T+1收盘) / T+1开盘（Day2收益贡献）
+            - r3 = (T+3收盘 - T+2收盘) / T+1开盘（Day3收益贡献）
+            - r1 + r2 + r3 = 累计收益率
     """
     eval_inputs = []
     eval_targets = []

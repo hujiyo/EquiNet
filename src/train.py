@@ -563,6 +563,10 @@ def calculate_smart_exit_return(all_preds, all_daily_returns, all_day_indices, t
     """
     智能止损策略收益率计算（A股T+1规则）
     
+    注意：此函数使用"收益率"而非"涨跌幅"
+    - 收益率：基准是买入价（T+1开盘价），用于计算投资回报
+    - r1 + r2 + r3 = 累计收益率
+    
     交易规则：
     - T日晚预测 → T+1日开盘买入
     - Day1（T+1）：买入后持有，无法卖出（A股T+1）
@@ -570,7 +574,7 @@ def calculate_smart_exit_return(all_preds, all_daily_returns, all_day_indices, t
     - Day3（T+3）：可以卖出
     
     策略规则：
-    1. Day1大跌止损：如果Day1收益 < stop_loss_day1（如-5%），Day2卖出
+    1. Day1大跌止损：如果Day1收益率 < stop_loss_day1（如-5%），Day2卖出
        - sell_at_day2_close=True: Day2收盘卖出，收益=r1+r2
        - sell_at_day2_close=False: Day2开盘卖出，收益≈r1
     2. 累计止损：如果Day1+Day2累计 < stop_loss_cum（如-5%），Day3卖出
@@ -579,7 +583,11 @@ def calculate_smart_exit_return(all_preds, all_daily_returns, all_day_indices, t
     
     Args:
         all_preds: 所有样本的预测分数
-        all_daily_returns: 每日收益列表 [[r1, r2, r3], ...]
+        all_daily_returns: 每日收益率列表 [[r1, r2, r3], ...]
+            - 基准是买入价（T+1开盘价）
+            - r1 = (T+1收盘 - T+1开盘) / T+1开盘
+            - r2 = (T+2收盘 - T+1收盘) / T+1开盘
+            - r3 = (T+3收盘 - T+2收盘) / T+1开盘
         all_day_indices: 每个样本对应的预测日索引
         top_n_per_day: 每天选股数量
         stop_loss_day1: Day1大跌止损阈值（默认-5%，Day1跌超这个值Day2卖出）

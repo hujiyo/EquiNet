@@ -124,12 +124,16 @@ def print_dispersion_sparkline(all_preds, epoch_returns_history=None):
     print(f'    均值={mean:.3f}, 标准差={std:.4f}, 范围=[{min_val:.3f}, {max_val:.3f}]')
     print(f'    >0.5: {pos_ratio:.1f}%, >0.7: {high_conf_ratio:.1f}%')
     
-    if epoch_returns_history and len(epoch_returns_history) >= 3:
+    if epoch_returns_history and len(epoch_returns_history) >= 2:
         stds = [e.get('dispersion_std', 0) for e in epoch_returns_history]
         returns = [e.get('return', 0) for e in epoch_returns_history]
         
-        std_change = (stds[-1] - stds[0]) / stds[0] * 100 if stds[0] > 0 else 0
-        return_change = (returns[-1] - returns[0]) / abs(returns[0]) * 100 if returns[0] != 0 else 0
+        window_size = min(10, len(stds))
+        baseline_std = np.mean(stds[-window_size:-1]) if window_size > 1 else stds[-2]
+        baseline_return = np.mean(returns[-window_size:-1]) if window_size > 1 else returns[-2]
+        
+        std_change = (stds[-1] - baseline_std) / baseline_std * 100 if baseline_std > 1e-6 else 0
+        return_change = (returns[-1] - baseline_return) / abs(baseline_return) * 100 if abs(baseline_return) > 1e-6 else 0
         
         if std_change < -20:
             status = "⚠️ 分散度下降"
@@ -256,11 +260,6 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
     num_samples = len(eval_inputs)
     if num_samples == 0:
         return 0, [0, 0], [0, 0], 0, 0, 0, 0.5, {}, {'count': 0, 'avg_return': 0, 'total_return': 0, 'filtered_count': 0}, None, None, {}
-
-    original_dtype = next(model.parameters()).dtype
-    use_fp32_eval = original_dtype == torch.bfloat16
-    if use_fp32_eval:
-        model = model.float()
     
     all_preds = []
     num_batches = (num_samples + batch_size - 1) // batch_size
@@ -272,7 +271,7 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
             
             batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], dtype=torch.float32, device=device)
             batch_preds = torch.sigmoid(model(batch_inputs))
-            all_preds.append(batch_preds.float().cpu().numpy().flatten())
+            all_preds.append(batch_preds.cpu().numpy().flatten())
             del batch_inputs
     
     all_preds = np.concatenate(all_preds)
@@ -355,9 +354,6 @@ def evaluate_model_batch(model, eval_inputs, eval_targets, eval_cumulative_retur
         if eval_daily_returns is not None and actual_top_n is not None:
             smart_exit_stats = calculate_smart_exit_return(all_preds, eval_daily_returns, eval_day_indices, actual_top_n)
 
-    if use_fp32_eval:
-        model = model.to(original_dtype)
-
     return total, class_correct, class_total, pred_positive_correct, pred_positive_total, pred_non_negative, auc_score, confidence_stats, top_stats, realistic_stats, smart_exit_stats, dispersion_stats, all_preds
 
 
@@ -392,11 +388,6 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
             'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None, 'smart_exit_stats': None
         }
 
-    original_dtype = next(model.parameters()).dtype
-    use_fp32_eval = original_dtype == torch.bfloat16
-    if use_fp32_eval:
-        model = model.float()
-
     all_preds = []
     num_batches = (num_samples + batch_size - 1) // batch_size
     
@@ -407,7 +398,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
             
             batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], dtype=torch.float32, device=device)
             batch_preds = torch.sigmoid(model(batch_inputs))
-            all_preds.append(batch_preds.float().cpu().numpy().flatten())
+            all_preds.append(batch_preds.cpu().numpy().flatten())
             del batch_inputs
     
     all_preds = np.concatenate(all_preds)
@@ -459,9 +450,6 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     else:
         stats['realistic_stats'] = None
         stats['smart_exit_stats'] = None
-
-    if use_fp32_eval:
-        model = model.to(original_dtype)
 
     stats['all_preds'] = all_preds
     return stats
@@ -830,9 +818,9 @@ def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, bat
             end_idx = min((i + 1) * batch_size, num_samples)
 
             batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx],
-                                       dtype=torch.bfloat16).to(device)
+                                       dtype=torch.float32).to(device)
             batch_targets = torch.tensor(eval_targets[start_idx:end_idx],
-                                        dtype=torch.bfloat16).to(device)
+                                        dtype=torch.float32).to(device)
 
             outputs = model(batch_inputs)
             loss = criterion(outputs.squeeze(-1), batch_targets)
@@ -934,7 +922,7 @@ def print_sample_predictions(model, eval_inputs, eval_targets, device, num_sampl
     print(f"  样本预测示例 (Epoch {epoch}):")
     with torch.no_grad():
         for idx in indices:
-            input_tensor = torch.tensor(eval_inputs[idx:idx+1], dtype=torch.bfloat16).to(device)
+            input_tensor = torch.tensor(eval_inputs[idx:idx+1], dtype=torch.float32).to(device)
             pred = torch.sigmoid(model(input_tensor)).item()
             target = eval_targets[idx]
             print(f"    样本{idx}: 预测={pred:.4f}, 真实={target:.1f}")
@@ -1066,15 +1054,14 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
     使用预计算训练数据集和固定评估集的训练函数（使用滚动窗口标准化避免数据泄露）
     提高训练效率，确保评估的一致性
 
-    注意：本训练函数使用 BF16 (bfloat16) 精度进行训练
-    - 训练速度比FP32快约2倍
-    - 内存占用减半
-    - 模型精度与FP32相当
+    注意：本训练函数使用 FP32 (float32) 精度进行训练
+    - 确保预测值有足够的精度进行排序
+    - 避免预测值碰撞问题
     """
     print("\n" + "="*60)
     print("训练配置")
     print("="*60)
-    print("训练精度: BF16 (Brain Floating Point 16)")
+    print("训练精度: FP32 (Float 32)")
     print("数据标准化: 滚动窗口标准化（避免数据泄露）")
     print("采样策略: 采样头在多股票上同步前进，使用正负样本池平衡")
     print(f"数据划分: 按时间划分，最近{DataConfig.TEST_DAYS}天作为测试集")
@@ -1229,9 +1216,9 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
                 sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
             )
 
-            # 将数据转换为tensor并移到设备上 (使用BF16精度)
-            epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.bfloat16).to(device)
-            epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.bfloat16).to(device)
+            # 将数据转换为tensor并移到设备上 (使用FP32精度)
+            epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.float32).to(device)
+            epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.float32).to(device)
 
             # 计算实际可用的batch数量（防止索引越界）
             actual_batches = len(epoch_inputs_tensor) // batch_size
@@ -1563,11 +1550,8 @@ if __name__ == "__main__":
 
     print("="*60)
 
-    print("正在创建 Transformer 模型 (BF16精度)...")
+    print("正在创建 Transformer 模型 (FP32精度)...")
     model = create_model().to(device)
-    
-    # 将模型参数转换为BF16精度
-    model = model.to(dtype=torch.bfloat16)
     
     # 打印模型参数数量
     total_params = sum(p.numel() for p in model.parameters())

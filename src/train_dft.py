@@ -189,8 +189,8 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         total_count = len(epoch_targets)
         print(f'  标签分布: 上涨={count_positive}({count_positive/total_count:.1%}), 边界={count_boundary}({count_boundary/total_count:.1%}), 不涨={count_negative}({count_negative/total_count:.1%})')
 
-        epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.bfloat16).to(device)
-        epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.bfloat16).to(device)
+        epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.float32).to(device)
+        epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.float32).to(device)
 
         actual_batches = len(epoch_inputs_tensor) // batch_size
         if actual_batches < batches_per_epoch:
@@ -365,7 +365,6 @@ if __name__ == "__main__":
 
     print(f"\n正在加载模型: {args.model}")
     model = create_model().to(device)
-    model = model.to(dtype=torch.bfloat16)
     state_dict = torch.load(args.model, map_location=device)
     model.load_state_dict(state_dict)
 

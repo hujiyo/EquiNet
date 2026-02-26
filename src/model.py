@@ -17,6 +17,7 @@ import torch.nn as nn
 import math
 from config import ModelConfig, DataConfig
 
+OUTPUT_LAYER_GAIN = ModelConfig.OUTPUT_LAYER_GAIN
 
 def init_weights(module):
     """
@@ -27,10 +28,13 @@ def init_weights(module):
     - Linear层偏置: 0
     - Norm层权重: 1
     - Norm层偏置: 0
+    
+    特殊处理:
+    - 输出层使用更大的gain，确保logits有足够大的范围
     """
     if isinstance(module, nn.Linear):
-        # Xavier uniform 初始化
-        nn.init.xavier_uniform_(module.weight, gain=1.0)
+        gain = OUTPUT_LAYER_GAIN if module.out_features == 1 else 1.0
+        nn.init.xavier_uniform_(module.weight, gain=gain)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     elif isinstance(module, nn.LayerNorm):

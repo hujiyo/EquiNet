@@ -708,10 +708,8 @@ def predict_single_stock(model_path, stock_data, device=None):
     try:
         model = create_model().to(device)
         
-        model = model.to(dtype=torch.bfloat16)
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.eval()
-        model = model.float()
     except Exception as e:
         print(f"模型加载失败: {e}")
         return None
@@ -751,10 +749,8 @@ def predict_multiple_stocks(model_path, stock_files_data, device=None):
     try:
         model = create_model().to(device)
         
-        model = model.to(dtype=torch.bfloat16)
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.eval()
-        model = model.float()
     except Exception as e:
         print(f"模型加载失败: {e}")
         return predictions

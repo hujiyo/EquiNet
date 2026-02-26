@@ -245,8 +245,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         print(f'  标签分布: 上涨={count_positive}({count_positive/total_count:.1%}), 边界={count_boundary}({count_boundary/total_count:.1%}), 不涨={count_negative}({count_negative/total_count:.1%})')
 
         # 转换为tensor
-        epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.bfloat16).to(device)
-        epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.bfloat16).to(device)
+        epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.float32).to(device)
+        epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.float32).to(device)
 
         # 计算实际可用的batch数量（防止索引越界）
         actual_batches = len(epoch_inputs_tensor) // batch_size
@@ -288,7 +288,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                     pseudo_pos_ratio=pseudo_pos_ratio,
                     pseudo_neg_ratio=pseudo_neg_ratio
                 )
-                pseudo_targets = torch.tensor(pseudo_targets_numpy, dtype=torch.bfloat16).to(device)
+                pseudo_targets = torch.tensor(pseudo_targets_numpy, dtype=torch.float32).to(device)
 
                 total_pseudo_pos += pseudo_stats['pseudo_pos_count']
                 total_pseudo_neg += pseudo_stats['pseudo_neg_count']
@@ -535,10 +535,8 @@ if __name__ == "__main__":
     print("="*60)
 
     # 创建模型A
-    print("\n正在创建模型A (BF16精度)...")
+    print("\n正在创建模型A (FP32精度)...")
     model_a = create_model().to(device)
-
-    model_a = model_a.to(dtype=torch.bfloat16)
 
     total_params = sum(p.numel() for p in model_a.parameters())
     print(f"模型A参数数: {total_params:,}")

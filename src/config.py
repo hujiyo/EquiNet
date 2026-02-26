@@ -56,7 +56,7 @@ class ModelConfig:
     # ========== 模型类型选择 ==========
     # 'continuous': 连续值模型 (master分支，使用6维连续输入)
     # 'tokenized': Token化模型 (test分支，将输入离散化为token ID)
-    MODEL_TYPE = 'tokenized'  # 可选: 'continuous' 或 'tokenized'
+    MODEL_TYPE = 'continuous'  # 可选: 'continuous' 或 'tokenized'
 
     # 基础模型参数
     INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
@@ -64,7 +64,7 @@ class ModelConfig:
     EMBED_HIDDEN_DIM = 48            # Embedding中间层维度（两阶段FFN：6→40→D_MODEL）
     FFN_EXPAND_RATIO = 4             # FFN隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数
-    NUM_LAYERS = 4                   # Transformer层数
+    NUM_LAYERS = 5                   # Transformer层数
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1之间）
     SEQ_LEN = DataConfig.CONTEXT_LENGTH  # 最大序列长度（直接引用CONTEXT_LENGTH，确保一致性）
 
@@ -76,6 +76,9 @@ class ModelConfig:
     # 词表大小 = 4*20(OHLC) + 36(volume) + 60(exchange) = 176
     VOCAB_SIZE = 176
     TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
+
+    # 输出层参数
+    OUTPUT_LAYER_GAIN = 3.0          # 输出层初始化增益（增大logits范围）
 
 # ==================== 训练参数 ====================
 class TrainingConfig:

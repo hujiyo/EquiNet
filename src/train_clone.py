@@ -358,8 +358,14 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         epoch_return = {
             'turn': epoch + 1,
             'return': stats_a['top_return'] * 100,
+            'return_a': stats_a['top_return'] * 100,
+            'return_b': None,
             'train_loss': avg_loss_a,
+            'train_loss_a': avg_loss_a,
+            'train_loss_b': None,
             'test_loss': test_loss_a,
+            'test_loss_a': test_loss_a,
+            'test_loss_b': None,
             'dispersion_std': stats_a.get('dispersion_std', 0),
             'dispersion_range': stats_a.get('dispersion_range', 0),
             'dispersion_iqr': stats_a.get('dispersion_iqr', 0),
@@ -367,7 +373,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             'high_conf_ratio': stats_a.get('high_conf_count', 0) / len(eval_targets) if eval_targets is not None else 0,
         }
         epoch_returns.append(epoch_return)
-        
+
         print_dispersion_sparkline(stats_a.get('all_preds', []), epoch_returns)
 
         # 早停检测（使用测试集loss）
@@ -439,9 +445,6 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, eval_criterion, device)
             epoch_return['train_loss_b'] = avg_loss_b
             epoch_return['test_loss_b'] = test_loss_b
-
-        # 将当前轮次收益率添加到列表
-        epoch_returns.append(epoch_return)
 
         print("-" * 60)
 

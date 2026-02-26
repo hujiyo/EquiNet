@@ -356,6 +356,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         epoch_return = {
             'turn': epoch + 1,
             'return': stats_b['top_return'] * 100,
+            'return_b': stats_b['top_return'] * 100,
             'train_loss': avg_loss_b,
             'test_loss': test_loss_b,
             'dispersion_std': stats_b.get('dispersion_std', 0),

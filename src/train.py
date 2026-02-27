@@ -169,7 +169,6 @@ class DynamicWeightedBCE(nn.Module):
         targets: [batch_size] 标签 (1.0/0.0)
         """
         if isinstance(targets, torch.Tensor):
-            # BF16需要先转为FP32再转numpy
             targets = targets.float().cpu().numpy()
         
         # 统计正负样本数量
@@ -192,14 +191,14 @@ class DynamicWeightedBCE(nn.Module):
         
     def forward(self, inputs, targets):
         """
-        inputs: [batch_size, 1] 模型输出的logits (BF16)
-        targets: [batch_size] 真实标签 (1.0/0.0) (BF16)
+        inputs: [batch_size, 1] 模型输出的logits
+        targets: [batch_size] 真实标签 (1.0/0.0)
         """
         # 确保输入形状正确：如果是 [batch_size, 1] 则 squeeze(-1) 变成 [batch_size]
         if inputs.dim() == 2 and inputs.size(1) == 1:
             inputs = inputs.squeeze(-1)
 
-        # BF16训练时，这里用FP32计算loss更稳定
+        # 使用FP32计算loss确保数值稳定性
         inputs_fp32 = inputs.float()
         targets_fp32 = targets.float()
 
@@ -699,7 +698,7 @@ def generate_pseudo_labels(pred_scores, original_targets,
         pseudo_targets: 伪标签数组，与original_targets形状相同
         stats: 统计信息字典
     """
-    # 转为numpy数组（BF16需要先转float32）
+    # 转为numpy数组
     if isinstance(pred_scores, torch.Tensor):
         pred_scores = pred_scores.float().detach().cpu().numpy()
     if isinstance(original_targets, torch.Tensor):
@@ -945,7 +944,7 @@ class GradientMonitor:
 
             grad_flat = grad.data.abs().flatten()
 
-            # 统计信息（转为float避免BF16问题）
+            # 统计信息（转为float确保数值精度）
             grad_norm = grad_flat.norm(2).float().item()
             grad_max = grad_flat.max().float().item()
             grad_mean = grad_flat.mean().float().item()

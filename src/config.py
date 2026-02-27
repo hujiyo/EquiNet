@@ -14,14 +14,15 @@ class DataConfig:
     OUTPUT_DIR = './out'             # 输出目录
 
     # 数据分割参数（按时间划分）
-    TEST_DAYS = 110                   # 测试集天数（每只股票的最近N天作为测试集）
+    TEST_DAYS = 125                   # 测试集天数（每只股票的最近N天作为测试集）
     RANDOM_SEED = 42                 # 随机种子
     
     # 训练集时间范围限制
     TRAIN_START_YEAR = 2019          # 训练集起始年份（2020年及以前的数据不参与训练）
     
     # 样本生成参数
-    CONTEXT_LENGTH = 30              # 历史数据长度（这是核心参数，其他地方应引用这个值）
+    CONTEXT_LENGTH = 45              # 历史数据长度（这是核心参数，其他地方应引用这个值）
+    # TEST_DAYS - CONTEXT_LENGTH = 80
     FUTURE_DAYS = 3                  # 未来预测天数
     REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS  # 总需求长度（上下文 + 未来天数）
 
@@ -144,14 +145,8 @@ class DeviceConfig:
         device = DeviceConfig.get_device()
         if device.type == "cuda":
             print(f"使用 GPU 进行训练: {torch.cuda.get_device_name()}")
-            # 检查BF16支持
-            if torch.cuda.is_bf16_supported():
-                print("✓ GPU 支持 BF16 加速训练")
-            else:
-                print("⚠ GPU 不支持 BF16，训练可能较慢或出错（建议使用RTX 30系及以上显卡）")
         else:
             print("CUDA 不可用，将使用 CPU 进行训练，训练速度可能较慢。")
-            print("⚠ CPU 模式下 BF16 性能可能不如 FP32")
         return device
 
 # ==================== 模型保存配置 ====================

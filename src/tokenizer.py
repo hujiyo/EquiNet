@@ -349,8 +349,7 @@ def tokenize_batch_torch(batch_input: torch.Tensor, flatten: bool = True) -> tor
     """
     PyTorch版本的批量token化（可用于GPU加速）
 
-    重要：本函数强制使用 FP32 进行离散化计算，避免 BF16 精度不足导致的桶边界抖动。
-    BF16 只有 7 位有效数字，在桶边界附近的值会因为精度损失随机跳到相邻的 token。
+    重要：本函数强制使用 FP32 进行离散化计算，确保数值精度。
 
     Args:
         batch_input: [batch_size, seq_len, 6] 连续值张量（任意精度）
@@ -365,8 +364,7 @@ def tokenize_batch_torch(batch_input: torch.Tensor, flatten: bool = True) -> tor
     # 初始化输出张量
     token_ids = torch.empty((batch_size, seq_len, num_features), dtype=torch.long, device=device)
 
-    # 关键修复：强制转换为 FP32 进行离散化计算，避免 BF16 精度问题
-    # BF16 只有 7 位有效数字，在桶边界附近的值会因为精度损失随机跳到相邻的 token
+    # 强制转换为 FP32 进行离散化计算，确保数值精度
     if batch_input.dtype != torch.float32:
         batch_input = batch_input.to(torch.float32)
 

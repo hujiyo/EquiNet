@@ -14,7 +14,6 @@ EquiNet 模型定义文件
 
 import torch
 import torch.nn as nn
-import math
 from config import ModelConfig, DataConfig
 
 OUTPUT_LAYER_GAIN = ModelConfig.OUTPUT_LAYER_GAIN
@@ -44,27 +43,21 @@ def init_weights(module):
 
 class PositionalEncoding(nn.Module):
     """
-    标准的正弦位置编码
-    让 Transformer 自己学习时间依赖关系，不加人为规则
+    可学习位置编码（Learned Positional Embedding）
+    类似 BERT / GPT 的做法：每个位置对应一个可训练的向量
+    让模型自己学习最优的位置表示，而非使用固定的正弦公式
     """
     def __init__(self, d_model, seq_len=DataConfig.CONTEXT_LENGTH):
         super(PositionalEncoding, self).__init__()
 
-        # 创建标准的正弦/余弦位置编码
-        pe = torch.zeros(seq_len, d_model)
-        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
-
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-
-        self.register_buffer('pe', pe)
+        # 可学习的位置嵌入：每个位置一个d_model维向量
+        self.pe = nn.Embedding(seq_len, d_model)
 
     def forward(self, x):
         #添加位置编码，LayerNorm在后续层中可能使用
         seq_len = x.size(1)
-        pe_slice = self.pe[:seq_len, :].unsqueeze(0)
-        return x + pe_slice
+        positions = torch.arange(seq_len, device=x.device)
+        return x + self.pe(positions).unsqueeze(0)
 
 
 class MultiHeadAttention(nn.Module):
@@ -286,7 +279,7 @@ class EnhancedStockTransformer(nn.Module):
 
 class TwoDimensionalPositionalEncoding(nn.Module):
     """
-    二维位置编码：时间步 + 特征类型
+    可学习的二维位置编码：时间步 + 特征类型
 
     设计原理：
     - 60×6的时间序列被展平成360个token
@@ -295,43 +288,20 @@ class TwoDimensionalPositionalEncoding(nn.Module):
       2. feature_id: 属于哪个特征（0-5，OHLC+volume+exchange）
 
     编码方案：
-    - 将d_model分为两半：前一半用于时间步编码，后一半用于特征类型编码
-    - 使用正弦编码，避免学习参数
+    - 时间步编码：nn.Embedding(num_timesteps, d_model)，可学习
+    - 特征类型编码：nn.Embedding(num_features, d_model)，可学习
+    - 两者直接相加（而非拼接），保持完整的d_model表达能力
     """
     def __init__(self, d_model, num_timesteps=DataConfig.CONTEXT_LENGTH, num_features=ModelConfig.INPUT_DIM):
         super(TwoDimensionalPositionalEncoding, self).__init__()
 
-        self.d_model = d_model
-        self.num_timesteps = num_timesteps  # 60
         self.num_features = num_features     # 6
 
-        # 确保d_model是偶数，可以均分
-        assert d_model % 2 == 0, f"d_model ({d_model}) 必须是偶数以便均分给时间步和特征编码"
+        # 可学习的时间步编码：每个时间步一个d_model维向量
+        self.temporal_pe = nn.Embedding(num_timesteps, d_model)
 
-        self.temporal_dim = d_model // 2  # 时间步编码维度
-        self.feature_dim = d_model // 2   # 特征类型编码维度
-
-        # 时间步编码：0-59
-        temporal_pe = torch.zeros(num_timesteps, self.temporal_dim)
-        temporal_pos = torch.arange(0, num_timesteps, dtype=torch.float).unsqueeze(1)
-
-        div_term = torch.exp(torch.arange(0, self.temporal_dim, 2).float() *
-                            (-math.log(10000.0) / self.temporal_dim))
-        temporal_pe[:, 0::2] = torch.sin(temporal_pos * div_term)
-        temporal_pe[:, 1::2] = torch.cos(temporal_pos * div_term)
-
-        self.register_buffer('temporal_pe', temporal_pe)
-
-        # 特征类型编码：0-5
-        feature_pe = torch.zeros(num_features, self.feature_dim)
-        feature_pos = torch.arange(0, num_features, dtype=torch.float).unsqueeze(1)
-
-        div_term = torch.exp(torch.arange(0, self.feature_dim, 2).float() *
-                            (-math.log(10000.0) / self.feature_dim))
-        feature_pe[:, 0::2] = torch.sin(feature_pos * div_term)
-        feature_pe[:, 1::2] = torch.cos(feature_pos * div_term)
-
-        self.register_buffer('feature_pe', feature_pe)
+        # 可学习的特征类型编码：每个特征类型一个d_model维向量
+        self.feature_pe = nn.Embedding(num_features, d_model)
 
     def forward(self, x):
         """
@@ -341,7 +311,7 @@ class TwoDimensionalPositionalEncoding(nn.Module):
         Returns:
             x + 二维位置编码
         """
-        batch_size, seq_len, _ = x.shape
+        seq_len = x.size(1)
         device = x.device
 
         # 为每个token计算其时间步ID和特征ID
@@ -354,15 +324,9 @@ class TwoDimensionalPositionalEncoding(nn.Module):
         # feature_id = token_pos % 6 (0-5)
         feature_ids = token_positions % self.num_features
 
-        # 获取对应的位置编码
-        # [seq_len, temporal_dim]
-        temporal_encodings = self.temporal_pe[temporal_ids]
-
-        # [seq_len, feature_dim]
-        feature_encodings = self.feature_pe[feature_ids]
-
-        # 拼接两种编码 [seq_len, d_model]
-        positional_encodings = torch.cat([temporal_encodings, feature_encodings], dim=-1)
+        # 获取对应的可学习位置编码并相加
+        # [seq_len, d_model] + [seq_len, d_model]
+        positional_encodings = self.temporal_pe(temporal_ids) + self.feature_pe(feature_ids)
 
         # 添加batch维度并加到输入上
         return x + positional_encodings.unsqueeze(0)

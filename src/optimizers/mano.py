@@ -310,19 +310,18 @@ def create_optimizer(model, optimizer_type='mano', lr=1e-3, momentum=0.95, weigh
     optimizer_type = optimizer_type.lower()
 
     if optimizer_type == 'mano':
-        # Separate 2D and 1D parameters
         mano_params = []
         adamw_params = []
 
         for name, param in model.named_parameters():
-            if param.dim() >= 2:
+            if param.dim() == 2:
                 mano_params.append(param)
             else:
                 adamw_params.append(param)
 
-        print(f"Optimizer: HybridManoAdamW (Mano for 2D matrices, AdamW for 1D params)")
+        print(f"Optimizer: HybridManoAdamW (Mano for 2D matrices, AdamW for 1D & 3D+ params)")
         print(f"  2D params: {len(mano_params)}")
-        print(f"  1D params: {len(adamw_params)}")
+        print(f"  1D & 3D+ params: {len(adamw_params)}")
 
         return HybridManoAdamW(
             mano_params=mano_params,

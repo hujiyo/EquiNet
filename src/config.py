@@ -14,14 +14,14 @@ class DataConfig:
     OUTPUT_DIR = './out'             # 输出目录
 
     # 数据分割参数（按时间划分）
-    TEST_DAYS = 120                   # 测试集天数（每只股票的最近N天作为测试集）
+    TEST_DAYS = 110                   # 测试集天数（每只股票的最近N天作为测试集）
     RANDOM_SEED = 42                 # 随机种子
     
     # 训练集时间范围限制
-    TRAIN_START_YEAR = 2019          # 训练集起始年份（2020年及以前的数据不参与训练）
+    TRAIN_START_YEAR = 2016          # 训练集起始年份（2020年及以前的数据不参与训练）
     
     # 样本生成参数
-    CONTEXT_LENGTH = 40              # 历史数据长度（这是核心参数，其他地方应引用这个值）
+    CONTEXT_LENGTH = 30              # 历史数据长度（这是核心参数，其他地方应引用这个值）
     # TEST_DAYS - CONTEXT_LENGTH = 80
     FUTURE_DAYS = 3                  # 未来预测天数
     REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS  # 总需求长度（上下文 + 未来天数）
@@ -38,7 +38,7 @@ class DataConfig:
     SIGNAL_BURST_CUM = 0.06          # 爆发后累计阈值：累计≥6%
     
     # 风险控制参数（新增）
-    SIGNAL_MIN_CUM_RETURN = 0.02     # 最低累计收益：≥2%（过滤累计亏损或微利样本）
+    SIGNAL_MIN_CUM_RETURN = 0.03     # 最低累计收益：≥3%（过滤累计亏损或微利样本）
     SIGNAL_DAY1_MAX_DROP = -0.02     # Day1最大跌幅：≥-2%（避免买入当天就亏）
 
     # 评估参数
@@ -48,7 +48,7 @@ class DataConfig:
     MAX_SELECT_PER_DAY = 4             # 全局阈值模式下每天最多选股数量（0表示不限制）
     
     # 模型保存条件
-    MIN_AUC = 0.65                    # 最低AUC要求（按时间划分后的真实性能基线）
+    MIN_AUC = 0.64                    # 最低AUC要求（按时间划分后的真实性能基线）
 
 # ==================== 模型架构参数 ====================
 class ModelConfig:

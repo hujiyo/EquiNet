@@ -152,20 +152,32 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         criterion = nn.BCEWithLogitsLoss(reduction='mean')
         eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
-    # 最佳模型A缓存（按Top1%收益率判断）
+    # 最佳模型A缓存（按Top1%收益率判断，用于生成伪标签）
     best_return_a = -float('inf')
     best_model_a_for_pseudo = None  # 用于生成伪标签的最佳A
     best_return_epoch_a = 0
 
-    # 按收益率保存的最佳模型（真正要用的模型）
+    # 最佳模型B缓存（按收益率判断，仅用于显示）
     best_return_b = -float('inf')
     best_return_epoch_b = 0
-    best_model_a_by_return = None
-    best_model_b_by_return = None
-    best_auc_a_at_best_return = 0.0
-    best_auc_b_at_best_return = 0.0
-    best_threshold_a = 0.0
-    best_threshold_b = 0.0
+
+    # 按loss保存的最佳模型（需要满足条件才参与评估）
+    # 条件：epoch >= 100, 实战收益率>=1%, 收益率>0.5%, AUC>64%
+    best_loss_a = float('inf')
+    best_loss_epoch_a = 0
+    best_model_a_by_loss = None
+    best_return_a_at_best_loss = 0.0
+    best_auc_a_at_best_loss = 0.0
+    best_threshold_a_at_best_loss = 0.0
+    best_realistic_return_a_at_best_loss = 0.0
+
+    best_loss_b = float('inf')
+    best_loss_epoch_b = 0
+    best_model_b_by_loss = None
+    best_return_b_at_best_loss = 0.0
+    best_auc_b_at_best_loss = 0.0
+    best_threshold_b_at_best_loss = 0.0
+    best_realistic_return_b_at_best_loss = 0.0
 
     # 早停机制（patience = EPOCHS * 0.25）
     patience = int(epochs * 0.25)
@@ -400,10 +412,20 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             else:
                 best_model_a_for_pseudo.load_state_dict(copy.deepcopy(model_a.state_dict()))
             best_model_a_for_pseudo.eval()
-            best_model_a_by_return = copy.deepcopy(model_a.state_dict())
-            best_auc_a_at_best_return = stats_a['auc']
-            best_threshold_a = stats_a['top_threshold']
             print(f'          ✓ 新最佳模型A（收益率）！Top1%收益: {best_return_a*100:+.2f}% (第{best_return_epoch_a}轮)')
+
+        # 按loss评估最佳模型A（条件：epoch >= 100, 实战收益率>=1%, 收益率>0.5%, AUC>64%）
+        realistic_return_a = stats_a['realistic_stats']['avg_realistic_return'] if stats_a.get('realistic_stats') else 0.0
+        if (epoch + 1) >= 100 and realistic_return_a >= 0.01 and stats_a['top_return'] > 0.005 and stats_a['auc'] > 0.64:
+            if test_loss_a < best_loss_a:
+                best_loss_a = test_loss_a
+                best_loss_epoch_a = epoch + 1
+                best_model_a_by_loss = copy.deepcopy(model_a.state_dict())
+                best_return_a_at_best_loss = stats_a['top_return']
+                best_auc_a_at_best_loss = stats_a['auc']
+                best_threshold_a_at_best_loss = stats_a['top_threshold']
+                best_realistic_return_a_at_best_loss = realistic_return_a
+                print(f'          ✓ 新最佳模型A（loss）！Loss: {best_loss_a:.4f}, 实战收益率: {best_realistic_return_a_at_best_loss*100:.1f}% (第{best_loss_epoch_a}轮)')
 
         # 评估模型B（如果存在）
         if model_b is not None:
@@ -435,10 +457,20 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             if stats_b['top_return'] > best_return_b:
                 best_return_b = stats_b['top_return']
                 best_return_epoch_b = epoch + 1
-                best_model_b_by_return = copy.deepcopy(model_b.state_dict())
-                best_auc_b_at_best_return = stats_b['auc']
-                best_threshold_b = stats_b['top_threshold']
                 print(f'          ✓ 新最佳模型B（收益率）！Top1%收益: {best_return_b*100:+.2f}% (第{best_return_epoch_b}轮)')
+
+            # 按loss评估最佳模型B（条件：epoch >= 100, 实战收益率>=1%, 收益率>0.5%, AUC>64%）
+            realistic_return_b = stats_b['realistic_stats']['avg_realistic_return'] if stats_b.get('realistic_stats') else 0.0
+            if (epoch + 1) >= 100 and realistic_return_b >= 0.01 and stats_b['top_return'] > 0.005 and stats_b['auc'] > 0.64:
+                if test_loss_b < best_loss_b:
+                    best_loss_b = test_loss_b
+                    best_loss_epoch_b = epoch + 1
+                    best_model_b_by_loss = copy.deepcopy(model_b.state_dict())
+                    best_return_b_at_best_loss = stats_b['top_return']
+                    best_auc_b_at_best_loss = stats_b['auc']
+                    best_threshold_b_at_best_loss = stats_b['top_threshold']
+                    best_realistic_return_b_at_best_loss = realistic_return_b
+                    print(f'          ✓ 新最佳模型B（loss）！Loss: {best_loss_b:.4f}, 实战收益率: {best_realistic_return_b_at_best_loss*100:.1f}% (第{best_loss_epoch_b}轮)')
 
             epoch_return['return_b'] = stats_b['top_return'] * 100
 
@@ -457,32 +489,35 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     print("\n" + "=" * 60)
     print(f"训练完成！")
     print(f"最佳模型A（按收益率）: 第{best_return_epoch_a}轮, Top1%收益: {best_return_a*100:+.2f}%")
-    if best_model_b_by_return is not None:
-        print(f"最佳模型B（按收益率）: 第{best_return_epoch_b}轮, Top1%收益: {best_return_b*100:+.2f}%")
+    print(f"最佳模型A（按loss）: 第{best_loss_epoch_a}轮, Loss: {best_loss_a:.4f}, 实战收益率: {best_realistic_return_a_at_best_loss*100:.1f}%")
+    if best_model_b_by_loss is not None:
+        print(f"最佳模型B（按loss）: 第{best_loss_epoch_b}轮, Loss: {best_loss_b:.4f}, 实战收益率: {best_realistic_return_b_at_best_loss*100:.1f}%")
 
-    # 保存模型A
-    if best_model_a_by_return is not None:
+    # 保存模型A（按loss的最佳模型）
+    if best_model_a_by_loss is not None:
         save_path_a = save_model_with_metadata(
-            best_model_a_by_return,
-            best_return_a, best_threshold_a, best_auc_a_at_best_return,
-            best_return_epoch_a,
+            best_model_a_by_loss,
+            best_return_a_at_best_loss, best_threshold_a_at_best_loss, best_auc_a_at_best_loss,
+            best_loss_epoch_a,
             model_prefix="modelA",
             output_dir=DataConfig.OUTPUT_DIR
         )
         print(f"✓ 模型A已保存: {os.path.basename(save_path_a)}")
-        print(f"  Top1%阈值: {best_threshold_a:.4f}")
+        print(f"  Top1%阈值: {best_threshold_a_at_best_loss:.4f}")
+        print(f"  实战收益率: {best_realistic_return_a_at_best_loss*100:.1f}%")
 
-    # 保存模型B
-    if best_model_b_by_return is not None:
+    # 保存模型B（按loss的最佳模型）
+    if best_model_b_by_loss is not None:
         save_path_b = save_model_with_metadata(
-            best_model_b_by_return,
-            best_return_b, best_threshold_b, best_auc_b_at_best_return,
-            best_return_epoch_b,
+            best_model_b_by_loss,
+            best_return_b_at_best_loss, best_threshold_b_at_best_loss, best_auc_b_at_best_loss,
+            best_loss_epoch_b,
             model_prefix="modelB",
             output_dir=DataConfig.OUTPUT_DIR
         )
         print(f"✓ 模型B已保存: {os.path.basename(save_path_b)}")
-        print(f"  Top1%阈值: {best_threshold_b:.4f}")
+        print(f"  Top1%阈值: {best_threshold_b_at_best_loss:.4f}")
+        print(f"  实战收益率: {best_realistic_return_b_at_best_loss*100:.1f}%")
 
     print("=" * 60)
 

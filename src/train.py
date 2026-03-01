@@ -21,7 +21,7 @@ from model import create_model
 
 from data import (
     load_and_preprocess_data,
-    TemporalSampler, sample_with_pools,
+    create_sampler, sample_with_pools,
     generate_sample_from_index,
     create_fixed_evaluation_dataset,
     create_train_evaluation_dataset,
@@ -1066,9 +1066,9 @@ def train_model(model, train_stock_info, test_stock_info, epochs=TrainingConfig.
     print(f"数据划分: 按时间划分，最近{DataConfig.TEST_DAYS}天作为测试集")
     print("="*60 + "\n")
     
-    # 创建时间顺序采样器
-    print("正在初始化时间顺序采样器...")
-    sampler = TemporalSampler(train_stock_info)
+    # 创建采样器（根据配置选择策略）
+    print("正在初始化采样器...")
+    sampler = create_sampler(train_stock_info)
     
     # 设置训练随机种子
     torch.manual_seed(DataConfig.RANDOM_SEED)

@@ -30,7 +30,7 @@ from model import create_model
 
 from data import (
     load_and_preprocess_data,
-    TemporalSampler, sample_with_pools,
+    create_sampler, sample_with_pools,
     create_fixed_evaluation_dataset
 )
 
@@ -162,7 +162,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
     patience = int(epochs * 0.25)
     early_stopping = EarlyStopping(patience=patience)
 
-    sampler = TemporalSampler(train_stock_info)
+    sampler = create_sampler(train_stock_info)
     train_rng = random.Random(seed)
 
     epoch_returns = []

@@ -25,7 +25,7 @@ from model import create_model
 
 from data import (
     load_and_preprocess_data,
-    TemporalSampler, sample_with_pools,
+    create_sampler, sample_with_pools,
     create_fixed_evaluation_dataset
 )
 
@@ -211,8 +211,8 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     patience = TrainingConfig.EPOCHS*0.25
     no_improve_count = 0
 
-    # 创建时间顺序采样器（使用train.py的统一采样机制）
-    sampler = TemporalSampler(train_stock_info)
+    # 创建采样器（根据配置选择策略）
+    sampler = create_sampler(train_stock_info)
     train_rng = random.Random(seed)
 
     # 记录每轮收益率

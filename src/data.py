@@ -246,6 +246,113 @@ class TemporalSampler:
         return looped_stocks_count, total_loops
 
 
+class RandomSampler:
+    """
+    随机采样器：每次随机选择股票和位置进行采样
+    
+    与TemporalSampler的区别：
+    - TemporalSampler: 时间顺序前进，指针不回头（除非循环）
+    - RandomSampler: 每次完全随机选择样本，无时间顺序
+    
+    适用场景：
+    - 对比实验：评估时间顺序采样对模型效果的影响
+    - 数据增强：打破时间依赖，增加样本多样性
+    """
+    def __init__(self, stock_info_list):
+        self.stock_info_list = stock_info_list
+        self.required_length = DataConfig.REQUIRED_LENGTH
+        
+        self.valid_stock_indices = []
+        self.stock_sample_ranges = []
+        
+        for stock_idx, stock_info in enumerate(stock_info_list):
+            train_start_idx = stock_info.get('train_start_idx', 0)
+            train_end_idx = stock_info.get('train_end_idx', len(stock_info['data']))
+            
+            start_pos = max(1, train_start_idx + 1)
+            max_pos = train_end_idx
+            
+            if start_pos <= max_pos:
+                self.valid_stock_indices.append(stock_idx)
+                self.stock_sample_ranges.append((start_pos, max_pos))
+        
+        valid_stocks = len(self.valid_stock_indices)
+        total_samples = sum(max_pos - start_pos + 1 
+                          for start_pos, max_pos in self.stock_sample_ranges)
+        
+        if valid_stocks == 0:
+            raise ValueError(
+                f"没有有效的训练股票！\n"
+                f"  总股票数: {len(stock_info_list)}\n"
+                f"  请检查数据质量或调整参数"
+            )
+        
+        print(f"  初始化随机采样器: {valid_stocks}只有效股票, 总样本数={total_samples}")
+        print(f"  采样策略: 完全随机采样，每次随机选择股票和位置")
+
+    def sample_batch_rounds(self, num_rounds, rng=None):
+        """
+        随机采样多轮：每次随机选择股票和位置
+
+        参数:
+            num_rounds: 要采样的轮数（每轮采样 valid_stocks 个样本）
+            rng: 随机数生成器（用于可复现性）
+
+        返回: [(stock_idx, start_idx), ...] 所有轮次的样本索引列表
+        """
+        if rng is None:
+            rng = random.Random()
+        
+        all_samples = []
+        
+        # 创建股票索引到范围的映射，避免打乱后索引错位
+        stock_to_range = {
+            stock_idx: self.stock_sample_ranges[i]
+            for i, stock_idx in enumerate(self.valid_stock_indices)
+        }
+        
+        for _ in range(num_rounds):
+            shuffled_indices = self.valid_stock_indices.copy()
+            rng.shuffle(shuffled_indices)
+            
+            for stock_idx in shuffled_indices:
+                start_pos, max_pos = stock_to_range[stock_idx]
+                start_idx = rng.randint(start_pos, max_pos)
+                all_samples.append((stock_idx, start_idx))
+        
+        return all_samples
+    
+    def get_progress(self):
+        """随机采样器无进度概念，返回 (0, 1) 表示无限采样"""
+        return 0, 1
+
+    def get_loop_stats(self):
+        """随机采样器无循环概念"""
+        return 0, 0
+
+
+def create_sampler(stock_info_list, strategy=None):
+    """
+    根据配置创建采样器
+    
+    参数:
+        stock_info_list: 股票信息列表
+        strategy: 采样策略，可选 'temporal' 或 'random'，默认使用 DataConfig.SAMPLING_STRATEGY
+    
+    返回:
+        sampler: TemporalSampler 或 RandomSampler 实例
+    """
+    if strategy is None:
+        strategy = DataConfig.SAMPLING_STRATEGY
+    
+    if strategy == 'random':
+        print("使用随机采样策略")
+        return RandomSampler(stock_info_list)
+    else:
+        print("使用时间顺序采样策略")
+        return TemporalSampler(stock_info_list)
+
+
 def check_strong_signal(daily_price_changes):
     """
     强势信号检测：判断是否存在强势买入信号（风险优化版）
@@ -469,7 +576,10 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
     print(f"    动态采样策略：按需生成索引，直到满足{batches_per_epoch}个batch...")
     
     while batches_generated < batches_per_epoch:
-        sample_indices = sampler.sample_batch_rounds(initial_rounds)
+        if isinstance(sampler, RandomSampler):
+            sample_indices = sampler.sample_batch_rounds(initial_rounds, rng)
+        else:
+            sample_indices = sampler.sample_batch_rounds(initial_rounds)
         
         if len(sample_indices) == 0:
             print(f"\n    ⚠ 警告：采样头已到达所有股票终点且无法循环，停止采样")

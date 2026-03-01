@@ -41,6 +41,11 @@ class DataConfig:
     SIGNAL_MIN_CUM_RETURN = 0.03     # 最低累计收益：≥3%（过滤累计亏损或微利样本）
     SIGNAL_DAY1_MAX_DROP = -0.02     # Day1最大跌幅：≥-2%（避免买入当天就亏）
 
+    # 采样策略配置
+    # 'temporal': 时间顺序采样（指针在训练集上滑动，支持循环）
+    # 'random': 随机采样（每次随机选择股票和位置）
+    SAMPLING_STRATEGY = 'random'   # 可选: 'temporal' 或 'random'
+
     # 评估参数
     EVAL_BATCH_SIZE = 256            # 评估批处理大小（分批处理，减少显存占用）
     TOP_PERCENT = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
@@ -96,7 +101,7 @@ class TrainingConfig:
 
     # 优化器参数
     USE_ADAMW = True                 # 是否使用AdamW优化器
-    USE_MANO = False                  # 是否使用Mano优化器（与AdamW/Adam互斥，优先级最高）
+    USE_MANO = True                  # 是否使用Mano优化器（与AdamW/Adam互斥，优先级最高）
     WEIGHT_DECAY = 1e-5              # 权重衰减
     GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
 
@@ -205,6 +210,7 @@ def print_config_summary():
 
     print(f"\n数据参数:")
     print(f"  数据目录: {DataConfig.DATA_DIR}")
+    print(f"  采样策略: {DataConfig.SAMPLING_STRATEGY} ({'时间顺序采样' if DataConfig.SAMPLING_STRATEGY == 'temporal' else '随机采样'})")
     print(f"  训练集起始年份: {DataConfig.TRAIN_START_YEAR}年（过滤{DataConfig.TRAIN_START_YEAR-1}年及以前的数据）")
     print(f"  测试集天数: {DataConfig.TEST_DAYS}天")
     print(f"  上下文长度: {DataConfig.CONTEXT_LENGTH}")

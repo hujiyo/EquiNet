@@ -292,33 +292,44 @@ class RandomSampler:
 
     def sample_batch_rounds(self, num_rounds, rng=None):
         """
-        随机采样多轮：每次随机选择股票和位置
+        随机采样多轮：按样本数量加权随机采样
 
         参数:
             num_rounds: 要采样的轮数（每轮采样 valid_stocks 个样本）
             rng: 随机数生成器（用于可复现性）
 
         返回: [(stock_idx, start_idx), ...] 所有轮次的样本索引列表
+        
+        加权策略：
+            - 每只股票被选中的概率与其样本数量成正比
+            - 样本多的股票被采样次数多，样本少的股票被采样次数少
+            - 确保每个样本被采样的期望概率相等
         """
         if rng is None:
             rng = random.Random()
         
         all_samples = []
+        num_samples_per_round = len(self.valid_stock_indices)
+        total_samples_to_generate = num_rounds * num_samples_per_round
         
-        # 创建股票索引到范围的映射，避免打乱后索引错位
+        sample_weights = [max_pos - start_pos + 1 
+                         for start_pos, max_pos in self.stock_sample_ranges]
+        
         stock_to_range = {
             stock_idx: self.stock_sample_ranges[i]
             for i, stock_idx in enumerate(self.valid_stock_indices)
         }
         
-        for _ in range(num_rounds):
-            shuffled_indices = self.valid_stock_indices.copy()
-            rng.shuffle(shuffled_indices)
+        for _ in range(total_samples_to_generate):
+            stock_idx = rng.choices(
+                self.valid_stock_indices,
+                weights=sample_weights,
+                k=1
+            )[0]
             
-            for stock_idx in shuffled_indices:
-                start_pos, max_pos = stock_to_range[stock_idx]
-                start_idx = rng.randint(start_pos, max_pos)
-                all_samples.append((stock_idx, start_idx))
+            start_pos, max_pos = stock_to_range[stock_idx]
+            start_idx = rng.randint(start_pos, max_pos)
+            all_samples.append((stock_idx, start_idx))
         
         return all_samples
     

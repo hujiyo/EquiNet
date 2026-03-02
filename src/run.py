@@ -22,7 +22,7 @@ from data import (
     create_fixed_evaluation_dataset,
     generate_sample_from_index
 )
-from train import evaluate_model
+from train import evaluate_model, calculate_test_loss, DynamicWeightedBCE
 
 
 # ==================== 工具函数 ====================
@@ -358,11 +358,34 @@ def run_evaluation(model, test_stock_info, device):
         eval_daily_returns=eval_daily_returns
     )
     
+    # 创建评估损失函数（与 train_clone.py 一致）
+    if LossConfig.use_dynamic_bce():
+        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        
+        # 测试集权重
+        test_targets = np.array(eval_targets)
+        test_pos_count = np.sum(test_targets >= 0.5)
+        test_neg_count = np.sum(test_targets < 0.5)
+        if test_pos_count > 0 and test_neg_count > 0:
+            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
+        elif test_pos_count == 0:
+            test_neg_weight = float(LossConfig.POS_WEIGHT)
+        else:
+            test_neg_weight = 0.1
+        eval_criterion.weight_0_0.fill_(test_neg_weight)
+    else:
+        import torch.nn as nn
+        eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
+    
+    # 计算测试集损失
+    test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device)
+    
     # 打印评估结果（与 train_clone.py 格式一致）
     print(f"│")
     print(f"│  ┌── 评估结果 ──────────────────────────────────┐")
+    print(f"│  │  测试损失:          {test_loss:.4f}")
     print(f"│  │  AUC:              {stats['auc']:.4f}")
-    print(f"│  │  预测均值:          {stats['pred_mean']:.4f}")
+    print(f"│  │  预测均值:          {stats['pred_mean']:.3f}")
     print(f"│  │  预测标准差:        {stats['pred_std']:.4f}")
     print(f"│  │  高置信(>0.7):      {stats['high_conf_count']} 个")
     print(f"│  │  低置信(<0.2):      {stats['low_conf_count']} 个")

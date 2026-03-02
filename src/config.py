@@ -44,7 +44,7 @@ class DataConfig:
     # 采样策略配置
     # 'temporal': 时间顺序采样（指针在训练集上滑动，支持循环）
     # 'random': 随机采样（每次随机选择股票和位置）
-    SAMPLING_STRATEGY = 'random'   # 可选: 'temporal' 或 'random'
+    SAMPLING_STRATEGY = 'temporal'   # 可选: 'temporal' 或 'random'
 
     # 评估参数
     EVAL_BATCH_SIZE = 256            # 评估批处理大小（分批处理，减少显存占用）
@@ -75,8 +75,8 @@ class ModelConfig:
     SEQ_LEN = DataConfig.CONTEXT_LENGTH  # 最大序列长度（直接引用CONTEXT_LENGTH，确保一致性）
 
     # 注意力机制参数（为小模型调整）
-    DROPOUT_RATE = 0.1                 # Dropout比率设置为0降低欠拟合
-    ATTENTION_DROPOUT = 0.1            # 注意力Dropout比率设置为0降低欠拟合
+    DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合
+    ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
 
     # Token化参数（仅当 MODEL_TYPE='tokenized' 时使用）
     # 词表大小 = 4*20(OHLC) + 36(volume) + 60(exchange) = 176

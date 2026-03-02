@@ -436,7 +436,10 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             total_samples_b = len(epoch_inputs)
             avg_loss_b = total_loss_b / total_samples_b if total_samples_b > 0 else 0
 
-            print(f'  [模型B] 损失: {avg_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
+            # 计算测试集损失
+            test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, eval_criterion, device)
+
+            print(f'  [模型B] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
             print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_b["top_return"]*100:+.2f}%')
             
@@ -473,8 +476,6 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                     print(f'          ✓ 新最佳模型B（loss）！Loss: {best_loss_b:.4f}, 实战收益率: {best_realistic_return_b_at_best_loss*100:.1f}% (第{best_loss_epoch_b}轮)')
 
             epoch_return['return_b'] = stats_b['top_return'] * 100
-
-            test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, eval_criterion, device)
             epoch_return['train_loss_b'] = avg_loss_b
             epoch_return['test_loss_b'] = test_loss_b
 

@@ -176,7 +176,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         current_lr = optimizer.param_groups[0]['lr']
         print(f'Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f} (DFT微调)')
 
-        epoch_inputs, epoch_targets = sample_with_pools(
+        epoch_inputs, epoch_targets, _ = sample_with_pools(
             sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
         )
 

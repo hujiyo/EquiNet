@@ -125,15 +125,37 @@ class TrainingConfig:
 class LossConfig:
     """损失函数相关配置"""
 
-    # 可选值: 'dynamic_bce'（使用DynamicWeightedBCE）或 'standard_bce'（使用BCEWithLogitsLoss）
-    LOSS_TYPE = 'dynamic_bce'
+    # 可选值: 'task_aligned'（任务对齐损失）或 'dynamic_bce' 或 'standard_bce'
+    LOSS_TYPE = 'task_aligned'
 
-    # DynamicWeightedBCE 的正样本权重
+    # DynamicWeightedBCE 的正样本权重（也用于 TaskAlignedLoss 的基础BCE组件）
     POS_WEIGHT = 4.0
+
+    # ========== TaskAlignedLoss 参数 ==========
+    # 各子损失的权重
+    RANK_LOSS_WEIGHT = 0.3       # 排序损失权重（确保高收益样本排在前面）
+    RETURN_LOSS_WEIGHT = 0.2     # 收益加权损失权重（收益越高/亏损越大，梯度越强）
+    TOPK_LOSS_WEIGHT = 0.1       # Top-K聚焦损失权重（只关注模型预测最高的那部分）
+
+    # 排序损失参数
+    RANK_MARGIN = 0.1            # 排序损失的margin（要求正负样本对的分数差距至少这么大）
+    RANK_NUM_PAIRS = 64          # 每个batch采样的正负样本对数量
+
+    # 收益加权参数
+    RETURN_ALPHA = 5.0           # 正样本收益率放大系数（收益越高权重越大）
+    RETURN_BETA = 3.0            # 负样本亏损放大系数（亏损越多权重越大）
+    RETURN_CLIP = 0.30           # 收益率裁剪范围（防止极端值主导梯度）
+
+    # Top-K聚焦参数
+    TOPK_RATIO = 0.10            # 每个batch中关注的Top比例（10%）
 
     @staticmethod
     def use_dynamic_bce():
         return LossConfig.LOSS_TYPE.lower() == 'dynamic_bce'
+
+    @staticmethod
+    def use_task_aligned():
+        return LossConfig.LOSS_TYPE.lower() == 'task_aligned'
 
 # ==================== 设备配置 ====================
 class DeviceConfig:

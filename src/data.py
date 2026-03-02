@@ -572,11 +572,14 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
 
     pos_pool_inputs = []
     pos_pool_targets = []
+    pos_pool_returns = []
     neg_pool_inputs = []
     neg_pool_targets = []
+    neg_pool_returns = []
 
     all_batch_inputs = []
     all_batch_targets = []
+    all_batch_returns = []
 
     batches_generated = 0
     
@@ -607,39 +610,47 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
             if sample is None:
                 continue
 
-            input_seq, target, _, _ = sample
+            input_seq, target, cumulative_return, _ = sample
 
             if target >= 0.5:
                 pos_pool_inputs.append(input_seq)
                 pos_pool_targets.append(target)
+                pos_pool_returns.append(cumulative_return)
             else:
                 neg_pool_inputs.append(input_seq)
                 neg_pool_targets.append(target)
+                neg_pool_returns.append(cumulative_return)
             
             if len(pos_pool_inputs) >= pos_quota and len(neg_pool_inputs) >= neg_quota:
                 batch_pos_inputs = pos_pool_inputs[:pos_quota]
                 batch_pos_targets = pos_pool_targets[:pos_quota]
+                batch_pos_returns = pos_pool_returns[:pos_quota]
                 
                 neg_indices = rng.sample(range(len(neg_pool_inputs)), neg_quota)
                 batch_neg_inputs = [neg_pool_inputs[i] for i in neg_indices]
                 batch_neg_targets = [neg_pool_targets[i] for i in neg_indices]
+                batch_neg_returns = [neg_pool_returns[i] for i in neg_indices]
                 
                 batch_inputs = batch_pos_inputs + batch_neg_inputs
                 batch_targets = batch_pos_targets + batch_neg_targets
+                batch_returns = batch_pos_returns + batch_neg_returns
                 
-                combined = list(zip(batch_inputs, batch_targets))
+                combined = list(zip(batch_inputs, batch_targets, batch_returns))
                 rng.shuffle(combined)
-                b_inputs, b_targets = zip(*combined)
+                b_inputs, b_targets, b_returns = zip(*combined)
                 
                 all_batch_inputs.extend(b_inputs)
                 all_batch_targets.extend(b_targets)
+                all_batch_returns.extend(b_returns)
                 
                 batches_generated += 1
                 
                 pos_pool_inputs = pos_pool_inputs[pos_quota:]
                 pos_pool_targets = pos_pool_targets[pos_quota:]
+                pos_pool_returns = pos_pool_returns[pos_quota:]
                 neg_pool_inputs = []
                 neg_pool_targets = []
+                neg_pool_returns = []
         
         print(f"    已生成 {batches_generated}/{batches_per_epoch} 个Batch (已采样{total_rounds_generated}轮)", end='\r', flush=True)
         
@@ -658,7 +669,7 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
         if batches_generated == 0:
              raise ValueError(f"样本严重不足：无法生成任何Batch")
 
-    return np.asarray(all_batch_inputs), np.asarray(all_batch_targets)
+    return np.asarray(all_batch_inputs), np.asarray(all_batch_targets), np.asarray(all_batch_returns)
 
 
 def create_fixed_evaluation_dataset(test_stock_info):

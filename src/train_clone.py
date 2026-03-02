@@ -37,6 +37,7 @@ from train import (
     generate_pseudo_labels,
     save_model_with_metadata,
     DynamicWeightedBCE,
+    TaskAlignedLoss,
     EarlyStopping,
     calculate_test_loss,
     print_dispersion_sparkline
@@ -130,12 +131,28 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         param_group['lr'] = TrainingConfig.WARMUP_START_LR
 
     # 损失函数选择
-    if LossConfig.use_dynamic_bce():
+    if LossConfig.use_task_aligned():
+        print("损失函数: TaskAlignedLoss (BCE + 排序损失 + 收益加权 + Top-K聚焦)")
+        print(f"  权重: rank={LossConfig.RANK_LOSS_WEIGHT}, return={LossConfig.RETURN_LOSS_WEIGHT}, topk={LossConfig.TOPK_LOSS_WEIGHT}")
+        criterion = TaskAlignedLoss(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        
+        test_targets = np.array(eval_targets)
+        test_pos_count = np.sum(test_targets >= 0.5)
+        test_neg_count = np.sum(test_targets < 0.5)
+        if test_pos_count > 0 and test_neg_count > 0:
+            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
+        elif test_pos_count == 0:
+            test_neg_weight = float(LossConfig.POS_WEIGHT)
+        else:
+            test_neg_weight = 0.1
+        eval_criterion.weight_0_0.fill_(test_neg_weight)
+        print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
+    elif LossConfig.use_dynamic_bce():
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         
-        # 测试集权重：开局算一次，整个训练过程复用
         test_targets = np.array(eval_targets)
         test_pos_count = np.sum(test_targets >= 0.5)
         test_neg_count = np.sum(test_targets < 0.5)
@@ -162,7 +179,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     best_return_epoch_b = 0
 
     # 按loss保存的最佳模型（需要满足条件才参与评估）
-    # 条件：epoch >= 100, 实战收益率>=1%, 收益率>0.5%, AUC>64%
+    # 条件：epoch >= 100, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%
     best_loss_a = float('inf')
     best_loss_epoch_a = 0
     best_model_a_by_loss = None
@@ -241,7 +258,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             print()
 
         # 使用时间顺序采样器生成训练数据（与train.py统一）
-        epoch_inputs, epoch_targets = sample_with_pools(
+        epoch_inputs, epoch_targets, epoch_cum_returns = sample_with_pools(
             sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
         )
 
@@ -259,6 +276,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         # 转换为tensor
         epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.float32).to(device)
         epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.float32).to(device)
+        epoch_returns_tensor = torch.tensor(epoch_cum_returns, dtype=torch.float32).to(device)
 
         # 计算实际可用的batch数量（防止索引越界）
         actual_batches = len(epoch_inputs_tensor) // batch_size
@@ -272,13 +290,17 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
 
             batch_inputs = epoch_inputs_tensor[start_idx:end_idx]
             batch_targets = epoch_targets_tensor[start_idx:end_idx]
+            batch_returns = epoch_returns_tensor[start_idx:end_idx]
 
             # ========== 训练模型A ==========
             optimizer_a.zero_grad()
             output_a = model_a(batch_inputs)
             if hasattr(criterion, 'update_weights'):
                 criterion.update_weights(batch_targets)
-            loss_a = criterion(output_a.squeeze(-1), batch_targets)
+            if isinstance(criterion, TaskAlignedLoss):
+                loss_a = criterion(output_a.squeeze(-1), batch_targets, batch_returns)
+            else:
+                loss_a = criterion(output_a.squeeze(-1), batch_targets)
             loss_a.backward()
             torch.nn.utils.clip_grad_norm_(model_a.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
             optimizer_a.step()
@@ -310,7 +332,10 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 output_b = model_b(batch_inputs)
                 if hasattr(criterion, 'update_weights'):
                     criterion.update_weights(pseudo_targets)
-                loss_b = criterion(output_b.squeeze(-1), pseudo_targets)
+                if isinstance(criterion, TaskAlignedLoss):
+                    loss_b = criterion(output_b.squeeze(-1), pseudo_targets, batch_returns)
+                else:
+                    loss_b = criterion(output_b.squeeze(-1), pseudo_targets)
                 loss_b.backward()
                 torch.nn.utils.clip_grad_norm_(model_b.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
                 optimizer_b.step()
@@ -332,7 +357,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         print()
 
         # 清理内存
-        del epoch_inputs_tensor, epoch_targets_tensor
+        del epoch_inputs_tensor, epoch_targets_tensor, epoch_returns_tensor
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -414,9 +439,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             best_model_a_for_pseudo.eval()
             print(f'          ✓ 新最佳模型A（收益率）！Top1%收益: {best_return_a*100:+.2f}% (第{best_return_epoch_a}轮)')
 
-        # 按loss评估最佳模型A（条件：epoch >= 100, 实战收益率>=1%, 收益率>0.5%, AUC>64%）
+        # 按loss评估最佳模型A（条件：epoch >= 100, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
         realistic_return_a = stats_a['realistic_stats']['avg_realistic_return'] if stats_a.get('realistic_stats') else 0.0
-        if (epoch + 1) >= 100 and realistic_return_a >= 0.01 and stats_a['top_return'] > 0.005 and stats_a['auc'] > 0.64:
+        if (epoch + 1) >= 100 and realistic_return_a >= 0.014 and stats_a['top_return'] > 0.008 and stats_a['auc'] > 0.65:
             if test_loss_a < best_loss_a:
                 best_loss_a = test_loss_a
                 best_loss_epoch_a = epoch + 1
@@ -462,9 +487,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 best_return_epoch_b = epoch + 1
                 print(f'          ✓ 新最佳模型B（收益率）！Top1%收益: {best_return_b*100:+.2f}% (第{best_return_epoch_b}轮)')
 
-            # 按loss评估最佳模型B（条件：epoch >= 100, 实战收益率>=1%, 收益率>0.5%, AUC>64%）
+            # 按loss评估最佳模型B（条件：epoch >= 100, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
             realistic_return_b = stats_b['realistic_stats']['avg_realistic_return'] if stats_b.get('realistic_stats') else 0.0
-            if (epoch + 1) >= 100 and realistic_return_b >= 0.01 and stats_b['top_return'] > 0.005 and stats_b['auc'] > 0.64:
+            if (epoch + 1) >= 100 and realistic_return_b >= 0.014 and stats_b['top_return'] > 0.008 and stats_b['auc'] > 0.65:
                 if test_loss_b < best_loss_b:
                     best_loss_b = test_loss_b
                     best_loss_epoch_b = epoch + 1

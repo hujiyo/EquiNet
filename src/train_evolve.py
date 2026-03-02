@@ -35,6 +35,7 @@ from train import (
     generate_pseudo_labels,
     calculate_test_loss,
     DynamicWeightedBCE,
+    TaskAlignedLoss,
     save_model_with_metadata,
     print_dispersion_sparkline
 )
@@ -72,9 +73,9 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     if isinstance(teacher_paths, str):
         teacher_paths = [teacher_paths]
 
-    # 收益加权功能暂时禁用（TemporalSampler不提供收益率数据）
+    # 收益加权功能已集成到 TaskAlignedLoss 中，旧的 use_return_weight 参数不再需要
     if use_return_weight:
-        print("  ⚠ 警告：use_return_weight与TemporalSampler不兼容，已自动禁用")
+        print("  ⚠ 警告：use_return_weight已集成到TaskAlignedLoss中，旧参数已禁用")
         use_return_weight = False
 
     num_teachers = len(teacher_paths)
@@ -163,12 +164,28 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
     )
     
     # 损失函数：由全局配置控制
-    if LossConfig.use_dynamic_bce():
+    if LossConfig.use_task_aligned():
+        print("损失函数: TaskAlignedLoss (BCE + 排序损失 + 收益加权 + Top-K聚焦)")
+        print(f"  权重: rank={LossConfig.RANK_LOSS_WEIGHT}, return={LossConfig.RETURN_LOSS_WEIGHT}, topk={LossConfig.TOPK_LOSS_WEIGHT}")
+        criterion = TaskAlignedLoss(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        
+        test_targets = np.array(eval_targets)
+        test_pos_count = np.sum(test_targets >= 0.5)
+        test_neg_count = np.sum(test_targets < 0.5)
+        if test_pos_count > 0 and test_neg_count > 0:
+            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
+        elif test_pos_count == 0:
+            test_neg_weight = float(LossConfig.POS_WEIGHT)
+        else:
+            test_neg_weight = 0.1
+        eval_criterion.weight_0_0.fill_(test_neg_weight)
+        print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
+    elif LossConfig.use_dynamic_bce():
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         
-        # 测试集权重：开局算一次，整个训练过程复用
         test_targets = np.array(eval_targets)
         test_pos_count = np.sum(test_targets >= 0.5)
         test_neg_count = np.sum(test_targets < 0.5)
@@ -185,9 +202,13 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         criterion = nn.BCEWithLogitsLoss(reduction='mean')
         eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
-    def compute_loss(logits, targets, sample_weight=None):
+    def compute_loss(logits, targets, returns=None, sample_weight=None):
         logits = logits.squeeze(-1)
         targets = targets.squeeze()
+
+        if isinstance(criterion, TaskAlignedLoss):
+            criterion.update_weights(targets)
+            return criterion(logits, targets, returns)
 
         if LossConfig.use_dynamic_bce():
             criterion.update_weights(targets)
@@ -231,7 +252,7 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
         phase = "进化训练"
 
         # 使用时间顺序采样器生成训练数据（与train.py统一）
-        train_inputs, train_targets = sample_with_pools(
+        train_inputs, train_targets, train_cum_returns = sample_with_pools(
             sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
         )
 
@@ -285,15 +306,11 @@ def train_evolve_model(teacher_paths, student_path, train_stock_info, test_stock
             batch_targets = torch.tensor(pseudo_targets[start_idx:end_idx], 
                                         dtype=torch.float32).to(device)
 
-            if use_return_weight:
-                batch_returns = torch.tensor(train_returns[start_idx:end_idx], dtype=torch.float32).to(device)
-                batch_returns = torch.clamp(batch_returns, -return_weight_clip, return_weight_clip)
-                batch_weight = 1.0 + return_weight_alpha * torch.abs(batch_returns)
-                batch_weight = batch_weight / (batch_weight.mean() + 1e-8)
+            batch_returns = torch.tensor(train_cum_returns[start_idx:end_idx], dtype=torch.float32).to(device)
             
             optimizer_b.zero_grad()
             logits_b = model_b(batch_inputs)
-            loss_b = compute_loss(logits_b, batch_targets, batch_weight if use_return_weight else None)
+            loss_b = compute_loss(logits_b, batch_targets, returns=batch_returns)
             
             # NaN检测
             if torch.isnan(loss_b) or torch.isinf(loss_b):

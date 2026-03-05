@@ -188,6 +188,15 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     best_threshold_a_at_best_loss = 0.0
     best_realistic_return_a_at_best_loss = 0.0
 
+    # 按实战收益率保存的最佳模型A（第100轮后）
+    best_realistic_return_a = -float('inf')
+    best_realistic_return_epoch_a = 0
+    best_model_a_by_realistic_return = None
+    best_return_a_at_best_realistic = 0.0
+    best_auc_a_at_best_realistic = 0.0
+    best_threshold_a_at_best_realistic = 0.0
+    best_realistic_return_value_at_best = 0.0
+
     best_loss_b = float('inf')
     best_loss_epoch_b = 0
     best_model_b_by_loss = None
@@ -366,7 +375,13 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             main_scheduler_a.step()
 
         # 评估模型A（使用统一的评估函数）
-        stats_a = evaluate_model(model_a, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="A", eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns)
+        stats_a = evaluate_model(
+            model_a, eval_inputs, eval_targets, eval_cumulative_returns,
+            device, model_name="A",
+            eval_day_indices=eval_day_indices,
+            eval_daily_returns=eval_daily_returns,
+            eval_available_days=eval_available_days
+        )
 
         # 计算训练集平均损失（除以样本数，与测试损失保持一致）
         # total_loss_a已经是所有样本的总损失（累加时乘以了batch_size）
@@ -452,9 +467,27 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 best_realistic_return_a_at_best_loss = realistic_return_a
                 print(f'          ✓ 新最佳模型A（loss）！Loss: {best_loss_a:.4f}, 实战收益率: {best_realistic_return_a_at_best_loss*100:.1f}% (第{best_loss_epoch_a}轮)')
 
+        # 按实战收益率评估最佳模型A（第100轮后）
+        if (epoch + 1) >= 100:
+            if realistic_return_a > best_realistic_return_a:
+                best_realistic_return_a = realistic_return_a
+                best_realistic_return_epoch_a = epoch + 1
+                best_model_a_by_realistic_return = copy.deepcopy(model_a.state_dict())
+                best_return_a_at_best_realistic = stats_a['top_return']
+                best_auc_a_at_best_realistic = stats_a['auc']
+                best_threshold_a_at_best_realistic = stats_a['top_threshold']
+                best_realistic_return_value_at_best = realistic_return_a
+                print(f'          ✓ 新最佳模型A（实战收益率）！实战: {best_realistic_return_a*100:.1f}%, Top1%: {best_return_a_at_best_realistic*100:+.2f}% (第{best_realistic_return_epoch_a}轮)')
+
         # 评估模型B（如果存在）
         if model_b is not None:
-            stats_b = evaluate_model(model_b, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="B", eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns)
+            stats_b = evaluate_model(
+                model_b, eval_inputs, eval_targets, eval_cumulative_returns,
+                device, model_name="B",
+                eval_day_indices=eval_day_indices,
+                eval_daily_returns=eval_daily_returns,
+                eval_available_days=eval_available_days
+            )
 
             # 计算训练集平均损失（除以样本数，与测试损失保持一致）
             # total_loss_b已经是所有样本的总损失（累加时乘以了batch_size）
@@ -514,8 +547,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     # 保存最佳模型（使用统一的保存函数）
     print("\n" + "=" * 60)
     print(f"训练完成！")
-    print(f"最佳模型A（按收益率）: 第{best_return_epoch_a}轮, Top1%收益: {best_return_a*100:+.2f}%")
+    print(f"最佳模型A（按收益率用于伪标签）: 第{best_return_epoch_a}轮, Top1%收益: {best_return_a*100:+.2f}%")
     print(f"最佳模型A（按loss）: 第{best_loss_epoch_a}轮, Loss: {best_loss_a:.4f}, 实战收益率: {best_realistic_return_a_at_best_loss*100:.1f}%")
+    print(f"最佳模型A（按实战收益率）: 第{best_realistic_return_epoch_a}轮, 实战收益率: {best_realistic_return_value_at_best*100:.1f}%, Top1%: {best_return_a_at_best_realistic*100:+.2f}%")
     if best_model_b_by_loss is not None:
         print(f"最佳模型B（按loss）: 第{best_loss_epoch_b}轮, Loss: {best_loss_b:.4f}, 实战收益率: {best_realistic_return_b_at_best_loss*100:.1f}%")
 
@@ -525,12 +559,25 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             best_model_a_by_loss,
             best_return_a_at_best_loss, best_threshold_a_at_best_loss, best_auc_a_at_best_loss,
             best_loss_epoch_a,
-            model_prefix="modelA",
+            model_prefix="modelA_loss",
             output_dir=DataConfig.OUTPUT_DIR
         )
-        print(f"✓ 模型A已保存: {os.path.basename(save_path_a)}")
+        print(f"✓ 模型A(loss)已保存: {os.path.basename(save_path_a)}")
         print(f"  Top1%阈值: {best_threshold_a_at_best_loss:.4f}")
         print(f"  实战收益率: {best_realistic_return_a_at_best_loss*100:.1f}%")
+
+    # 保存模型A（按实战收益率的最佳模型）
+    if best_model_a_by_realistic_return is not None:
+        save_path_a_realistic = save_model_with_metadata(
+            best_model_a_by_realistic_return,
+            best_return_a_at_best_realistic, best_threshold_a_at_best_realistic, best_auc_a_at_best_realistic,
+            best_realistic_return_epoch_a,
+            model_prefix="modelA_realistic",
+            output_dir=DataConfig.OUTPUT_DIR
+        )
+        print(f"✓ 模型A(realistic)已保存: {os.path.basename(save_path_a_realistic)}")
+        print(f"  Top1%阈值: {best_threshold_a_at_best_realistic:.4f}")
+        print(f"  实战收益率: {best_realistic_return_value_at_best*100:.1f}%")
 
     # 保存模型B（按loss的最佳模型）
     if best_model_b_by_loss is not None:

@@ -556,6 +556,128 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     return input_seq, target, cumulative_return, daily_returns
 
 
+def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
+    """
+    生成样本，支持不完整的未来数据（用于最近几天的临时评估）
+    
+    与generate_sample_from_index的区别：
+    - 允许未来数据不足3天
+    - 返回可用天数信息
+    
+    返回: (input_seq, target, cumulative_return, daily_returns, available_days) 或 None
+        available_days: 可用的未来天数 (1, 2, 或 3)
+    """
+    stock_info = stock_info_list[stock_idx]
+    stock_data = stock_info['data']
+    context_length = DataConfig.CONTEXT_LENGTH
+    data_length = len(stock_data)
+
+    if start_idx < 1:
+        return None
+    
+    input_seq_raw = stock_data[start_idx:start_idx + context_length]
+    prev_day_data = stock_data[start_idx - 1]
+
+    prev_close = prev_day_data[3]
+    prev_volume = prev_day_data[4]
+    if prev_close == 0 or prev_volume == 0 or np.any(prev_day_data[:4] == 0):
+        return None
+    
+    closes = input_seq_raw[:, 3]
+    volumes = input_seq_raw[:, 4]
+    if np.any(closes == 0) or np.any(volumes == 0):
+        return None
+
+    last_day_idx = start_idx + context_length - 1
+    prev_day_idx = start_idx + context_length - 2
+    prev_day_close = stock_data[prev_day_idx, 3]
+    last_day_close = stock_data[last_day_idx, 3]
+
+    if prev_day_close > 0:
+        last_day_return = (last_day_close - prev_day_close) / prev_day_close
+        if last_day_return >= 0.095:
+            return None
+
+    input_seq = np.empty((context_length, 6), dtype=np.float32)
+    
+    input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
+    if context_length > 1:
+        input_seq[1:, :4] = (input_seq_raw[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
+    
+    input_seq[0, 4] = (volumes[0] - prev_volume) / prev_volume
+    if context_length > 1:
+        input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
+    
+    input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
+    
+    np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
+    np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
+    input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
+    np.clip(input_seq[:, 4:6], 0.0, 1.0, out=input_seq[:, 4:6])
+
+    if np.any(~np.isfinite(input_seq)):
+        return None
+
+    t1_idx = start_idx + context_length
+    t2_idx = start_idx + context_length + 1
+    t3_idx = start_idx + context_length + 2
+    
+    available_days = 0
+    if t1_idx < data_length:
+        available_days = 1
+    if t2_idx < data_length:
+        available_days = 2
+    if t3_idx < data_length:
+        available_days = 3
+    
+    if available_days == 0:
+        return None
+    
+    t1_open = stock_data[t1_idx, 0]
+    t1_close = stock_data[t1_idx, 3]
+
+    if t1_open == 0:
+        return None
+
+    daily_returns = []
+    cumulative_return = 0.0
+    
+    day1_return = (t1_close - t1_open) / t1_open
+    daily_returns.append(day1_return)
+    cumulative_return = day1_return
+    
+    t2_close = None
+    t3_close = None
+    
+    if available_days >= 2:
+        t2_close = stock_data[t2_idx, 3]
+        day2_return = (t2_close - t1_close) / t1_open
+        daily_returns.append(day2_return)
+        cumulative_return = day1_return + day2_return
+    
+    if available_days >= 3:
+        t3_close = stock_data[t3_idx, 3]
+        day3_return = (t3_close - t2_close) / t1_open
+        daily_returns.append(day3_return)
+        cumulative_return = day1_return + day2_return + day3_return
+    
+    daily_price_changes = []
+    day1_price_change = (t1_close - closes[-1]) / closes[-1]
+    daily_price_changes.append(day1_price_change)
+    
+    if available_days >= 2:
+        day2_price_change = (t2_close - t1_close) / t1_close
+        daily_price_changes.append(day2_price_change)
+    
+    if available_days >= 3:
+        day3_price_change = (t3_close - t2_close) / t2_close
+        daily_price_changes.append(day3_price_change)
+    
+    target = float(check_strong_signal(daily_price_changes))
+
+    return input_seq, target, cumulative_return, daily_returns, available_days
+
+
 def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng):
     """
     使用样本池机制采样（流式处理版）：
@@ -676,6 +798,8 @@ def create_fixed_evaluation_dataset(test_stock_info):
     """
     创建固定评估数据集（涨停样本已在generate_sample_from_index中过滤）
     
+    只包含完整样本（available_days == 3），用于模型评估
+    
     返回:
         eval_inputs: 输入序列
         eval_targets: 标签
@@ -701,6 +825,7 @@ def create_fixed_evaluation_dataset(test_stock_info):
 
         start_min = max(1, test_split_point)
         start_max = data_length - DataConfig.REQUIRED_LENGTH
+        
         if start_max < start_min:
             continue
 
@@ -725,6 +850,59 @@ def create_fixed_evaluation_dataset(test_stock_info):
     return (np.asarray(eval_inputs), np.asarray(eval_targets), 
             np.asarray(eval_cumulative_returns), np.asarray(eval_day_indices),
             eval_daily_returns)
+
+
+def create_recent_days_dataset(test_stock_info):
+    """
+    创建最近几天的临时评估数据集（用于显示最近几天的实战收益率）
+    
+    包含数据不完整的临时样本，仅用于展示，不参与模型评估
+    
+    返回:
+        recent_inputs: 输入序列
+        recent_cumulative_returns: 累计收益率（可能不完整）
+        recent_day_indices: 预测日索引
+        recent_available_days: 可用天数 (1, 2, 或 3)
+    """
+    recent_inputs = []
+    recent_cumulative_returns = []
+    recent_day_indices = []
+    recent_available_days = []
+
+    for stock_info in test_stock_info:
+        stock_data = stock_info['data']
+        data_length = len(stock_data)
+        test_split_point = stock_info.get('test_split_point', max(0, data_length - DataConfig.TEST_DAYS))
+
+        start_max_full = data_length - DataConfig.REQUIRED_LENGTH
+        start_max_partial = data_length - DataConfig.CONTEXT_LENGTH - 1
+        
+        if start_max_partial < start_max_full + 1:
+            continue
+
+        for start_idx in range(start_max_full + 1, start_max_partial + 1):
+            sample = generate_sample_from_index_partial([stock_info], 0, start_idx)
+            if sample is None:
+                continue
+
+            input_seq, target, cumulative_return, daily_returns, available_days = sample
+            
+            predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
+            if predict_day_idx < test_split_point:
+                continue
+            
+            recent_inputs.append(input_seq)
+            recent_cumulative_returns.append(float(cumulative_return))
+            recent_available_days.append(available_days)
+            
+            day_index = predict_day_idx - test_split_point
+            recent_day_indices.append(day_index)
+
+    if len(recent_inputs) == 0:
+        return None, None, None, None
+
+    return (np.asarray(recent_inputs), np.asarray(recent_cumulative_returns), 
+            np.asarray(recent_day_indices), np.asarray(recent_available_days))
 
 
 def create_train_evaluation_dataset(train_stock_info, first_n_days=80):

@@ -20,6 +20,7 @@ from model import create_model
 from data import (
     load_and_preprocess_data,
     create_fixed_evaluation_dataset,
+    create_recent_days_dataset,
     generate_sample_from_index
 )
 from train import evaluate_model, calculate_test_loss, DynamicWeightedBCE
@@ -34,8 +35,8 @@ def parse_model_filename(filename):
     """
     info = {'filename': filename, 'prefix': '', 'return_pct': '', 'threshold': '', 'auc': '', 'epoch': '', 'time': ''}
     
-    # 提取模型前缀 (modelA, modelB, evolved, modelB_dft)
-    prefix_match = re.match(r'^(modelA|modelB_dft|modelB|evolved)', filename)
+    # 提取模型前缀 (modelA, modelB, modelB_dft)
+    prefix_match = re.match(r'^(modelA|modelB_dft|modelB)', filename)
     if prefix_match:
         info['prefix'] = prefix_match.group(1)
     
@@ -299,7 +300,6 @@ def select_model(models):
             'modelA': '模型A(原始)',
             'modelB': '模型B(克隆)',
             'modelB_dft': '模型B(DFT)',
-            'evolved': '进化模型'
         }.get(info['prefix'], info['prefix'])
         
         detail_parts = []
@@ -562,6 +562,112 @@ def run_stock_selection(model, threshold, device):
     return results
 
 
+def print_recent_days_chart(daily_stats, last_n=10):
+    """
+    打印最近N天的实战收益率表格
+    
+    参数:
+        daily_stats: 每日统计列表 [(count, return, available_days), ...]
+        last_n: 显示最近多少天
+    """
+    if not daily_stats or len(daily_stats) == 0:
+        return
+    
+    total_days = len(daily_stats)
+    start_idx = max(0, total_days - last_n)
+    recent_stats = daily_stats[start_idx:]
+    
+    print()
+    print("╔" + "═"*52 + "╗")
+    title = f"最近{last_n}天实战收益率"
+    padding = (52 - 2 - len(title)) // 2
+    print("║" + " "*padding + title + " "*(52 - 2 - padding - len(title)) + "║")
+    print("╠" + "═"*52 + "╣")
+    print("║  Day  │ Count │ Return   │ 相对日期   │ 数据      ║")
+    print("╠" + "─"*52 + "╣")
+    
+    for i, (count, ret, available_days) in enumerate(recent_stats):
+        day_num = start_idx + i + 1
+        
+        days_from_end = total_days - day_num + 1
+        if days_from_end == 1:
+            relative_date = "昨天"
+        elif days_from_end == 2:
+            relative_date = "前天"
+        elif days_from_end == 3:
+            relative_date = "大前天"
+        else:
+            relative_date = f"T-{days_from_end}"
+        
+        if available_days == 3:
+            data_status = "完整"
+        elif available_days == 2:
+            data_status = "临时(2天)"
+        elif available_days == 1:
+            data_status = "临时(1天)"
+        else:
+            data_status = "-"
+        
+        ret_str = f"{ret*100:+.1f}%"
+        
+        print(f"║  {day_num:>3}  │  {count:>3}  │ {ret_str:>8} │ {relative_date:<8} │ {data_status:<9} ║")
+    
+    print("╚" + "═"*52 + "╝")
+
+
+def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4):
+    """
+    计算最近几天的实战收益率（包含临时数据）
+    
+    返回: daily_stats [(count, return, available_days), ...]
+    """
+    recent_inputs, recent_returns, recent_day_indices, recent_available_days = \
+        create_recent_days_dataset(test_stock_info)
+    
+    if recent_inputs is None or len(recent_inputs) == 0:
+        return []
+    
+    model.eval()
+    all_preds = []
+    
+    with torch.no_grad():
+        batch_size = DataConfig.EVAL_BATCH_SIZE
+        for i in range(0, len(recent_inputs), batch_size):
+            batch = torch.tensor(recent_inputs[i:i+batch_size], dtype=torch.float32, device=device)
+            preds = torch.sigmoid(model(batch)).cpu().numpy().flatten()
+            all_preds.extend(preds)
+    
+    all_preds = np.array(all_preds)
+    
+    unique_days = np.unique(recent_day_indices)
+    unique_days = np.sort(unique_days)
+    
+    daily_stats = []
+    
+    for day in unique_days:
+        day_mask = recent_day_indices == day
+        day_indices = np.where(day_mask)[0]
+        
+        if len(day_indices) == 0:
+            daily_stats.append((0, 0.0, 0))
+            continue
+        
+        day_preds = all_preds[day_indices]
+        day_returns = recent_returns[day_indices]
+        day_available = recent_available_days[day_indices]
+        
+        sorted_local_indices = np.argsort(day_preds)[::-1]
+        select_count = min(top_n_per_day, len(day_indices))
+        top_local_indices = sorted_local_indices[:select_count]
+        
+        day_return = np.mean(day_returns[top_local_indices])
+        min_available = int(np.min(day_available[top_local_indices]))
+        
+        daily_stats.append((select_count, day_return, min_available))
+    
+    return daily_stats
+
+
 # ==================== 主函数 ====================
 
 def main():
@@ -612,6 +718,11 @@ def main():
     
     # 执行选股
     results = run_stock_selection(model, threshold, device)
+    
+    # 计算并打印最近10天实战收益率表格（包含临时数据）
+    recent_stats = calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=DataConfig.TOP_N_PER_DAY)
+    if recent_stats:
+        print_recent_days_chart(recent_stats, last_n=10)
     
     # 询问是否使用自定义阈值重新选股
     while True:

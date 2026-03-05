@@ -78,7 +78,13 @@ def train_dft_model(model, train_stock_info, test_stock_info,
 
     eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info)
 
-    stats_init = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="初始模型", eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns)
+    stats_init = evaluate_model(
+        model, eval_inputs, eval_targets, eval_cumulative_returns,
+        device, model_name="初始模型",
+        eval_day_indices=eval_day_indices,
+        eval_daily_returns=eval_daily_returns,
+        eval_available_days=eval_available_days
+    )
     print(f"初始模型评估: AUC={stats_init['auc']:.4f}, Top1%收益={stats_init['top_return']*100:+.2f}%")
     if stats_init['realistic_stats'] is not None:
         rs = stats_init['realistic_stats']
@@ -232,7 +238,13 @@ def train_dft_model(model, train_stock_info, test_stock_info,
 
         main_scheduler.step()
 
-        stats = evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns, device, model_name="DFT", eval_day_indices=eval_day_indices, eval_daily_returns=eval_daily_returns)
+        stats = evaluate_model(
+            model, eval_inputs, eval_targets, eval_cumulative_returns,
+            device, model_name="DFT",
+            eval_day_indices=eval_day_indices,
+            eval_daily_returns=eval_daily_returns,
+            eval_available_days=eval_available_days
+        )
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
         test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device)

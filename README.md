@@ -27,7 +27,6 @@ EquiNet/
 │   ├── out/                 	# 训练输出的模型权重
 │   ├── train.py         	    # 主训练脚本
 │   ├── train_clone.py        # AB教师训练脚本
-│   ├── train_evolve.py       # 进化训练脚本
 │   ├── config.py        	    # 统一配置文件
 │   └── ...              	    # 其他可能的源码
 ├── LICENSE

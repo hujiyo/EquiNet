@@ -3,7 +3,7 @@ EquiNet 模型推理与选股脚本
 
 功能：
 1. 读取 out/ 下可用的模型列表，用户选择模型
-2. 加载模型后执行评估（与 train_clone.py 对模型A的评估一致）
+2. 加载模型后执行评估（与 train.py 对模型A的评估一致）
 3. 打印评估结果 + Top1%阈值（高精度）
 4. 用户决定是否进入选股模式
 5. 选股：用 data/ 最新数据作为最后一天，模型打分，按分数排序输出
@@ -23,7 +23,7 @@ from data import (
     create_recent_days_dataset,
     generate_sample_from_index
 )
-from train import evaluate_model, calculate_test_loss, DynamicWeightedBCE
+from training_utils import evaluate_model, calculate_test_loss, DynamicWeightedBCE
 
 
 # ==================== 工具函数 ====================
@@ -339,7 +339,7 @@ def select_model(models):
 
 def run_evaluation(model, test_stock_info, device):
     """
-    执行模型评估（与 train_clone.py 中对模型A的评估完全一致）
+    执行模型评估（与 train.py 中对模型A的评估完全一致）
     返回评估统计字典
     """
     print_section("模型评估")
@@ -358,7 +358,7 @@ def run_evaluation(model, test_stock_info, device):
         eval_daily_returns=eval_daily_returns
     )
     
-    # 创建评估损失函数（与 train_clone.py 一致）
+    # 创建评估损失函数（与 train.py 一致）
     if LossConfig.use_dynamic_bce():
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         
@@ -380,7 +380,7 @@ def run_evaluation(model, test_stock_info, device):
     # 计算测试集损失
     test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device)
     
-    # 打印评估结果（与 train_clone.py 格式一致）
+    # 打印评估结果（与 train.py 格式一致）
     print(f"│")
     print(f"│  ┌── 评估结果 ──────────────────────────────────┐")
     print(f"│  │  测试损失:          {test_loss:.4f}")

@@ -26,7 +26,8 @@ EquiNet/
 │   ├── data/                	# 存放.csv股票数据文件
 │   ├── out/                 	# 训练输出的模型权重
 │   ├── train.py         	    # 主训练脚本
-│   ├── train_clone.py        # AB教师训练脚本
+│   ├── training_utils.py     # 训练工具模块
+│   ├── train_dft.py           # DFT微调训练脚本
 │   ├── config.py        	    # 统一配置文件
 │   └── ...              	    # 其他可能的源码
 ├── LICENSE

@@ -1,930 +1,667 @@
 '''
-训练工具模块
+克隆模型训练脚本
 
-提供训练相关的工具类和函数，供其他训练脚本导入使用：
-- WarmupScheduler: 学习率预热调度器
-- GradientMonitor: 梯度监控器
-- DynamicWeightedBCE: 动态加权BCE损失函数
-- TaskAlignedLoss: 任务对齐损失函数
-- EarlyStopping: 早停机制
-- evaluate_model: 模型评估函数
-- calculate_test_loss: 计算测试集损失
-- generate_pseudo_labels: 伪标签生成
-- save_model_with_metadata: 带元数据的模型保存
-- print_dispersion_sparkline: 预测值分布可视化
+核心思想：
+- 前25%轮：只训练模型A（原始标签）
+- 第25%轮：克隆模型A为模型B（完全独立的参数）
+- 第25%轮起：
+  - 模型A继续用原始标签训练
+  - 模型B用A的高置信预测作为伪标签训练：
+    - A预测前1% → B的标签 = 1（伪正标签）
+    - A预测倒数5% → B的标签 = 0（伪负标签）
+    - 其它 → 保持原始标签不变
+
+这样模型B学习的是A"确信"的模式，同时过滤掉A不确定的噪声样本
 '''
 
-import os,torch,torch.nn as nn,numpy as np
+import os, torch, torch.nn as nn, torch.optim as optim, numpy as np
+import copy
+import random
+import csv
 from datetime import datetime
-import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
-from config import DataConfig,LossConfig
+from config import (ModelConfig, TrainingConfig, DataConfig,
+                   DeviceConfig, ModelSaveConfig,
+                   print_config_summary, LossConfig)
 
-class WarmupScheduler:
+from model import create_model
+
+from data import (
+    load_and_preprocess_data,
+    create_sampler, sample_with_pools,
+    create_fixed_evaluation_dataset
+)
+
+from training_utils import (
+    WarmupScheduler,
+    evaluate_model,
+    generate_pseudo_labels,
+    save_model_with_metadata,
+    DynamicWeightedBCE,
+    TaskAlignedLoss,
+    EarlyStopping,
+    calculate_test_loss,
+    print_dispersion_sparkline
+)
+
+def train_clone_model(model_a, train_stock_info, test_stock_info,
+                      epochs=TrainingConfig.EPOCHS,
+                      learning_rate=TrainingConfig.LEARNING_RATE,
+                      device=None,
+                      batch_size=TrainingConfig.BATCH_SIZE,
+                      batches_per_epoch=TrainingConfig.BATCHES_PER_EPOCH,
+                      clone_epoch=TrainingConfig.EPOCHS*0.25,
+                      pseudo_pos_ratio=0.01,
+                      pseudo_neg_ratio=0.05):
     """
-    学习率预热调度器
-    在前几轮训练中，学习率从很小的值逐步增加到目标学习率
-    这有助于模型在训练初期更稳定地收敛
+    克隆模型训练函数
+
+    训练策略：
+    - 前 clone_epoch 轮：只训练模型A
+    - 第 clone_epoch 轮：克隆模型A为模型B
+    - 之后：A继续原始训练，B用A的高置信预测作为伪标签
+      - 按比例选取：A预测值前 pseudo_pos_ratio (1%) 的样本 → 伪正标签
+      - 按比例选取：A预测值倒数 pseudo_neg_ratio (5%) 的样本 → 伪负标签
+      - 其它样本 → 保持原始标签不变
     """
-    def __init__(self, optimizer, warmup_epochs, target_lr, start_lr=None):
-        """
-        Args:
-            optimizer: PyTorch优化器
-            warmup_epochs: 预热轮数
-            target_lr: 目标学习率（预热结束后的学习率）
-            start_lr: 预热起始学习率，如果为None则使用target_lr的1/100
-        """
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.target_lr = target_lr
-        self.start_lr = start_lr if start_lr is not None else target_lr / 100
-        self.current_epoch = 0
-        
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = self.start_lr
-    
-    def step(self, epoch=None):
-        """
-        更新学习率
-        Args:
-            epoch: 当前轮数，如果为None则使用内部计数器
-        """
-        if epoch is not None:
-            self.current_epoch = epoch
-        else:
-            self.current_epoch += 1
-        
-        if self.current_epoch < self.warmup_epochs:
-            lr = self.start_lr + (self.target_lr - self.start_lr) * ((self.current_epoch + 1) / self.warmup_epochs)
-        else:
-            lr = self.target_lr
-        
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-        
-        return lr
-    
-    def get_last_lr(self):
-        """获取当前学习率（兼容PyTorch调度器接口）"""
-        return [param_group['lr'] for param_group in self.optimizer.param_groups]
-    
-    def is_warmup_phase(self):
-        """判断是否还在预热阶段"""
-        return self.current_epoch < self.warmup_epochs
+    print("\n" + "="*60)
+    print("克隆模型训练")
+    print("="*60)
+    print(f"训练策略：")
+    print(f"  - 前{clone_epoch}轮：只训练模型A（原始标签）")
+    print(f"  - 第{clone_epoch}轮：克隆模型A为模型B")
+    print(f"  - 之后：")
+    print(f"    - 模型A：继续用原始标签训练")
+    print(f"    - 模型B：用A的高置信预测作为伪标签")
+    print(f"      - A预测值前{pseudo_pos_ratio*100:.0f}% → 伪正标签")
+    print(f"      - A预测值倒数{pseudo_neg_ratio*100:.0f}% → 伪负标签")
+    print(f"      - 其它 → 保持原始标签不变")
+    print("="*60 + "\n")
 
-def print_dispersion_sparkline(all_preds, epoch_returns_history=None):
-    """
-    打印预测值在0-1区间上的分布直方图（终端字符可视化）
-    
-    Args:
-        all_preds: 所有样本的预测值数组
-        epoch_returns_history: 历史epoch记录列表（用于显示趋势）
-    """
-    print(f'  【预测值分布直方图】')
-    
-    all_preds = np.array(all_preds)
-    
-    num_bins = 20
-    counts, _ = np.histogram(all_preds, bins=num_bins, range=(0, 1))
-    max_count = max(counts) if max(counts) > 0 else 1
-    
-    chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
-    
-    hist_line = ""
-    for count in counts:
-        idx = int(count / max_count * (len(chars) - 1))
-        idx = min(max(idx, 0), len(chars) - 1)
-        hist_line += chars[idx]
-    
-    print(f'    0.0  {hist_line}  1.0')
-    print(f'         ├────────────────────┤')
-    
-    std = float(np.std(all_preds))
-    mean = float(np.mean(all_preds))
-    min_val = float(np.min(all_preds))
-    max_val = float(np.max(all_preds))
-    pos_ratio = float(np.mean(all_preds >= 0.5)) * 100
-    high_conf_ratio = float(np.mean(all_preds >= 0.7)) * 100
-    
-    print(f'    均值={mean:.3f}, 标准差={std:.4f}, 范围=[{min_val:.3f}, {max_val:.3f}]')
-    print(f'    >0.5: {pos_ratio:.1f}%, >0.7: {high_conf_ratio:.1f}%')
-    
-    if epoch_returns_history and len(epoch_returns_history) >= 2:
-        stds = [e.get('dispersion_std', 0) for e in epoch_returns_history]
-        returns = [e.get('return', 0) for e in epoch_returns_history]
-        
-        window_size = min(10, len(stds))
-        baseline_std = np.mean(stds[-window_size:-1]) if window_size > 1 else stds[-2]
-        baseline_return = np.mean(returns[-window_size:-1]) if window_size > 1 else returns[-2]
-        
-        std_change = (stds[-1] - baseline_std) / baseline_std * 100 if baseline_std > 1e-6 else 0
-        return_change = (returns[-1] - baseline_return) / abs(baseline_return) * 100 if abs(baseline_return) > 1e-6 else 0
-        
-        if std_change < -20:
-            status = "⚠️ 分散度下降"
-        elif std_change > 10:
-            status = "📈 分散度上升"
-        else:
-            status = "➡️ 分散度稳定"
-        
-        print(f'    趋势: {status} ({std_change:+.1f}%) | 收益率变化: ({return_change:+.1f}%)')
+    # 设置随机种子
+    torch.manual_seed(DataConfig.RANDOM_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(DataConfig.RANDOM_SEED)
+        torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
 
-class DynamicWeightedBCE(nn.Module):
-    """
-    动态加权BCE损失函数：按标签桶分配权重
-    - 标签1.0固定权重4.0
-    - 标签0.6/0.3/0.0按样本数量动态分配权重（样本少=权重高）
-    """
-    def __init__(self, pos_weight=4.0, reduction='mean'):
-        super(DynamicWeightedBCE, self).__init__()
-        self.reduction = reduction
-        
-        self.register_buffer('pos_weight', torch.tensor(pos_weight))
-        
-        self.register_buffer('weight_0_6', torch.tensor(1.0))
-        self.register_buffer('weight_0_3', torch.tensor(1.0))
-        self.register_buffer('weight_0_0', torch.tensor(1.0))
-        
-    def update_weights(self, targets):
-        """
-        二分类动态权重：根据正负样本比例动态调整
-        targets: [batch_size] 标签 (1.0/0.0)
-        """
-        if isinstance(targets, torch.Tensor):
-            targets = targets.float().cpu().numpy()
-        
-        count_positive = np.sum(targets >= 0.5)
-        count_negative = np.sum(targets < 0.5)
-        
-        if count_positive > 0 and count_negative > 0:
-            neg_weight = float(self.pos_weight) * (count_positive / count_negative)
-            self.weight_0_0.fill_(neg_weight)
-        elif count_positive == 0:
-            self.weight_0_0.fill_(float(self.pos_weight))
-        else:
-            self.weight_0_0.fill_(0.1)
-        
-    def forward(self, inputs, targets):
-        """
-        inputs: [batch_size, 1] 模型输出的logits
-        targets: [batch_size] 真实标签 (1.0/0.0)
-        """
-        if inputs.dim() == 2 and inputs.size(1) == 1:
-            inputs = inputs.squeeze(-1)
+    # 创建评估数据集
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info)
 
-        inputs_fp32 = inputs.float()
-        targets_fp32 = targets.float()
+    # 模型B初始化为None
+    model_b = None
+    optimizer_b = None
 
-        loss = F.binary_cross_entropy_with_logits(inputs_fp32, targets_fp32, reduction='none')
-        
-        pos_weight = self.pos_weight.to(dtype=loss.dtype, device=loss.device)
-        neg_weight = self.weight_0_0.to(dtype=loss.dtype, device=loss.device)
-
-        weights = torch.where(targets_fp32 >= 0.5, pos_weight, neg_weight)
-        loss = loss * weights
-
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:
-            return loss
-
-
-class TaskAlignedLoss(nn.Module):
-    """
-    任务对齐损失函数：专为Top-K选股任务设计的多目标组合损失
-    
-    总损失 = L_bce + λ1·L_rank + λ2·L_return + λ3·L_topk
-    
-    四个组件各司其职：
-    1. L_bce:    基础分类能力（DynamicWeightedBCE，保持正负样本均衡）
-    2. L_rank:   排序损失（高收益样本的预测分数应高于低收益样本）
-    3. L_return: 收益加权损失（收益越高/亏损越大的样本，分类错误代价越高）
-    4. L_topk:   头部聚焦损失（只关注模型预测分数最高的那批样本的质量）
-    """
-    def __init__(self, pos_weight=4.0, reduction='mean'):
-        super(TaskAlignedLoss, self).__init__()
-        self.reduction = reduction
-        
-        self.bce = DynamicWeightedBCE(pos_weight=pos_weight, reduction=reduction)
-        
-        self.rank_weight = LossConfig.RANK_LOSS_WEIGHT
-        self.return_weight = LossConfig.RETURN_LOSS_WEIGHT
-        self.topk_weight = LossConfig.TOPK_LOSS_WEIGHT
-        
-        self.rank_margin = LossConfig.RANK_MARGIN
-        self.rank_num_pairs = LossConfig.RANK_NUM_PAIRS
-        
-        self.return_alpha = LossConfig.RETURN_ALPHA
-        self.return_beta = LossConfig.RETURN_BETA
-        self.return_clip = LossConfig.RETURN_CLIP
-        
-        self.topk_ratio = LossConfig.TOPK_RATIO
-    
-    def update_weights(self, targets):
-        """动态更新BCE组件的正负样本权重"""
-        self.bce.update_weights(targets)
-    
-    def _ranking_loss(self, logits, returns):
-        """
-        排序损失：确保高收益样本的预测分数高于低收益样本
-        """
-        batch_size = logits.size(0)
-        if batch_size < 2:
-            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-        
-        sorted_indices = torch.argsort(returns, descending=True)
-        
-        half = batch_size // 2
-        high_indices = sorted_indices[:half]
-        low_indices = sorted_indices[half:]
-        
-        num_pairs = min(self.rank_num_pairs, half * len(low_indices))
-        if num_pairs == 0:
-            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-        
-        high_sample = high_indices[torch.randint(0, len(high_indices), (num_pairs,), device=logits.device)]
-        low_sample = low_indices[torch.randint(0, len(low_indices), (num_pairs,), device=logits.device)]
-        
-        score_diff = logits[high_sample] - logits[low_sample]
-        loss = F.relu(self.rank_margin - score_diff)
-        
-        return loss.mean()
-    
-    def _return_weighted_loss(self, logits, targets, returns):
-        """
-        收益加权损失：用收益率大小调制BCE的梯度
-        """
-        clipped_returns = torch.clamp(returns, -self.return_clip, self.return_clip)
-        
-        bce_per_sample = F.binary_cross_entropy_with_logits(
-            logits.float(), targets.float(), reduction='none'
+    # 根据配置选择优化器
+    if TrainingConfig.USE_MANO:
+        from optimizers import create_optimizer
+        optimizer_a = create_optimizer(
+            model_a,
+            optimizer_type='mano',
+            lr=learning_rate,
+            momentum=TrainingConfig.MANO_MOMENTUM,
+            weight_decay=TrainingConfig.WEIGHT_DECAY,
+            betas=TrainingConfig.MANO_ADAMW_BETAS
         )
-        
-        pos_mask = targets >= 0.5
-        neg_loss_mask = (targets < 0.5) & (returns < 0)
-        
-        weights = torch.ones_like(returns)
-        weights[pos_mask] = 1.0 + self.return_alpha * clipped_returns[pos_mask].abs()
-        weights[neg_loss_mask] = 1.0 + self.return_beta * clipped_returns[neg_loss_mask].abs()
-        
-        weights = weights / (weights.mean() + 1e-8)
-        
-        loss = (bce_per_sample * weights).mean()
-        return loss
-    
-    def _topk_focus_loss(self, logits, targets, returns):
-        """
-        Top-K聚焦损失：只关注模型预测分数最高的那些样本
-        """
-        batch_size = logits.size(0)
-        k = max(1, int(batch_size * self.topk_ratio))
-        
-        _, topk_indices = torch.topk(logits.detach(), k)
-        
-        topk_logits = logits[topk_indices]
-        topk_targets = targets[topk_indices]
-        topk_returns = returns[topk_indices]
-        
-        topk_bce = F.binary_cross_entropy_with_logits(
-            topk_logits.float(), topk_targets.float(), reduction='none'
-        )
-        
-        clipped_returns = torch.clamp(topk_returns, -self.return_clip, self.return_clip)
-        penalty = torch.where(
-            topk_returns < 0,
-            1.0 + self.return_beta * clipped_returns.abs(),
-            torch.ones_like(topk_returns)
-        )
-        
-        loss = (topk_bce * penalty).mean()
-        return loss
-    
-    def forward(self, logits, targets, returns=None):
-        """
-        前向计算：组合所有子损失
-        
-        Args:
-            logits: [batch_size] 或 [batch_size, 1] 模型原始输出
-            targets: [batch_size] 真实标签 (0/1)
-            returns: [batch_size] 真实累计收益率（可选，不提供则退化为纯BCE）
-        """
-        if logits.dim() == 2 and logits.size(1) == 1:
-            logits = logits.squeeze(-1)
-        
-        loss_bce = self.bce(logits, targets)
-        
-        if returns is None:
-            return loss_bce
-        
-        if returns.dim() == 2:
-            returns = returns.squeeze(-1)
-        returns = returns.to(dtype=logits.dtype, device=logits.device)
-        
-        loss_rank = self._ranking_loss(logits, returns)
-        
-        loss_return = self._return_weighted_loss(logits, targets, returns)
-        
-        loss_topk = self._topk_focus_loss(logits, targets, returns)
-        
-        total_loss = loss_bce + \
-                     self.rank_weight * loss_rank + \
-                     self.return_weight * loss_return + \
-                     self.topk_weight * loss_topk
-        
-        return total_loss
-
-
-def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
-                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None):
-    """
-    模型评估函数
-    涨停样本已在generate_sample_from_index中过滤，无需再次过滤
-
-    优化版本：分批处理，减少显存占用
-
-    返回统计字典，包含：
-        auc：AUC得分
-        top_return：Top1%收益率
-        top_count：Top1%样本数
-        top_threshold：Top1%最低置信度
-        high_conf_count：高置信(>0.7)样本数
-        low_conf_count：低置信(<0.2)样本数
-        pred_mean：预测均值
-        pred_std：预测标准差
-        filtered_count：被过滤的涨停样本数（始终为0，因已在生成阶段过滤）
-        realistic_stats：实战收益率统计（如果提供了eval_day_indices）
-        smart_exit_stats：智能止损策略统计（如果提供了eval_daily_returns）
-    """
-    model.eval()
-
-    num_samples = len(eval_inputs)
-    if num_samples == 0:
-        return {
-            'auc': 0.5, 'top_return': 0.0, 'top_count': 0, 'top_threshold': 0.0,
-            'high_conf_count': 0, 'low_conf_count': 0, 'pred_mean': 0.0, 
-            'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None, 'smart_exit_stats': None
-        }
-
-    all_preds = []
-    num_batches = (num_samples + batch_size - 1) // batch_size
-    
-    with torch.no_grad():
-        for i in range(num_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, num_samples)
-            
-            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], dtype=torch.float32, device=device)
-            batch_preds = torch.sigmoid(model(batch_inputs))
-            all_preds.append(batch_preds.cpu().numpy().flatten())
-            del batch_inputs
-    
-    all_preds = np.concatenate(all_preds)
-    all_targets = np.array(eval_targets)
-    all_returns = np.array(eval_cumulative_returns)
-
-    try:
-        auc = roc_auc_score(all_targets, all_preds)
-    except ValueError:
-        auc = 0.5
-
-    percent = DataConfig.TOP_PERCENT
-    top_k = max(1, int(len(all_preds) * percent / 100))
-    sorted_indices = np.argsort(all_preds)[::-1]
-    top_indices = sorted_indices[:top_k]
-    top_returns = all_returns[top_indices]
-
-    top_return = np.mean(top_returns)
-    top_threshold = all_preds[sorted_indices[top_k - 1]]
-
-    high_conf = all_preds > 0.7
-    low_conf = all_preds < 0.2
-
-    stats = {
-        'auc': auc,
-        'top_return': top_return,
-        'top_count': top_k,
-        'top_threshold': top_threshold,
-        'high_conf_count': np.sum(high_conf),
-        'low_conf_count': np.sum(low_conf),
-        'pred_mean': np.mean(all_preds),
-        'pred_std': np.std(all_preds),
-        'filtered_count': 0,
-        'dispersion_std': float(np.std(all_preds)),
-        'dispersion_range': float(np.max(all_preds) - np.min(all_preds)),
-        'dispersion_iqr': float(np.percentile(all_preds, 75) - np.percentile(all_preds, 25)),
-    }
-
-    if eval_day_indices is not None:
-        actual_top_n = top_n_per_day if top_n_per_day is not None else DataConfig.TOP_N_PER_DAY
-        if actual_top_n == 0:
-            actual_top_n = None
-        stats['realistic_stats'] = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent, actual_top_n)
-        
-        if eval_daily_returns is not None and actual_top_n is not None:
-            stats['smart_exit_stats'] = calculate_smart_exit_return(all_preds, eval_daily_returns, eval_day_indices, actual_top_n)
-        else:
-            stats['smart_exit_stats'] = None
+    elif TrainingConfig.USE_ADAMW:
+        optimizer_a = optim.AdamW(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
     else:
-        stats['realistic_stats'] = None
-        stats['smart_exit_stats'] = None
+        optimizer_a = optim.Adam(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
 
-    stats['all_preds'] = all_preds
-    return stats
+    # 计算动态预热轮次（总轮数的10%）
+    warmup_epochs = max(1, int(epochs * TrainingConfig.WARMUP_RATIO))
 
+    # 学习率调度（模型A）
+    warmup_scheduler_a = WarmupScheduler(
+        optimizer_a,
+        warmup_epochs=warmup_epochs,
+        target_lr=learning_rate,
+        start_lr=TrainingConfig.WARMUP_START_LR
+    )
 
-def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_percent=1.0, top_n_per_day=None):
-    """
-    计算实战收益率（高仿实战）
-    
-    支持两种模式:
-    1. 全局阈值模式（top_n_per_day=None）: 按全局Top%确定阈值，每天选超过阈值的股票
-    2. 每日Top N模式（top_n_per_day指定）: 每天选预测分数最高的前N只股票
-    """
-    unique_days = np.unique(all_day_indices)
-    unique_days = np.sort(unique_days)
-    
-    daily_stats = []
-    daily_returns = []
-    
-    if top_n_per_day is not None:
-        for day in unique_days:
-            day_mask = all_day_indices == day
-            day_indices = np.where(day_mask)[0]
-            
-            if len(day_indices) == 0:
-                daily_stats.append((0, 0.0))
-                continue
-            
-            day_preds = all_preds[day_indices]
-            day_returns = all_returns[day_indices]
-            
-            sorted_local_indices = np.argsort(day_preds)[::-1]
-            select_count = min(top_n_per_day, len(day_indices))
-            top_local_indices = sorted_local_indices[:select_count]
-            
-            day_return = np.mean(day_returns[top_local_indices])
-            daily_returns.append(day_return)
-            daily_stats.append((select_count, day_return))
+    for param_group in optimizer_a.param_groups:
+        param_group['lr'] = learning_rate
+
+    total_main_epochs = epochs - warmup_epochs
+    main_scheduler_a = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_a,
+        T_max=total_main_epochs,
+        eta_min=TrainingConfig.COSINE_ETA_MIN
+    )
+
+    for param_group in optimizer_a.param_groups:
+        param_group['lr'] = TrainingConfig.WARMUP_START_LR
+
+    # 损失函数选择
+    if LossConfig.use_task_aligned():
+        print("损失函数: TaskAlignedLoss (BCE + 排序损失 + 收益加权 + Top-K聚焦)")
+        print(f"  权重: rank={LossConfig.RANK_LOSS_WEIGHT}, return={LossConfig.RETURN_LOSS_WEIGHT}, topk={LossConfig.TOPK_LOSS_WEIGHT}")
+        criterion = TaskAlignedLoss(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         
-        threshold = None
+        test_targets = np.array(eval_targets)
+        test_pos_count = np.sum(test_targets >= 0.5)
+        test_neg_count = np.sum(test_targets < 0.5)
+        if test_pos_count > 0 and test_neg_count > 0:
+            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
+        elif test_pos_count == 0:
+            test_neg_weight = float(LossConfig.POS_WEIGHT)
+        else:
+            test_neg_weight = 0.1
+        eval_criterion.weight_0_0.fill_(test_neg_weight)
+        print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
+    elif LossConfig.use_dynamic_bce():
+        print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
+        criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        
+        test_targets = np.array(eval_targets)
+        test_pos_count = np.sum(test_targets >= 0.5)
+        test_neg_count = np.sum(test_targets < 0.5)
+        if test_pos_count > 0 and test_neg_count > 0:
+            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
+        elif test_pos_count == 0:
+            test_neg_weight = float(LossConfig.POS_WEIGHT)
+        else:
+            test_neg_weight = 0.1
+        eval_criterion.weight_0_0.fill_(test_neg_weight)
+        print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
     else:
-        top_k = max(1, int(len(all_preds) * top_percent / 100))
-        sorted_indices = np.argsort(all_preds)[::-1]
-        threshold = all_preds[sorted_indices[top_k - 1]]
-        
-        above_threshold_mask = all_preds > threshold
-        max_select = DataConfig.MAX_SELECT_PER_DAY
-        
-        for day in unique_days:
-            day_mask = all_day_indices == day
-            day_above_threshold = above_threshold_mask & day_mask
-            day_indices = np.where(day_above_threshold)[0]
-            
-            count = len(day_indices)
-            if count > 0:
-                if max_select > 0 and count > max_select:
-                    day_preds = all_preds[day_indices]
-                    top_local = np.argsort(day_preds)[::-1][:max_select]
-                    selected_indices = day_indices[top_local]
-                    count = max_select
-                else:
-                    selected_indices = day_indices
-                day_return = np.mean(all_returns[selected_indices])
-                daily_returns.append(day_return)
-                daily_stats.append((count, day_return))
+        print("损失函数: 简单BCE (BCEWithLogitsLoss)")
+        criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
+
+    # 最佳模型A缓存（按Top1%收益率判断，用于生成伪标签）
+    best_return_a = -float('inf')
+    best_model_a_for_pseudo = None  # 用于生成伪标签的最佳A
+    best_return_epoch_a = 0
+
+    # 最佳模型B缓存（按收益率判断，仅用于显示）
+    best_return_b = -float('inf')
+    best_return_epoch_b = 0
+
+    # 按loss保存的最佳模型（需要满足条件才参与评估）
+    # 条件：epoch >= 100, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%
+    best_loss_a = float('inf')
+    best_loss_epoch_a = 0
+    best_model_a_by_loss = None
+    best_return_a_at_best_loss = 0.0
+    best_auc_a_at_best_loss = 0.0
+    best_threshold_a_at_best_loss = 0.0
+    best_realistic_return_a_at_best_loss = 0.0
+
+    # 按实战收益率保存的最佳模型A（第100轮后）
+    best_realistic_return_a = -float('inf')
+    best_realistic_return_epoch_a = 0
+    best_model_a_by_realistic_return = None
+    best_return_a_at_best_realistic = 0.0
+    best_auc_a_at_best_realistic = 0.0
+    best_threshold_a_at_best_realistic = 0.0
+    best_realistic_return_value_at_best = 0.0
+
+    best_loss_b = float('inf')
+    best_loss_epoch_b = 0
+    best_model_b_by_loss = None
+    best_return_b_at_best_loss = 0.0
+    best_auc_b_at_best_loss = 0.0
+    best_threshold_b_at_best_loss = 0.0
+    best_realistic_return_b_at_best_loss = 0.0
+
+    # 早停机制（patience = EPOCHS * 0.25）
+    patience = int(epochs * 0.25)
+    early_stopping = EarlyStopping(patience=patience)
+
+    # 创建采样器（根据配置选择策略）
+    sampler = create_sampler(train_stock_info)
+    train_rng = random.Random(DataConfig.RANDOM_SEED)
+
+    # 记录每轮收益率
+    epoch_returns = []  # 格式: [{'turn': 1, 'return_a': 1.62, 'return_b': None}, ...]
+
+    for epoch in range(epochs):
+        model_a.train()
+        if model_b is not None:
+            model_b.train()
+
+        total_loss_a = 0
+        total_loss_b = 0
+        total_pseudo_pos = 0
+        total_pseudo_neg = 0
+        total_unchanged = 0
+
+        has_model_b = (epoch + 1) >= clone_epoch
+
+        # 学习率更新
+        if warmup_scheduler_a.is_warmup_phase():
+            current_lr = warmup_scheduler_a.step(epoch)
+            lr_status = f"预热阶段 ({epoch + 1}/{warmup_epochs})"
+        else:
+            current_lr = main_scheduler_a.get_last_lr()[0]
+            lr_status = "正常训练"
+
+        status = "A+B训练" if has_model_b else "只训练A"
+        print(f'Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f} ({lr_status}) [{status}]')
+
+        # 第clone_epoch轮时克隆模型B
+        if (epoch + 1) == clone_epoch and model_b is None:
+            print(f"\n  >>> 第{clone_epoch}轮：克隆模型A为模型B <<<")
+            model_b = copy.deepcopy(model_a)
+            model_b = model_b.to(device)
+
+            # 模型B使用半学习率，更保守的更新
+            if TrainingConfig.USE_MANO:
+                from optimizers import create_optimizer
+                optimizer_b = create_optimizer(
+                    model_b,
+                    optimizer_type='mano',
+                    lr=learning_rate * 0.5,
+                    momentum=TrainingConfig.MANO_MOMENTUM,
+                    weight_decay=TrainingConfig.WEIGHT_DECAY,
+                    betas=TrainingConfig.MANO_ADAMW_BETAS
+                )
+            elif TrainingConfig.USE_ADAMW:
+                optimizer_b = optim.AdamW(model_b.parameters(), lr=learning_rate * 0.5,
+                                          weight_decay=TrainingConfig.WEIGHT_DECAY)
             else:
-                daily_stats.append((0, 0.0))
-    
-    if len(daily_returns) > 0:
-        avg_realistic_return = np.mean(daily_returns)
-        cumulative_return = np.sum(daily_returns)
-    else:
-        avg_realistic_return = 0.0
-        cumulative_return = 0.0
-    
-    return {
-        'threshold': threshold,
-        'daily_stats': daily_stats,
-        'cumulative_return': cumulative_return,
-        'valid_days': len(daily_returns),
-        'avg_realistic_return': avg_realistic_return,
-        'mode': 'top_n_per_day' if top_n_per_day else 'global_threshold'
-    }
+                optimizer_b = optim.Adam(model_b.parameters(), lr=learning_rate * 0.5,
+                                         weight_decay=TrainingConfig.WEIGHT_DECAY)
+            print(f"  模型B已创建，参数数: {sum(p.numel() for p in model_b.parameters()):,}")
+            print()
 
+        # 使用时间顺序采样器生成训练数据（与主训练流程统一）
+        epoch_inputs, epoch_targets, epoch_cum_returns = sample_with_pools(
+            sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
+        )
 
-def calculate_smart_exit_return(all_preds, all_daily_returns, all_day_indices, top_n_per_day=4,
-                                 stop_loss_day1=-0.05, stop_loss_cum=-0.05, take_profit=0.08,
-                                 sell_at_day2_close=True):
-    """
-    智能止损策略收益率计算（A股T+1规则）
-    """
-    unique_days = np.unique(all_day_indices)
-    unique_days = np.sort(unique_days)
-    
-    daily_stats = []
-    daily_returns = []
-    
-    total_trades = 0
-    stop_loss_day1_count = 0
-    stop_loss_cum_count = 0
-    take_profit_count = 0
-    normal_exit_count = 0
-    
-    for day in unique_days:
-        day_mask = all_day_indices == day
-        day_indices = np.where(day_mask)[0]
-        
-        if len(day_indices) == 0:
-            daily_stats.append((0, 0.0, 'none'))
-            continue
-        
-        day_preds = all_preds[day_indices]
-        day_daily_returns = [all_daily_returns[i] for i in day_indices]
-        
-        sorted_local_indices = np.argsort(day_preds)[::-1]
-        select_count = min(top_n_per_day, len(day_indices))
-        top_local_indices = sorted_local_indices[:select_count]
-        
-        day_trade_returns = []
-        day_exit_types = {'stop_day1': 0, 'stop_cum': 0, 'profit': 0, 'normal': 0, 'partial': 0}
-        
-        for idx in top_local_indices:
-            daily_ret = day_daily_returns[idx]
-            if daily_ret is None or len(daily_ret) == 0:
-                continue
+        # 打印循环统计
+        looped_count, total_loops = sampler.get_loop_stats()
+        print(f"  [循环统计] 已循环股票: {looped_count}/{len(train_stock_info)}, 总循环次数: {total_loops}")
 
-            available = len(daily_ret)
-            r1 = daily_ret[0]
-            r2 = daily_ret[1] if available >= 2 else 0.0
-            r3 = daily_ret[2] if available >= 3 else 0.0
-            has_day2 = available >= 2
-            has_day3 = available >= 3
+        # 打印标签分布
+        count_positive = np.sum(epoch_targets >= 0.9)
+        count_boundary = np.sum((epoch_targets > 0.1) & (epoch_targets < 0.9))
+        count_negative = np.sum(epoch_targets <= 0.1)
+        total_count = len(epoch_targets)
+        print(f'  标签分布: 上涨={count_positive}({count_positive/total_count:.1%}), 边界={count_boundary}({count_boundary/total_count:.1%}), 不涨={count_negative}({count_negative/total_count:.1%})')
 
-            total_trades += 1
-            
-            if r1 < stop_loss_day1:
-                if has_day2:
-                    final_ret = r1 + (r2 if sell_at_day2_close else 0.0)
-                    stop_loss_day1_count += 1
-                    day_exit_types['stop_day1'] += 1
-                else:
-                    final_ret = r1
-                    day_exit_types['partial'] += 1
-            elif has_day2 and (r1 + r2) < stop_loss_cum:
-                final_ret = r1 + r2
-                stop_loss_cum_count += 1
-                day_exit_types['stop_cum'] += 1
-            elif has_day3 and (r1 + r2 + r3) >= take_profit:
-                final_ret = r1 + r2 + r3
-                take_profit_count += 1
-                day_exit_types['profit'] += 1
-            elif has_day3:
-                final_ret = r1 + r2 + r3
-                normal_exit_count += 1
-                day_exit_types['normal'] += 1
-            elif has_day2:
-                final_ret = r1 + r2
-                day_exit_types['partial'] += 1
+        # 转换为tensor
+        epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.float32).to(device)
+        epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.float32).to(device)
+        epoch_returns_tensor = torch.tensor(epoch_cum_returns, dtype=torch.float32).to(device)
+
+        # 计算实际可用的batch数量（防止索引越界）
+        actual_batches = len(epoch_inputs_tensor) // batch_size
+        if actual_batches < batches_per_epoch:
+            print(f'  ⚠ 警告：实际batch数({actual_batches}) < 期望batch数({batches_per_epoch})，将使用实际数量')
+
+        # 训练循环：使用实际的batch数量，而不是固定的batches_per_epoch
+        for step in range(actual_batches):
+            start_idx = step * batch_size
+            end_idx = (step + 1) * batch_size  # 不需要min，因为actual_batches已经保证了不越界
+
+            batch_inputs = epoch_inputs_tensor[start_idx:end_idx]
+            batch_targets = epoch_targets_tensor[start_idx:end_idx]
+            batch_returns = epoch_returns_tensor[start_idx:end_idx]
+
+            # ========== 训练模型A ==========
+            optimizer_a.zero_grad()
+            output_a = model_a(batch_inputs)
+            if hasattr(criterion, 'update_weights'):
+                criterion.update_weights(batch_targets)
+            if isinstance(criterion, TaskAlignedLoss):
+                loss_a = criterion(output_a.squeeze(-1), batch_targets, batch_returns)
             else:
-                final_ret = r1
-                day_exit_types['partial'] += 1
-            
-            day_trade_returns.append(final_ret)
+                loss_a = criterion(output_a.squeeze(-1), batch_targets)
+            loss_a.backward()
+            torch.nn.utils.clip_grad_norm_(model_a.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
+            optimizer_a.step()
+            # 累加loss时乘以batch_size，得到该batch的总损失
+            total_loss_a += loss_a.item() * (end_idx - start_idx)
+
+            # ========== 训练模型B（如果存在）==========
+            if model_b is not None and best_model_a_for_pseudo is not None:
+                optimizer_b.zero_grad()
+
+                # 用【最佳模型A】的预测生成伪标签
+                with torch.no_grad():
+                    output_a_for_pseudo = best_model_a_for_pseudo(batch_inputs)
+                    pred_a_for_pseudo = torch.sigmoid(output_a_for_pseudo).squeeze()
+
+                # 使用统一的伪标签生成函数
+                pseudo_targets_numpy, pseudo_stats = generate_pseudo_labels(
+                    pred_a_for_pseudo, batch_targets,
+                    pseudo_pos_ratio=pseudo_pos_ratio,
+                    pseudo_neg_ratio=pseudo_neg_ratio
+                )
+                pseudo_targets = torch.tensor(pseudo_targets_numpy, dtype=torch.float32).to(device)
+
+                total_pseudo_pos += pseudo_stats['pseudo_pos_count']
+                total_pseudo_neg += pseudo_stats['pseudo_neg_count']
+                total_unchanged += pseudo_stats['unchanged_count']
+
+                # 训练模型B
+                output_b = model_b(batch_inputs)
+                if hasattr(criterion, 'update_weights'):
+                    criterion.update_weights(pseudo_targets)
+                if isinstance(criterion, TaskAlignedLoss):
+                    loss_b = criterion(output_b.squeeze(-1), pseudo_targets, batch_returns)
+                else:
+                    loss_b = criterion(output_b.squeeze(-1), pseudo_targets)
+                loss_b.backward()
+                torch.nn.utils.clip_grad_norm_(model_b.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
+                optimizer_b.step()
+                # 累加loss时乘以batch_size，得到该batch的总损失
+                total_loss_b += loss_b.item() * (end_idx - start_idx)
+
+            # 进度显示
+            progress = (step + 1) / actual_batches * 100
+            # 使用已处理的样本数计算当前平均损失
+            processed_samples = (step + 1) * batch_size
+            avg_loss_a = total_loss_a / processed_samples
+            if model_b is not None:
+                avg_loss_b = total_loss_b / processed_samples
+                print(f'\r  训练进度: {progress:.1f}%, Loss_A: {avg_loss_a:.4f}, Loss_B: {avg_loss_b:.4f}', end='', flush=True)
+            else:
+                print(f'\r  训练进度: {progress:.1f}%, Loss_A: {avg_loss_a:.4f}', end='', flush=True)
+
+        print()
+        print()
+
+        # 清理内存
+        del epoch_inputs_tensor, epoch_targets_tensor, epoch_returns_tensor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # 更新学习率
+        if not warmup_scheduler_a.is_warmup_phase():
+            main_scheduler_a.step()
+
+        # 评估模型A（使用统一的评估函数）
+        stats_a = evaluate_model(
+            model_a, eval_inputs, eval_targets, eval_cumulative_returns,
+            device, model_name="A",
+            eval_day_indices=eval_day_indices,
+            eval_daily_returns=eval_daily_returns,
+            eval_available_days=eval_available_days
+        )
+
+        # 计算训练集平均损失（除以样本数，与测试损失保持一致）
+        # total_loss_a已经是所有样本的总损失（累加时乘以了batch_size）
+        total_samples_a = len(epoch_inputs)
+        avg_loss_a = total_loss_a / total_samples_a if total_samples_a > 0 else 0
+
+        # 计算测试集损失（用于早停检测）
+        test_loss_a = calculate_test_loss(model_a, eval_inputs, eval_targets, eval_criterion, device)
+
+        # 打印模型A结果
+        print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
+        print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
+        print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_a["top_return"]*100:+.2f}%')
         
-        if len(day_trade_returns) == 0:
-            daily_stats.append((0, 0.0, 'none'))
-            continue
-
-        avg_day_return = np.mean(day_trade_returns)
-        daily_returns.append(avg_day_return)
+        if stats_a['realistic_stats'] is not None:
+            rs = stats_a['realistic_stats']
+            daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
+            mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if rs.get('mode') == 'top_n_per_day' else f"全局阈值,每日上限{DataConfig.MAX_SELECT_PER_DAY}" if DataConfig.MAX_SELECT_PER_DAY > 0 else "全局阈值,不限数量"
+            print(f'          【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
+            print(f'          【实战收益率({mode_str})】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
         
-        exit_type = max(day_exit_types, key=day_exit_types.get)
-        daily_stats.append((len(day_trade_returns), avg_day_return, exit_type))
-    
-    if len(daily_returns) > 0:
-        avg_realistic_return = np.mean(daily_returns)
-        cumulative_return = np.sum(daily_returns)
-    else:
-        avg_realistic_return = 0.0
-        cumulative_return = 0.0
-    
-    return {
-        'daily_stats': daily_stats,
-        'cumulative_return': cumulative_return,
-        'valid_days': len(daily_returns),
-        'avg_realistic_return': avg_realistic_return,
-        'total_trades': total_trades,
-        'stop_loss_day1_count': stop_loss_day1_count,
-        'stop_loss_cum_count': stop_loss_cum_count,
-        'take_profit_count': take_profit_count,
-        'normal_exit_count': normal_exit_count,
-        'stop_loss_day1_ratio': stop_loss_day1_count / total_trades if total_trades > 0 else 0,
-        'stop_loss_cum_ratio': stop_loss_cum_count / total_trades if total_trades > 0 else 0,
-        'take_profit_ratio': take_profit_count / total_trades if total_trades > 0 else 0,
-        'strategy': f'smart_exit(stop_day1={stop_loss_day1*100:.1f}%, stop_cum={stop_loss_cum*100:.1f}%, profit={take_profit*100:.1f}%)'
-    }
-
-
-def generate_pseudo_labels(pred_scores, original_targets,
-                           pseudo_pos_ratio=0.01,
-                           pseudo_neg_ratio=0.05):
-    """
-    统一的伪标签生成函数（按数量取Top-K%方式）
-
-    核心思想：
-    - 按预测分数排序，取前 pseudo_pos_ratio 比例的样本 → 强制标签=1.0（伪正）
-    - 按预测分数排序，取倒数 pseudo_neg_ratio 比例的样本 → 强制标签=0.0（伪负）
-    - 其余样本保持原始标签不变
-    """
-    if isinstance(pred_scores, torch.Tensor):
-        pred_scores = pred_scores.float().detach().cpu().numpy()
-    if isinstance(original_targets, torch.Tensor):
-        original_targets = original_targets.float().detach().cpu().numpy()
-
-    pred_scores = np.asarray(pred_scores).flatten()
-    original_targets = np.asarray(original_targets).copy()
-
-    if len(pred_scores) == 0:
-        stats = {
-            'pseudo_pos_count': 0,
-            'pseudo_neg_count': 0,
-            'unchanged_count': 0,
-            'threshold_pos': 0.0,
-            'threshold_neg': 0.0,
+        if stats_a.get('smart_exit_stats') is not None:
+            se = stats_a['smart_exit_stats']
+            print(f'          【智能止损】收益率: {se["avg_realistic_return"]*100:.1f}%, Day1止损: {se["stop_loss_day1_count"]}次, 累计止损: {se["stop_loss_cum_count"]}次, 止盈: {se["take_profit_count"]}次')
+        
+        epoch_return = {
+            'turn': epoch + 1,
+            'return': stats_a['top_return'] * 100,
+            'return_a': stats_a['top_return'] * 100,
+            'return_b': None,
+            'train_loss': avg_loss_a,
+            'train_loss_a': avg_loss_a,
+            'train_loss_b': None,
+            'test_loss': test_loss_a,
+            'test_loss_a': test_loss_a,
+            'test_loss_b': None,
+            'dispersion_std': stats_a.get('dispersion_std', 0),
+            'dispersion_range': stats_a.get('dispersion_range', 0),
+            'dispersion_iqr': stats_a.get('dispersion_iqr', 0),
+            'pos_ratio': stats_a.get('pred_mean', 0),
+            'high_conf_ratio': stats_a.get('high_conf_count', 0) / len(eval_targets) if eval_targets is not None else 0,
         }
-        return original_targets, stats
+        epoch_returns.append(epoch_return)
 
-    k_pos = max(1, int(len(pred_scores) * pseudo_pos_ratio))
-    k_pos = min(k_pos, len(pred_scores))
-    threshold_pos = np.sort(pred_scores)[-k_pos]
+        print_dispersion_sparkline(stats_a.get('all_preds', []), epoch_returns)
 
-    k_neg = max(1, int(len(pred_scores) * pseudo_neg_ratio))
-    k_neg = min(k_neg, len(pred_scores))
-    threshold_neg = np.sort(pred_scores)[k_neg - 1]
-
-    pseudo_targets = original_targets.copy()
-
-    high_mask = pred_scores >= threshold_pos
-    pseudo_targets[high_mask] = 1.0
-
-    low_mask = pred_scores <= threshold_neg
-    pseudo_targets[low_mask] = 0.0
-
-    stats = {
-        'pseudo_pos_count': int(np.sum(high_mask)),
-        'pseudo_neg_count': int(np.sum(low_mask)),
-        'unchanged_count': int(len(pred_scores) - np.sum(high_mask) - np.sum(low_mask)),
-        'threshold_pos': float(threshold_pos),
-        'threshold_neg': float(threshold_neg),
-    }
-
-    return pseudo_targets, stats
-
-
-def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
-                             epoch, model_prefix="model", extra_info="",
-                             output_dir=DataConfig.OUTPUT_DIR):
-    """
-    通用的模型保存函数，带详细元数据
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%m%d_%H%M")
-
-    return_str = f"{top_return*100:+.2f}".replace('+', 'p').replace('-', 'n').replace('.', '_')
-    thr_str = f"{top_threshold:.3f}".replace('.', '_')
-    auc_str = f"{auc:.4f}".replace('.', '_')
-
-    if extra_info:
-        filename = f"{model_prefix}_top{DataConfig.TOP_PERCENT}_{return_str}pct_thr{thr_str}_auc{auc_str}_ep{epoch}_{extra_info}_{timestamp}.pth"
-    else:
-        filename = f"{model_prefix}_top{DataConfig.TOP_PERCENT}_{return_str}pct_thr{thr_str}_auc{auc_str}_ep{epoch}_{timestamp}.pth"
-
-    save_path = os.path.join(output_dir, filename)
-    torch.save(model_state_dict, save_path)
-
-    return save_path
-
-def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, batch_size=1024):
-    """
-    计算测试集损失（官方标准：除以样本数）
-
-    优化版本：
-    - 权重在训练开始时已设置，此处直接使用
-    - 支持大batch_size，提高GPU利用率
-    """
-    model.eval()
-    total_loss = 0.0
-    num_samples = len(eval_inputs)
-    
-    if num_samples == 0:
-        return 0.0
-    
-    num_batches = (num_samples + batch_size - 1) // batch_size
-
-    with torch.no_grad():
-        for i in range(num_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, num_samples)
-
-            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx],
-                                       dtype=torch.float32).to(device)
-            batch_targets = torch.tensor(eval_targets[start_idx:end_idx],
-                                        dtype=torch.float32).to(device)
-
-            outputs = model(batch_inputs)
-            loss = criterion(outputs.squeeze(-1), batch_targets)
-            total_loss += loss.item() * (end_idx - start_idx)
-
-    return total_loss / num_samples
-
-
-class EarlyStopping:
-    """
-    早停机制类
-
-    监控指标：
-    - avg_loss: 平均损失（越低越好）
-    - top_return: Top1%收益率（越高越好）
-
-    任意一个指标改善即重置计数器
-    """
-    def __init__(self, patience=10):
-        """
-        Args:
-            patience: 容忍无改善的轮数
-        """
-        self.patience = patience
-        self.no_improve_count = 0
-
-        self.best_loss = float('inf')
-        self.best_return = -float('inf')
-        self.best_return_auc = 0.0
-        self.best_return_threshold = 0.0
-
-    def check_improve(self, avg_loss=None, top_return=None, auc=None, threshold=None):
-        """
-        检查是否有改善
-
-        Args:
-            avg_loss: 平均损失
-            top_return: Top1%收益率
-            auc: AUC得分（仅当收益率改善时更新）
-            threshold: Top阈值（仅当收益率改善时更新）
-
-        Returns:
-            improved: 是否有改善
-            reason: 改善原因字符串
-        """
-        improved = False
-        reasons = []
-
-        if avg_loss is not None and avg_loss < self.best_loss:
-            self.best_loss = avg_loss
-            improved = True
-            reasons.append(f'损失改善: {avg_loss:.4f}')
-
-        if top_return is not None and top_return > self.best_return:
-            self.best_return = top_return
-            improved = True
-            if auc is not None:
-                self.best_return_auc = auc
-            if threshold is not None:
-                self.best_return_threshold = threshold
-            reasons.append(f'收益率改善: {top_return*100:+.2f}%')
+        # 早停检测（使用测试集loss）
+        improved, improve_reason = early_stopping.check_improve(
+            avg_loss=test_loss_a,
+            top_return=stats_a['top_return'],
+            auc=stats_a['auc'],
+            threshold=stats_a['top_threshold']
+        )
 
         if improved:
-            self.no_improve_count = 0
-            return True, ' & '.join(reasons)
+            no_improve_count, patience_limit = early_stopping.get_progress()
+            print(f'          ✓ {improve_reason} (进度: {no_improve_count}/{patience_limit})')
         else:
-            self.no_improve_count += 1
-            return False, None
+            no_improve_count, patience_limit = early_stopping.get_progress()
+            print(f'          ⚠ 无改善 ({no_improve_count}/{patience_limit})')
 
-    def should_stop(self):
-        """是否应该停止训练"""
-        return self.no_improve_count >= self.patience
+        # 更新用于生成伪标签的最佳模型A（按Top1%收益率判断）
+        if stats_a['top_return'] > best_return_a:
+            best_return_a = stats_a['top_return']
+            best_return_epoch_a = epoch + 1
+            if best_model_a_for_pseudo is None:
+                best_model_a_for_pseudo = copy.deepcopy(model_a)
+            else:
+                best_model_a_for_pseudo.load_state_dict(copy.deepcopy(model_a.state_dict()))
+            best_model_a_for_pseudo.eval()
+            print(f'          ✓ 新最佳模型A（收益率）！Top1%收益: {best_return_a*100:+.2f}% (第{best_return_epoch_a}轮)')
 
-    def get_progress(self):
-        """获取当前进度"""
-        return self.no_improve_count, self.patience
+        # 按loss评估最佳模型A（条件：epoch >= 100, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
+        realistic_return_a = stats_a['realistic_stats']['avg_realistic_return'] if stats_a.get('realistic_stats') else 0.0
+        if (epoch + 1) >= 100 and realistic_return_a >= 0.014 and stats_a['top_return'] > 0.008 and stats_a['auc'] > 0.65:
+            if test_loss_a < best_loss_a:
+                best_loss_a = test_loss_a
+                best_loss_epoch_a = epoch + 1
+                best_model_a_by_loss = copy.deepcopy(model_a.state_dict())
+                best_return_a_at_best_loss = stats_a['top_return']
+                best_auc_a_at_best_loss = stats_a['auc']
+                best_threshold_a_at_best_loss = stats_a['top_threshold']
+                best_realistic_return_a_at_best_loss = realistic_return_a
+                print(f'          ✓ 新最佳模型A（loss）！Loss: {best_loss_a:.4f}, 实战收益率: {best_realistic_return_a_at_best_loss*100:.1f}% (第{best_loss_epoch_a}轮)')
 
-    def get_best_metrics(self):
-        """获取最佳指标"""
-        return {
-            'best_loss': self.best_loss,
-            'best_return': self.best_return,
-            'best_return_auc': self.best_return_auc,
-            'best_return_threshold': self.best_return_threshold
-        }
+        # 按实战收益率评估最佳模型A（第100轮后）
+        if (epoch + 1) >= 100:
+            if realistic_return_a > best_realistic_return_a:
+                best_realistic_return_a = realistic_return_a
+                best_realistic_return_epoch_a = epoch + 1
+                best_model_a_by_realistic_return = copy.deepcopy(model_a.state_dict())
+                best_return_a_at_best_realistic = stats_a['top_return']
+                best_auc_a_at_best_realistic = stats_a['auc']
+                best_threshold_a_at_best_realistic = stats_a['top_threshold']
+                best_realistic_return_value_at_best = realistic_return_a
+                print(f'          ✓ 新最佳模型A（实战收益率）！实战: {best_realistic_return_a*100:.1f}%, Top1%: {best_return_a_at_best_realistic*100:+.2f}% (第{best_realistic_return_epoch_a}轮)')
 
-class GradientMonitor:
-    """
-    梯度监控器：检测梯度爆炸和梯度消失
-    在每个batch的backward后收集各层梯度统计信息
-    """
-    def __init__(self):
-        self.grad_stats = {}
-        self.hooks = []
+        # 评估模型B（如果存在）
+        if model_b is not None:
+            stats_b = evaluate_model(
+                model_b, eval_inputs, eval_targets, eval_cumulative_returns,
+                device, model_name="B",
+                eval_day_indices=eval_day_indices,
+                eval_daily_returns=eval_daily_returns,
+                eval_available_days=eval_available_days
+            )
 
-    def _create_hook(self, name):
-        def hook(grad):
-            if grad is None:
-                return grad
+            # 计算训练集平均损失（除以样本数，与测试损失保持一致）
+            # total_loss_b已经是所有样本的总损失（累加时乘以了batch_size）
+            total_samples_b = len(epoch_inputs)
+            avg_loss_b = total_loss_b / total_samples_b if total_samples_b > 0 else 0
 
-            grad_flat = grad.data.abs().flatten()
+            # 计算测试集损失
+            test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, eval_criterion, device)
 
-            grad_norm = grad_flat.norm(2).float().item()
-            grad_max = grad_flat.max().float().item()
-            grad_mean = grad_flat.mean().float().item()
-            has_nan = torch.isnan(grad.data).any().item()
-            has_inf = torch.isinf(grad.data).any().item()
+            print(f'  [模型B] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
+            print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
+            print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_b["top_return"]*100:+.2f}%')
+            
+            if stats_b['realistic_stats'] is not None:
+                rs = stats_b['realistic_stats']
+                daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
+                mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if rs.get('mode') == 'top_n_per_day' else f"全局阈值,每日上限{DataConfig.MAX_SELECT_PER_DAY}" if DataConfig.MAX_SELECT_PER_DAY > 0 else "全局阈值,不限数量"
+                print(f'          【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
+                print(f'          【实战收益率({mode_str})】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
+            
+            if stats_b.get('smart_exit_stats') is not None:
+                se = stats_b['smart_exit_stats']
+                print(f'          【智能止损】收益率: {se["avg_realistic_return"]*100:.1f}%, Day1止损: {se["stop_loss_day1_count"]}次, 累计止损: {se["stop_loss_cum_count"]}次, 止盈: {se["take_profit_count"]}次')
+            
+            print(f'          伪标签来源: 最佳A(第{best_return_epoch_a}轮, 收益{best_return_a*100:+.2f}%)')
+            print(f'          伪标签统计: 伪正={total_pseudo_pos}, 伪负={total_pseudo_neg}, 不变={total_unchanged}')
 
-            if name not in self.grad_stats:
-                self.grad_stats[name] = {
-                    'norm': [],
-                    'max': [],
-                    'mean': [],
-                    'nan_count': 0,
-                    'inf_count': 0,
-                    'zero_count': 0
-                }
+            if stats_b['top_return'] > best_return_b:
+                best_return_b = stats_b['top_return']
+                best_return_epoch_b = epoch + 1
+                print(f'          ✓ 新最佳模型B（收益率）！Top1%收益: {best_return_b*100:+.2f}% (第{best_return_epoch_b}轮)')
 
-            stats = self.grad_stats[name]
-            stats['norm'].append(grad_norm)
-            stats['max'].append(grad_max)
-            stats['mean'].append(grad_mean)
+            # 按loss评估最佳模型B（条件：epoch >= 100, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
+            realistic_return_b = stats_b['realistic_stats']['avg_realistic_return'] if stats_b.get('realistic_stats') else 0.0
+            if (epoch + 1) >= 100 and realistic_return_b >= 0.014 and stats_b['top_return'] > 0.008 and stats_b['auc'] > 0.65:
+                if test_loss_b < best_loss_b:
+                    best_loss_b = test_loss_b
+                    best_loss_epoch_b = epoch + 1
+                    best_model_b_by_loss = copy.deepcopy(model_b.state_dict())
+                    best_return_b_at_best_loss = stats_b['top_return']
+                    best_auc_b_at_best_loss = stats_b['auc']
+                    best_threshold_b_at_best_loss = stats_b['top_threshold']
+                    best_realistic_return_b_at_best_loss = realistic_return_b
+                    print(f'          ✓ 新最佳模型B（loss）！Loss: {best_loss_b:.4f}, 实战收益率: {best_realistic_return_b_at_best_loss*100:.1f}% (第{best_loss_epoch_b}轮)')
 
-            if len(stats['norm']) > 100:
-                stats['norm'].pop(0)
-                stats['max'].pop(0)
-                stats['mean'].pop(0)
+            epoch_return['return_b'] = stats_b['top_return'] * 100
+            epoch_return['train_loss_b'] = avg_loss_b
+            epoch_return['test_loss_b'] = test_loss_b
 
-            if has_nan:
-                stats['nan_count'] += 1
-            if has_inf:
-                stats['inf_count'] += 1
-            if grad_norm < 1e-8:
-                stats['zero_count'] += 1
+        print("-" * 60)
 
-            return grad
-        return hook
+        # 早停检查
+        if early_stopping.should_stop():
+            print(f"\n⚠ 早停触发：连续{patience}轮无改善，停止训练")
+            break
 
-    def register_hooks(self, model):
-        """为模型所有参数注册梯度hook"""
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                hook = param.register_hook(self._create_hook(name))
-                self.hooks.append(hook)
-        print(f"  已为 {len(self.hooks)} 个参数注册梯度监控hook")
+    # 保存最佳模型（使用统一的保存函数）
+    print("\n" + "=" * 60)
+    print(f"训练完成！")
+    print(f"最佳模型A（按收益率用于伪标签）: 第{best_return_epoch_a}轮, Top1%收益: {best_return_a*100:+.2f}%")
+    print(f"最佳模型A（按loss）: 第{best_loss_epoch_a}轮, Loss: {best_loss_a:.4f}, 实战收益率: {best_realistic_return_a_at_best_loss*100:.1f}%")
+    print(f"最佳模型A（按实战收益率）: 第{best_realistic_return_epoch_a}轮, 实战收益率: {best_realistic_return_value_at_best*100:.1f}%, Top1%: {best_return_a_at_best_realistic*100:+.2f}%")
+    if best_model_b_by_loss is not None:
+        print(f"最佳模型B（按loss）: 第{best_loss_epoch_b}轮, Loss: {best_loss_b:.4f}, 实战收益率: {best_realistic_return_b_at_best_loss*100:.1f}%")
 
-    def remove_hooks(self):
-        """移除所有hook"""
-        for hook in self.hooks:
-            hook.remove()
-        self.hooks.clear()
+    # 保存模型A（按loss的最佳模型）
+    if best_model_a_by_loss is not None:
+        save_path_a = save_model_with_metadata(
+            best_model_a_by_loss,
+            best_return_a_at_best_loss, best_threshold_a_at_best_loss, best_auc_a_at_best_loss,
+            best_loss_epoch_a,
+            model_prefix="modelA_loss",
+            output_dir=DataConfig.OUTPUT_DIR
+        )
+        print(f"✓ 模型A(loss)已保存: {os.path.basename(save_path_a)}")
+        print(f"  Top1%阈值: {best_threshold_a_at_best_loss:.4f}")
+        print(f"  实战收益率: {best_realistic_return_a_at_best_loss*100:.1f}%")
 
-    def get_epoch_summary(self):
-        """获取当前epoch的梯度统计摘要"""
-        summary = {}
-        for name, stats in self.grad_stats.items():
-            if stats['norm']:
-                summary[name] = {
-                    'avg_norm': np.mean(stats['norm']),
-                    'max_norm': np.max(stats['norm']),
-                    'avg_max': np.mean(stats['max']),
-                    'avg_mean': np.mean(stats['mean']),
-                    'nan_count': stats['nan_count'],
-                    'inf_count': stats['inf_count'],
-                    'zero_count': stats['zero_count'],
-                    'total_batches': len(stats['norm'])
-                }
-        return summary
+    # 保存模型A（按实战收益率的最佳模型）
+    if best_model_a_by_realistic_return is not None:
+        save_path_a_realistic = save_model_with_metadata(
+            best_model_a_by_realistic_return,
+            best_return_a_at_best_realistic, best_threshold_a_at_best_realistic, best_auc_a_at_best_realistic,
+            best_realistic_return_epoch_a,
+            model_prefix="modelA_realistic",
+            output_dir=DataConfig.OUTPUT_DIR
+        )
+        print(f"✓ 模型A(realistic)已保存: {os.path.basename(save_path_a_realistic)}")
+        print(f"  Top1%阈值: {best_threshold_a_at_best_realistic:.4f}")
+        print(f"  实战收益率: {best_realistic_return_value_at_best*100:.1f}%")
 
-    def reset(self):
-        """重置统计信息（新epoch开始时调用）"""
-        self.grad_stats.clear()
+    # 保存模型B（按loss的最佳模型）
+    if best_model_b_by_loss is not None:
+        save_path_b = save_model_with_metadata(
+            best_model_b_by_loss,
+            best_return_b_at_best_loss, best_threshold_b_at_best_loss, best_auc_b_at_best_loss,
+            best_loss_epoch_b,
+            model_prefix="modelB",
+            output_dir=DataConfig.OUTPUT_DIR
+        )
+        print(f"✓ 模型B已保存: {os.path.basename(save_path_b)}")
+        print(f"  Top1%阈值: {best_threshold_b_at_best_loss:.4f}")
+        print(f"  实战收益率: {best_realistic_return_b_at_best_loss*100:.1f}%")
 
-    def diagnose(self):
-        """
-        诊断梯度问题，返回报告
-        返回: (爆炸层列表, 消失层列表, 异常层列表)
-        """
-        exploding = []
-        vanishing = []
-        abnormal = []
+    print("=" * 60)
 
-        summary = self.get_epoch_summary()
+    # 保存每轮收益率到CSV（使用时间戳避免多模型训练时覆盖）
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"clone_epoch_returns_{timestamp}.csv")
+    with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['turn', 'A', 'B', 'train_loss_A', 'test_loss_A', 'train_loss_B', 'test_loss_B'])
+        writer.writeheader()
 
-        for name, stats in summary.items():
-            if stats['avg_norm'] > 10 or stats['max_norm'] > 100:
-                exploding.append((name, stats))
+        for epoch_return in epoch_returns:
+            row = {
+                'turn': epoch_return['turn'],
+                'A': f"{epoch_return['return_a']:.2f}" if epoch_return['return_a'] is not None else "",
+                'B': f"{epoch_return['return_b']:.2f}" if epoch_return['return_b'] is not None else "",
+                'train_loss_A': f"{epoch_return['train_loss_a']:.4f}" if epoch_return.get('train_loss_a') is not None else "",
+                'test_loss_A': f"{epoch_return['test_loss_a']:.4f}" if epoch_return.get('test_loss_a') is not None else "",
+                'train_loss_B': f"{epoch_return['train_loss_b']:.4f}" if epoch_return.get('train_loss_b') is not None else "",
+                'test_loss_B': f"{epoch_return['test_loss_b']:.4f}" if epoch_return.get('test_loss_b') is not None else ""
+            }
+            writer.writerow(row)
 
-            elif stats['avg_norm'] < 1e-5:
-                vanishing.append((name, stats))
+    print(f"✓ 每轮收益率已保存: {os.path.basename(returns_csv_path)}")
+    print(f"  共记录 {len(epoch_returns)} 轮训练数据")
+    print("=" * 60)
 
-            if stats['nan_count'] > 0 or stats['inf_count'] > 0:
-                abnormal.append((name, stats))
+    return best_return_a, best_return_b
 
-        return exploding, vanishing, abnormal
+
+if __name__ == "__main__":
+    # 设置工作目录
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+    # 打印配置摘要
+    print_config_summary()
+
+    # 获取设备
+    device = DeviceConfig.print_device_info()
+
+    # 创建输出目录
+    os.makedirs(DataConfig.OUTPUT_DIR, exist_ok=True)
+
+    # 加载数据
+    print("正在加载和预处理数据...")
+    train_stock_info, test_stock_info = load_and_preprocess_data()
+
+    # 打印数据集统计
+    print("\n" + "="*60)
+    print("数据集统计")
+    print("="*60)
+    print(f"训练集: {len(train_stock_info)} 只股票")
+    print(f"测试集: {len(test_stock_info)} 只股票")
+    print("="*60)
+
+    # 创建模型A
+    print("\n正在创建模型A (FP32精度)...")
+    model_a = create_model().to(device)
+
+    total_params = sum(p.numel() for p in model_a.parameters())
+    print(f"模型A参数数: {total_params:,}")
+
+    # 开始训练
+    print("\n开始克隆模型训练...")
+    best_return_a, best_return_b = train_clone_model(
+        model_a, train_stock_info, test_stock_info,
+        device=device,
+        clone_epoch=TrainingConfig.EPOCHS*0.25,
+        pseudo_pos_ratio=0.01,
+        pseudo_neg_ratio=0.05
+    )
+
+    print(f"\n最终结果:")
+    print(f"  模型A: 最佳Top1%收益={best_return_a*100:+.2f}%")
+    print(f"  模型B: 最佳Top1%收益={best_return_b*100:+.2f}%")

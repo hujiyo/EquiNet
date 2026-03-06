@@ -588,6 +588,19 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
     if np.any(closes == 0) or np.any(volumes == 0):
         return None
 
+    sample_window_start = start_idx - 1
+    sample_window_end = min(data_length, start_idx + DataConfig.REQUIRED_LENGTH)
+    sample_data = stock_data[sample_window_start:sample_window_end]
+
+    limit_threshold = 0.11
+    for day_idx in range(1, len(sample_data)):
+        today_close = sample_data[day_idx, 3]
+        yesterday_close = sample_data[day_idx - 1, 3]
+        if yesterday_close > 0:
+            daily_return = (today_close - yesterday_close) / yesterday_close
+            if abs(daily_return) > limit_threshold:
+                return None
+
     last_day_idx = start_idx + context_length - 1
     prev_day_idx = start_idx + context_length - 2
     prev_day_close = stock_data[prev_day_idx, 3]
@@ -856,7 +869,9 @@ def create_recent_days_dataset(test_stock_info):
     """
     创建最近几天的临时评估数据集（用于显示最近几天的实战收益率）
     
-    包含数据不完整的临时样本，仅用于展示，不参与模型评估
+    包含完整样本和临时样本，用于展示最近几天的选股情况
+    - 完整样本（available_days == 3）：与 create_fixed_evaluation_dataset 一致
+    - 临时样本（available_days < 3）：仅用于展示，方便用户决策
     
     返回:
         recent_inputs: 输入序列
@@ -873,14 +888,15 @@ def create_recent_days_dataset(test_stock_info):
         stock_data = stock_info['data']
         data_length = len(stock_data)
         test_split_point = stock_info.get('test_split_point', max(0, data_length - DataConfig.TEST_DAYS))
-
-        start_max_full = data_length - DataConfig.REQUIRED_LENGTH
-        start_max_partial = data_length - DataConfig.CONTEXT_LENGTH - 1
         
-        if start_max_partial < start_max_full + 1:
+        # 和 create_fixed_evaluation_dataset 一样的起点，但扩展到包含最近的临时数据
+        start_min = max(1, test_split_point)
+        start_max = data_length - DataConfig.CONTEXT_LENGTH - 1
+        
+        if start_max < start_min:
             continue
 
-        for start_idx in range(start_max_full + 1, start_max_partial + 1):
+        for start_idx in range(start_min, start_max + 1):
             sample = generate_sample_from_index_partial([stock_info], 0, start_idx)
             if sample is None:
                 continue
@@ -888,8 +904,6 @@ def create_recent_days_dataset(test_stock_info):
             input_seq, target, cumulative_return, daily_returns, available_days = sample
             
             predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
-            if predict_day_idx < test_split_point:
-                continue
             
             recent_inputs.append(input_seq)
             recent_cumulative_returns.append(float(cumulative_return))

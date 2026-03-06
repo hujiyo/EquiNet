@@ -1,12 +1,14 @@
 '''
 EquiNet 模型推理与选股脚本
 
-功能：
-1. 读取 out/ 下可用的模型列表，用户选择模型
-2. 加载模型后执行评估（与 train.py 对模型A的评估一致）
-3. 打印评估结果 + Top1%阈值（高精度）
-4. 用户决定是否进入选股模式
-5. 选股：用 data/ 最新数据作为最后一天，模型打分，按分数排序输出
+核心流程：
+1. 模型选择：读取 out/ 下可用的模型列表，用户选择模型
+2. 模型评估：加载模型后执行评估（与 train.py 对模型A的评估完全一致）
+3. 选股模式：用 data/ 最新数据作为最后一天，模型打分，按分数排序输出
+
+数据一致性保证：
+- 评估数据集：只包含完整样本（available_days == 3），与 train.py 完全一致
+- 最近几天展示：包含临时样本（available_days < 3），仅用于展示，不参与阈值计算
 '''
 
 import os, sys, torch, numpy as np, glob, re
@@ -587,17 +589,18 @@ def print_recent_days_chart(daily_stats, last_n=10):
     print("╠" + "─"*52 + "╣")
     
     for i, (count, ret, available_days) in enumerate(recent_stats):
-        day_num = start_idx + i + 1
+        # day_num 表示"倒数第几天"
+        day_num = last_n - i
         
-        days_from_end = total_days - day_num + 1
-        if days_from_end == 1:
+        # 相对日期
+        if i == last_n - 1:
             relative_date = "昨天"
-        elif days_from_end == 2:
+        elif i == last_n - 2:
             relative_date = "前天"
-        elif days_from_end == 3:
+        elif i == last_n - 3:
             relative_date = "大前天"
         else:
-            relative_date = f"T-{days_from_end}"
+            relative_date = f"T-{day_num}"
         
         if available_days == 3:
             data_status = "完整"
@@ -615,9 +618,14 @@ def print_recent_days_chart(daily_stats, last_n=10):
     print("╚" + "═"*52 + "╝")
 
 
-def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4):
+def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4, threshold=None):
     """
-    计算最近几天的实战收益率（包含临时数据）
+    计算最近几天的实战收益率（用于展示，包含临时数据）
+    
+    关键设计：
+    - 阈值来源：直接使用传入的阈值（由 run_evaluation 计算，基于固定评估集）
+    - 选股范围：所有样本（包括临时样本），用于展示最近几天的选股情况
+    - 临时样本：仅用于展示，方便用户决策，不参与任何阈值计算
     
     返回: daily_stats [(count, return, available_days), ...]
     """
@@ -638,32 +646,66 @@ def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4)
             all_preds.extend(preds)
     
     all_preds = np.array(all_preds)
+    all_returns = np.array(recent_returns)
+    all_available_days = np.array(recent_available_days)
     
     unique_days = np.unique(recent_day_indices)
     unique_days = np.sort(unique_days)
     
     daily_stats = []
     
-    for day in unique_days:
-        day_mask = recent_day_indices == day
-        day_indices = np.where(day_mask)[0]
+    use_threshold_mode = (top_n_per_day == 0 and threshold is not None)
+    
+    if use_threshold_mode:
+        max_select = DataConfig.MAX_SELECT_PER_DAY
         
-        if len(day_indices) == 0:
-            daily_stats.append((0, 0.0, 0))
-            continue
+        above_threshold_mask = all_preds > threshold
         
-        day_preds = all_preds[day_indices]
-        day_returns = recent_returns[day_indices]
-        day_available = recent_available_days[day_indices]
-        
-        sorted_local_indices = np.argsort(day_preds)[::-1]
-        select_count = min(top_n_per_day, len(day_indices))
-        top_local_indices = sorted_local_indices[:select_count]
-        
-        day_return = np.mean(day_returns[top_local_indices])
-        min_available = int(np.min(day_available[top_local_indices]))
-        
-        daily_stats.append((select_count, day_return, min_available))
+        for day in unique_days:
+            day_mask = recent_day_indices == day
+            day_above_threshold = above_threshold_mask & day_mask
+            day_indices = np.where(day_above_threshold)[0]
+            
+            count = len(day_indices)
+            if count > 0:
+                if max_select > 0 and count > max_select:
+                    day_preds = all_preds[day_indices]
+                    top_local = np.argsort(day_preds)[::-1][:max_select]
+                    selected_indices = day_indices[top_local]
+                    count = max_select
+                else:
+                    selected_indices = day_indices
+                
+                day_return = np.mean(all_returns[selected_indices])
+                min_available = int(np.min(all_available_days[selected_indices]))
+                daily_stats.append((count, day_return, min_available))
+            else:
+                daily_stats.append((0, 0.0, 0))
+    else:
+        for day in unique_days:
+            day_mask = recent_day_indices == day
+            day_indices = np.where(day_mask)[0]
+            
+            if len(day_indices) == 0:
+                daily_stats.append((0, 0.0, 0))
+                continue
+            
+            day_preds = all_preds[day_indices]
+            day_returns = all_returns[day_indices]
+            day_available = all_available_days[day_indices]
+            
+            sorted_local_indices = np.argsort(day_preds)[::-1]
+            select_count = min(top_n_per_day, len(day_indices))
+            top_local_indices = sorted_local_indices[:select_count]
+            
+            if select_count == 0 or len(top_local_indices) == 0:
+                daily_stats.append((0, 0.0, 0))
+                continue
+            
+            day_return = np.mean(day_returns[top_local_indices])
+            min_available = int(np.min(day_available[top_local_indices]))
+            
+            daily_stats.append((select_count, day_return, min_available))
     
     return daily_stats
 
@@ -719,8 +761,8 @@ def main():
     # 执行选股
     results = run_stock_selection(model, threshold, device)
     
-    # 计算并打印最近10天实战收益率表格（包含临时数据）
-    recent_stats = calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=DataConfig.TOP_N_PER_DAY)
+    # 计算并打印最近10天实战收益率表格（包含临时数据，仅用于展示）
+    recent_stats = calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=DataConfig.TOP_N_PER_DAY, threshold=threshold)
     if recent_stats:
         print_recent_days_chart(recent_stats, last_n=10)
     

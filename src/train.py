@@ -379,8 +379,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             model_a, eval_inputs, eval_targets, eval_cumulative_returns,
             device, model_name="A",
             eval_day_indices=eval_day_indices,
-            eval_daily_returns=eval_daily_returns,
-            eval_available_days=eval_available_days
+            eval_daily_returns=eval_daily_returns
         )
 
         # 计算训练集平均损失（除以样本数，与测试损失保持一致）
@@ -485,8 +484,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 model_b, eval_inputs, eval_targets, eval_cumulative_returns,
                 device, model_name="B",
                 eval_day_indices=eval_day_indices,
-                eval_daily_returns=eval_daily_returns,
-                eval_available_days=eval_available_days
+                eval_daily_returns=eval_daily_returns
             )
 
             # 计算训练集平均损失（除以样本数，与测试损失保持一致）

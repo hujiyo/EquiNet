@@ -347,7 +347,7 @@ class TokenizedStockTransformer(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [batch_size, 60, 6] 连续值 或 [batch_size, 360] token ID
+            x: [batch_size, CONTEXT_LENGTH, INPUT_DIM] 连续值 或 [batch_size, CONTEXT_LENGTH*INPUT_DIM] token ID
 
         Returns:
             output: [batch_size, 1] 预测logits

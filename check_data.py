@@ -7,24 +7,12 @@
 - 检查数据是否准确（OHLC 逻辑、价格范围等）
 - 假设更早的数据是正确的，只检查近 100 天
 
-使用方法:
-    # 激活 conda 环境
-    conda activate equinet
-    
-    # 检查所有股票（默认检查最近 100 天）
-    python check_data.py
-    
-    # 指定检查天数
-    python check_data.py --days 50
-    
-    # 检查指定股票
-    python check_data.py --stocks 000001 600000
-    
-    # 只检查不修复
-    python check_data.py --check-only
-    
-    # 详细输出模式
-    python check_data.py --verbose
+使用方法:    
+python check_data.py # 检查所有股票（默认检查最近 100 天）    
+python check_data.py --days 50 # 指定检查天数   
+python check_data.py --stocks 000001 600000 # 检查指定股票    
+python check_data.py --check-only # 只检查不修复
+python check_data.py --verbose # 详细输出模式
 """
 
 import time
@@ -484,12 +472,8 @@ class DataChecker:
         Returns:
             检查结果列表
         """
-        print("\n" + "="*80)
-        print("股票数据质量检查")
-        print("="*80)
         print(f"检查范围：最近 {self.check_days} 天")
         print(f"检查项目：数据完整性、OHLC 逻辑、涨跌幅合理性")
-        print("="*80)
         
         if not self.login_baostock():
             print("无法登录 Baostock，退出检查")
@@ -563,9 +547,7 @@ class DataChecker:
     
     def _print_summary(self, results: List[CheckResult]):
         """打印摘要"""
-        print("\n" + "="*80)
-        print("检查摘要")
-        print("="*80)
+        print("*"*32 + " 检查摘要 " + "*"*32)
         total = self.stats['total']
         print(f"总检查数：{total}")
         pass_rate = f"{(self.stats['pass']/total*100):.1f}%" if total else "N/A"
@@ -573,7 +555,6 @@ class DataChecker:
         print(f"✗ 失败：{self.stats['fail']}")
         print(f"⚠ 警告：{self.stats['warning']}")
         print(f"○ 跳过：{self.stats['skip']}")
-        print("="*80)
         
         failed_results = [r for r in results if r.status == CheckStatus.FAIL]
         warning_results = [r for r in results if r.status == CheckStatus.WARNING]
@@ -591,9 +572,6 @@ class DataChecker:
                 print(f"  - {r.stock_code}: {r.message}")
             if len(warning_results) > 10:
                 print(f"  ... 还有 {len(warning_results) - 10} 只")
-        
-        print("="*80)
-
 
 def main():
     """主函数"""

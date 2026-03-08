@@ -18,7 +18,8 @@ from config import DataConfig, DeviceConfig
 from multiprocessing import Pool, cpu_count
 
 
-def process_single_file(file_path, file_name, test_days, train_start_year):
+def process_single_file(args):
+    file_path, file_name, test_days, train_start_year = args
     """
     处理单个股票CSV文件，返回包含训练和测试数据的字典
     
@@ -159,9 +160,8 @@ class TemporalSampler:
     时间顺序采样器：采样头在多个股票上同步向前移动，不回头
     
     采样边界设计：
-    - 每只股票的指针初始位置 = train_start_idx（TRAIN_START_YEAR年起始位置，或上市第一天）
-    - 每只股票的指针末位置 = train_end_idx（总长度-80-63=总长度-143）
-    - 指针到达末尾后该股票不再参与训练
+    - 每只股票的指针初始位置 = train_start_idx（TRAIN_START_YEAR年起始位置+1，或上市第一天+1）
+    - 每只股票的指针末位置 = train_end_idx（总长度 - TEST_DAYS - REQUIRED_LENGTH）
     
     关键设计：start_pos = max(1, train_start_idx + 1)
     原因：每个样本需要前一天数据作为归一化基准（prev_day_data = stock_data[start_idx-1]）
@@ -170,8 +170,7 @@ class TemporalSampler:
     核心算法：
     1. 计算总样本数和每个epoch需要的样本数
     2. 将总样本数均匀分配到各个epoch
-    3. 每个epoch采样固定数量的"轮次"，确保最后一个epoch恰好到达最新时间
-    4. 每轮从所有股票当前位置各取一个样本，然后指针前进
+    3. 每轮从所有股票当前位置各取一个样本，然后指针前进
     """
     def __init__(self, stock_info_list):
         self.stock_info_list = stock_info_list

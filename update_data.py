@@ -12,27 +12,12 @@
 - 详细的更新日志和错误处理
 
 使用方法:
-    # 激活 conda 环境
-    conda activate equinet
-    
-    # 安装 baostock (如果未安装)
-    pip install baostock
-    
-    # 增量更新所有股票 (默认模式)
-    python update_data.py
-    
-    # 全量更新所有股票
-    python update_data.py --mode full
-    
-    # 更新指定股票
-    python update_data.py --stocks 000001 600000 300750
-    
-    # 禁用备份
-    python update_data.py --no-backup
+python update_data.py # 增量更新所有股票 (默认模式)
+python update_data.py --mode full # 全量更新所有股票   
+python update_data.py --stocks 000001 600000 300750 # 更新指定股票    
+python update_data.py --no-backup # 禁用备份
 """
 
-import os
-import sys
 import time
 import datetime
 import pandas as pd
@@ -414,10 +399,6 @@ class StockDataUpdater:
             incremental: 是否增量更新
             stock_codes: 指定要更新的股票代码列表，None 表示更新所有
         """
-        print("\n" + "="*80)
-        print("股票数据更新")
-        print("="*80)
-        
         if not self.login_baostock():
             print("无法登录 Baostock，退出更新")
             return
@@ -459,9 +440,7 @@ class StockDataUpdater:
                 if i % 50 == 0:
                     time.sleep(1)
             
-            print("\n" + "="*80)
-            print("更新完成统计")
-            print("="*80)
+            print("*"*32 + "更新完成统计" + "*"*32)
             print(f"成功：{success_count}/{len(codes_to_update)}")
             print(f"失败：{len(failed_stocks)}")
             
@@ -470,8 +449,6 @@ class StockDataUpdater:
                 if len(failed_stocks) > 20:
                     failed_str += '...'
                 print(f"\n失败的股票：{failed_str}")
-            
-            print("="*80)
             
         finally:
             self.logout_baostock()

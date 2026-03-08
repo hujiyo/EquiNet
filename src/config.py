@@ -41,6 +41,11 @@ class DataConfig:
     # 'random': 随机采样（每次随机选择股票和位置）
     SAMPLING_STRATEGY = 'temporal'
 
+    # 是否过滤上下文最后一天接近涨停的样本
+    # True: 过滤最后一天涨停的样本（防止模型过度依赖涨停信号，避免追涨策略）
+    # False: 保留所有样本（让模型自己学习涨停后的走势规律）
+    FILTER_CONTEXT_LAST_DAY_LIMIT_UP = True
+
     # 评估参数
     EVAL_BATCH_SIZE = 256            # 评估批处理大小（分批处理，减少显存占用）
     TOP_K = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
@@ -183,6 +188,7 @@ def print_config_summary():
     print(f"  测试集天数: {DataConfig.TEST_DAYS}天")
     print(f"  上下文长度: {DataConfig.CONTEXT_LENGTH}")
     print(f"  上涨阈值: {DataConfig.UPRISE_THRESHOLD*100}%")
+    print(f"  涨停过滤: {'开启' if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP else '关闭'}")
 
     print(f"标签机制: 强势信号检测（0/1二分类）")
     print(f"  1.单日爆发: Day1涨幅 ≥ {DataConfig.SIGNAL_DAY1_BURST*100:.0f}%")

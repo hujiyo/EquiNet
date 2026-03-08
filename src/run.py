@@ -140,15 +140,16 @@ def generate_latest_input(stock_data, file_name):
             if abs(daily_return) > limit_threshold:
                 return None
     
-    # 最后一天涨停检查（最后一天涨停≥9.5%则跳过，因为次日大概率无法买入）
-    prev_day_idx = data_length - 2
-    last_day_idx = data_length - 1
-    prev_day_close = stock_data[prev_day_idx, 3]
-    last_day_close = stock_data[last_day_idx, 3]
-    if prev_day_close > 0:
-        last_day_return = (last_day_close - prev_day_close) / prev_day_close
-        if last_day_return >= 0.095:
-            return None
+    # 最后一天涨停检查（通过config.py配置开关控制）
+    if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP:
+        prev_day_idx = data_length - 2
+        last_day_idx = data_length - 1
+        prev_day_close = stock_data[prev_day_idx, 3]
+        last_day_close = stock_data[last_day_idx, 3]
+        if prev_day_close > 0:
+            last_day_return = (last_day_close - prev_day_close) / prev_day_close
+            if last_day_return >= 0.095:
+                return None
     
     # 构建输入特征（与 generate_sample_from_index 完全一致，用于预测）
     input_seq = np.empty((context_length, 6), dtype=np.float32)

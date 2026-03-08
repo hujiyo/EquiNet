@@ -511,15 +511,17 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
             if abs(daily_return) > limit_threshold:
                 return None
 
-    last_day_idx = start_idx + context_length - 1
-    prev_day_idx = start_idx + context_length - 2
-    prev_day_close = stock_data[prev_day_idx, 3]
-    last_day_close = stock_data[last_day_idx, 3]
+    # 规则7：上下文最后一天涨停过滤（可通过配置开关控制）
+    if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP:
+        last_day_idx = start_idx + context_length - 1
+        prev_day_idx = start_idx + context_length - 2
+        prev_day_close = stock_data[prev_day_idx, 3]
+        last_day_close = stock_data[last_day_idx, 3]
 
-    if prev_day_close > 0:
-        last_day_return = (last_day_close - prev_day_close) / prev_day_close
-        if last_day_return >= 0.095:
-            return None
+        if prev_day_close > 0:
+            last_day_return = (last_day_close - prev_day_close) / prev_day_close
+            if last_day_return >= 0.095:
+                return None
 
     input_seq = np.empty((context_length, 6), dtype=np.float32)
     
@@ -624,15 +626,17 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
             if abs(daily_return) > limit_threshold:
                 return None
 
-    last_day_idx = start_idx + context_length - 1
-    prev_day_idx = start_idx + context_length - 2
-    prev_day_close = stock_data[prev_day_idx, 3]
-    last_day_close = stock_data[last_day_idx, 3]
+    # 上下文最后一天涨停过滤（通过配置开关控制）
+    if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP:
+        last_day_idx = start_idx + context_length - 1
+        prev_day_idx = start_idx + context_length - 2
+        prev_day_close = stock_data[prev_day_idx, 3]
+        last_day_close = stock_data[last_day_idx, 3]
 
-    if prev_day_close > 0:
-        last_day_return = (last_day_close - prev_day_close) / prev_day_close
-        if last_day_return >= 0.095:
-            return None
+        if prev_day_close > 0:
+            last_day_return = (last_day_close - prev_day_close) / prev_day_close
+            if last_day_return >= 0.095:
+                return None
 
     input_seq = np.empty((context_length, 6), dtype=np.float32)
     

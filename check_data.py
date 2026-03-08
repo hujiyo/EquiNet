@@ -201,10 +201,19 @@ class DataChecker:
             df['max'] = pd.to_numeric(df['max'], errors='coerce')
             df['min'] = pd.to_numeric(df['min'], errors='coerce')
             df['end'] = pd.to_numeric(df['end'], errors='coerce')
-            df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+            
+            # 修复：本地数据的 volume 字段存储的是成交额（单位：千元）
+            # Baostock 的 amount 单位是元，需要除以 1000 才能与本地数据比较
+            if 'amount' in df.columns:
+                df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+                df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
+            else:
+                print(f"⚠ {stock_code} 警告：Baostock 未返回 amount 字段，使用原始 volume 字段")
+                df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
+            
             df['turn'] = pd.to_numeric(df['turn'], errors='coerce')
             
-            df = df.dropna(subset=['start', 'max', 'min', 'end', 'volume'])
+            df = df.dropna(subset=['start', 'max', 'min', 'end'])
             
             return df[['time', 'start', 'max', 'min', 'end', 'volume', 'turn']]
             

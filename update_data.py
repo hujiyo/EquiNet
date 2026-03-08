@@ -228,18 +228,21 @@ class StockDataUpdater:
             df['max'] = pd.to_numeric(df['max'], errors='coerce')
             df['min'] = pd.to_numeric(df['min'], errors='coerce')
             df['end'] = pd.to_numeric(df['end'], errors='coerce')
-            df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
             
-            df = df.dropna(subset=['start', 'max', 'min', 'end', 'volume'])
+            # 修复：使用成交额（amount）而非成交量（volume）
+            # 原始数据的 volume 字段存储的是成交额，单位：千元
+            # Baostock 的 amount 单位是元，需要除以 1000
+            if 'amount' in df.columns:
+                df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+                df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
+            else:
+                print(f"⚠ {stock_code} 警告：Baostock 未返回 amount 字段，volume 将设为 0")
+                df['volume'] = pd.Series([0.0] * len(df), dtype=float)
+            
+            df = df.dropna(subset=['start', 'max', 'min', 'end'])
             
             if len(df) == 0:
                 return None
-            
-            df['start'] = df['start'].astype(float)
-            df['max'] = df['max'].astype(float)
-            df['min'] = df['min'].astype(float)
-            df['end'] = df['end'].astype(float)
-            df['volume'] = df['volume'].astype(float)
             
             if 'turn' in df.columns:
                 df['turn'] = pd.to_numeric(df['turn'], errors='coerce')

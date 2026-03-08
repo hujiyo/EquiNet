@@ -14,31 +14,44 @@ import random
 import numpy as np
 import pandas as pd
 import torch
+from config import DataConfig, DeviceConfig
+from multiprocessing import Pool, cpu_count
 
-from config import DataConfig, DeviceConfig, ModelConfig
 
-
-def process_single_file(args):
+def process_single_file(file_path, file_name, test_days, train_start_year):
     """
-    处理单个文件，返回原始数据（不做全局标准化，避免数据泄露）
+    处理单个股票CSV文件，返回包含训练和测试数据的字典
     
-    采样边界设计（确保训练集和测试集完全不交叠）：
-    - 测试集：最后 test_days (80) 天，完全冻结
-    - 训练集最后一个样本：需要 REQUIRED_LENGTH (63) 天（60上下文+3预测）
-    - 指针到达末尾后该股票不再参与训练
-    - 为了不交叠：训练集末位置 = 总长度 - test_days - REQUIRED_LENGTH = 总长度 - 143
-    - 最低数据长度：至少 REQUIRED_LENGTH + test_days = 143 天
+    数据处理流程：
+    1. 读取CSV并反转时间顺序
+    2. 提取OHLCV数据：['start', 'max', 'min', 'end', 'volume', 'exchange']
+    3. 验证数据长度是否满足最低要求
     
-    指针位置：
-    - 训练集指针初始位置：2021年起始位置（如果还未上市则为数据第一天）
-    - 训练集指针末位置：总长度 - test_days - REQUIRED_LENGTH
+    数据分割策略（确保训练集和测试集严格分离）：
+    - 测试集：最后 test_days 天的数据，完全冻结用于评估
+    - 训练集：从 train_start_year 开始到 train_end_idx 结束
+    - 缓冲区：训练集结束后有 REQUIRED_LENGTH 天的缓冲区，防止数据泄露
+    
+    关键索引计算：
+    - train_end_idx: 训练集最后一个可用位置 = data_length - test_days - required_length
+    - test_split_point: 测试集起始位置 = data_length - test_days
+    - train_start_idx: 根据 train_start_year 找到的实际起始位置
+    
+    返回数据包含完整的训练和测试数据副本，使用时需根据索引切片访问。
+    
+    Args:
+        file_path: CSV文件路径
+        file_name: 文件名
+        test_days: 测试集天数
+        train_start_year: 训练开始年份
+    
+    Returns:
+        dict or None: 包含股票信息的字典，数据不足时返回None
     """
-    file_path, file_name, test_days, train_start_year = args
     try:
         df = pd.read_csv(file_path)
-        
         df = df.iloc[::-1].reset_index(drop=True)
-        
+                
         data = df[['start', 'max', 'min', 'end', 'volume', 'exchange']].values
         times = df['time'].values
         
@@ -72,14 +85,14 @@ def process_single_file(args):
         test_data = data.copy()
         
         stock_info = {
-            'file_name': file_name,
-            'data_length': data_length,
-            'train_data': train_data,
-            'test_data': test_data,
-            'train_start_idx': train_start_idx,
-            'train_end_idx': train_end_idx,
-            'train_length': train_length,
-            'test_split_point': test_split_point
+            'file_name': file_name,              # 股票文件名，用于识别不同股票
+            'data_length': data_length,          # 总数据长度（天数），用于验证数据充足性
+            'train_data': train_data,            # 完整数据副本，训练时根据[train_start_idx:train_end_idx]切片访问
+            'test_data': test_data,              # 完整数据副本，测试时根据[test_split_point:]切片访问
+            'train_start_idx': train_start_idx,  # 训练集起始索引，根据train_start_year计算得出
+            'train_end_idx': train_end_idx,      # 训练集结束索引，确保与测试集有缓冲区
+            'train_length': train_length,        # 可用训练数据长度，用于验证训练集是否充足
+            'test_split_point': test_split_point # 测试集起始索引，固定为最后test_days天的开始位置
         }
         
         return stock_info
@@ -93,11 +106,10 @@ def load_and_preprocess_data(data_dir=DataConfig.DATA_DIR, test_days=DataConfig.
     数据加载和预处理，使用多进程并行加载
     
     采样边界设计：
-    - 训练集：从2021年（或上市日）到 总长度-test_days-REQUIRED_LENGTH
+    - 训练集：从TRAIN_START_YEAR年（或上市日）到 总长度-test_days-REQUIRED_LENGTH
     - 测试集：最近test_days天
-    - 最低数据要求：test_days + REQUIRED_LENGTH = 143天
+    - 最低数据要求：test_days + REQUIRED_LENGTH
     """
-    from multiprocessing import Pool, cpu_count
     
     all_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
     all_files.sort()
@@ -147,9 +159,13 @@ class TemporalSampler:
     时间顺序采样器：采样头在多个股票上同步向前移动，不回头
     
     采样边界设计：
-    - 每只股票的指针初始位置 = train_start_idx（2021年起始位置，或上市第一天）
+    - 每只股票的指针初始位置 = train_start_idx（TRAIN_START_YEAR年起始位置，或上市第一天）
     - 每只股票的指针末位置 = train_end_idx（总长度-80-63=总长度-143）
     - 指针到达末尾后该股票不再参与训练
+    
+    关键设计：start_pos = max(1, train_start_idx + 1)
+    原因：每个样本需要前一天数据作为归一化基准（prev_day_data = stock_data[start_idx-1]）
+    因此第一个有效样本必须从 index=1 开始，确保 index=0 存在作为基准日
     
     核心算法：
     1. 计算总样本数和每个epoch需要的样本数
@@ -172,6 +188,9 @@ class TemporalSampler:
             train_end_idx = stock_info.get('train_end_idx', len(stock_info['data']))
             data_length = stock_info.get('data_length', 0)
             
+            # 关键设计：start_pos = max(1, train_start_idx + 1)
+            # 原因：每个样本需要前一天数据作为归一化基准（prev_day_data = stock_data[start_idx-1]）
+            # 因此第一个有效样本必须从 index=1 开始，确保 index=0 存在作为基准日
             start_pos = max(1, train_start_idx + 1)
             max_pos = train_end_idx
             
@@ -269,6 +288,9 @@ class RandomSampler:
             train_start_idx = stock_info.get('train_start_idx', 0)
             train_end_idx = stock_info.get('train_end_idx', len(stock_info['data']))
             
+            # 关键设计：start_pos = max(1, train_start_idx + 1)
+            # 原因：每个样本需要前一天数据作为归一化基准（prev_day_data = stock_data[start_idx-1]）
+            # 因此第一个有效样本必须从 index=1 开始，确保 index=0 存在作为基准日
             start_pos = max(1, train_start_idx + 1)
             max_pos = train_end_idx
             
@@ -450,7 +472,7 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
             - Day2涨跌幅 = (T+2收盘 - T+1收盘) / T+1收盘
             - Day3涨跌幅 = (T+3收盘 - T+2收盘) / T+2收盘
         
-        【收益率】用于计算投资回报，评估模型表现
+        【收益率】用于计算投资回报，评估模型表现，EquiNet默认用户是Day1以开盘价买入，Day3再以收盘价卖出，因此收益率计算逻辑如下：
             - 基准是买入价（T+1开盘价）
             - Day1收益率 = (T+1收盘 - T+1开盘) / T+1开盘（日内收益）
             - Day2收益率贡献 = (T+2收盘 - T+1收盘) / T+1开盘
@@ -561,6 +583,7 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
     生成样本，支持不完整的未来数据（用于最近几天的临时评估）
     
     与generate_sample_from_index的区别：
+    - 由run.py使用，与模型训练阶段脚本无关
     - 允许未来数据不足3天
     - 返回可用天数信息
     
@@ -572,8 +595,9 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
     context_length = DataConfig.CONTEXT_LENGTH
     data_length = len(stock_data)
 
+    # 安全检查：确保存在前一天数据作为归一化基准
     if start_idx < 1:
-        return None
+        return None  # 无法获取 stock_data[start_idx-1] 作为基准日
     
     input_seq_raw = stock_data[start_idx:start_idx + context_length]
     prev_day_data = stock_data[start_idx - 1]
@@ -867,7 +891,7 @@ def create_fixed_evaluation_dataset(test_stock_info):
 
 def create_recent_days_dataset(test_stock_info):
     """
-    创建最近几天的临时评估数据集（用于显示最近几天的实战收益率）
+    创建最近几天的临时评估数据集（用于run.py中显示最近几天的实战收益率）
     
     包含完整样本和临时样本，用于展示最近几天的选股情况
     - 完整样本（available_days == 3）：与 create_fixed_evaluation_dataset 一致
@@ -917,186 +941,3 @@ def create_recent_days_dataset(test_stock_info):
 
     return (np.asarray(recent_inputs), np.asarray(recent_cumulative_returns), 
             np.asarray(recent_day_indices), np.asarray(recent_available_days))
-
-
-def create_train_evaluation_dataset(train_stock_info, first_n_days=80):
-    """
-    创建训练集评估数据集，用于检测过拟合
-    使用每个股票的前N个交易日作为训练集评估样本
-
-    Args:
-        train_stock_info: 训练股票信息列表
-        first_n_days: 使用前多少个交易日，默认80
-
-    Returns:
-        eval_inputs, eval_targets, eval_cumulative_returns
-    """
-    eval_inputs = []
-    eval_targets = []
-    eval_cumulative_returns = []
-    eval_daily_returns = []
-
-    for stock_info in train_stock_info:
-        stock_data = stock_info['data']
-        data_length = len(stock_data)
-        train_start_idx = stock_info.get('train_start_idx', 0)
-
-        start_min = max(1, train_start_idx + 1)
-        start_max = min(train_start_idx + first_n_days, data_length - DataConfig.REQUIRED_LENGTH)
-        if start_max < start_min:
-            continue
-
-        for start_idx in range(start_min, start_max + 1):
-            sample = generate_sample_from_index([stock_info], 0, start_idx)
-            if sample is None:
-                continue
-
-            input_seq, target, cumulative_return, daily_returns = sample
-            eval_inputs.append(input_seq)
-            eval_targets.append(target)
-            eval_cumulative_returns.append(float(cumulative_return))
-            eval_daily_returns.append(daily_returns)
-
-    if len(eval_inputs) == 0:
-        raise ValueError("训练集评估集为空：train_stock_info中没有可用样本")
-
-    print(f"    训练集评估数据集已生成: {len(eval_inputs)}个样本 (每股票前{first_n_days}交易日)")
-    return np.asarray(eval_inputs), np.asarray(eval_targets), np.asarray(eval_cumulative_returns), eval_daily_returns
-
-
-def normalize_data_for_prediction(data):
-    """
-    统一的数据归一化函数（滚动窗口标准化）
-    用于所有预测场景，确保与训练时完全一致
-    
-    Args:
-        data: numpy array, shape [seq_len, 6] (OHLC + volume + exchange)
-        
-    Returns:
-        normalized_data: numpy array, shape [seq_len-1, 6] 或 None（如果数据无效）
-    """
-    if len(data) < 2:
-        return None
-    
-    normalized_data = np.zeros_like(data, dtype=np.float64)
-    
-    for i in range(1, len(data)):
-        yesterday_close = data[i-1, 3]
-        yesterday_volume = data[i-1, 4]
-        
-        if yesterday_close == 0 or yesterday_volume == 0:
-            return None
-        
-        normalized_data[i, :4] = (data[i, :4] - yesterday_close) / yesterday_close
-        normalized_data[i, 4] = (data[i, 4] - yesterday_volume) / yesterday_volume
-        normalized_data[i, 5] = np.clip(data[i, 5] / 100.0, 0.0, 1.0)
-    
-    normalized_data[:, :4] = np.clip(normalized_data[:, :4], -0.1, 0.1)
-    normalized_data[:, 4] = np.clip(normalized_data[:, 4], -5.0, 5.0)
-    normalized_data[:, 4] = np.clip(normalized_data[:, 4] / 10.0 + 0.5, 0.0, 1.0)
-    normalized_data[:, 5] = np.clip(normalized_data[:, 5], 0.0, 1.0)
-    
-    result = normalized_data[1:]
-    if np.any(np.isnan(result)) or np.any(np.isinf(result)):
-        return None
-    
-    return result
-
-
-def predict_single_stock(model_path, stock_data, device=None):
-    """
-    统一的单股票预测函数
-    
-    Args:
-        model_path: 模型文件路径
-        stock_data: numpy array, shape [seq_len, 6] (OHLC + volume + exchange)，至少需要CONTEXT_LENGTH+1天数据
-        device: 计算设备
-        
-    Returns:
-        probability: float, 预测概率 [0, 1]，如果预测失败返回None
-    """
-    from model import create_model
-    
-    if device is None:
-        device = DeviceConfig.get_device()
-    
-    if len(stock_data) < DataConfig.CONTEXT_LENGTH + 1:
-        return None
-    
-    recent_data = stock_data[-(DataConfig.CONTEXT_LENGTH + 1):]
-    
-    normalized_data = normalize_data_for_prediction(recent_data)
-    if normalized_data is None:
-        return None
-    
-    try:
-        model = create_model().to(device)
-        
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model.eval()
-    except Exception as e:
-        print(f"模型加载失败: {e}")
-        return None
-    
-    try:
-        input_tensor = torch.tensor(normalized_data, dtype=torch.float32).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            output = model(input_tensor)
-            probability = torch.sigmoid(output).float().cpu().item()
-        
-        return probability
-    except Exception as e:
-        print(f"预测失败: {e}")
-        return None
-
-
-def predict_multiple_stocks(model_path, stock_files_data, device=None):
-    """
-    统一的多股票预测函数
-    
-    Args:
-        model_path: 模型文件路径
-        stock_files_data: dict, {文件名: numpy_array}
-        device: 计算设备
-        
-    Returns:
-        predictions: list of (filename, probability)
-    """
-    from model import create_model
-    
-    if device is None:
-        device = DeviceConfig.get_device()
-    
-    predictions = []
-    
-    try:
-        model = create_model().to(device)
-        
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model.eval()
-    except Exception as e:
-        print(f"模型加载失败: {e}")
-        return predictions
-    
-    with torch.no_grad():
-        for filename, stock_data in stock_files_data.items():
-            if len(stock_data) < DataConfig.CONTEXT_LENGTH + 1:
-                continue
-            
-            recent_data = stock_data[-(DataConfig.CONTEXT_LENGTH + 1):]
-            normalized_data = normalize_data_for_prediction(recent_data)
-            if normalized_data is None:
-                continue
-            
-            try:
-                input_tensor = torch.tensor(normalized_data, dtype=torch.float32).unsqueeze(0).to(device)
-                output = model(input_tensor)
-                probability = torch.sigmoid(output).float().cpu().item()
-                
-                predictions.append((filename, probability))
-            except Exception as e:
-                print(f"{filename} 预测失败: {e}")
-                continue
-    
-    return predictions

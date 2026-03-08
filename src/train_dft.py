@@ -22,9 +22,7 @@ import copy
 import random
 import csv
 from datetime import datetime
-from config import (ModelConfig, TrainingConfig, DataConfig,
-                   DeviceConfig, ModelSaveConfig,
-                   print_config_summary, LossConfig)
+from config import (TrainingConfig,DataConfig,DeviceConfig,print_config_summary,LossConfig)
 
 from model import create_model
 
@@ -35,14 +33,12 @@ from data import (
 )
 
 from training_utils import (
-    WarmupScheduler,
     evaluate_model,
     save_model_with_metadata,
     EarlyStopping,
     calculate_test_loss,
     DynamicWeightedBCE
 )
-
 
 def train_dft_model(model, train_stock_info, test_stock_info,
                     epochs=TrainingConfig.EPOCHS,
@@ -230,7 +226,6 @@ def train_dft_model(model, train_stock_info, test_stock_info,
             print(f'\r  训练进度: {progress:.1f}%, Loss(DFT): {avg_loss:.4f}', end='', flush=True)
 
         print()
-        print()
 
         del epoch_inputs_tensor, epoch_targets_tensor
         if torch.cuda.is_available():
@@ -251,7 +246,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
 
         print(f'  [DFT模型] 训练损失: {avg_loss:.4f}, 测试损失: {test_loss:.4f}, AUC: {stats["auc"]:.4f}')
         print(f'            预测均值: {stats["pred_mean"]:.3f}, 高置信(>0.7): {stats["high_conf_count"]}, 低置信(<0.2): {stats["low_conf_count"]}')
-        print(f'            Top{DataConfig.TOP_PERCENT}%收益: {stats["top_return"]*100:+.2f}%')
+        print(f'            Top{DataConfig.TOP_K}%收益: {stats["top_return"]*100:+.2f}%')
         
         if stats['realistic_stats'] is not None:
             rs = stats['realistic_stats']

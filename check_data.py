@@ -27,21 +27,19 @@
     python check_data.py --verbose
 """
 
-import os
-import sys
 import time
 import datetime
 import pandas as pd
 import baostock as bs
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Dict
 from dataclasses import dataclass
 from enum import Enum
 
 
 class CheckStatus(Enum):
     """检查状态枚举"""
-    PASS = "✓ 通过"
+    PASS = "✓"
     FAIL = "✗ 失败"
     WARNING = "⚠ 警告"
     SKIP = "○ 跳过"

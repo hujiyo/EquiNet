@@ -19,9 +19,7 @@ import copy
 import random
 import csv
 from datetime import datetime
-from config import (ModelConfig, TrainingConfig, DataConfig,
-                   DeviceConfig, ModelSaveConfig,
-                   print_config_summary, LossConfig)
+from config import (TrainingConfig,DataConfig,DeviceConfig,print_config_summary,LossConfig)
 
 from model import create_model
 
@@ -393,7 +391,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         # 打印模型A结果
         print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
         print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
-        print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_a["top_return"]*100:+.2f}%')
+        print(f'          Top{DataConfig.TOP_K}%收益: {stats_a["top_return"]*100:+.2f}%')
         
         if stats_a['realistic_stats'] is not None:
             rs = stats_a['realistic_stats']
@@ -497,7 +495,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
 
             print(f'  [模型B] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
-            print(f'          Top{DataConfig.TOP_PERCENT}%收益: {stats_b["top_return"]*100:+.2f}%')
+            print(f'          Top{DataConfig.TOP_K}%收益: {stats_b["top_return"]*100:+.2f}%')
             
             if stats_b['realistic_stats'] is not None:
                 rs = stats_b['realistic_stats']

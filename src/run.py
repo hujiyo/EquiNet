@@ -23,7 +23,6 @@ from data import (
     load_and_preprocess_data,
     create_fixed_evaluation_dataset,
     create_recent_days_dataset,
-    generate_sample_from_index
 )
 from training_utils import evaluate_model, calculate_test_loss, DynamicWeightedBCE
 
@@ -101,7 +100,7 @@ def load_model(model_path, device):
 
 def generate_latest_input(stock_data, file_name):
     """
-    为单只股票生成最新一天的模型输入（不需要未来数据）
+    为单只股票生成最新一天的模型输入（不需要未来数据）用于预测
     
     逻辑与 generate_sample_from_index 一致，但只生成输入序列，不生成标签。
     取数据最后 CONTEXT_LENGTH 天作为输入窗口。
@@ -151,7 +150,7 @@ def generate_latest_input(stock_data, file_name):
         if last_day_return >= 0.095:
             return None
     
-    # 构建输入特征（与 generate_sample_from_index 完全一致）
+    # 构建输入特征（与 generate_sample_from_index 完全一致，用于预测）
     input_seq = np.empty((context_length, 6), dtype=np.float32)
     
     # OHLC 涨跌幅
@@ -391,10 +390,10 @@ def run_evaluation(model, test_stock_info, device):
     print(f"│  │  预测标准差:        {stats['pred_std']:.4f}")
     print(f"│  │  高置信(>0.7):      {stats['high_conf_count']} 个")
     print(f"│  │  低置信(<0.2):      {stats['low_conf_count']} 个")
-    print(f"│  │  Top{DataConfig.TOP_PERCENT}%样本数:        {stats['top_count']} 个")
-    print(f"│  │  Top{DataConfig.TOP_PERCENT}%平均收益:      {stats['top_return']*100:+.2f}%")
+    print(f"│  │  Top{DataConfig.TOP_K}%样本数:        {stats['top_count']} 个")
+    print(f"│  │  Top{DataConfig.TOP_K}%平均收益:      {stats['top_return']*100:+.2f}%")
     print(f"│  │")
-    print(f"│  │  ★ Top{DataConfig.TOP_PERCENT}%阈值:        {stats['top_threshold']:.10f}")
+    print(f"│  │  ★ Top{DataConfig.TOP_K}%阈值:        {stats['top_threshold']:.10f}")
     print(f"│  │")
     
     # 实战收益率
@@ -551,7 +550,7 @@ def run_stock_selection(model, threshold, device):
         print(f"│  最低分: {above_scores[-1]:.8f}")
         print(f"│  平均分: {np.mean(above_scores):.8f}")
         print(f"│")
-        print(f"│  推荐关注（Top{DataConfig.TOP_PERCENT}%阈值以上）:")
+        print(f"│  推荐关注（Top{DataConfig.TOP_K}%阈值以上）:")
         for i in range(min(threshold_idx, 10)):
             code, score, date, close, change = results[i]
             print(f"│    {i+1}. {code}  分数={score:.8f}  价格={close:.2f}  涨跌={change:+.2f}%")

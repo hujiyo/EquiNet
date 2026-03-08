@@ -389,7 +389,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     except ValueError:
         auc = 0.5
 
-    percent = DataConfig.TOP_PERCENT
+    percent = DataConfig.TOP_K
     top_k = max(1, int(len(all_preds) * percent / 100))
     sorted_indices = np.argsort(all_preds)[::-1]
     top_indices = sorted_indices[:top_k]
@@ -698,9 +698,9 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
     auc_str = f"{auc:.4f}".replace('.', '_')
 
     if extra_info:
-        filename = f"{model_prefix}_top{DataConfig.TOP_PERCENT}_{return_str}pct_thr{thr_str}_auc{auc_str}_ep{epoch}_{extra_info}_{timestamp}.pth"
+        filename = f"{model_prefix}_top{DataConfig.TOP_K}_{return_str}pct_thr{thr_str}_auc{auc_str}_ep{epoch}_{extra_info}_{timestamp}.pth"
     else:
-        filename = f"{model_prefix}_top{DataConfig.TOP_PERCENT}_{return_str}pct_thr{thr_str}_auc{auc_str}_ep{epoch}_{timestamp}.pth"
+        filename = f"{model_prefix}_top{DataConfig.TOP_K}_{return_str}pct_thr{thr_str}_auc{auc_str}_ep{epoch}_{timestamp}.pth"
 
     save_path = os.path.join(output_dir, filename)
     torch.save(model_state_dict, save_path)

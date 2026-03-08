@@ -420,6 +420,64 @@ def tokenize_batch_torch(batch_input: torch.Tensor, flatten: bool = True) -> tor
     return token_ids  # [batch, seq_len, 6]
 
 
+def detokenize_features(token_ids: np.ndarray, unflatten: bool = True) -> np.ndarray:
+    """
+    将token ID序列转换回连续特征序列（逆向转换，返回桶中心值）
+    
+    Args:
+        token_ids: [seq_len * 6] 或 [seq_len, 6] token ID数组
+        unflatten: 是否需要将一维数组重塑为二维（如果输入已是二维则忽略）
+    
+    Returns:
+        continuous_values: [seq_len, 6] 连续值数组（桶中心值）
+    """
+    # 处理输入形状
+    if token_ids.ndim == 1:
+        if unflatten:
+            seq_len = len(token_ids) // 6
+            token_ids = token_ids.reshape(seq_len, 6)
+        else:
+            raise ValueError("一维token_ids需要unflatten=True")
+    
+    seq_len, num_features = token_ids.shape
+    continuous_values = np.zeros((seq_len, num_features), dtype=np.float32)
+    
+    for t in range(seq_len):
+        # 特征0-3: OHLC
+        ohlc_offsets = [TokenConfig.OPEN_OFFSET, TokenConfig.HIGH_OFFSET, 
+                        TokenConfig.LOW_OFFSET, TokenConfig.CLOSE_OFFSET]
+        for f in range(4):
+            token_id = token_ids[t, f]
+            bucket = token_id - ohlc_offsets[f]
+            continuous_values[t, f] = _bucket_to_value(
+                bucket, TokenConfig.OHLC_MIN, TokenConfig.OHLC_MAX, TokenConfig.OHLC_NUM_BUCKETS
+            )
+        
+        # 特征4: volume（非均匀分桶逆向）
+        token_id = token_ids[t, 4]
+        bucket = token_id - TokenConfig.VOLUME_OFFSET
+        if bucket < TokenConfig.VOLUME_ZONE1_BUCKETS:  # 区间一
+            bucket_width = TokenConfig.VOLUME_ZONE1_MAX / TokenConfig.VOLUME_ZONE1_BUCKETS
+            continuous_values[t, 4] = (bucket + 0.5) * bucket_width
+        else:  # 区间二
+            zone2_bucket = bucket - TokenConfig.VOLUME_ZONE1_BUCKETS
+            bucket_width = (1.0 - TokenConfig.VOLUME_ZONE1_MAX) / TokenConfig.VOLUME_ZONE2_BUCKETS
+            continuous_values[t, 4] = TokenConfig.VOLUME_ZONE1_MAX + (zone2_bucket + 0.5) * bucket_width
+        
+        # 特征5: exchange（非均匀分桶逆向）
+        token_id = token_ids[t, 5]
+        bucket = token_id - TokenConfig.EXCHANGE_OFFSET
+        if bucket < TokenConfig.EXCHANGE_ZONE1_BUCKETS:  # 区间一
+            bucket_width = TokenConfig.EXCHANGE_ZONE1_MAX / TokenConfig.EXCHANGE_ZONE1_BUCKETS
+            continuous_values[t, 5] = (bucket + 0.5) * bucket_width
+        else:  # 区间二
+            zone2_bucket = bucket - TokenConfig.EXCHANGE_ZONE1_BUCKETS
+            bucket_width = (1.0 - TokenConfig.EXCHANGE_ZONE1_MAX) / TokenConfig.EXCHANGE_ZONE2_BUCKETS
+            continuous_values[t, 5] = TokenConfig.EXCHANGE_ZONE1_MAX + (zone2_bucket + 0.5) * bucket_width
+    
+    return continuous_values
+
+
 def get_token_info(token_id: int) -> dict:
     """
     获取token的详细信息（用于调试）
@@ -498,66 +556,3 @@ def get_token_info(token_id: int) -> dict:
         'bucket_range': (bucket_start, bucket_end),
         'center_value': center_value
     }
-
-
-if __name__ == "__main__":
-    # 测试代码
-    print("=" * 50)
-    print("Token化模块测试")
-    print("=" * 50)
-    
-    print(f"\n配置信息:")
-    print(f"  OHLC桶数: {TokenConfig.OHLC_NUM_BUCKETS} (步长1%)")
-    print(f"  Volume桶数: {TokenConfig.VOLUME_NUM_BUCKETS} (两段式: -100%到+100%用20桶步长10%, +100%到+500%用16桶步长25%)")
-    print(f"  Exchange桶数: {TokenConfig.EXCHANGE_NUM_BUCKETS} (两段式: 0-20%用40桶步长0.5%, 20-100%用20桶步长4%)")
-    print(f"  总词表大小: {TokenConfig.VOCAB_SIZE}")
-    print(f"  Token序列长度: {TokenConfig.TOKEN_SEQ_LEN}")
-    
-    # 创建测试数据（模拟实际数据分布，范围与连续版一致[0,1]）
-    np.random.seed(42)
-    seq_len = DataConfig.CONTEXT_LENGTH
-    
-    test_input = np.zeros((seq_len, 6), dtype=np.float32)
-    test_input[:, :4] = np.random.uniform(-0.1, 0.1, (seq_len, 4))  # OHLC: [-10%, +10%]
-    test_input[:, 4] = np.random.uniform(0, 1, seq_len)  # volume: [0, 1]
-    test_input[:, 5] = np.random.uniform(0, 1, seq_len)  # exchange: [0, 1]（与连续版一致）
-    
-    print(f"\n测试输入形状: {test_input.shape}")
-    print(f"  OHLC范围: [{test_input[:, :4].min():.4f}, {test_input[:, :4].max():.4f}]")
-    print(f"  Volume范围: [{test_input[:, 4].min():.4f}, {test_input[:, 4].max():.4f}]")
-    print(f"  Exchange范围: [{test_input[:, 5].min():.4f}, {test_input[:, 5].max():.4f}]")
-    
-    # 测试单样本token化
-    token_ids = tokenize_features_vectorized(test_input)
-    print(f"\nToken化结果形状: {token_ids.shape}")
-    print(f"  Token ID范围: [{token_ids.min()}, {token_ids.max()}]")
-    
-    # 验证token分布
-    print(f"\n前6个token (第1天的6个特征):")
-    for i in range(6):
-        info = get_token_info(token_ids[i])
-        print(f"  {info['feature_name']:8s}: token={info['token_id']:3d}, "
-              f"bucket={info['bucket_idx']:2d}, range=[{info['bucket_range'][0]:+.4f}, {info['bucket_range'][1]:+.4f}]")
-    
-    # 测试批量token化
-    batch_size = 32
-    batch_input = np.zeros((batch_size, seq_len, 6), dtype=np.float32)
-    batch_input[:, :, :4] = np.random.uniform(-0.1, 0.1, (batch_size, seq_len, 4))
-    batch_input[:, :, 4] = np.random.uniform(0, 1, (batch_size, seq_len))
-    batch_input[:, :, 5] = np.random.uniform(0, 0.1, (batch_size, seq_len))
-    
-    batch_tokens = tokenize_batch(batch_input)
-    print(f"\n批量Token化结果形状: {batch_tokens.shape}")
-    
-    # 测试PyTorch版本
-    batch_tensor = torch.from_numpy(batch_input)
-    batch_tokens_torch = tokenize_batch_torch(batch_tensor)
-    print(f"PyTorch Token化结果形状: {batch_tokens_torch.shape}")
-    
-    # 验证NumPy和PyTorch结果一致
-    assert np.allclose(batch_tokens, batch_tokens_torch.numpy()), "NumPy和PyTorch结果不一致!"
-    print("\n✓ NumPy和PyTorch结果一致")
-    
-    print("\n" + "=" * 50)
-    print("测试完成!")
-    print("=" * 50)

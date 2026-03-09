@@ -19,11 +19,7 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
-from data import (
-    load_and_preprocess_data,
-    create_fixed_evaluation_dataset,
-    create_recent_days_dataset,
-)
+from data import load_and_preprocess_data, create_fixed_evaluation_dataset, create_recent_days_dataset, normalize_and_validate_context_window
 from training_utils import evaluate_model, calculate_test_loss, DynamicWeightedBCE
 
 
@@ -102,7 +98,7 @@ def generate_latest_input(stock_data, file_name):
     """
     为单只股票生成最新一天的模型输入（不需要未来数据）用于预测
     
-    逻辑与 generate_sample_from_index 一致，但只生成输入序列，不生成标签。
+    使用 data.py 的统一归一化函数，确保与训练时的数据处理逻辑完全一致。
     取数据最后 CONTEXT_LENGTH 天作为输入窗口。
     
     返回: (input_seq, stock_code) 或 None
@@ -116,64 +112,17 @@ def generate_latest_input(stock_data, file_name):
     
     # 取最后 context_length 天作为输入窗口
     start_idx = data_length - context_length
-    input_seq_raw = stock_data[start_idx:]  # [context_length, 6]
-    prev_day_data = stock_data[start_idx - 1]
     
-    prev_close = prev_day_data[3]
-    prev_volume = prev_day_data[4]
-    if prev_close == 0 or prev_volume == 0 or np.any(prev_day_data[:4] == 0):
-        return None
+    # 使用 data.py 的统一归一化和验证函数
+    input_seq = normalize_and_validate_context_window(
+        stock_data, 
+        start_idx, 
+        context_length,
+        check_limit_up=True,
+        required_length=context_length  # 只检查上下文窗口（无未来数据）
+    )
     
-    closes = input_seq_raw[:, 3]
-    volumes = input_seq_raw[:, 4]
-    if np.any(closes == 0) or np.any(volumes == 0):
-        return None
-    
-    # 涨停过滤（窗口内任何一天涨跌超过11%则跳过）
-    limit_threshold = 0.11
-    all_data = stock_data[start_idx - 1:]  # 包含prev_day
-    for day_idx in range(1, len(all_data)):
-        today_close = all_data[day_idx, 3]
-        yesterday_close = all_data[day_idx - 1, 3]
-        if yesterday_close > 0:
-            daily_return = (today_close - yesterday_close) / yesterday_close
-            if abs(daily_return) > limit_threshold:
-                return None
-    
-    # 最后一天涨停检查（通过config.py配置开关控制）
-    if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP:
-        prev_day_idx = data_length - 2
-        last_day_idx = data_length - 1
-        prev_day_close = stock_data[prev_day_idx, 3]
-        last_day_close = stock_data[last_day_idx, 3]
-        if prev_day_close > 0:
-            last_day_return = (last_day_close - prev_day_close) / prev_day_close
-            if last_day_return >= 0.095:
-                return None
-    
-    # 构建输入特征（与 generate_sample_from_index 完全一致，用于预测）
-    input_seq = np.empty((context_length, 6), dtype=np.float32)
-    
-    # OHLC 涨跌幅
-    input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
-    if context_length > 1:
-        input_seq[1:, :4] = (input_seq_raw[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
-    
-    # 量比
-    input_seq[0, 4] = (volumes[0] - prev_volume) / prev_volume
-    if context_length > 1:
-        input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
-    
-    # 换手率
-    input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
-    
-    # 裁剪
-    np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
-    np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
-    input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
-    np.clip(input_seq[:, 4:6], 0.0, 1.0, out=input_seq[:, 4:6])
-    
-    if np.any(~np.isfinite(input_seq)):
+    if input_seq is None:
         return None
     
     # 提取股票代码（去掉.csv后缀）

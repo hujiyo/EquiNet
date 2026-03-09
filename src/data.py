@@ -483,73 +483,27 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     context_length = DataConfig.CONTEXT_LENGTH
     required_length = DataConfig.REQUIRED_LENGTH
 
-    input_seq_raw = stock_data[start_idx:start_idx + context_length]
-    prev_day_data = stock_data[start_idx - 1]
-
-    prev_close = prev_day_data[3]
-    prev_volume = prev_day_data[4]
-    if prev_close == 0 or prev_volume == 0 or np.any(prev_day_data[:4] == 0):
-        return None
+    # 使用统一归一化函数，消除重复代码
+    input_seq = normalize_and_validate_context_window(
+        stock_data, start_idx, context_length,
+        check_limit_up=True, required_length=required_length
+    )
     
-    closes = input_seq_raw[:, 3]
-    volumes = input_seq_raw[:, 4]
-    if np.any(closes == 0) or np.any(volumes == 0):
+    if input_seq is None:
         return None
 
-    sample_window_start = start_idx - 1
-    sample_window_end = start_idx + required_length
-    sample_data = stock_data[sample_window_start:sample_window_end]
-
-    limit_threshold = 0.11
-
-    for day_idx in range(1, len(sample_data)):
-        today_close = sample_data[day_idx, 3]
-        yesterday_close = sample_data[day_idx - 1, 3]
-
-        if yesterday_close > 0:
-            daily_return = (today_close - yesterday_close) / yesterday_close
-            if abs(daily_return) > limit_threshold:
-                return None
-
-    # 规则7：上下文最后一天涨停过滤（可通过配置开关控制）
-    if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP:
-        last_day_idx = start_idx + context_length - 1
-        prev_day_idx = start_idx + context_length - 2
-        prev_day_close = stock_data[prev_day_idx, 3]
-        last_day_close = stock_data[last_day_idx, 3]
-
-        if prev_day_close > 0:
-            last_day_return = (last_day_close - prev_day_close) / prev_day_close
-            if last_day_return >= 0.095:
-                return None
-
-    input_seq = np.empty((context_length, 6), dtype=np.float32)
-    
-    input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
-    if context_length > 1:
-        input_seq[1:, :4] = (input_seq_raw[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
-    
-    input_seq[0, 4] = (volumes[0] - prev_volume) / prev_volume
-    if context_length > 1:
-        input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
-    
-    input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
-    
-    np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
-    np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
-    input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
-    np.clip(input_seq[:, 4:6], 0.0, 1.0, out=input_seq[:, 4:6])
-
-    if np.any(~np.isfinite(input_seq)):
-        return None
-
+    # 提取未来数据并验证零值
     t1_open = stock_data[start_idx + context_length, 0]
     t1_close = stock_data[start_idx + context_length, 3]
     t2_close = stock_data[start_idx + context_length + 1, 3]
     t3_close = stock_data[start_idx + context_length + 2, 3]
 
-    if t1_open == 0:
+    if t1_open == 0 or t1_close == 0 or t2_close == 0 or t3_close == 0:
         return None
+    
+    # 获取上下文最后一天收盘价（用于计算 Day1 涨跌幅）
+    input_seq_raw = stock_data[start_idx:start_idx + context_length]
+    closes = input_seq_raw[:, 3]
 
     cumulative_return = (t3_close - t1_open) / t1_open
 
@@ -596,68 +550,19 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
     context_length = DataConfig.CONTEXT_LENGTH
     data_length = len(stock_data)
 
-    # 安全检查：确保存在前一天数据作为归一化基准
-    if start_idx < 1:
-        return None  # 无法获取 stock_data[start_idx-1] 作为基准日
+    # 计算实际可用的样本窗口长度（用于涨停过滤）
+    required_length = min(DataConfig.REQUIRED_LENGTH, data_length - start_idx)
     
-    input_seq_raw = stock_data[start_idx:start_idx + context_length]
-    prev_day_data = stock_data[start_idx - 1]
-
-    prev_close = prev_day_data[3]
-    prev_volume = prev_day_data[4]
-    if prev_close == 0 or prev_volume == 0 or np.any(prev_day_data[:4] == 0):
-        return None
+    # 使用统一归一化函数，消除重复代码
+    input_seq = normalize_and_validate_context_window(
+        stock_data, start_idx, context_length,
+        check_limit_up=True, required_length=required_length
+    )
     
-    closes = input_seq_raw[:, 3]
-    volumes = input_seq_raw[:, 4]
-    if np.any(closes == 0) or np.any(volumes == 0):
+    if input_seq is None:
         return None
 
-    sample_window_start = start_idx - 1
-    sample_window_end = min(data_length, start_idx + DataConfig.REQUIRED_LENGTH)
-    sample_data = stock_data[sample_window_start:sample_window_end]
-
-    limit_threshold = 0.11
-    for day_idx in range(1, len(sample_data)):
-        today_close = sample_data[day_idx, 3]
-        yesterday_close = sample_data[day_idx - 1, 3]
-        if yesterday_close > 0:
-            daily_return = (today_close - yesterday_close) / yesterday_close
-            if abs(daily_return) > limit_threshold:
-                return None
-
-    # 上下文最后一天涨停过滤（通过配置开关控制）
-    if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP:
-        last_day_idx = start_idx + context_length - 1
-        prev_day_idx = start_idx + context_length - 2
-        prev_day_close = stock_data[prev_day_idx, 3]
-        last_day_close = stock_data[last_day_idx, 3]
-
-        if prev_day_close > 0:
-            last_day_return = (last_day_close - prev_day_close) / prev_day_close
-            if last_day_return >= 0.095:
-                return None
-
-    input_seq = np.empty((context_length, 6), dtype=np.float32)
-    
-    input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
-    if context_length > 1:
-        input_seq[1:, :4] = (input_seq_raw[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
-    
-    input_seq[0, 4] = (volumes[0] - prev_volume) / prev_volume
-    if context_length > 1:
-        input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
-    
-    input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
-    
-    np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
-    np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
-    input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
-    np.clip(input_seq[:, 4:6], 0.0, 1.0, out=input_seq[:, 4:6])
-
-    if np.any(~np.isfinite(input_seq)):
-        return None
-
+    # 计算可用的未来天数
     t1_idx = start_idx + context_length
     t2_idx = start_idx + context_length + 1
     t3_idx = start_idx + context_length + 2
@@ -673,10 +578,14 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
     if available_days == 0:
         return None
     
+    # 获取上下文最后一天收盘价（用于计算 Day1 涨跌幅）
+    input_seq_raw = stock_data[start_idx:start_idx + context_length]
+    closes = input_seq_raw[:, 3]
+    
     t1_open = stock_data[t1_idx, 0]
     t1_close = stock_data[t1_idx, 3]
 
-    if t1_open == 0:
+    if t1_open == 0 or t1_close == 0:
         return None
 
     daily_returns = []
@@ -691,12 +600,16 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
     
     if available_days >= 2:
         t2_close = stock_data[t2_idx, 3]
+        if t2_close == 0:
+            return None
         day2_return = (t2_close - t1_close) / t1_open
         daily_returns.append(day2_return)
         cumulative_return = day1_return + day2_return
     
     if available_days >= 3:
         t3_close = stock_data[t3_idx, 3]
+        if t3_close == 0:
+            return None
         day3_return = (t3_close - t2_close) / t1_open
         daily_returns.append(day3_return)
         cumulative_return = day1_return + day2_return + day3_return
@@ -944,3 +857,99 @@ def create_recent_days_dataset(test_stock_info):
 
     return (np.asarray(recent_inputs), np.asarray(recent_cumulative_returns), 
             np.asarray(recent_day_indices), np.asarray(recent_available_days))
+
+
+def normalize_and_validate_context_window(stock_data, start_idx, context_length, 
+                                          check_limit_up=True, required_length=None):
+    """
+    统一的上下文窗口归一化和验证函数
+    
+    用于消除 run.py 和 data.py 中的代码重复。
+    执行完整的数据验证和归一化流程，与 generate_sample_from_index 保持一致。
+    
+    Args:
+        stock_data: 股票原始数据 [N, 6]
+        start_idx: 上下文窗口起始索引（需要 >= 1，因为需要前一天作为基准）
+        context_length: 上下文窗口长度
+        check_limit_up: 是否检查涨停（默认 True）
+        required_length: 完整采样窗口长度（用于涨停过滤），如果为 None 则只检查上下文窗口
+    
+    Returns:
+        input_seq: [context_length, 6] 归一化后的输入序列，或 None（如果验证失败）
+    
+    验证项：
+        1. 基准日（start_idx-1）的 OHLC 和 volume 非零
+        2. 上下文窗口的 close 和 volume 非零
+        3. 涨停过滤：窗口内任何一天涨跌幅不超过 11%
+        4. 上下文最后一天涨停过滤（可选，通过 DataConfig 控制）
+        5. 归一化后无 nan/inf
+    """
+    if start_idx < 1:
+        return None
+    
+    if required_length is None:
+        required_length = context_length
+    
+    input_seq_raw = stock_data[start_idx:start_idx + context_length]
+    prev_day_data = stock_data[start_idx - 1]
+
+    prev_close = prev_day_data[3]
+    prev_volume = prev_day_data[4]
+    if prev_close == 0 or prev_volume == 0 or np.any(prev_day_data[:4] == 0):
+        return None
+    
+    closes = input_seq_raw[:, 3]
+    volumes = input_seq_raw[:, 4]
+    if np.any(closes == 0) or np.any(volumes == 0):
+        return None
+
+    if check_limit_up:
+        sample_window_start = start_idx - 1
+        sample_window_end = start_idx + required_length
+        sample_data = stock_data[sample_window_start:sample_window_end]
+
+        limit_threshold = 0.11
+        for day_idx in range(1, len(sample_data)):
+            today_close = sample_data[day_idx, 3]
+            yesterday_close = sample_data[day_idx - 1, 3]
+
+            if yesterday_close == 0:
+                return None
+            daily_return = (today_close - yesterday_close) / yesterday_close
+            if abs(daily_return) > limit_threshold:
+                return None
+
+    # 上下文最后一天涨停过滤（独立于 check_limit_up，仅受 DataConfig 控制）
+    if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP:
+        last_day_idx = start_idx + context_length - 1
+        prev_day_idx = start_idx + context_length - 2
+        prev_day_close = stock_data[prev_day_idx, 3]
+        last_day_close = stock_data[last_day_idx, 3]
+
+        if prev_day_close == 0:
+            return None
+        last_day_return = (last_day_close - prev_day_close) / prev_day_close
+        if last_day_return >= 0.095:
+            return None
+
+    input_seq = np.empty((context_length, 6), dtype=np.float32)
+    
+    input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
+    if context_length > 1:
+        input_seq[1:, :4] = (input_seq_raw[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
+    
+    input_seq[0, 4] = (volumes[0] - prev_volume) / prev_volume
+    if context_length > 1:
+        input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
+    
+    input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
+    
+    np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
+    np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
+    input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
+    np.clip(input_seq[:, 4:6], 0.0, 1.0, out=input_seq[:, 4:6])
+
+    if np.any(~np.isfinite(input_seq)):
+        return None
+
+    return input_seq

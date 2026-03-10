@@ -342,7 +342,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     模型评估函数
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
 
-    优化版本：分批处理，减少显存占用
+    分批处理，减少显存占用
 
     返回统计字典，包含：
         auc：AUC得分

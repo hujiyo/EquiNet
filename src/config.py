@@ -24,18 +24,6 @@ class DataConfig:
     FUTURE_DAYS = 3                  # 未来预测天数
     REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS  # 每样本总需求长度
 
-    # 强势信号检测参数（用于二分类标签设置）
-    SIGNAL_DAY1_BURST = 0.05         # 单日爆发阈值：Day1涨幅≥5%
-    SIGNAL_TWO_DAY_CUM = 0.06        # 双日累计阈值：Day1+Day2≥6%
-    SIGNAL_DAY_MIN = 0.01            # 单日最小涨幅：≥1%
-    SIGNAL_THREE_DAY_CUM = 0.05      # 三日累计阈值：Day1+Day2+Day3≥5%
-    SIGNAL_ANY_BURST = 0.08          # 任意一天爆发阈值：≥8%
-    SIGNAL_BURST_CUM = 0.06          # 爆发后累计阈值：累计≥6%
-    UPRISE_THRESHOLD = 0.08          # 上涨阈值（8%，涨幅≥8%视为上涨）
-    # 风险控制参数（用于二分类标签设置）
-    SIGNAL_MIN_CUM_RETURN = 0.03     # 最低累计收益：≥3%（过滤累计亏损或微利样本）
-    SIGNAL_DAY1_MAX_DROP = -0.02     # Day1最大跌幅：≥-2%（避免买入当天就亏）
-
     # 采样策略配置
     # 'temporal': 时间顺序采样（指针在训练集上循环滑动）
     # 'random': 随机采样（每次随机选择股票和位置）
@@ -51,6 +39,76 @@ class DataConfig:
     TOP_K = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
     TOP_N_PER_DAY = 0                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
     MAX_SELECT_PER_DAY = 4             # 全局阈值模式下每天最多选股数量（0表示不限制）
+
+# ==================== 用户自定义标签生成函数 ====================
+def generate_label(day1_change, day2_change, day3_change):
+    """
+    【用户自定义标签生成函数】
+
+    此函数定义什么是"强势买入信号"。
+    只要返回 0（无信号）或 1（有信号）即可。
+
+    ========== 核心概念区分 ==========
+    【涨跌幅】vs【收益率】：
+    - 涨跌幅：基准是前一日收盘价，用于判断股票走势强弱
+      * Day1涨跌幅 = (T+1收盘 - T日收盘) / T日收盘
+      * Day2涨跌幅 = (T+2收盘 - T+1收盘) / T+1收盘
+      * Day3涨跌幅 = (T+3收盘 - T+2收盘) / T+2收盘
+    - 收益率：基准是买入价（T+1开盘价），用于计算投资回报
+      * 不在此函数中使用，仅用于评估模型表现
+
+    ========== 可用变量说明 ==========
+    Args:
+        day1_change: Day1 涨跌幅，范围约 [-0.10, 0.10]
+        day2_change: Day2 涨跌幅，范围约 [-0.10, 0.10]
+        day3_change: Day3 涨跌幅，范围约 [-0.10, 0.10]
+    派生变量（根据需要自行计算）：
+    - cum_2day = day1_change + day2_change（Day1+Day2 累计涨跌幅）
+    - cum_3day = day1_change + day2_change + day3_change（三天累计涨跌幅）
+    - max_day = max(day1_change, day2_change, day3_change)（最大涨跌幅）
+    - min_day = min(day1_change, day2_change, day3_change)（最小涨跌幅）
+
+    ========== 默认规则说明 ==========
+    当前实现使用五条件规则，满足任一即返回1（强势信号）：
+    1. 单日爆发：Day1≥5% 且 累计≥3%
+    2. 双日接力：Day1+Day2≥6% 且 Day1,Day2>1% 且 累计≥3%
+    3. 稳健上涨：Day1,Day2,Day3≥1% 且 累计≥5%
+    4. 爆发后延续：任意一天≥8% 且 累计≥6% 且 Day1≥-2%
+    5. 累计达标：3天累计≥8% 且 Day1≥-2%    
+
+    Returns:
+        int: 1 表示强势信号（正样本），0 表示无信号（负样本）
+    """
+    # ========== 派生变量计算 ==========
+    cum_2day = day1_change + day2_change
+    cum_3day = day1_change + day2_change + day3_change
+    max_day = max(day1_change, day2_change, day3_change)
+
+    # ========== 五条件规则（默认实现，可完全自定义）==========
+    # 满足任一条件即返回1（强势信号）
+
+    # 条件1：单日爆发 + 累计兜底
+    if day1_change >= 0.05 and cum_3day >= 0.03:
+        return 1
+
+    # 条件2：双日接力 + 累计兜底
+    if cum_2day >= 0.06 and day1_change > 0.01 and day2_change > 0.01 and cum_3day >= 0.03:
+        return 1
+
+    # 条件3：稳健上涨（天然安全）
+    if day1_change >= 0.01 and day2_change >= 0.01 and day3_change >= 0.01 and cum_3day >= 0.05:
+        return 1
+
+    # 条件4：爆发后延续 + Day1保护
+    if max_day >= 0.08 and cum_3day >= 0.06 and day1_change >= -0.02:
+        return 1
+
+    # 条件5：累计达标 + Day1保护
+    if cum_3day >= 0.08 and day1_change >= -0.02:
+        return 1
+
+    return 0
+
 # ==================== 模型架构参数 ====================
 class ModelConfig:
     """模型架构相关参数"""
@@ -187,16 +245,7 @@ def print_config_summary():
     print(f"  训练集起始年份: {DataConfig.TRAIN_START_YEAR}年（过滤{DataConfig.TRAIN_START_YEAR-1}年及以前的数据）")
     print(f"  测试集天数: {DataConfig.TEST_DAYS}天")
     print(f"  上下文长度: {DataConfig.CONTEXT_LENGTH}")
-    print(f"  上涨阈值: {DataConfig.UPRISE_THRESHOLD*100}%")
     print(f"  涨停过滤: {'开启' if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP else '关闭'}")
-
-    print(f"标签机制: 强势信号检测（0/1二分类）")
-    print(f"  1.单日爆发: Day1涨幅 ≥ {DataConfig.SIGNAL_DAY1_BURST*100:.0f}%")
-    print(f"  2.双日接力: Day1+Day2 ≥ {DataConfig.SIGNAL_TWO_DAY_CUM*100:.0f}% 且 Day1,Day2 > {DataConfig.SIGNAL_DAY_MIN*100:.0f}%")
-    print(f"  3.稳健上涨: Day1,Day2,Day3 ≥ {DataConfig.SIGNAL_DAY_MIN*100:.0f}% 且 累计 ≥ {DataConfig.SIGNAL_THREE_DAY_CUM*100:.0f}%")
-    print(f"  4.爆发后延续: 任意一天 ≥ {DataConfig.SIGNAL_ANY_BURST*100:.0f}% 且 累计 ≥ {DataConfig.SIGNAL_BURST_CUM*100:.0f}%")
-    print(f"  5.累计达标: 3天累计涨幅 ≥ {DataConfig.UPRISE_THRESHOLD*100:.0f}%（基础条件）")
-
     print(f"评估参数:")
     print(f"  评估批处理大小: {DataConfig.EVAL_BATCH_SIZE}")
     print("=" * 50)

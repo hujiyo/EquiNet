@@ -13,8 +13,7 @@ import os
 import random
 import numpy as np
 import pandas as pd
-import torch
-from config import DataConfig, DeviceConfig
+from config import DataConfig, generate_label
 from multiprocessing import Pool, cpu_count
 
 
@@ -385,74 +384,6 @@ def create_sampler(stock_info_list, strategy=None):
         return TemporalSampler(stock_info_list)
 
 
-def check_strong_signal(daily_price_changes):
-    """
-    强势信号检测：判断是否存在强势买入信号（风险优化版）
-    
-    注意：此函数使用"涨跌幅"而非"收益率"
-    - 涨跌幅：基准是前一日收盘价，用于判断股票走势强弱
-    - 收益率：基准是买入价，用于计算投资回报
-    
-    标签=1的条件（满足任一即可）：
-    1. 单日爆发：Day1涨跌幅 ≥ 5% 且 累计 ≥ 2%
-    2. 双日接力：Day1+Day2累计涨跌幅 ≥ 6% 且 Day1>1%, Day2>1% 且 累计 ≥ 2%
-    3. 稳健上涨：Day1 ≥ 1% 且 Day2 ≥ 1% 且 Day3 ≥ 1% 且 累计 ≥ 5%
-    4. 爆发后延续：任意一天涨跌幅 ≥ 8% 且 累计 ≥ 6% 且 Day1 ≥ -2%
-    5. 累计达标：3天累计涨跌幅 ≥ 8% 且 Day1 ≥ -2%
-    
-    风险控制：
-    - 条件1、2增加累计≥2%兜底，过滤8.13%和1.47%的累计亏损样本
-    - 条件4、5增加Day1≥-2%限制，过滤25.60%和4.65%的"买入当天就亏"样本
-    - 条件3天然安全，无需修改
-    
-    Args:
-        daily_price_changes: list或np.array, 3天的涨跌幅 [Day1, Day2, Day3]
-            Day1涨跌幅 = (T+1收盘 - T日收盘) / T日收盘
-            Day2涨跌幅 = (T+2收盘 - T+1收盘) / T+1收盘
-            Day3涨跌幅 = (T+3收盘 - T+2收盘) / T+2收盘
-        
-    Returns:
-        int: 1表示存在强势信号，0表示无信号
-    """
-    if len(daily_price_changes) < 3:
-        return 0
-    
-    r1, r2, r3 = daily_price_changes[0], daily_price_changes[1], daily_price_changes[2]
-    cum_2day = r1 + r2
-    cum_3day = r1 + r2 + r3
-    
-    # 条件1：单日爆发 + 累计兜底
-    if r1 >= DataConfig.SIGNAL_DAY1_BURST and cum_3day >= DataConfig.SIGNAL_MIN_CUM_RETURN:
-        return 1
-    
-    # 条件2：双日接力 + 累计兜底
-    if (cum_2day >= DataConfig.SIGNAL_TWO_DAY_CUM and 
-        r1 > DataConfig.SIGNAL_DAY_MIN and 
-        r2 > DataConfig.SIGNAL_DAY_MIN and 
-        cum_3day >= DataConfig.SIGNAL_MIN_CUM_RETURN):
-        return 1
-    
-    # 条件3：稳健上涨（天然安全，无需修改）
-    if (r1 >= DataConfig.SIGNAL_DAY_MIN and 
-        r2 >= DataConfig.SIGNAL_DAY_MIN and 
-        r3 >= DataConfig.SIGNAL_DAY_MIN and 
-        cum_3day >= DataConfig.SIGNAL_THREE_DAY_CUM):
-        return 1
-    
-    # 条件4：爆发后延续 + Day1保护
-    max_day = max(r1, r2, r3)
-    if (max_day >= DataConfig.SIGNAL_ANY_BURST and 
-        cum_3day >= DataConfig.SIGNAL_BURST_CUM and 
-        r1 >= DataConfig.SIGNAL_DAY1_MAX_DROP):
-        return 1
-    
-    # 条件5：累计达标 + Day1保护
-    if cum_3day >= DataConfig.UPRISE_THRESHOLD and r1 >= DataConfig.SIGNAL_DAY1_MAX_DROP:
-        return 1
-    
-    return 0
-
-
 def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     """
     根据预生成的索引生成单个样本（向量化优化版）
@@ -527,8 +458,12 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     day3_return = (t3_close - t2_close) / t1_open             # Day3收益贡献
     daily_returns.append(day3_return)
     
-    # 标签生成使用涨跌幅
-    target = float(check_strong_signal(daily_price_changes))
+    # 标签生成使用涨跌幅，直接调用 config.generate_label()
+    target = float(generate_label(
+        day1_change=daily_price_changes[0],
+        day2_change=daily_price_changes[1],
+        day3_change=daily_price_changes[2]
+    ))
 
     return input_seq, target, cumulative_return, daily_returns
 
@@ -536,13 +471,14 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
 def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
     """
     生成样本，支持不完整的未来数据（用于最近几天的临时评估）
-    
+
     与generate_sample_from_index的区别：
     - 由run.py使用，与模型训练阶段脚本无关
     - 允许未来数据不足3天
     - 返回可用天数信息
-    
-    返回: (input_seq, target, cumulative_return, daily_returns, available_days) 或 None
+    - 不生成标签（仅用于推理展示）
+
+    返回: (input_seq, cumulative_return, daily_returns, available_days) 或 None
         available_days: 可用的未来天数 (1, 2, 或 3)
     """
     stock_info = stock_info_list[stock_idx]
@@ -614,21 +550,7 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
         daily_returns.append(day3_return)
         cumulative_return = day1_return + day2_return + day3_return
     
-    daily_price_changes = []
-    day1_price_change = (t1_close - closes[-1]) / closes[-1]
-    daily_price_changes.append(day1_price_change)
-    
-    if available_days >= 2:
-        day2_price_change = (t2_close - t1_close) / t1_close
-        daily_price_changes.append(day2_price_change)
-    
-    if available_days >= 3:
-        day3_price_change = (t3_close - t2_close) / t2_close
-        daily_price_changes.append(day3_price_change)
-    
-    target = float(check_strong_signal(daily_price_changes))
-
-    return input_seq, target, cumulative_return, daily_returns, available_days
+    return input_seq, cumulative_return, daily_returns, available_days
 
 
 def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng):
@@ -841,7 +763,7 @@ def create_recent_days_dataset(test_stock_info):
             if sample is None:
                 continue
 
-            input_seq, target, cumulative_return, daily_returns, available_days = sample
+            input_seq, cumulative_return, daily_returns, available_days = sample
             
             predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
             

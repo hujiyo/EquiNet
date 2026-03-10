@@ -8,11 +8,11 @@
 - 假设更早的数据是正确的，只检查近 100 天
 
 使用方法:    
-python check_data.py # 检查所有股票（默认检查最近 100 天）    
-python check_data.py --days 50 # 指定检查天数   
-python check_data.py --stocks 000001 600000 # 检查指定股票    
-python check_data.py --check-only # 只检查不修复
-python check_data.py --verbose # 详细输出模式
+python data_check.py # 检查所有股票（默认检查最近 100 天）    
+python data_check.py --days 50 # 指定检查天数   
+python data_check.py --stocks 000001 600000 # 检查指定股票    
+python data_check.py --check-only # 只检查不修复
+python data_check.py --verbose # 详细输出模式
 """
 
 import time

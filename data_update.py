@@ -12,10 +12,10 @@
 - 详细的更新日志和错误处理
 
 使用方法:
-python update_data.py # 增量更新所有股票 (默认模式)
-python update_data.py --mode full # 全量更新所有股票   
-python update_data.py --stocks 000001 600000 300750 # 更新指定股票    
-python update_data.py --no-backup # 禁用备份
+python data_update.py # 增量更新所有股票 (默认模式)
+python data_update.py --mode full # 全量更新所有股票   
+python data_update.py --stocks 000001 600000 300750 # 更新指定股票    
+python data_update.py --no-backup # 禁用备份
 """
 
 import time

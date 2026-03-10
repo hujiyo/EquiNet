@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import List, Optional, Dict
 from dataclasses import dataclass
 from enum import Enum
-
+import argparse
 
 class CheckStatus(Enum):
     """检查状态枚举"""
@@ -43,12 +43,8 @@ class CheckResult:
 
 
 class DataChecker:
-    """股票数据检查器"""
-    
     def __init__(self, data_dir: str, check_days: int = 100):
         """
-        初始化数据检查器
-        
         Args:
             data_dir: 数据存储目录
             check_days: 检查最近多少天的数据（默认 100 天）
@@ -66,12 +62,10 @@ class DataChecker:
         }
         
     def login_baostock(self) -> bool:
-        """登录 Baostock"""
         try:
             lg = bs.login()
             if lg.error_code == '0':
                 self.login_success = True
-                print("✓ Baostock 登录成功")
                 return True
             else:
                 print(f"✗ Baostock 登录失败：{lg.error_msg}")
@@ -81,7 +75,6 @@ class DataChecker:
             return False
     
     def logout_baostock(self):
-        """登出 Baostock"""
         if self.login_success:
             bs.logout()
             self.login_success = False
@@ -113,7 +106,6 @@ class DataChecker:
         Args:
             file_path: 文件路径
             days: 获取最近多少天
-            
         Returns:
             DataFrame 或 None
         """
@@ -139,7 +131,6 @@ class DataChecker:
             stock_code: 股票代码
             start_date: 开始日期 (YYYY-MM-DD)
             end_date: 结束日期 (YYYY-MM-DD)
-            
         Returns:
             DataFrame 或 None
         """
@@ -154,7 +145,7 @@ class DataChecker:
                 start_date=start_date,
                 end_date=end_date,
                 frequency="d",
-                adjustflag="2"
+                adjustflag="3"
             )
             
             if rs.error_code != '0':
@@ -190,8 +181,7 @@ class DataChecker:
             df['min'] = pd.to_numeric(df['min'], errors='coerce')
             df['end'] = pd.to_numeric(df['end'], errors='coerce')
             
-            # 修复：本地数据的 volume 字段存储的是成交额（单位：千元）
-            # Baostock 的 amount 单位是元，需要除以 1000 才能与本地数据比较
+            # 本地数据的 volume 字段存储的是成交额（单位：千元）,Baostock中的amount 单位是元
             if 'amount' in df.columns:
                 df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
                 df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
@@ -241,7 +231,6 @@ class DataChecker:
             stock_code: 股票代码
             file_path: 文件路径
             verbose: 是否详细输出
-            
         Returns:
             CheckResult
         """
@@ -343,7 +332,7 @@ class DataChecker:
         return CheckResult(
             stock_code=stock_code,
             status=CheckStatus.PASS,
-            message=f"数据完整且准确 (最新：{local_latest}, 检查 {len(bs_data)} 天)",
+            message=f"数据完整且准确 (最新：{local_latest}, 检查 {len(bs_data)} 个交易日)",
             details={'latest_date': local_latest, 'checked_days': len(bs_data)}
         )
     
@@ -354,7 +343,6 @@ class DataChecker:
         Args:
             file_path: 文件路径
             check_days: 检查最近多少天
-            
         Returns:
             CheckResult
         """
@@ -414,7 +402,6 @@ class DataChecker:
         Args:
             file_path: 文件路径
             check_days: 检查最近多少天
-            
         Returns:
             CheckResult
         """
@@ -459,16 +446,151 @@ class DataChecker:
                 message=f"检查异常：{e}"
             )
     
-    def run_full_check(self, stock_codes: Optional[List[str]] = None, 
+    def repair_stock_data(self, stock_code: str, file_path: Path, result: CheckResult) -> bool:
+        """
+        尝试修复检测到的数据错误
+
+        修复策略：
+        - 缺失交易日：补拉缺失日期数据并合并写入
+        - 价格不匹配 / OHLC 逻辑错误：重新全量拉取覆盖
+        - 数据滞后（WARNING）：增量补更到最新
+
+        Args:
+            stock_code: 股票代码
+            file_path: 本地文件路径
+            result: 对应的 CheckResult
+        Returns:
+            修复是否成功
+        """
+        msg = result.message
+
+        # ── 情况1：缺失交易日 ──────────────────────────────────────────
+        if "缺失" in msg and result.details and 'missing_dates' in result.details:
+            missing_dates = result.details['missing_dates']
+            print(f"  → 修复：补拉 {len(missing_dates)} 个缺失交易日")
+            start_bs = f"{missing_dates[0][:4]}-{missing_dates[0][4:6]}-{missing_dates[0][6:]}"
+            end_bs   = f"{missing_dates[-1][:4]}-{missing_dates[-1][4:6]}-{missing_dates[-1][6:]}"
+            patch_df = self.fetch_baostock_data(stock_code, start_bs, end_bs)
+            if patch_df is None or len(patch_df) == 0:
+                print(f"  ✗ 无法获取补丁数据，跳过")
+                return False
+            try:
+                old_df = pd.read_csv(file_path)
+                old_df['time'] = old_df['time'].astype(str)
+                patch_df['time'] = patch_df['time'].astype(str)
+                patch_df = patch_df.rename(columns={'turn': 'exchange'})
+                patch_df = patch_df[['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']]
+                existing = set(old_df['time'])
+                patch_df = patch_df[~patch_df['time'].isin(existing)]
+                if len(patch_df) == 0:
+                    print(f"  ⚠ 补丁数据已存在，无需写入")
+                    return True
+                combined = pd.concat([old_df, patch_df], ignore_index=True)
+                combined = combined.sort_values('time', ascending=False).reset_index(drop=True)
+                combined.to_csv(file_path, index=False)
+                print(f"  ✓ 补入 {len(patch_df)} 条，总计 {len(combined)} 条")
+                return True
+            except Exception as e:
+                print(f"  ✗ 写入失败：{e}")
+                return False
+
+        # ── 情况2：价格不匹配 / OHLC 逻辑错误 / 无法读取 ───────────────
+        if any(k in msg for k in ["不匹配", "OHLC", "超出范围", "无法读取", "最高价"]):
+            print(f"  → 修复：重新全量拉取 {stock_code}")
+            rs = bs.query_history_k_data_plus(
+                self._format_stock_code(stock_code),
+                "date,open,high,low,close,volume,amount,turn,tradestatus,pctChg,peTTM,"
+                "pbMRQ,psTTM,pcfNcfTTM,isST",
+                start_date="2010-01-01",
+                end_date=datetime.datetime.now().strftime("%Y-%m-%d"),
+                frequency="d",
+                adjustflag="3"
+            )
+            if rs.error_code != '0':
+                print(f"  ✗ 全量拉取失败：{rs.error_msg}")
+                return False
+            data_list = []
+            while rs.error_code == '0' and rs.next():
+                data_list.append(rs.get_row_data())
+            if not data_list:
+                print(f"  ✗ 未获取到数据")
+                return False
+            try:
+                df = pd.DataFrame(data_list, columns=rs.fields)
+                df = df.rename(columns={'date': 'time', 'open': 'start', 'high': 'max',
+                                        'low': 'min', 'close': 'end'})
+                df['time'] = df['time'].str.replace('-', '')
+                df = df[df['time'] != '']
+                df['time'] = df['time'].astype(int)
+                for col in ['start', 'max', 'min', 'end']:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                df = df.dropna(subset=['start', 'max', 'min', 'end'])
+                if 'amount' in df.columns:
+                    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+                    df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
+                else:
+                    df['volume'] = 0.0
+                if 'turn' in df.columns:
+                    df['exchange'] = pd.to_numeric(df['turn'], errors='coerce').fillna(0.0)
+                else:
+                    df['exchange'] = 0.0
+                df = df[['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']]
+                df = df.iloc[::-1].reset_index(drop=True)
+                df.to_csv(file_path, index=False)
+                print(f"  ✓ 全量写入 {len(df)} 条")
+                return True
+            except Exception as e:
+                print(f"  ✗ 写入失败：{e}")
+                return False
+
+        # ── 情况3：数据滞后（WARNING）────────────────────────────────────
+        if "滞后" in msg and result.details and 'latest_date' in result.details:
+            latest = result.details['latest_date']
+            start_date = f"{latest[:4]}-{latest[4:6]}-{latest[6:]}"
+            # 从最新日期次日开始补
+            next_day = (datetime.datetime.strptime(start_date, "%Y-%m-%d")
+                        + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+            print(f"  → 修复：增量补更 {stock_code}（从 {next_day} 起）")
+            patch_df = self.fetch_baostock_data(
+                stock_code, next_day,
+                datetime.datetime.now().strftime("%Y-%m-%d")
+            )
+            if patch_df is None or len(patch_df) == 0:
+                print(f"  ⚠ 无新数据可补（可能已是最新）")
+                return True
+            try:
+                old_df = pd.read_csv(file_path)
+                old_df['time'] = old_df['time'].astype(str)
+                patch_df['time'] = patch_df['time'].astype(str)
+                patch_df = patch_df.rename(columns={'turn': 'exchange'})
+                patch_df = patch_df[['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']]
+                existing = set(old_df['time'])
+                patch_df = patch_df[~patch_df['time'].isin(existing)]
+                if len(patch_df) == 0:
+                    print(f"  ⚠ 补丁数据已存在，无需写入")
+                    return True
+                combined = pd.concat([patch_df, old_df], ignore_index=True)
+                combined = combined.sort_values('time', ascending=False).reset_index(drop=True)
+                combined.to_csv(file_path, index=False)
+                new_latest = str(int(combined.iloc[0]['time']))
+                print(f"  ✓ 补入 {len(patch_df)} 条，最新：{new_latest}")
+                return True
+            except Exception as e:
+                print(f"  ✗ 写入失败：{e}")
+                return False
+
+        print(f"  ⚠ 无对应修复策略：{msg}")
+        return False
+
+    def run_full_check(self, stock_codes: Optional[List[str]] = None,
                       verbose: bool = False, check_ohlc: bool = True) -> List[CheckResult]:
         """
-        运行完整的数据检查
-        
+        运行完整的数据检查，发现错误时自动修复
+
         Args:
             stock_codes: 指定要检查的股票列表
             verbose: 是否详细输出
             check_ohlc: 是否检查 OHLC 逻辑
-            
         Returns:
             检查结果列表
         """
@@ -489,45 +611,63 @@ class DataChecker:
                 print(f"\n检查所有股票：{len(files_to_check)} 只")
             
             results = []
-            
+            repair_success = 0
+            repair_fail = 0
+
             for i, file_path in enumerate(files_to_check, 1):
                 stock_code = file_path.stem
-                
+
                 if verbose:
                     print(f"\n[{i}/{len(files_to_check)}] 检查 {stock_code}...")
                 else:
                     print(f"[{i}/{len(files_to_check)}] 检查 {stock_code}...", end=" ")
-                
+
                 integrity_result = self.check_data_integrity(stock_code, file_path, verbose)
                 results.append(integrity_result)
-                
+
                 self._update_stats(integrity_result.status)
-                
+
                 if not verbose:
                     print(f"{integrity_result.status.value}", end="")
                     if integrity_result.status == CheckStatus.PASS:
-                        print(f" - {integrity_result.message}", end="")
+                        print(f" - {integrity_result.message}")
                     else:
                         print(f" - {integrity_result.message}")
-                
+
+                if integrity_result.status in (CheckStatus.FAIL, CheckStatus.WARNING):
+                    ok = self.repair_stock_data(stock_code, file_path, integrity_result)
+                    if ok:
+                        repair_success += 1
+                    else:
+                        repair_fail += 1
+
                 if check_ohlc and integrity_result.status == CheckStatus.PASS:
                     ohlc_result = self.check_ohlc_logic(file_path, self.check_days)
                     if ohlc_result.status != CheckStatus.PASS:
                         results.append(ohlc_result)
                         if not verbose:
                             print(f"  {ohlc_result.status.value} - {ohlc_result.message}")
-                    
+                        ok = self.repair_stock_data(stock_code, file_path, ohlc_result)
+                        if ok:
+                            repair_success += 1
+                        else:
+                            repair_fail += 1
+
                     price_result = self.check_price_changes(file_path, self.check_days)
                     if price_result.status != CheckStatus.PASS:
                         results.append(price_result)
                         if not verbose:
                             print(f"  {price_result.status.value} - {price_result.message}")
-                
+                        ok = self.repair_stock_data(stock_code, file_path, price_result)
+                        if ok:
+                            repair_success += 1
+                        else:
+                            repair_fail += 1
+
                 if verbose and i % 50 == 0:
                     time.sleep(0.5)
-            
-            self._print_summary(results)
-            
+
+            self._print_summary(results, repair_success, repair_fail)
             return results
             
         finally:
@@ -545,7 +685,9 @@ class DataChecker:
         elif status == CheckStatus.SKIP:
             self.stats['skip'] += 1
     
-    def _print_summary(self, results: List[CheckResult]):
+    def _print_summary(self, results: List[CheckResult],
+                       repair_success: int = 0,
+                       repair_fail: int = 0):
         """打印摘要"""
         print("*"*32 + " 检查摘要 " + "*"*32)
         total = self.stats['total']
@@ -573,22 +715,16 @@ class DataChecker:
             if len(warning_results) > 10:
                 print(f"  ... 还有 {len(warning_results) - 10} 只")
 
+        if repair_success + repair_fail > 0:
+            print(f"\n修复统计：成功 {repair_success}，失败 {repair_fail}")
+
 def main():
-    """主函数"""
-    import argparse
-    
     parser = argparse.ArgumentParser(description='股票数据质量检查工具')
-    parser.add_argument('--data-dir', type=str, default=r'src\data',
-                       help='数据存储目录 (默认：src\\data)')
-    parser.add_argument('--days', type=int, default=100,
-                       help='检查最近多少天的数据 (默认：100)')
-    parser.add_argument('--stocks', type=str, nargs='+',
-                       help='指定要检查的股票代码列表')
-    parser.add_argument('--verbose', action='store_true',
-                       help='详细输出模式')
-    parser.add_argument('--no-ohlc', action='store_true',
-                       help='跳过 OHLC 逻辑检查')
-    
+    parser.add_argument('--data-dir', type=str, default=r'src\data',help='数据存储目录 (默认：src\\data)')
+    parser.add_argument('--days', type=int, default=100,help='检查最近多少天的数据 (默认：100)')
+    parser.add_argument('--stocks', type=str, nargs='+',help='指定要检查的股票代码列表')
+    parser.add_argument('--verbose', action='store_true',help='详细输出模式')
+    parser.add_argument('--no-ohlc', action='store_true',help='跳过 OHLC 逻辑检查')
     args = parser.parse_args()
     
     data_dir = Path(args.data_dir)

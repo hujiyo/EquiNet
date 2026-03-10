@@ -25,15 +25,11 @@ import baostock as bs
 from pathlib import Path
 from typing import List, Optional, Tuple
 import shutil
-
+import argparse
 
 class StockDataUpdater:
-    """股票数据更新器"""
-    
     def __init__(self, data_dir: str, backup: bool = True):
         """
-        初始化数据更新器
-        
         Args:
             data_dir: 数据存储目录
             backup: 是否启用备份（默认启用）
@@ -41,18 +37,14 @@ class StockDataUpdater:
         self.data_dir = Path(data_dir)
         self.backup_dir = self.data_dir.parent / "data_backup"
         self.enable_backup = backup
-        
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        
         self.login_success = False
-        
+
     def login_baostock(self) -> bool:
-        """登录 Baostock"""
         try:
             lg = bs.login()
             if lg.error_code == '0':
                 self.login_success = True
-                print("✓ Baostock 登录成功")
                 return True
             else:
                 print(f"✗ Baostock 登录失败：{lg.error_msg}")
@@ -62,7 +54,6 @@ class StockDataUpdater:
             return False
     
     def logout_baostock(self):
-        """登出 Baostock"""
         if self.login_success:
             bs.logout()
             self.login_success = False
@@ -101,10 +92,8 @@ class StockDataUpdater:
     def get_last_date_in_file(self, stock_code: str) -> Optional[str]:
         """
         获取文件中最新的日期
-        
         Args:
             stock_code: 股票代码
-            
         Returns:
             最新日期字符串 (YYYYMMDD 格式) 或 None
         """
@@ -148,12 +137,11 @@ class StockDataUpdater:
     
     def fetch_stock_data(self, stock_code: str, start_date: Optional[str] = None) -> Optional[pd.DataFrame]:
         """
-        获取单只股票的 K 线数据（前复权）
+        获取单只股票的 K 线数据（不复权）
         
         Args:
             stock_code: 股票代码
             start_date: 起始日期 (YYYY-MM-DD 格式)，None 表示获取所有数据
-            
         Returns:
             DataFrame 或 None
         """
@@ -178,7 +166,7 @@ class StockDataUpdater:
                 start_date=query_start,
                 end_date=end_date,
                 frequency="d",
-                adjustflag="2"
+                adjustflag="3"
             )
             
             if rs.error_code != '0':
@@ -214,12 +202,10 @@ class StockDataUpdater:
             df['min'] = pd.to_numeric(df['min'], errors='coerce')
             df['end'] = pd.to_numeric(df['end'], errors='coerce')
             
-            # 修复：使用成交额（amount）而非成交量（volume）
-            # 原始数据的 volume 字段存储的是成交额，单位：千元
-            # Baostock 的 amount 单位是元，需要除以 1000
+            # 原始数据的 volume 字段存储的是成交额，因此这里使用成交额（amount）而非成交量（volume）,单位是"千元"
             if 'amount' in df.columns:
                 df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-                df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
+                df['volume'] = (df['amount'] / 1000.0).fillna(0.0) # Baostock 的 amount 单位是元，需要除以 1000
             else:
                 print(f"⚠ {stock_code} 警告：Baostock 未返回 amount 字段，volume 将设为 0")
                 df['volume'] = pd.Series([0.0] * len(df), dtype=float)
@@ -236,9 +222,7 @@ class StockDataUpdater:
                 df['exchange'] = 0.0
             
             df = df[['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']]
-            
             df = df.iloc[::-1].reset_index(drop=True)
-            
             return df
             
         except Exception as e:
@@ -251,7 +235,6 @@ class StockDataUpdater:
         
         Args:
             stock_code: 原始股票代码
-            
         Returns:
             格式化后的代码 (如 sh.600000) 或 None
         """
@@ -272,7 +255,6 @@ class StockDataUpdater:
             df: 数据 DataFrame
             incremental: 是否为增量更新
             old_latest_date: 原文件中最新日期（仅增量更新时使用）
-            
         Returns:
             是否保存成功
         """
@@ -334,7 +316,7 @@ class StockDataUpdater:
                         print(f"✗ {stock_code} 数据拉取失败，稍后重试")
                         return False
                     if df.empty:
-                        print(f"✓ {stock_code} 已是最新数据 (最新：{last_date})")
+                        print(f"✓ {stock_code} 已最新 (最新：{last_date})")
                         return True
                     return self.save_stock_data(stock_code, df, incremental=True, old_latest_date=last_date)
                 else:
@@ -363,7 +345,6 @@ class StockDataUpdater:
         
         Args:
             date_str: YYYYMMDD 格式的日期
-            
         Returns:
             YYYY-MM-DD 格式的日期或 None
         """
@@ -380,7 +361,6 @@ class StockDataUpdater:
         
         Args:
             date_str: YYYY-MM-DD 格式的日期
-            
         Returns:
             下一天的日期 (YYYY-MM-DD)
         """
@@ -419,14 +399,13 @@ class StockDataUpdater:
                     print(f"获取到 {len(codes_to_update)} 只股票")
             
             if self.enable_backup:
-                print("\n正在备份现有数据...")
                 self.backup_data()
             
             success_count = 0
             failed_stocks = []
             
             for i, stock_code in enumerate(codes_to_update, 1):
-                print(f"\n[{i}/{len(codes_to_update)}] 更新 {stock_code}...", end=" ")
+                print(f"[{i}/{len(codes_to_update)}] 更新 {stock_code}...", end=" ")
                 
                 try:
                     if self.update_single_stock(stock_code, incremental):
@@ -455,19 +434,12 @@ class StockDataUpdater:
 
 
 def main():
-    """主函数"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='股票数据更新工具')
-    parser.add_argument('--data-dir', type=str, default=r'src\data',
-                       help='数据存储目录 (默认：src\\data)')
+    parser = argparse.ArgumentParser(description='EquiNet股票数据更新工具')
+    parser.add_argument('--data-dir', type=str, default=r'src\data',help='数据存储目录 (默认：src\\data)')
     parser.add_argument('--mode', type=str, choices=['incremental', 'full'], default='incremental',
                        help='更新模式：incremental(增量) 或 full(全量)')
-    parser.add_argument('--stocks', type=str, nargs='+',
-                       help='指定要更新的股票代码列表')
-    parser.add_argument('--no-backup', action='store_true',
-                       help='禁用备份')
-    
+    parser.add_argument('--stocks', type=str, nargs='+',help='指定要更新的股票代码列表')
+    parser.add_argument('--no-backup', action='store_true',help='禁用备份')
     args = parser.parse_args()
     
     data_dir = Path(args.data_dir)

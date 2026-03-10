@@ -13,7 +13,7 @@ import os
 import random
 import numpy as np
 import pandas as pd
-from config import DataConfig, generate_label
+from config import DataConfig, generate_label, calculate_returns
 from multiprocessing import Pool, cpu_count
 
 
@@ -436,7 +436,14 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     input_seq_raw = stock_data[start_idx:start_idx + context_length]
     closes = input_seq_raw[:, 3]
 
-    cumulative_return = (t3_close - t1_open) / t1_open
+    # ========== 收益率计算（用于评估模型表现）==========
+    # 使用 config 中的统一函数
+    cumulative_return, daily_returns = calculate_returns(
+        t1_open=t1_open,
+        t1_close=t1_close,
+        t2_close=t2_close,
+        t3_close=t3_close
+    )
 
     # ========== 涨跌幅计算（用于标签生成）==========
     # 基准是前一日收盘价，用于判断股票走势强弱
@@ -447,17 +454,7 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     daily_price_changes.append(day2_price_change)
     day3_price_change = (t3_close - t2_close) / t2_close      # (T+3收盘 - T+2收盘) / T+2收盘
     daily_price_changes.append(day3_price_change)
-    
-    # ========== 收益率计算（用于评估模型表现）==========
-    # 基准是买入价（T+1开盘价），用于计算投资回报
-    daily_returns = []
-    day1_return = (t1_close - t1_open) / t1_open              # Day1日内收益
-    daily_returns.append(day1_return)
-    day2_return = (t2_close - t1_close) / t1_open             # Day2收益贡献
-    daily_returns.append(day2_return)
-    day3_return = (t3_close - t2_close) / t1_open             # Day3收益贡献
-    daily_returns.append(day3_return)
-    
+
     # 标签生成使用涨跌幅，直接调用 config.generate_label()
     target = float(generate_label(
         day1_change=daily_price_changes[0],
@@ -514,42 +511,33 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
     if available_days == 0:
         return None
     
-    # 获取上下文最后一天收盘价（用于计算 Day1 涨跌幅）
-    input_seq_raw = stock_data[start_idx:start_idx + context_length]
-    closes = input_seq_raw[:, 3]
-    
     t1_open = stock_data[t1_idx, 0]
     t1_close = stock_data[t1_idx, 3]
 
     if t1_open == 0 or t1_close == 0:
         return None
 
-    daily_returns = []
-    cumulative_return = 0.0
-    
-    day1_return = (t1_close - t1_open) / t1_open
-    daily_returns.append(day1_return)
-    cumulative_return = day1_return
-    
+    # ========== 收益率计算（用于评估模型表现）==========
     t2_close = None
     t3_close = None
-    
+
     if available_days >= 2:
         t2_close = stock_data[t2_idx, 3]
         if t2_close == 0:
             return None
-        day2_return = (t2_close - t1_close) / t1_open
-        daily_returns.append(day2_return)
-        cumulative_return = day1_return + day2_return
-    
+
     if available_days >= 3:
         t3_close = stock_data[t3_idx, 3]
         if t3_close == 0:
             return None
-        day3_return = (t3_close - t2_close) / t1_open
-        daily_returns.append(day3_return)
-        cumulative_return = day1_return + day2_return + day3_return
-    
+
+    cumulative_return, daily_returns = calculate_returns(
+        t1_open=t1_open,
+        t1_close=t1_close,
+        t2_close=t2_close,
+        t3_close=t3_close
+    )
+
     return input_seq, cumulative_return, daily_returns, available_days
 
 

@@ -43,8 +43,6 @@ class DataConfig:
 # ==================== 用户自定义标签生成函数 ====================
 def generate_label(day1_change, day2_change, day3_change):
     """
-    【用户自定义标签生成函数】
-
     此函数定义什么是"强势买入信号"。
     只要返回 0（无信号）或 1（有信号）即可。
 
@@ -68,7 +66,7 @@ def generate_label(day1_change, day2_change, day3_change):
     - max_day = max(day1_change, day2_change, day3_change)（最大涨跌幅）
     - min_day = min(day1_change, day2_change, day3_change)（最小涨跌幅）
 
-    ========== 默认规则说明 ==========
+    ========== 规则说明 ==========
     当前实现使用五条件规则，满足任一即返回1（强势信号）：
     1. 单日爆发：Day1≥5% 且 累计≥3%
     2. 双日接力：Day1+Day2≥6% 且 Day1,Day2>1% 且 累计≥3%
@@ -87,27 +85,73 @@ def generate_label(day1_change, day2_change, day3_change):
     # ========== 五条件规则（默认实现，可完全自定义）==========
     # 满足任一条件即返回1（强势信号）
 
-    # 条件1：单日爆发 + 累计兜底
+    # 规则1：单日爆发 + 累计兜底
     if day1_change >= 0.05 and cum_3day >= 0.03:
         return 1
 
-    # 条件2：双日接力 + 累计兜底
+    # 规则2：双日接力 + 累计兜底
     if cum_2day >= 0.06 and day1_change > 0.01 and day2_change > 0.01 and cum_3day >= 0.03:
         return 1
 
-    # 条件3：稳健上涨（天然安全）
+    # 规则3：稳健上涨（天然安全）
     if day1_change >= 0.01 and day2_change >= 0.01 and day3_change >= 0.01 and cum_3day >= 0.05:
         return 1
 
-    # 条件4：爆发后延续 + Day1保护
+    # 规则4：爆发后延续 + Day1保护
     if max_day >= 0.08 and cum_3day >= 0.06 and day1_change >= -0.02:
         return 1
 
-    # 条件5：累计达标 + Day1保护
+    # 规则5：累计达标 + Day1保护
     if cum_3day >= 0.08 and day1_change >= -0.02:
         return 1
 
     return 0
+
+# ==================== 用户自定义收益率计算函数 ====================
+def calculate_returns(t1_open, t1_close, t2_close=None, t3_close=None):
+    """
+    此函数定义如何计算投资收益率，用于评估模型表现。
+    支持 1～3 天的可用数据，t2_close 和 t3_close 为可选参数。
+
+    ========== 核心概念区分 ==========
+    【涨跌幅】vs【收益率】：
+    - 涨跌幅：基准是前一日收盘价，用于判断股票走势强弱（在 generate_label 中使用）
+    - 收益率：基准是买入价（T+1开盘价），用于计算投资回报（在此函数中使用）
+
+    Args:
+        t1_open: T+1 开盘价（买入价），不能为零
+        t1_close: T+1 收盘价（必填）
+        t2_close: T+2 收盘价（可选，传入 None 表示数据不可用）
+        t3_close: T+3 收盘价（可选，传入 None 表示数据不可用）
+
+    ========== 收益率计算公式 ==========
+    基准是买入价（T+1开盘价）：
+    - Day1收益率 = (T+1收盘 - T+1开盘) / T+1开盘（日内收益）
+    - Day2收益率贡献 = (T+2收盘 - T+1收盘) / T+1开盘
+    - Day3收益率贡献 = (T+3收盘 - T+2收盘) / T+1开盘
+    - 累计收益率 = Day1 + Day2 + Day3 = (T+3收盘 - T+1开盘) / T+1开盘
+
+    Returns:
+        tuple: (cumulative_return, daily_returns)
+            - cumulative_return: 已有数据的累计收益率（浮点数）
+            - daily_returns: 已有数据的每日收益率列表（长度 1～3）
+    """
+    # 收益率计算（分母统一为 t1_open）
+    day1_return = (t1_close - t1_open) / t1_open
+    daily_returns = [day1_return]
+    cumulative_return = day1_return
+
+    if t2_close is not None:
+        day2_return = (t2_close - t1_close) / t1_open
+        daily_returns.append(day2_return)
+        cumulative_return += day2_return
+
+    if t3_close is not None and t2_close is not None:
+        day3_return = (t3_close - t2_close) / t1_open
+        daily_returns.append(day3_return)
+        cumulative_return += day3_return
+
+    return cumulative_return, daily_returns
 
 # ==================== 模型架构参数 ====================
 class ModelConfig:

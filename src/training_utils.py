@@ -688,7 +688,14 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
                              output_dir=DataConfig.OUTPUT_DIR):
     """
     通用的模型保存函数，带详细元数据
+
+    保存格式为包含以下键的字典：
+    - 'model_arch': 模型架构参数（用于 run.py 自动重建正确大小的模型）
+    - 'train_params': 训练超参数快照
+    - 'eval_stats': 评估指标
+    - 'state_dict': 模型权重
     """
+    from config import ModelConfig, TrainingConfig, LossConfig
     os.makedirs(output_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%m%d_%H%M")
@@ -702,8 +709,42 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
     else:
         filename = f"{model_prefix}_top{DataConfig.TOP_K}_{return_str}pct_thr{thr_str}_auc{auc_str}_ep{epoch}_{timestamp}.pth"
 
+    checkpoint = {
+        'model_arch': {
+            'model_type':       ModelConfig.MODEL_TYPE,
+            'input_dim':        ModelConfig.INPUT_DIM,
+            'd_model':          ModelConfig.D_MODEL,
+            'embed_hidden_dim': ModelConfig.EMBED_HIDDEN_DIM,
+            'ffn_expand_ratio': ModelConfig.FFN_EXPAND_RATIO,
+            'nhead':            ModelConfig.NHEAD,
+            'num_layers':       ModelConfig.NUM_LAYERS,
+            'output_dim':       ModelConfig.OUTPUT_DIM,
+            'dropout_rate':     ModelConfig.DROPOUT_RATE,
+            'attention_dropout':ModelConfig.ATTENTION_DROPOUT,
+            'context_length':   DataConfig.CONTEXT_LENGTH,
+        },
+        'train_params': {
+            'epochs':           TrainingConfig.EPOCHS,
+            'learning_rate':    TrainingConfig.LEARNING_RATE,
+            'batch_size':       TrainingConfig.BATCH_SIZE,
+            'use_adamw':        TrainingConfig.USE_ADAMW,
+            'use_mano':         TrainingConfig.USE_MANO,
+            'weight_decay':     TrainingConfig.WEIGHT_DECAY,
+            'loss_type':        LossConfig.LOSS_TYPE,
+            'pos_weight':       LossConfig.POS_WEIGHT,
+        },
+        'eval_stats': {
+            'top_return':   float(top_return),
+            'top_threshold':float(top_threshold),
+            'auc':          float(auc),
+            'epoch':        int(epoch),
+            'top_k':        DataConfig.TOP_K,
+        },
+        'state_dict': model_state_dict,
+    }
+
     save_path = os.path.join(output_dir, filename)
-    torch.save(model_state_dict, save_path)
+    torch.save(checkpoint, save_path)
 
     return save_path
 

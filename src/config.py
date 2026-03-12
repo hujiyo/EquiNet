@@ -176,8 +176,6 @@ class ModelConfig:
     ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
 
     # Token化参数（仅当 MODEL_TYPE='tokenized' 时使用）
-    # 词表大小 = 4*20(OHLC) + 36(volume) + 60(exchange) = 176
-    VOCAB_SIZE = 176
     TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
 
     # 输出层参数

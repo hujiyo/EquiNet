@@ -433,7 +433,7 @@ def create_model(input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL,
     elif model_type == 'tokenized':
         # 创建Token化模型
         model = TokenizedStockTransformer(
-            vocab_size=ModelConfig.VOCAB_SIZE,
+            vocab_size=TokenConfig.VOCAB_SIZE,
             d_model=d_model,
             nhead=nhead,
             num_layers=num_layers,
@@ -448,7 +448,6 @@ def create_model(input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL,
         print(f"\n{'='*50}")
         print(f"Token化模型架构 (TokenizedStockTransformer)")
         print(f"{'='*50}")
-        print(f"词表大小: {ModelConfig.VOCAB_SIZE}")
         print(f"Token序列长度: {ModelConfig.TOKEN_SEQ_LEN}")
         print(f"位置编码: 二维 (时间步+特征类型)")
         print(f"Embedding维度: {d_model}")

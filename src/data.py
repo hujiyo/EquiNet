@@ -401,13 +401,13 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
             - Day1涨跌幅 = (T+1收盘 - T日收盘) / T日收盘
             - Day2涨跌幅 = (T+2收盘 - T+1收盘) / T+1收盘
             - Day3涨跌幅 = (T+3收盘 - T+2收盘) / T+2收盘
-        
-        【收益率】用于计算投资回报，评估模型表现，EquiNet默认用户是Day1以开盘价买入，Day3再以收盘价卖出，因此收益率计算逻辑如下：
+
+        【收益率】用于计算投资回报，评估模型表现，支持智能止损：
             - 基准是买入价（T+1开盘价）
-            - Day1收益率 = (T+1收盘 - T+1开盘) / T+1开盘（日内收益）
-            - Day2收益率贡献 = (T+2收盘 - T+1收盘) / T+1开盘
-            - Day3收益率贡献 = (T+3收盘 - T+2收盘) / T+1开盘
-            - 累计收益率 = Day1 + Day2 + Day3 = (T+3收盘 - T+1开盘) / T+1开盘
+            - Day1 ≤ -3% → 第二天开盘止损
+            - Day1+Day2 < -2% 或 Day1,Day2都<1% → 第二天收盘止损
+            - 否则持有满3天，第三天收盘卖出
+            - cumulative_return 为实际累计收益率（调用方应优先使用此值）       
     """
     stock_info = stock_info_list[stock_idx]
     stock_data = stock_info['data']
@@ -426,26 +426,18 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     # 提取未来数据并验证零值
     t1_open = stock_data[start_idx + context_length, 0]
     t1_close = stock_data[start_idx + context_length, 3]
+    t2_open = stock_data[start_idx + context_length + 1, 0]
     t2_close = stock_data[start_idx + context_length + 1, 3]
     t3_close = stock_data[start_idx + context_length + 2, 3]
 
-    if t1_open == 0 or t1_close == 0 or t2_close == 0 or t3_close == 0:
+    if t1_open == 0 or t1_close == 0 or t2_open == 0 or t2_close == 0 or t3_close == 0:
         return None
-    
-    # 获取上下文最后一天收盘价（用于计算 Day1 涨跌幅）
+
+    # 获取上下文最后一天收盘价（用于计算涨跌幅）
     input_seq_raw = stock_data[start_idx:start_idx + context_length]
     closes = input_seq_raw[:, 3]
 
-    # ========== 收益率计算（用于评估模型表现）==========
-    # 使用 config 中的统一函数
-    cumulative_return, daily_returns = calculate_returns(
-        t1_open=t1_open,
-        t1_close=t1_close,
-        t2_close=t2_close,
-        t3_close=t3_close
-    )
-
-    # ========== 涨跌幅计算（用于标签生成）==========
+    # ========== 涨跌幅计算（用于标签生成和止损判断）==========
     # 基准是前一日收盘价，用于判断股票走势强弱
     daily_price_changes = []
     day1_price_change = (t1_close - closes[-1]) / closes[-1]  # (T+1收盘 - T日收盘) / T日收盘
@@ -454,6 +446,19 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     daily_price_changes.append(day2_price_change)
     day3_price_change = (t3_close - t2_close) / t2_close      # (T+3收盘 - T+2收盘) / T+2收盘
     daily_price_changes.append(day3_price_change)
+
+    # ========== 收益率计算（用于评估模型表现，含智能止损）==========
+    # 使用 config 中的统一函数，传入涨跌幅用于止损判断
+    cumulative_return, daily_returns = calculate_returns(
+        t1_open=t1_open,
+        t1_close=t1_close,
+        t2_open=t2_open,
+        t2_close=t2_close,
+        t3_close=t3_close,
+        day1_change=daily_price_changes[0],
+        day2_change=daily_price_changes[1],
+        day3_change=daily_price_changes[2]
+    )
 
     # 标签生成使用涨跌幅，直接调用 config.generate_label()
     target = float(generate_label(
@@ -517,25 +522,43 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
     if t1_open == 0 or t1_close == 0:
         return None
 
-    # ========== 收益率计算（用于评估模型表现）==========
+    # ========== 涨跌幅计算（用于止损判断）==========
+    # 获取 T 日收盘价用于计算 Day1 涨跌幅
+    t_day_close = stock_data[start_idx + context_length - 1, 3]
+
+    day1_change = None
+    day2_change = None
+    day3_change = None
+
+    day1_change = (t1_close - t_day_close) / t_day_close
+
+    # ========== 收益率计算（用于评估模型表现，含智能止损）==========
+    t2_open = None
     t2_close = None
     t3_close = None
 
     if available_days >= 2:
+        t2_open = stock_data[t2_idx, 0]
         t2_close = stock_data[t2_idx, 3]
-        if t2_close == 0:
+        if t2_open == 0 or t2_close == 0:
             return None
+        day2_change = (t2_close - t1_close) / t1_close
 
     if available_days >= 3:
         t3_close = stock_data[t3_idx, 3]
         if t3_close == 0:
             return None
+        day3_change = (t3_close - t2_close) / t2_close
 
     cumulative_return, daily_returns = calculate_returns(
         t1_open=t1_open,
         t1_close=t1_close,
+        t2_open=t2_open,
         t2_close=t2_close,
-        t3_close=t3_close
+        t3_close=t3_close,
+        day1_change=day1_change,
+        day2_change=day2_change,
+        day3_change=day3_change
     )
 
     return input_seq, cumulative_return, daily_returns, available_days

@@ -94,15 +94,11 @@ def generate_label(day1_change, day2_change, day3_change):
         return 1
 
     # 规则3：稳健上涨（天然安全）
-    if day1_change >= 0.01 and day2_change >= 0.01 and day3_change >= 0.01 and cum_3day >= 0.05:
+    if day1_change >= 0.02 and day2_change >= 0.01 and day3_change >= 0.01 and cum_3day >= 0.05:
         return 1
 
     # 规则4：爆发后延续 + Day1保护
-    if max_day >= 0.08 and cum_3day >= 0.06 and day1_change >= -0.02:
-        return 1
-
-    # 规则5：累计达标 + Day1保护
-    if cum_3day >= 0.08 and day1_change >= -0.02:
+    if (day1_change >= 0.08 or day2_change >= 0.08) and cum_3day >= 0.06 and day1_change >= 0:
         return 1
 
     return 0

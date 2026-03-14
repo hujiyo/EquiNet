@@ -11,7 +11,7 @@
 python data_check.py # 检查所有股票（默认检查最近 100 天）    
 python data_check.py --days 50 # 指定检查天数   
 python data_check.py --stocks 000001 600000 # 检查指定股票    
-python data_check.py --check-only # 只检查不修复
+python data_check.py --no-backup # 禁用备份
 python data_check.py --verbose # 详细输出模式
 """
 
@@ -19,6 +19,7 @@ import time
 import datetime
 import pandas as pd
 import baostock as bs
+import shutil
 from pathlib import Path
 from typing import List, Optional, Dict
 from dataclasses import dataclass
@@ -43,13 +44,16 @@ class CheckResult:
 
 
 class DataChecker:
-    def __init__(self, data_dir: str, check_days: int = 100):
+    def __init__(self, data_dir: str, check_days: int = 100, backup: bool = True):
         """
         Args:
             data_dir: 数据存储目录
             check_days: 检查最近多少天的数据（默认 100 天）
+            backup: 是否启用备份（默认启用）
         """
         self.data_dir = Path(data_dir)
+        self.backup_dir = self.data_dir.parent / "data_backup"
+        self.enable_backup = backup
         self.check_days = check_days
         self.login_success = False
         
@@ -78,6 +82,24 @@ class DataChecker:
         if self.login_success:
             bs.logout()
             self.login_success = False
+    
+    def backup_data(self):
+        """备份现有数据"""
+        if not self.enable_backup:
+            return
+        
+        try:
+            if self.data_dir.exists():
+                backup_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_path = self.backup_dir / backup_timestamp
+                backup_path.mkdir(parents=True, exist_ok=True)
+                
+                for csv_file in self.data_dir.glob("*.csv"):
+                    shutil.copy2(csv_file, backup_path / csv_file.name)
+                
+                print(f"✓ 数据已备份到：{backup_path}")
+        except Exception as e:
+            print(f"✗ 备份失败：{e}")
     
     def get_all_csv_files(self) -> List[Path]:
         """获取所有 CSV 文件"""
@@ -610,6 +632,9 @@ class DataChecker:
                 files_to_check = self.get_all_csv_files()
                 print(f"\n检查所有股票：{len(files_to_check)} 只")
             
+            if self.enable_backup:
+                self.backup_data()
+            
             results = []
             repair_success = 0
             repair_fail = 0
@@ -725,6 +750,7 @@ def main():
     parser.add_argument('--stocks', type=str, nargs='+',help='指定要检查的股票代码列表')
     parser.add_argument('--verbose', action='store_true',help='详细输出模式')
     parser.add_argument('--no-ohlc', action='store_true',help='跳过 OHLC 逻辑检查')
+    parser.add_argument('--no-backup', action='store_true',help='禁用备份')
     args = parser.parse_args()
     
     data_dir = Path(args.data_dir)
@@ -732,7 +758,7 @@ def main():
         script_dir = Path(__file__).parent
         data_dir = script_dir / data_dir
     
-    checker = DataChecker(str(data_dir), check_days=args.days)
+    checker = DataChecker(str(data_dir), check_days=args.days, backup=not args.no_backup)
     
     checker.run_full_check(
         stock_codes=args.stocks,

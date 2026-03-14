@@ -12,13 +12,16 @@
 - generate_pseudo_labels: 伪标签生成
 - save_model_with_metadata: 带元数据的模型保存
 - print_dispersion_sparkline: 预测值分布可视化
+- create_optimizer_from_config: 根据配置创建优化器
+- create_scheduler_from_config: 根据配置创建学习率调度器
 '''
 
 import os,torch,torch.nn as nn,numpy as np
 from datetime import datetime
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
-from config import DataConfig,LossConfig
+from config import DataConfig,LossConfig,TrainingConfig
+import torch.optim as optim
 
 class WarmupScheduler:
     """
@@ -928,3 +931,76 @@ class GradientMonitor:
                 abnormal.append((name, stats))
 
         return exploding, vanishing, abnormal
+
+
+def create_optimizer_from_config(model, lr=None):
+    """
+    根据配置创建优化器（统一入口）
+
+    Args:
+        model: PyTorch模型
+        lr: 学习率，如果为None则使用 TrainingConfig.LEARNING_RATE
+
+    Returns:
+        optimizer: 创建的优化器实例
+    """
+    from optimizers import create_optimizer
+
+    actual_lr = lr if lr is not None else TrainingConfig.LEARNING_RATE
+
+    if TrainingConfig.USE_MANO:
+        optimizer = create_optimizer(
+            model,
+            optimizer_type='mano',
+            lr=actual_lr,
+            momentum=TrainingConfig.MANO_MOMENTUM,
+            weight_decay=TrainingConfig.WEIGHT_DECAY,
+            betas=TrainingConfig.MANO_ADAMW_BETAS
+        )
+    elif TrainingConfig.USE_ADAMW:
+        optimizer = optim.AdamW(model.parameters(), lr=actual_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=actual_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
+
+    return optimizer
+
+
+def create_scheduler_from_config(optimizer, epochs, lr=None, eta_min=None, warmup_start_lr=None):
+    """
+    根据配置创建学习率调度器（预热 + 余弦退火）
+
+    Args:
+        optimizer: PyTorch优化器
+        epochs: 总训练轮数
+        lr: 目标学习率，如果为None则使用 TrainingConfig.LEARNING_RATE
+        eta_min: 余弦退火最小学习率，如果为None则使用 TrainingConfig.COSINE_ETA_MIN
+        warmup_start_lr: 预热起始学习率，如果为None则使用 TrainingConfig.WARMUP_START_LR
+
+    Returns:
+        tuple: (warmup_scheduler, main_scheduler, warmup_epochs)
+            - warmup_scheduler: 预热调度器
+            - main_scheduler: 余弦退火调度器
+            - warmup_epochs: 预热轮数（用于打印状态）
+    """
+    actual_lr = lr if lr is not None else TrainingConfig.LEARNING_RATE
+    actual_eta_min = eta_min if eta_min is not None else TrainingConfig.COSINE_ETA_MIN
+    actual_warmup_start_lr = warmup_start_lr if warmup_start_lr is not None else TrainingConfig.WARMUP_START_LR
+
+    warmup_epochs = max(1, int(epochs * TrainingConfig.WARMUP_RATIO))
+
+    warmup_scheduler = WarmupScheduler(
+        optimizer,
+        warmup_epochs=warmup_epochs,
+        target_lr=actual_lr,
+        start_lr=actual_warmup_start_lr
+    )
+
+    # 确保余弦退火的 T_max 至少为1，防止 epochs 过小时崩溃
+    total_main_epochs = max(1, epochs - warmup_epochs)
+    main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_main_epochs,
+        eta_min=actual_eta_min
+    )
+
+    return warmup_scheduler, main_scheduler, warmup_epochs

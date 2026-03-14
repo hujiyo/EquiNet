@@ -40,7 +40,9 @@ from training_utils import (
     TaskAlignedLoss,
     EarlyStopping,
     calculate_test_loss,
-    print_dispersion_sparkline
+    print_dispersion_sparkline,
+    create_optimizer_from_config,
+    create_scheduler_from_config
 )
 
 
@@ -173,45 +175,17 @@ def train_dft_model(model, train_stock_info, test_stock_info,
     dft_lr = learning_rate * 0.2
     print(f"DFT学习率: {dft_lr:.6f} (原学习率的20%)")
 
-    # 根据配置选择优化器
-    if TrainingConfig.USE_MANO:
-        from optimizers import create_optimizer
-        optimizer = create_optimizer(
-            model,
-            optimizer_type='mano',
-            lr=dft_lr,
-            momentum=TrainingConfig.MANO_MOMENTUM,
-            weight_decay=TrainingConfig.WEIGHT_DECAY,
-            betas=TrainingConfig.MANO_ADAMW_BETAS
-        )
-    elif TrainingConfig.USE_ADAMW:
-        optimizer = optim.AdamW(model.parameters(), lr=dft_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
-    else:
-        optimizer = optim.Adam(model.parameters(), lr=dft_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
+    # 创建优化器
+    optimizer = create_optimizer_from_config(model, lr=dft_lr)
 
-    # 计算动态预热轮次（总轮数的10%）
-    warmup_epochs = max(1, int(epochs * TrainingConfig.WARMUP_RATIO))
-
-    # 学习率调度：预热 + 余弦退火
-    warmup_scheduler = WarmupScheduler(
+    # 创建学习率调度器（DFT使用自定义的起始学习率和最小学习率）
+    warmup_scheduler, main_scheduler, warmup_epochs = create_scheduler_from_config(
         optimizer,
-        warmup_epochs=warmup_epochs,
-        target_lr=dft_lr,
-        start_lr=dft_lr * 0.1
+        epochs=epochs,
+        lr=dft_lr,
+        eta_min=dft_lr * 0.01,
+        warmup_start_lr=dft_lr * 0.1
     )
-
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = dft_lr
-
-    total_main_epochs = epochs - warmup_epochs
-    main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_main_epochs,
-        eta_min=dft_lr * 0.01
-    )
-
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = dft_lr * 0.1
 
     # 损失函数选择
     use_task_aligned = LossConfig.use_task_aligned()

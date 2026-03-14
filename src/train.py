@@ -38,7 +38,9 @@ from training_utils import (
     TaskAlignedLoss,
     EarlyStopping,
     calculate_test_loss,
-    print_dispersion_sparkline
+    print_dispersion_sparkline,
+    create_optimizer_from_config,
+    create_scheduler_from_config
 )
 
 def train_clone_model(model_a, train_stock_info, test_stock_info,
@@ -88,45 +90,15 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     model_b = None
     optimizer_b = None
 
-    # 根据配置选择优化器
-    if TrainingConfig.USE_MANO:
-        from optimizers import create_optimizer
-        optimizer_a = create_optimizer(
-            model_a,
-            optimizer_type='mano',
-            lr=learning_rate,
-            momentum=TrainingConfig.MANO_MOMENTUM,
-            weight_decay=TrainingConfig.WEIGHT_DECAY,
-            betas=TrainingConfig.MANO_ADAMW_BETAS
-        )
-    elif TrainingConfig.USE_ADAMW:
-        optimizer_a = optim.AdamW(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
-    else:
-        optimizer_a = optim.Adam(model_a.parameters(), lr=learning_rate, weight_decay=TrainingConfig.WEIGHT_DECAY)
+    # 创建优化器（模型A）
+    optimizer_a = create_optimizer_from_config(model_a, lr=learning_rate)
 
-    # 计算动态预热轮次（总轮数的10%）
-    warmup_epochs = max(1, int(epochs * TrainingConfig.WARMUP_RATIO))
-
-    # 学习率调度（模型A）
-    warmup_scheduler_a = WarmupScheduler(
+    # 创建学习率调度器（模型A）
+    warmup_scheduler_a, main_scheduler_a, warmup_epochs = create_scheduler_from_config(
         optimizer_a,
-        warmup_epochs=warmup_epochs,
-        target_lr=learning_rate,
-        start_lr=TrainingConfig.WARMUP_START_LR
+        epochs=epochs,
+        lr=learning_rate
     )
-
-    for param_group in optimizer_a.param_groups:
-        param_group['lr'] = learning_rate
-
-    total_main_epochs = epochs - warmup_epochs
-    main_scheduler_a = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_a,
-        T_max=total_main_epochs,
-        eta_min=TrainingConfig.COSINE_ETA_MIN
-    )
-
-    for param_group in optimizer_a.param_groups:
-        param_group['lr'] = TrainingConfig.WARMUP_START_LR
 
     # 损失函数选择
     if LossConfig.use_task_aligned():
@@ -245,22 +217,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             model_b = model_b.to(device)
 
             # 模型B使用半学习率，更保守的更新
-            if TrainingConfig.USE_MANO:
-                from optimizers import create_optimizer
-                optimizer_b = create_optimizer(
-                    model_b,
-                    optimizer_type='mano',
-                    lr=learning_rate * 0.5,
-                    momentum=TrainingConfig.MANO_MOMENTUM,
-                    weight_decay=TrainingConfig.WEIGHT_DECAY,
-                    betas=TrainingConfig.MANO_ADAMW_BETAS
-                )
-            elif TrainingConfig.USE_ADAMW:
-                optimizer_b = optim.AdamW(model_b.parameters(), lr=learning_rate * 0.5,
-                                          weight_decay=TrainingConfig.WEIGHT_DECAY)
-            else:
-                optimizer_b = optim.Adam(model_b.parameters(), lr=learning_rate * 0.5,
-                                         weight_decay=TrainingConfig.WEIGHT_DECAY)
+            optimizer_b = create_optimizer_from_config(model_b, lr=learning_rate * 0.5)
             print(f"  模型B已创建，参数数: {sum(p.numel() for p in model_b.parameters()):,}")
             print()
 

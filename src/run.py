@@ -84,14 +84,34 @@ def list_available_models(output_dir=DataConfig.OUTPUT_DIR):
 
 
 def load_model(model_path, device):
-    """加载模型"""
-    model = create_model()
-    state_dict = torch.load(model_path, map_location=device, weights_only=True)
-      
+    """
+    加载模型，支持两种 .pth 格式：
+    - 新格式（checkpoint 字典）：含 model_arch / train_params / eval_stats / state_dict
+    - 旧格式（裸 state_dict）：直接是权重字典，按 config.py 当前参数创建模型
+
+    返回: (model, metadata)
+        metadata: 新格式时为包含元数据的字典，旧格式时为 None
+    """
+    raw = torch.load(model_path, map_location=device, weights_only=True)
+
+    if isinstance(raw, dict) and 'state_dict' in raw:
+        # 新格式：从内嵌的 model_arch 重建与训练时完全一致的模型
+        model_arch   = raw.get('model_arch')
+        train_params = raw.get('train_params')
+        eval_stats   = raw.get('eval_stats')
+        state_dict   = raw['state_dict']
+        metadata     = {'model_arch': model_arch, 'train_params': train_params, 'eval_stats': eval_stats}
+        model = create_model(model_arch=model_arch)
+    else:
+        # 旧格式：裸 state_dict，使用当前 config.py 参数
+        state_dict = raw
+        metadata   = None
+        model = create_model()
+
     model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
-    return model
+    return model, metadata
 
 
 def generate_latest_input(stock_data, file_name):
@@ -683,9 +703,30 @@ def main():
     model_path = os.path.join(DataConfig.OUTPUT_DIR, selected_file)
     
     print(f"\n  正在加载模型: {selected_file}")
-    model = load_model(model_path, device)
+    model, metadata = load_model(model_path, device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  模型参数量: {total_params:,}")
+
+    if metadata is not None:
+        arch = metadata.get('model_arch') or {}
+        tp   = metadata.get('train_params') or {}
+        es   = metadata.get('eval_stats') or {}
+        print(f"  ┌── 模型内嵌元数据 ──────────────────────────────")
+        print(f"  │  架构: {arch.get('model_type','?')}  "
+              f"d_model={arch.get('d_model','?')}  "
+              f"layers={arch.get('num_layers','?')}  "
+              f"heads={arch.get('nhead','?')}  "
+              f"ctx={arch.get('context_length','?')}")
+        print(f"  │  训练: lr={tp.get('learning_rate','?')}  "
+              f"bs={tp.get('batch_size','?')}  "
+              f"loss={tp.get('loss_type','?')}")
+        print(f"  │  评估: Top{es.get('top_k','?')}%收益={es.get('top_return',0)*100:+.2f}%  "
+              f"AUC={es.get('auc',0):.4f}  "
+              f"Ep={es.get('epoch','?')}")
+        print(f"  └───────────────────────────────────────────────")
+    else:
+        print(f"  (旧格式模型，无内嵌元数据，使用当前 config.py 参数)")
+
     print(f"  ✓ 模型加载成功")
     
     # 加载数据并评估

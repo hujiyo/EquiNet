@@ -15,6 +15,7 @@ EquiNet 模型定义文件
 import torch
 import torch.nn as nn
 from config import ModelConfig, DataConfig
+from tokenizer import TokenConfig
 
 def init_weights(module):
     """
@@ -387,7 +388,8 @@ class TokenizedStockTransformer(nn.Module):
 
 def create_model(input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL, 
                  nhead=ModelConfig.NHEAD, num_layers=ModelConfig.NUM_LAYERS,
-                 output_dim=ModelConfig.OUTPUT_DIM, seq_len=DataConfig.CONTEXT_LENGTH):
+                 output_dim=ModelConfig.OUTPUT_DIM, seq_len=DataConfig.CONTEXT_LENGTH,
+                 model_arch=None):
     """
     根据配置创建模型（工厂函数）
 
@@ -397,11 +399,22 @@ def create_model(input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL,
 
     Args:
         参数均为可选，如果不提供则使用 ModelConfig 中的默认值
+        model_arch: 可选的元数据字典（来自 .pth 内的 'model_arch' 键），
+                    若提供则优先使用其中的参数覆盖默认值，
+                    用于 run.py 自动重建与训练时架构一致的模型
 
     Returns:
         model: 对应类型的模型实例
     """
-    model_type = ModelConfig.MODEL_TYPE.lower()
+    if model_arch is not None:
+        input_dim  = model_arch.get('input_dim',  input_dim)
+        d_model    = model_arch.get('d_model',    d_model)
+        nhead      = model_arch.get('nhead',      nhead)
+        num_layers = model_arch.get('num_layers', num_layers)
+        output_dim = model_arch.get('output_dim', output_dim)
+        seq_len    = model_arch.get('context_length', seq_len)
+
+    model_type = (model_arch.get('model_type', ModelConfig.MODEL_TYPE) if model_arch else ModelConfig.MODEL_TYPE).lower()
 
     if model_type == 'continuous':
         # 创建连续值模型

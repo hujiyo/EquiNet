@@ -51,7 +51,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                       batches_per_epoch=TrainingConfig.BATCHES_PER_EPOCH,
                       clone_epoch=TrainingConfig.EPOCHS*0.25,
                       pseudo_pos_ratio=0.01,
-                      pseudo_neg_ratio=0.05):
+                      pseudo_neg_ratio=0.05,
+                      enable_model_b=True):
     """
     克隆模型训练函数
 
@@ -145,8 +146,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     best_return_epoch_a = 0
 
     # 最佳模型B缓存（按收益率判断，仅用于显示）
-    best_return_b = -float('inf')
-    best_return_epoch_b = 0
+    best_return_b = None if not enable_model_b else -float('inf')
+    best_return_epoch_b = None if not enable_model_b else 0
 
     # 按loss保存的最佳模型（需要满足条件才参与评估）
     # 条件：epoch >= 100, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%
@@ -207,19 +208,23 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             current_lr = main_scheduler_a.get_last_lr()[0]
             lr_status = "正常训练"
 
-        status = "A+B训练" if has_model_b else "只训练A"
+        status = "A+B训练" if (enable_model_b and has_model_b) else "只训练A"
         print(f'Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f} ({lr_status}) [{status}]')
 
         # 第clone_epoch轮时克隆模型B
         if (epoch + 1) == clone_epoch and model_b is None:
-            print(f"\n  >>> 第{clone_epoch}轮：克隆模型A为模型B <<<")
-            model_b = copy.deepcopy(model_a)
-            model_b = model_b.to(device)
+            if enable_model_b:
+                print(f"\n  >>> 第{clone_epoch}轮：克隆模型A为模型B <<<")
+                model_b = copy.deepcopy(model_a)
+                model_b = model_b.to(device)
 
-            # 模型B使用半学习率，更保守的更新
-            optimizer_b = create_optimizer_from_config(model_b, lr=learning_rate * 0.5)
-            print(f"  模型B已创建，参数数: {sum(p.numel() for p in model_b.parameters()):,}")
-            print()
+                # 模型B使用半学习率，更保守的更新
+                optimizer_b = create_optimizer_from_config(model_b, lr=learning_rate * 0.5)
+                print(f"  模型B已创建，参数数: {sum(p.numel() for p in model_b.parameters()):,}")
+                print()
+            else:
+                print(f"\n  >>> 第{clone_epoch}轮：模型B训练已禁用，跳过克隆 <<<")
+                print()
 
         # 使用时间顺序采样器生成训练数据（与主训练流程统一）
         epoch_inputs, epoch_targets, epoch_cum_returns = sample_with_pools(
@@ -271,8 +276,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             # 累加loss时乘以batch_size，得到该batch的总损失
             total_loss_a += loss_a.item() * (end_idx - start_idx)
 
-            # ========== 训练模型B（如果存在）==========
-            if model_b is not None and best_model_a_for_pseudo is not None:
+            # ========== 训练模型B（如果存在且启用）==========
+            if enable_model_b and model_b is not None and best_model_a_for_pseudo is not None:
                 optimizer_b.zero_grad()
 
                 # 用【最佳模型A】的预测生成伪标签
@@ -311,7 +316,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             # 使用已处理的样本数计算当前平均损失
             processed_samples = (step + 1) * batch_size
             avg_loss_a = total_loss_a / processed_samples
-            if model_b is not None:
+            if enable_model_b and model_b is not None:
                 avg_loss_b = total_loss_b / processed_samples
                 print(f'\r  训练进度: {progress:.1f}%, Loss_A: {avg_loss_a:.4f}, Loss_B: {avg_loss_b:.4f}', end='', flush=True)
             else:
@@ -433,8 +438,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 best_realistic_return_value_at_best = realistic_return_a
                 print(f'          ✓ 新最佳模型A（实战收益率）！实战: {best_realistic_return_a*100:.1f}%, Top1%: {best_return_a_at_best_realistic*100:+.2f}% (第{best_realistic_return_epoch_a}轮)')
 
-        # 评估模型B（如果存在）
-        if model_b is not None:
+        # 评估模型B（如果存在且启用）
+        if enable_model_b and model_b is not None:
             stats_b = evaluate_model(
                 model_b, eval_inputs, eval_targets, eval_cumulative_returns,
                 device, model_name="B",
@@ -468,7 +473,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             print(f'          伪标签来源: 最佳A(第{best_return_epoch_a}轮, 收益{best_return_a*100:+.2f}%)')
             print(f'          伪标签统计: 伪正={total_pseudo_pos}, 伪负={total_pseudo_neg}, 不变={total_unchanged}')
 
-            if stats_b['top_return'] > best_return_b:
+            if best_return_b is not None and stats_b['top_return'] > best_return_b:
                 best_return_b = stats_b['top_return']
                 best_return_epoch_b = epoch + 1
                 print(f'          ✓ 新最佳模型B（收益率）！Top1%收益: {best_return_b*100:+.2f}% (第{best_return_epoch_b}轮)')
@@ -503,7 +508,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     print(f"最佳模型A（按收益率用于伪标签）: 第{best_return_epoch_a}轮, Top1%收益: {best_return_a*100:+.2f}%")
     print(f"最佳模型A（按loss）: 第{best_loss_epoch_a}轮, Loss: {best_loss_a:.4f}, 实战收益率: {best_realistic_return_a_at_best_loss*100:.1f}%")
     print(f"最佳模型A（按实战收益率）: 第{best_realistic_return_epoch_a}轮, 实战收益率: {best_realistic_return_value_at_best*100:.1f}%, Top1%: {best_return_a_at_best_realistic*100:+.2f}%")
-    if best_model_b_by_loss is not None:
+    if enable_model_b and best_model_b_by_loss is not None:
         print(f"最佳模型B（按loss）: 第{best_loss_epoch_b}轮, Loss: {best_loss_b:.4f}, 实战收益率: {best_realistic_return_b_at_best_loss*100:.1f}%")
 
     # 保存模型A（按loss的最佳模型）
@@ -533,7 +538,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         print(f"  实战收益率: {best_realistic_return_value_at_best*100:.1f}%")
 
     # 保存模型B（按loss的最佳模型）
-    if best_model_b_by_loss is not None:
+    if enable_model_b and best_model_b_by_loss is not None:
         save_path_b = save_model_with_metadata(
             best_model_b_by_loss,
             best_return_b_at_best_loss, best_threshold_b_at_best_loss, best_auc_b_at_best_loss,
@@ -550,20 +555,32 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     # 保存每轮收益率到CSV（使用时间戳避免多模型训练时覆盖）
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"clone_epoch_returns_{timestamp}.csv")
+    
+    # 根据 enable_model_b 动态决定 CSV 字段
+    if enable_model_b:
+        fieldnames = ['turn', 'A', 'B', 'train_loss_A', 'test_loss_A', 'train_loss_B', 'test_loss_B']
+    else:
+        fieldnames = ['turn', 'A', 'train_loss_A', 'test_loss_A']
+    
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'A', 'B', 'train_loss_A', 'test_loss_A', 'train_loss_B', 'test_loss_B'])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
         for epoch_return in epoch_returns:
             row = {
                 'turn': epoch_return['turn'],
                 'A': f"{epoch_return['return_a']:.2f}" if epoch_return['return_a'] is not None else "",
-                'B': f"{epoch_return['return_b']:.2f}" if epoch_return['return_b'] is not None else "",
                 'train_loss_A': f"{epoch_return['train_loss_a']:.4f}" if epoch_return.get('train_loss_a') is not None else "",
-                'test_loss_A': f"{epoch_return['test_loss_a']:.4f}" if epoch_return.get('test_loss_a') is not None else "",
-                'train_loss_B': f"{epoch_return['train_loss_b']:.4f}" if epoch_return.get('train_loss_b') is not None else "",
-                'test_loss_B': f"{epoch_return['test_loss_b']:.4f}" if epoch_return.get('test_loss_b') is not None else ""
+                'test_loss_A': f"{epoch_return['test_loss_a']:.4f}" if epoch_return.get('test_loss_a') is not None else ""
             }
+            
+            if enable_model_b:
+                row.update({
+                    'B': f"{epoch_return['return_b']:.2f}" if epoch_return['return_b'] is not None else "",
+                    'train_loss_B': f"{epoch_return['train_loss_b']:.4f}" if epoch_return.get('train_loss_b') is not None else "",
+                    'test_loss_B': f"{epoch_return['test_loss_b']:.4f}" if epoch_return.get('test_loss_b') is not None else ""
+                })
+            
             writer.writerow(row)
 
     print(f"✓ 每轮收益率已保存: {os.path.basename(returns_csv_path)}")
@@ -612,9 +629,13 @@ if __name__ == "__main__":
         device=device,
         clone_epoch=TrainingConfig.EPOCHS*0.25,
         pseudo_pos_ratio=0.01,
-        pseudo_neg_ratio=0.05
+        pseudo_neg_ratio=0.05,
+        enable_model_b=True
     )
 
     print(f"\n最终结果:")
     print(f"  模型A: 最佳Top1%收益={best_return_a*100:+.2f}%")
-    print(f"  模型B: 最佳Top1%收益={best_return_b*100:+.2f}%")
+    if best_return_b is not None:
+        print(f"  模型B: 最佳Top1%收益={best_return_b*100:+.2f}%")
+    else:
+        print(f"  模型B: 训练已禁用")

@@ -242,7 +242,7 @@ def print_banner():
     """打印欢迎界面"""
     print()
     print("╔" + "═"*62 + "╗")
-    print("║" + " "*14 + "EquiNet v2 · 模型推理与选股" + " "*14 + "    ║")
+    print("║" + " "*14 + "EquiNet · 模型推理与选股" + " "*14 + "    ║")
     print("╚" + "═"*62 + "╝")
     print()
 
@@ -789,9 +789,6 @@ def main():
                 print("  ✗ 阈值应在 0 到 1 之间")
         except ValueError:
             print("  ✗ 无效输入")
-    
-    print("\n  感谢使用 EquiNet v2！")
-
 
 if __name__ == "__main__":
     main()

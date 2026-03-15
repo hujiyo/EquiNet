@@ -9,6 +9,7 @@ dependencies:
   - pandas
   - openpyxl
   - scikit-learn
+  - scipy
   - transformers
   - ipykernel
   - pip

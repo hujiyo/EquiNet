@@ -8,6 +8,7 @@ doc*/
 *.pyc
 *.json
 *.jsonl
+*.png
 
 .vscode/
 .vs/

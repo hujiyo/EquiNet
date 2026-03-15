@@ -170,26 +170,23 @@ class AttentionPooling(nn.Module):
 
 class StockTransformer(nn.Module):
     """
-    Transformer 模型（Pre-Norm架构 + FFN-Embedding）
+    Transformer 模型（Pre-Norm 架构 + Linear-Embedding）
 
-    核心改进1：统一Embedding - 端到端学习特征融合
-    - 6个输入特征(OHLC + Volume + Exchange) -> 统一映射到 d_model 维
-    - 让模型自己学习如何组合和表达不同类型的特征
-    - 相比分离embedding，减少了人为的结构假设
+    核心设计：回归主流 Transformer 架构
+    - 6 个输入特征 (OHLC + Volume + Exchange) -> 单一线性层映射到 d_model 维
+    - 遵循 BERT/GPT/LLaMA 等主流模型的设计：embedding = nn.Linear(input_dim, d_model)
+    - 简化结构，减少不必要的非线性变换，让模型更容易训练
 
-    核心改进2：统一Transformer层架构
-    - 所有层都使用 Attention + FFN 结构
-    - 简化模型设计，降低结构复杂度
+    架构统一性：
+    - Embedding 层：线性投影（无激活函数）
+    - Transformer 层：标准 Attention + FFN 结构
     """
     def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, seq_len):
         super(StockTransformer, self).__init__()
 
-        # FFN-Embedding：两阶段FFN结构，让特征在进入Transformer前充分混合
-        self.embedding = nn.Sequential(
-            nn.Linear(ModelConfig.INPUT_DIM, ModelConfig.EMBED_HIDDEN_DIM),
-            nn.GELU(),
-            nn.Linear(ModelConfig.EMBED_HIDDEN_DIM, d_model)
-        )
+        # Linear-Embedding：单一线性层，主流 Transformer 标准做法
+        # 输入特征直接线性映射到 d_model 维，无中间层和激活函数
+        self.embedding = nn.Linear(input_dim, d_model)
 
         # 使用标准位置编码
         self.pos_encoding = PositionalEncoding(d_model, seq_len)

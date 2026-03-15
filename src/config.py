@@ -36,6 +36,21 @@ class DataConfig:
 
     # 评估参数
     EVAL_BATCH_SIZE = 256            # 评估批处理大小（分批处理，减少显存占用）
+
+    # ========== 特征归一化配置 ==========
+    # 使用 QuantileTransformer + StandardScaler 进行高级特征归一化
+    # 优点：
+    #   1. 统一所有特征到均值0、标准差1的分布
+    #   2. 自动处理特征范围不同（Volume/Exchange vs OHLC）
+    #   3. 自动处理特征集中度不同（Volume 99%集中在小范围）
+    #   4. 自动处理异常值和偏态分布
+    USE_FEATURE_NORMALIZER = True    # 是否启用特征归一化器
+
+    # 归一化器配置（仅当 USE_FEATURE_NORMALIZER=True 时生效）
+    NORMALIZER_OUTPUT_DISTRIBUTION = 'normal'  # 'normal' (标准正态) 或 'uniform' (均匀分布)
+    NORMALIZER_N_QUANTILES = 1000            # 分位数数量（越大越精确但越慢）
+    NORMALIZER_PATH = './feature_normalizer.pkl'  # 归一化器保存/加载路径
+
     TOP_K = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
     TOP_N_PER_DAY = 0                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
     MAX_SELECT_PER_DAY = 4             # 全局阈值模式下每天最多选股数量（0表示不限制）

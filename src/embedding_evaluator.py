@@ -31,8 +31,9 @@ from datetime import datetime
 import argparse
 
 from model import create_model
-from data import load_and_preprocess_data
+from data import load_and_preprocess_data, set_feature_normalizer, disable_feature_normalizer
 from config import DataConfig, ModelConfig
+from feature_normalizer import FeatureNormalizer
 
 
 class EmbeddingLayerAnalyzer:
@@ -719,18 +720,44 @@ def main():
     
     save_dir = './embedding_eval_results'
     os.makedirs(save_dir, exist_ok=True)
-    
+
+    # ========== 特征归一化器配置 ==========
+    if DataConfig.USE_FEATURE_NORMALIZER:
+        print("\n" + "="*60)
+        print("特征归一化器配置")
+        print("="*60)
+        print(f"归一化器路径: {DataConfig.NORMALIZER_PATH}")
+        
+        if os.path.exists(DataConfig.NORMALIZER_PATH):
+            print(f"\n✓ 检测到归一化器文件，正在加载...")
+            normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
+            set_feature_normalizer(normalizer)
+            print("✓ 特征归一化器已启用")
+        else:
+            print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
+            print("将使用原始数据（不应用高级归一化）")
+            disable_feature_normalizer()
+        
+        print("="*60)
+    else:
+        print("\n[特征归一化器] 已禁用（USE_FEATURE_NORMALIZER=False）")
+        disable_feature_normalizer()
+
     print("\n[步骤1] 加载数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
     
     print("\n[步骤2] 准备测试样本...")
+    from data import normalize_and_validate_context_window
     all_inputs = []
     for stock in test_stock_info[:50]:
         data = stock['data']
         test_split = stock['test_split_point']
         for i in range(test_split, min(test_split + 10, len(data) - 33)):
-            context = data[i:i+30]
-            all_inputs.append(context)
+            input_seq = normalize_and_validate_context_window(
+                data, i, 30, check_limit_up=False, required_length=33
+            )
+            if input_seq is not None:
+                all_inputs.append(input_seq)
     
     sample_inputs = np.array(all_inputs[:500])
     print(f"  准备了 {len(sample_inputs)} 个测试样本")

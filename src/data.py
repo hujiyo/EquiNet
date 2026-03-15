@@ -15,6 +15,41 @@ import numpy as np
 import pandas as pd
 from config import DataConfig, generate_label, calculate_returns
 from multiprocessing import Pool, cpu_count
+from feature_normalizer import FeatureNormalizer
+
+# 全局特征归一化器（None 表示未启用）
+_feature_normalizer = None
+
+
+def set_feature_normalizer(normalizer: FeatureNormalizer):
+    """
+    设置全局特征归一化器
+
+    Args:
+        normalizer: 已拟合的 FeatureNormalizer 实例
+    """
+    global _feature_normalizer
+    _feature_normalizer = normalizer
+    print("[data.py] ✓ 特征归一化器已启用")
+
+
+def get_feature_normalizer() -> FeatureNormalizer:
+    """
+    获取当前的特征归一化器
+
+    Returns:
+        当前启用的归一化器，如果未启用则返回 None
+    """
+    return _feature_normalizer
+
+
+def disable_feature_normalizer():
+    """
+    禁用特征归一化器
+    """
+    global _feature_normalizer
+    _feature_normalizer = None
+    print("[data.py] 特征归一化器已禁用")
 
 
 def process_single_file(args):
@@ -876,11 +911,16 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
     
     input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
-    
+
     np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
     np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
     input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
     np.clip(input_seq[:, 4:6], 0.0, 1.0, out=input_seq[:, 4:6])
+
+    # 应用高级特征归一化（如果归一化器已加载）
+    global _feature_normalizer
+    if _feature_normalizer is not None:
+        input_seq = _feature_normalizer.transform(input_seq)
 
     if np.any(~np.isfinite(input_seq)):
         return None

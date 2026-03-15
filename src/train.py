@@ -26,8 +26,10 @@ from model import create_model
 from data import (
     load_and_preprocess_data,
     create_sampler, sample_with_pools,
-    create_fixed_evaluation_dataset
+    create_fixed_evaluation_dataset,
+    set_feature_normalizer, disable_feature_normalizer
 )
+from feature_normalizer import FeatureNormalizer
 
 from training_utils import (
     WarmupScheduler,
@@ -603,8 +605,35 @@ if __name__ == "__main__":
     # 创建输出目录
     os.makedirs(DataConfig.OUTPUT_DIR, exist_ok=True)
 
+    # ========== 特征归一化器配置 ==========
+    if DataConfig.USE_FEATURE_NORMALIZER:
+        print("\n" + "="*60)
+        print("特征归一化器配置")
+        print("="*60)
+        print(f"归一化器路径: {DataConfig.NORMALIZER_PATH}")
+        print(f"输出分布: {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION}")
+        print(f"分位数数量: {DataConfig.NORMALIZER_N_QUANTILES}")
+
+        # 检查归一化器文件是否存在
+        if os.path.exists(DataConfig.NORMALIZER_PATH):
+            print(f"\n✓ 检测到归一化器文件，正在加载...")
+            normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
+            set_feature_normalizer(normalizer)
+            print("✓ 特征归一化器已启用")
+        else:
+            print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
+            print("请先运行以下命令创建归一化器：")
+            print(f"  python setup_feature_normalizer.py --output-distribution {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION} --n-quantiles {DataConfig.NORMALIZER_N_QUANTILES}")
+            print("\n或者将 config.py 中的 USE_FEATURE_NORMALIZER 设置为 False")
+            raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
+
+        print("="*60)
+    else:
+        print("\n[特征归一化器] 已禁用（USE_FEATURE_NORMALIZER=False）")
+        disable_feature_normalizer()
+
     # 加载数据
-    print("正在加载和预处理数据...")
+    print("\n正在加载和预处理数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
     # 打印数据集统计

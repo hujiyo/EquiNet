@@ -19,7 +19,10 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
-from data import load_and_preprocess_data, create_fixed_evaluation_dataset, create_recent_days_dataset, normalize_and_validate_context_window
+from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,
+                  create_recent_days_dataset, normalize_and_validate_context_window,
+                  set_feature_normalizer, disable_feature_normalizer)
+from feature_normalizer import FeatureNormalizer
 from training_utils import evaluate_model, calculate_test_loss, DynamicWeightedBCE
 
 
@@ -731,6 +734,22 @@ def main():
     
     # 加载数据并评估
     print(f"\n  正在加载数据集...")
+
+    # ========== 特征归一化器配置 ==========
+    if DataConfig.USE_FEATURE_NORMALIZER:
+        if os.path.exists(DataConfig.NORMALIZER_PATH):
+            print(f"\n  [特征归一化] 正在加载归一化器...")
+            normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
+            set_feature_normalizer(normalizer)
+            print(f"  [特征归一化] ✓ 已启用")
+        else:
+            print(f"\n  ⚠ 警告: 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
+            print(f"  模型可能是在未启用归一化器的情况下训练的")
+            print(f"  如需启用归一化器，请先运行: python setup_feature_normalizer.py")
+            disable_feature_normalizer()
+    else:
+        disable_feature_normalizer()
+
     train_stock_info, test_stock_info = load_and_preprocess_data()
     
     # 运行评估

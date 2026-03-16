@@ -792,25 +792,22 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
 
     # ========== 特征归一化器配置 ==========
-    if DataConfig.USE_FEATURE_NORMALIZER:
-        print("\n" + "="*60)
-        print("特征归一化器配置")
-        print("="*60)
-        print(f"归一化器路径: {DataConfig.NORMALIZER_PATH}")
-        
-        if os.path.exists(DataConfig.NORMALIZER_PATH):
-            print(f"\n✓ 检测到归一化器文件，正在加载...")
-            feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
-            print("✓ 特征归一化器已启用")
-        else:
-            print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
-            print("将使用原始数据（不应用高级归一化）")
-            feature_normalizer = None
+    print("\n" + "="*60)
+    print("特征归一化器配置")
+    print("="*60)
+    print(f"归一化器路径: {DataConfig.NORMALIZER_PATH}")
 
-        print("="*60)
+    if os.path.exists(DataConfig.NORMALIZER_PATH):
+        print(f"\n✓ 检测到归一化器文件，正在加载...")
+        feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
+        print("✓ 特征归一化器已启用")
     else:
-        print("\n[特征归一化器] 已禁用（USE_FEATURE_NORMALIZER=False）")
-        feature_normalizer = None
+        print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
+        print("请先运行以下命令创建归一化器：")
+        print(f"  python data.py --fit-normalizer")
+        raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
+
+    print("="*60)
 
     print("\n[步骤1] 加载数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
@@ -823,8 +820,7 @@ def main():
         test_split = stock['test_split_point']
         for i in range(test_split, min(test_split + 10, len(data) - 33)):
             input_seq = normalize_and_validate_context_window(
-                data, i, 30, check_limit_up=False, required_length=33,
-                feature_normalizer=feature_normalizer
+                data, i, 30, check_limit_up=False, required_length=33
             )
             if input_seq is not None:
                 all_inputs.append(input_seq)

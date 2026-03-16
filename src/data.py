@@ -813,15 +813,15 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
             np.asarray(recent_day_indices), np.asarray(recent_available_days))
 
 
-def normalize_and_validate_context_window(stock_data, start_idx, context_length, 
+def normalize_and_validate_context_window(stock_data, start_idx, context_length,
                                           check_limit_up=True, required_length=None,
                                           feature_normalizer=None):
     """
     统一的上下文窗口归一化和验证函数
-    
+
     用于消除 run.py 和 data.py 中的代码重复。
     执行完整的数据验证和归一化流程，与 generate_sample_from_index 保持一致。
-    
+
     Args:
         stock_data: 股票原始数据 [N, 6]
         start_idx: 上下文窗口起始索引（需要 >= 1，因为需要前一天作为基准）
@@ -829,10 +829,10 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         check_limit_up: 是否检查涨停（默认 True）
         required_length: 完整采样窗口长度（用于涨停过滤），如果为 None 则只检查上下文窗口
         feature_normalizer: 可选的特征归一化器实例，如果提供则应用高级归一化
-    
+
     Returns:
         input_seq: [context_length, 6] 归一化后的输入序列，或 None（如果验证失败）
-    
+
     验证项：
         1. 基准日（start_idx-1）的 OHLC 和 volume 非零
         2. 上下文窗口的 close 和 volume 非零

@@ -44,9 +44,8 @@ class DataConfig:
     #   2. 自动处理特征范围不同（Volume/Exchange vs OHLC）
     #   3. 自动处理特征集中度不同（Volume 99%集中在小范围）
     #   4. 自动处理异常值和偏态分布
-    USE_FEATURE_NORMALIZER = True    # 是否启用特征归一化器
 
-    # 归一化器配置（仅当 USE_FEATURE_NORMALIZER=True 时生效）
+    # 归一化器配置
     NORMALIZER_OUTPUT_DISTRIBUTION = 'normal'  # 'normal' (标准正态) 或 'uniform' (均匀分布)
     NORMALIZER_N_QUANTILES = 1000            # 分位数数量（越大越精确但越慢）
     NORMALIZER_PATH = './feature_normalizer.pkl'  # 归一化器保存/加载路径

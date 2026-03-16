@@ -738,16 +738,14 @@ def main():
     print(f"\n  正在加载数据集...")
 
     # ========== 特征归一化器配置 ==========
-    feature_normalizer = None
-    if DataConfig.USE_FEATURE_NORMALIZER:
-        if os.path.exists(DataConfig.NORMALIZER_PATH):
-            print(f"\n  [特征归一化] 正在加载归一化器...")
-            feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
-            print(f"  [特征归一化] ✓ 已启用")
-        else:
-            print(f"\n  ⚠ 警告: 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
-            print(f"  模型可能是在未启用归一化器的情况下训练的")
-            print(f"  如需启用归一化器，请先运行: python data.py --fit-normalizer")
+    if os.path.exists(DataConfig.NORMALIZER_PATH):
+        print(f"\n  [特征归一化] 正在加载归一化器...")
+        feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
+        print(f"  [特征归一化] ✓ 已启用")
+    else:
+        print(f"\n  ⚠ 错误: 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
+        print(f"  请先运行: python data.py --fit-normalizer")
+        raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
 
     train_stock_info, test_stock_info = load_and_preprocess_data()
 

@@ -610,30 +610,25 @@ if __name__ == "__main__":
     os.makedirs(DataConfig.OUTPUT_DIR, exist_ok=True)
 
     # ========== 特征归一化器配置 ==========
-    feature_normalizer = None
-    if DataConfig.USE_FEATURE_NORMALIZER:
-        print("\n" + "="*60)
-        print("特征归一化器配置")
-        print("="*60)
-        print(f"归一化器路径: {DataConfig.NORMALIZER_PATH}")
-        print(f"输出分布: {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION}")
-        print(f"分位数数量: {DataConfig.NORMALIZER_N_QUANTILES}")
+    print("\n" + "="*60)
+    print("特征归一化器配置")
+    print("="*60)
+    print(f"归一化器路径: {DataConfig.NORMALIZER_PATH}")
+    print(f"输出分布: {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION}")
+    print(f"分位数数量: {DataConfig.NORMALIZER_N_QUANTILES}")
 
-        # 检查归一化器文件是否存在
-        if os.path.exists(DataConfig.NORMALIZER_PATH):
-            print(f"\n✓ 检测到归一化器文件，正在加载...")
-            feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
-            print("✓ 特征归一化器已启用")
-        else:
-            print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
-            print("请先运行以下命令创建归一化器：")
-            print(f"  python data.py --fit-normalizer --output-distribution {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION} --n-quantiles {DataConfig.NORMALIZER_N_QUANTILES}")
-            print("\n或者将 config.py 中的 USE_FEATURE_NORMALIZER 设置为 False")
-            raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
-
-        print("="*60)
+    # 检查归一化器文件是否存在
+    if os.path.exists(DataConfig.NORMALIZER_PATH):
+        print(f"\n✓ 检测到归一化器文件，正在加载...")
+        feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
+        print("✓ 特征归一化器已启用")
     else:
-        print("\n[特征归一化器] 已禁用（USE_FEATURE_NORMALIZER=False）")
+        print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
+        print("请先运行以下命令创建归一化器：")
+        print(f"  python data.py --fit-normalizer --output-distribution {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION} --n-quantiles {DataConfig.NORMALIZER_N_QUANTILES}")
+        raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
+
+    print("="*60)
 
     # 加载数据
     print("\n正在加载和预处理数据...")

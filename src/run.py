@@ -20,8 +20,7 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,
-                  create_recent_days_dataset, normalize_and_validate_context_window,
-                  set_feature_normalizer, disable_feature_normalizer)
+                  create_recent_days_dataset, normalize_and_validate_context_window)
 from feature_normalizer import FeatureNormalizer
 from training_utils import evaluate_model, calculate_test_loss, DynamicWeightedBCE
 
@@ -311,16 +310,19 @@ def select_model(models):
             print(f"  ✗ 无效输入，请输入数字")
 
 
-def run_evaluation(model, test_stock_info, device):
+def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     """
     执行模型评估（与 train.py 中对模型A的评估完全一致）
     返回评估统计字典
+
+    Args:
+        feature_normalizer: 可选的特征归一化器实例
     """
     print_section("模型评估")
     print(f"│  正在创建评估数据集...")
-    
+
     eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = \
-        create_fixed_evaluation_dataset(test_stock_info)
+        create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
     
     print(f"│  评估样本数: {len(eval_inputs)}")
     print(f"│  正在评估模型...")
@@ -736,24 +738,21 @@ def main():
     print(f"\n  正在加载数据集...")
 
     # ========== 特征归一化器配置 ==========
+    feature_normalizer = None
     if DataConfig.USE_FEATURE_NORMALIZER:
         if os.path.exists(DataConfig.NORMALIZER_PATH):
             print(f"\n  [特征归一化] 正在加载归一化器...")
-            normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
-            set_feature_normalizer(normalizer)
+            feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
             print(f"  [特征归一化] ✓ 已启用")
         else:
             print(f"\n  ⚠ 警告: 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
             print(f"  模型可能是在未启用归一化器的情况下训练的")
-            print(f"  如需启用归一化器，请先运行: python setup_feature_normalizer.py")
-            disable_feature_normalizer()
-    else:
-        disable_feature_normalizer()
+            print(f"  如需启用归一化器，请先运行: python data.py --fit-normalizer")
 
     train_stock_info, test_stock_info = load_and_preprocess_data()
-    
+
     # 运行评估
-    stats = run_evaluation(model, test_stock_info, device)
+    stats = run_evaluation(model, test_stock_info, device, feature_normalizer)
     threshold = stats['top_threshold']
     
     # 询问是否选股

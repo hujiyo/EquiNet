@@ -104,7 +104,7 @@ final = scaler.fit_transform(transformed)
 ### 步骤1: 拟合归一化器（首次）
 
 ```bash
-python src/init_normalizer.py
+python src/data.py --fit-normalizer
 ```
 
 **关键**：只在训练集上拟合，避免数据泄漏！

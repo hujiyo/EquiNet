@@ -26,8 +26,7 @@ from model import create_model
 from data import (
     load_and_preprocess_data,
     create_sampler, sample_with_pools,
-    create_fixed_evaluation_dataset,
-    set_feature_normalizer, disable_feature_normalizer
+    create_fixed_evaluation_dataset
 )
 from feature_normalizer import FeatureNormalizer
 
@@ -54,7 +53,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                       clone_epoch=TrainingConfig.EPOCHS*0.25,
                       pseudo_pos_ratio=0.01,
                       pseudo_neg_ratio=0.05,
-                      enable_model_b=True):
+                      enable_model_b=True,
+                      feature_normalizer=None):
     """
     克隆模型训练函数
 
@@ -65,6 +65,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
       - 按比例选取：A预测值前 pseudo_pos_ratio (1%) 的样本 → 伪正标签
       - 按比例选取：A预测值倒数 pseudo_neg_ratio (5%) 的样本 → 伪负标签
       - 其它样本 → 保持原始标签不变
+
+    Args:
+        feature_normalizer: 可选的特征归一化器实例
     """
     print("\n" + "="*60)
     print("克隆模型训练")
@@ -87,7 +90,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
 
     # 创建评估数据集
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info)
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
 
     # 模型B初始化为None
     model_b = None
@@ -230,7 +233,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
 
         # 使用时间顺序采样器生成训练数据（与主训练流程统一）
         epoch_inputs, epoch_targets, epoch_cum_returns = sample_with_pools(
-            sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
+            sampler, train_stock_info, batch_size, batches_per_epoch, train_rng,
+            feature_normalizer
         )
 
         # 打印循环统计
@@ -606,6 +610,7 @@ if __name__ == "__main__":
     os.makedirs(DataConfig.OUTPUT_DIR, exist_ok=True)
 
     # ========== 特征归一化器配置 ==========
+    feature_normalizer = None
     if DataConfig.USE_FEATURE_NORMALIZER:
         print("\n" + "="*60)
         print("特征归一化器配置")
@@ -617,20 +622,18 @@ if __name__ == "__main__":
         # 检查归一化器文件是否存在
         if os.path.exists(DataConfig.NORMALIZER_PATH):
             print(f"\n✓ 检测到归一化器文件，正在加载...")
-            normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
-            set_feature_normalizer(normalizer)
+            feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
             print("✓ 特征归一化器已启用")
         else:
             print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
             print("请先运行以下命令创建归一化器：")
-            print(f"  python setup_feature_normalizer.py --output-distribution {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION} --n-quantiles {DataConfig.NORMALIZER_N_QUANTILES}")
+            print(f"  python data.py --fit-normalizer --output-distribution {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION} --n-quantiles {DataConfig.NORMALIZER_N_QUANTILES}")
             print("\n或者将 config.py 中的 USE_FEATURE_NORMALIZER 设置为 False")
             raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
 
         print("="*60)
     else:
         print("\n[特征归一化器] 已禁用（USE_FEATURE_NORMALIZER=False）")
-        disable_feature_normalizer()
 
     # 加载数据
     print("\n正在加载和预处理数据...")
@@ -659,7 +662,8 @@ if __name__ == "__main__":
         clone_epoch=TrainingConfig.EPOCHS*0.25,
         pseudo_pos_ratio=0.01,
         pseudo_neg_ratio=0.05,
-        enable_model_b=False
+        enable_model_b=False,
+        feature_normalizer=feature_normalizer
     )
 
     print(f"\n最终结果:")

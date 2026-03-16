@@ -31,7 +31,7 @@ from datetime import datetime
 import argparse
 
 from model import create_model
-from data import load_and_preprocess_data, set_feature_normalizer, disable_feature_normalizer
+from data import load_and_preprocess_data
 from config import DataConfig, ModelConfig
 from feature_normalizer import FeatureNormalizer
 
@@ -800,22 +800,21 @@ def main():
         
         if os.path.exists(DataConfig.NORMALIZER_PATH):
             print(f"\n✓ 检测到归一化器文件，正在加载...")
-            normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
-            set_feature_normalizer(normalizer)
+            feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
             print("✓ 特征归一化器已启用")
         else:
             print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
             print("将使用原始数据（不应用高级归一化）")
-            disable_feature_normalizer()
-        
+            feature_normalizer = None
+
         print("="*60)
     else:
         print("\n[特征归一化器] 已禁用（USE_FEATURE_NORMALIZER=False）")
-        disable_feature_normalizer()
+        feature_normalizer = None
 
     print("\n[步骤1] 加载数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
-    
+
     print("\n[步骤2] 准备测试样本...")
     from data import normalize_and_validate_context_window
     all_inputs = []
@@ -824,7 +823,8 @@ def main():
         test_split = stock['test_split_point']
         for i in range(test_split, min(test_split + 10, len(data) - 33)):
             input_seq = normalize_and_validate_context_window(
-                data, i, 30, check_limit_up=False, required_length=33
+                data, i, 30, check_limit_up=False, required_length=33,
+                feature_normalizer=feature_normalizer
             )
             if input_seq is not None:
                 all_inputs.append(input_seq)

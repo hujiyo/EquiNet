@@ -11,45 +11,12 @@ EquiNet 数据处理模块
 
 import os
 import random
+import argparse
 import numpy as np
 import pandas as pd
 from config import DataConfig, generate_label, calculate_returns
 from multiprocessing import Pool, cpu_count
 from feature_normalizer import FeatureNormalizer
-
-# 全局特征归一化器（None 表示未启用）
-_feature_normalizer = None
-
-
-def set_feature_normalizer(normalizer: FeatureNormalizer):
-    """
-    设置全局特征归一化器
-
-    Args:
-        normalizer: 已拟合的 FeatureNormalizer 实例
-    """
-    global _feature_normalizer
-    _feature_normalizer = normalizer
-    print("[data.py] ✓ 特征归一化器已启用")
-
-
-def get_feature_normalizer() -> FeatureNormalizer:
-    """
-    获取当前的特征归一化器
-
-    Returns:
-        当前启用的归一化器，如果未启用则返回 None
-    """
-    return _feature_normalizer
-
-
-def disable_feature_normalizer():
-    """
-    禁用特征归一化器
-    """
-    global _feature_normalizer
-    _feature_normalizer = None
-    print("[data.py] 特征归一化器已禁用")
 
 
 def process_single_file(args):
@@ -419,7 +386,7 @@ def create_sampler(stock_info_list, strategy=None):
         return TemporalSampler(stock_info_list)
 
 
-def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
+def generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_normalizer=None):
     """
     根据预生成的索引生成单个样本（向量化优化版）
 
@@ -427,6 +394,7 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
         stock_info_list: 股票信息列表
         stock_idx: 股票索引
         start_idx: 样本起始索引
+        feature_normalizer: 可选的特征归一化器实例
 
     返回: (input_seq, target, cumulative_return, daily_returns) 或 None（如果样本无效）
     
@@ -452,7 +420,8 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     # 使用统一归一化函数，消除重复代码
     input_seq = normalize_and_validate_context_window(
         stock_data, start_idx, context_length,
-        check_limit_up=True, required_length=required_length
+        check_limit_up=True, required_length=required_length,
+        feature_normalizer=feature_normalizer
     )
     
     if input_seq is None:
@@ -505,7 +474,7 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx):
     return input_seq, target, cumulative_return, daily_returns
 
 
-def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
+def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx, feature_normalizer=None):
     """
     生成样本，支持不完整的未来数据（用于最近几天的临时评估）
 
@@ -529,7 +498,8 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
     # 使用统一归一化函数，消除重复代码
     input_seq = normalize_and_validate_context_window(
         stock_data, start_idx, context_length,
-        check_limit_up=True, required_length=required_length
+        check_limit_up=True, required_length=required_length,
+        feature_normalizer=feature_normalizer
     )
     
     if input_seq is None:
@@ -599,7 +569,7 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx):
     return input_seq, cumulative_return, daily_returns, available_days
 
 
-def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng):
+def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng, feature_normalizer=None):
     """
     使用样本池机制采样（流式处理版）：
     1. 按时间顺序遍历样本索引
@@ -608,6 +578,14 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
     4. 确保Batch之间的时间有序性，严格防止未来数据泄露到过去的Batch中
     5. 支持循环采样：数据到达末尾后自动循环回起点
     6. 动态生成索引：按需生成，直到batch数量满足要求
+
+    Args:
+        sampler: 采样器实例
+        stock_info_list: 股票信息列表
+        batch_size: 批次大小
+        batches_per_epoch: 每个epoch的batch数量
+        rng: 随机数生成器
+        feature_normalizer: 可选的特征归一化器实例
     """
     positive_ratio = 0.25
     pos_quota = max(1, int(batch_size * positive_ratio))
@@ -649,7 +627,7 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
             if batches_generated >= batches_per_epoch:
                 break
 
-            sample = generate_sample_from_index(stock_info_list, stock_idx, start_idx)
+            sample = generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_normalizer)
             if sample is None:
                 continue
 
@@ -715,11 +693,15 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
     return np.asarray(all_batch_inputs), np.asarray(all_batch_targets), np.asarray(all_batch_returns)
 
 
-def create_fixed_evaluation_dataset(test_stock_info):
+def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
     """
     创建固定评估数据集（涨停样本已在generate_sample_from_index中过滤）
     
     只包含完整样本（available_days == 3），用于模型评估
+    
+    Args:
+        test_stock_info: 测试集股票信息列表
+        feature_normalizer: 可选的特征归一化器实例
     
     返回:
         eval_inputs: 输入序列
@@ -751,7 +733,7 @@ def create_fixed_evaluation_dataset(test_stock_info):
             continue
 
         for start_idx in range(start_min, start_max + 1):
-            sample = generate_sample_from_index([stock_info], 0, start_idx)
+            sample = generate_sample_from_index([stock_info], 0, start_idx, feature_normalizer)
             if sample is None:
                 continue
 
@@ -773,13 +755,17 @@ def create_fixed_evaluation_dataset(test_stock_info):
             eval_daily_returns)
 
 
-def create_recent_days_dataset(test_stock_info):
+def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
     """
     创建最近几天的临时评估数据集（用于run.py中显示最近几天的实战收益率）
     
     包含完整样本和临时样本，用于展示最近几天的选股情况
     - 完整样本（available_days == 3）：与 create_fixed_evaluation_dataset 一致
     - 临时样本（available_days < 3）：仅用于展示，方便用户决策
+
+    Args:
+        test_stock_info: 测试集股票信息列表
+        feature_normalizer: 可选的特征归一化器实例
     
     返回:
         recent_inputs: 输入序列
@@ -805,7 +791,7 @@ def create_recent_days_dataset(test_stock_info):
             continue
 
         for start_idx in range(start_min, start_max + 1):
-            sample = generate_sample_from_index_partial([stock_info], 0, start_idx)
+            sample = generate_sample_from_index_partial([stock_info], 0, start_idx, feature_normalizer)
             if sample is None:
                 continue
 
@@ -828,7 +814,8 @@ def create_recent_days_dataset(test_stock_info):
 
 
 def normalize_and_validate_context_window(stock_data, start_idx, context_length, 
-                                          check_limit_up=True, required_length=None):
+                                          check_limit_up=True, required_length=None,
+                                          feature_normalizer=None):
     """
     统一的上下文窗口归一化和验证函数
     
@@ -841,6 +828,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         context_length: 上下文窗口长度
         check_limit_up: 是否检查涨停（默认 True）
         required_length: 完整采样窗口长度（用于涨停过滤），如果为 None 则只检查上下文窗口
+        feature_normalizer: 可选的特征归一化器实例，如果提供则应用高级归一化
     
     Returns:
         input_seq: [context_length, 6] 归一化后的输入序列，或 None（如果验证失败）
@@ -917,12 +905,133 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
     np.clip(input_seq[:, 4:6], 0.0, 1.0, out=input_seq[:, 4:6])
 
-    # 应用高级特征归一化（如果归一化器已加载）
-    global _feature_normalizer
-    if _feature_normalizer is not None:
-        input_seq = _feature_normalizer.transform(input_seq)
+    # 应用高级特征归一化（如果提供了归一化器）
+    if feature_normalizer is not None:
+        input_seq = feature_normalizer.transform(input_seq)
 
     if np.any(~np.isfinite(input_seq)):
         return None
 
     return input_seq
+
+
+def fit_feature_normalizer(output_path='./feature_normalizer.pkl',
+                           output_distribution='normal',
+                           n_quantiles=1000,
+                           force=False):
+    """
+    在训练集上拟合特征归一化器并保存到文件
+
+    Args:
+        output_path: 归一化器输出文件路径
+        output_distribution: 输出分布类型 ('normal' 或 'uniform')
+        n_quantiles: 分位数数量
+        force: 是否强制重新拟合，即使文件已存在
+
+    Returns:
+        normalizer: 拟合后的 FeatureNormalizer 实例
+    """
+    if os.path.exists(output_path) and not force:
+        print(f"归一化器文件已存在: {output_path}")
+        print("如需重新拟合，请使用 --force 参数")
+        response = input("是否加载现有归一化器？(y/n): ")
+        if response.lower() == 'y':
+            normalizer = FeatureNormalizer.load(output_path)
+            print("\n✓ 已加载现有归一化器")
+            return normalizer
+
+    print("\n[步骤1] 加载训练数据...")
+    print("注意：归一化器只在训练集上拟合，避免数据泄漏")
+
+    # 直接加载数据，不需要通过全局变量控制归一化器
+    train_stock_info, test_stock_info = load_and_preprocess_data()
+
+    print(f"\n训练集股票数: {len(train_stock_info)}")
+    print(f"测试集股票数: {len(test_stock_info)}")
+
+    print("\n[步骤2] 创建特征归一化器...")
+    print(f"  输出分布: {output_distribution}")
+    print(f"  分位数数量: {n_quantiles}")
+
+    normalizer = FeatureNormalizer(
+        output_distribution=output_distribution,
+        n_quantiles=n_quantiles
+    )
+
+    print("\n[步骤3] 在训练集上拟合归一化器...")
+    print("⏳ 这可能需要几分钟...")
+
+    normalizer.fit(train_stock_info)
+
+    print("\n[步骤4] 保存归一化器...")
+    normalizer.save(output_path)
+
+    return normalizer
+
+
+def main():
+    """命令行入口函数，支持以下用法："""
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+    parser = argparse.ArgumentParser(
+        description='EquiNet 数据处理模块',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+用法示例：
+  python data.py                           # 仅加载数据（默认行为）
+  python data.py --fit-normalizer         # 拟合并保存特征归一化器
+  python data.py --fit-normalizer --force # 强制重新拟合归一化器
+  python data.py --fit-normalizer --output-distribution uniform --n-quantiles 500
+        '''
+    )
+    parser.add_argument('--fit-normalizer', action='store_true',
+                        help='在训练集上拟合特征归一化器并保存到文件')
+    parser.add_argument('--output-distribution', type=str, default='normal',
+                        choices=['normal', 'uniform'],
+                        help='输出分布类型: normal (标准正态) 或 uniform (均匀分布)，默认 normal')
+    parser.add_argument('--n-quantiles', type=int, default=1000,
+                        help='分位数数量（默认1000，越大越精确但越慢）')
+    parser.add_argument('--output', type=str, default='./feature_normalizer.pkl',
+                        help='归一化器输出文件路径，默认 ./feature_normalizer.pkl')
+    parser.add_argument('--force', action='store_true',
+                        help='强制重新拟合归一化器，即使文件已存在')
+
+    args = parser.parse_args()
+
+    print("="*70)
+    print("EquiNet 数据处理模块")
+    print("="*70)
+
+    if args.fit_normalizer:
+        print("\n>>> 模式：拟合特征归一化器")
+        print("="*70)
+
+        fit_feature_normalizer(
+            output_path=args.output,
+            output_distribution=args.output_distribution,
+            n_quantiles=args.n_quantiles,
+            force=args.force
+        )
+
+        print("\n" + "="*70)
+        print("✓ 特征归一化器设置完成！")
+        print("="*70)
+
+        print("\n后续使用说明：")
+        print(f"1. 归一化器已保存到: {args.output}")
+        print("2. 在训练脚本中使用：")
+        print("   from feature_normalizer import FeatureNormalizer")
+        print(f"   normalizer = FeatureNormalizer.load('{args.output}')")
+        print("   # 然后将 normalizer 传递给 data.py 中的函数，如：")
+        print("   # generate_sample_from_index(..., feature_normalizer=normalizer)")
+        print("\n3. 在模型中可以考虑移除 LayerNorm，因为预处理已做好")
+        print("   如果保留 LayerNorm，会起到额外的稳定作用")
+    else:
+        print("\n>>> 模式：加载数据（默认）")
+        print("使用 --fit-normalizer 参数来拟合特征归一化器")
+        print("\n输入以下命令查看更多选项：")
+        print("  python data.py --help")
+
+
+if __name__ == "__main__":
+    main()

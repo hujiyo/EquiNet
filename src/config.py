@@ -237,6 +237,16 @@ class ModelConfig:
     # Token化参数（仅当 MODEL_TYPE='tokenized' 时使用）
     TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
 
+    # ========== 初始化参数 ==========
+    # Embedding层初始化增益
+    # - 控制第一层 Linear(6, 48) 的权重范围
+    # - gain=1.0: 标准Xavier (std≈0.4), 保守, 训练慢但稳定
+    # - gain=1.5: 推荐值 (std≈0.6), 平衡, 收敛快且稳定
+    # - gain=2.0: 激进 (std≈0.8), 收敛更快但可能过拟合
+    # - gain=0.5: 极度保守 (std≈0.2), 适合极低SNR任务
+    # 原理: W ~ U[-gain*√(6/(fan_in+fan_out)), +gain*√(6/(fan_in+fan_out))]
+    EMBEDDING_INIT_GAIN = 1.5         # Embedding层初始化增益（推荐1.5，范围0.5-2.0）
+
     # 输出层参数
     OUTPUT_LAYER_GAIN = 3.0          # 输出层初始化增益（增大logits范围）
 

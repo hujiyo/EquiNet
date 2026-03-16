@@ -22,16 +22,33 @@ def init_weights(module):
     Xavier (Glorot) 初始化 - 适合 Transformer 模型
 
     初始化范围:
-    - Linear层权重: uniform[-a, +a], a = sqrt(6 / (fan_in + fan_out))
+    - Linear层权重: uniform[-a, +a], a = gain * sqrt(6 / (fan_in + fan_out))
     - Linear层偏置: 0
     - Norm层权重: 1
     - Norm层偏置: 0
-    
+
     特殊处理:
-    - 输出层使用更大的gain，确保logits有足够大的范围
+    - Embedding层: gain=EMBEDDING_INIT_GAIN (可在config.py中调整，推荐1.5)
+    - 输出层: gain=OUTPUT_LAYER_GAIN (确保logits有足够大的范围)
+    - 其他层: gain=1.0 (标准Xavier)
+
+    Embedding层增益说明 (见config.py中的EMBEDDING_INIT_GAIN注释):
+    - 1.0: 标准Xavier (std≈0.4), 保守, 训练慢但稳定
+    - 1.5: 推荐值 (std≈0.6), 平衡, 收敛快且稳定 (201 epoch达到AUC 0.695)
+    - 2.0: 激进 (std≈0.8), 收敛更快但可能过拟合
+    - 0.5: 极度保守 (std≈0.2), 适合极低SNR任务
     """
     if isinstance(module, nn.Linear):
-        gain = ModelConfig.OUTPUT_LAYER_GAIN if module.out_features == 1 else 1.0
+        if module.out_features == 1:
+            # 输出层：使用大增益
+            gain = ModelConfig.OUTPUT_LAYER_GAIN
+        elif module.in_features == ModelConfig.INPUT_DIM and module.out_features == ModelConfig.D_MODEL:
+            # Embedding层 (6→48): 从配置读取增益
+            gain = ModelConfig.EMBEDDING_INIT_GAIN
+        else:
+            # 其他层：标准Xavier
+            gain = 1.0
+
         nn.init.xavier_uniform_(module.weight, gain=gain)
         if module.bias is not None:
             nn.init.zeros_(module.bias)

@@ -9,7 +9,6 @@ doc*/
 *.json
 *.jsonl
 *.png
-*.pkl
 
 .vscode/
 .vs/

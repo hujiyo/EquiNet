@@ -659,7 +659,7 @@ if __name__ == "__main__":
         clone_epoch=TrainingConfig.EPOCHS*0.25,
         pseudo_pos_ratio=0.01,
         pseudo_neg_ratio=0.05,
-        enable_model_b=True
+        enable_model_b=False
     )
 
     print(f"\n最终结果:")

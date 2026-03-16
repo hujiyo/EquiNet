@@ -14,22 +14,14 @@ import os
 import sys
 import argparse
 
-# 设置工作目录为 src/ 目录
-# CRITICAL: DataConfig.DATA_DIR='./data' 实际指向 src/data/
-# 参考 train.py 的做法，工作目录应该是 src/
-script_dir = os.path.dirname(os.path.abspath(__file__))
-src_dir = os.path.join(script_dir, 'src')
-os.chdir(src_dir)
-
-# 将 src/ 目录添加到 sys.path，确保可以导入模块
-if src_dir not in sys.path:
-    sys.path.insert(0, src_dir)
-
 from data import load_and_preprocess_data, set_feature_normalizer, disable_feature_normalizer
 from feature_normalizer import FeatureNormalizer
 
 
 def main():
+    # 设置工作目录为脚本所在目录（src/）
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
     parser = argparse.ArgumentParser(description='特征归一化器设置工具')
     parser.add_argument('--output-distribution', type=str, default='normal',
                         choices=['normal', 'uniform'],

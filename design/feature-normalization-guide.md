@@ -1,17 +1,6 @@
 # 特征归一化完整指南
 
-## 📋 目录
-
-1. [问题诊断](#问题诊断)
-2. [Quantile Transformation 原理](#quantile-transformation-原理)
-3. [为什么需要两步操作](#为什么需要两步操作)
-4. [使用方法](#使用方法)
-5. [效果对比](#效果对比)
-6. [常见问题](#常见问题)
-
----
-
-## 🔍 问题诊断
+## 问题诊断
 
 ### 现状分析
 
@@ -32,9 +21,9 @@ input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
 
 | 特征 | 范围 | 均值 | 问题 |
 |------|------|------|------|
-| Open, High, Low, Close | `[-0.1, 0.1]` | ≈ 0 | ✅ 范围小，零均值 |
-| Volume | `[0, 1]` | ≈ 0.5 | ⚠️ 范围是 OHLC 的 5 倍，有偏置 |
-| Exchange | `[0, 1]` | ≈ ? | ⚠️ 范围是 OHLC 的 5 倍，可能有偏置 |
+| Open, High, Low, Close | `[-0.1, 0.1]` | ≈ 0 | 范围小，零均值 |
+| Volume | `[0, 1]` | ≈ 0.5 | 范围是 OHLC 的 5 倍，有偏置 |
+| Exchange | `[0, 1]` | ≈ ? | 范围是 OHLC 的 5 倍，可能有偏置 |
 
 **问题1: 范围不同**
 - Volume/Exchange 的范围是 OHLC 的 **5 倍**
@@ -47,7 +36,7 @@ input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
 
 ---
 
-## 🎯 Quantile Transformation 原理
+## Quantile Transformation 原理
 
 ### 核心思想
 
@@ -99,17 +88,17 @@ final = scaler.fit_transform(transformed)
 
 ---
 
-## 📖 使用方法
+## 使用方法
 
 ### 步骤1: 拟合归一化器（首次）
 
 ```bash
-python src/data.py --fit-normalizer
+python src/data.py
 ```
 
 **关键**：只在训练集上拟合，避免数据泄漏！
 **输出**：
-- `./feature_normalizer.pkl` - 归一化器文件
+- `./normalizer.pkl` - 归一化器文件
 
 ### 步骤2: 开启USE_FEATURE_NORMALIZER
 
@@ -130,7 +119,7 @@ python src/eval_normalization.py
 
 ---
 
-## 📊 效果对比
+## 效果对比
 
 ### 预期结果
 
@@ -143,8 +132,8 @@ python src/eval_normalization.py
 ### 推荐方案
 
 **阶段1: 立即采用**
-- ✅ 使用 Quantile Transformation
-- ✅ 保留 LayerNorm（双重保险）
+- 使用 Quantile Transformation
+- 保留 LayerNorm（双重保险）
 
 **阶段2: 验证后优化**
 - 如果效果良好，可移除 LayerNorm
@@ -158,7 +147,7 @@ python src/eval_normalization.py
 
 | 选项 | 输出分布 | 适用场景 |
 |------|---------|---------|
-| `'normal'` | 标准正态 N(0,1) | ✅ 大多数深度学习模型 |
+| `'normal'` | 标准正态 N(0,1) | 大多数深度学习模型 |
 | `'uniform'` | 均匀分布 U(0,1) | 某些特定模型 |
 
 ### Q2: `n_quantiles` 多大合适？
@@ -194,7 +183,7 @@ python src/eval_normalization.py
 
 ---
 
-## 🚀 高级话题
+## 高级话题
 
 ### FT-Transformer 的 Feature Tokenizer
 
@@ -222,11 +211,11 @@ class FeatureTokenizer(nn.Module):
 ```
 
 **优点**：
-- ✅ 完全消除特征尺度问题
-- ✅ 模型自动学习特征权重
-- ✅ 业界 SOTA 方案
+- 完全消除特征尺度问题
+- 模型自动学习特征权重
+- 业界 SOTA 方案
 
-## 📚 参考资料
+## 参考资料
 
 1. [Scikit-learn Preprocessing Documentation](https://scikit-learn.org/stable/modules/preprocessing.html)
 2. [FT-Transformer Paper](https://arxiv.org/abs/2106.11959)

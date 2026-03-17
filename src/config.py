@@ -48,12 +48,110 @@ class DataConfig:
     # 归一化器配置
     NORMALIZER_OUTPUT_DISTRIBUTION = 'normal'  # 'normal' (标准正态) 或 'uniform' (均匀分布)
     NORMALIZER_N_QUANTILES = 1000            # 分位数数量（越大越精确但越慢）
-    NORMALIZER_PATH = './feature_normalizer.pkl'  # 归一化器保存/加载路径
+    NORMALIZER_PATH = './normalizer.pkl'  # 归一化器保存/加载路径
 
     TOP_K = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
     TOP_N_PER_DAY = 0                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
     MAX_SELECT_PER_DAY = 4             # 全局阈值模式下每天最多选股数量（0表示不限制）
 
+# ==================== 模型架构参数 ====================
+class ModelConfig:
+    """模型架构相关参数"""
+
+    # ========== 模型类型选择 ==========
+    # 'continuous': 连续值模型 (6维连续输入)
+    # 'tokenized': Token化模型 (将输入离散化为token ID)
+    MODEL_TYPE = 'continuous'  # 可选: 'continuous' 或 'tokenized'
+
+    # 基础模型参数
+    INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
+    D_MODEL = 48                     # 模型维度（Transformer 内部维度）
+    FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
+    NHEAD = 4                        # 注意力头数
+    NUM_LAYERS = 6                   # Transformer 层数
+    OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1 之间）
+
+    # 注意力机制参数
+    DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合
+    ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
+
+    # Token化参数（仅当 MODEL_TYPE='tokenized' 时使用）
+    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
+
+    # ========== 初始化参数 ==========
+    # Embedding层初始化增益
+    # - 控制第一层 Linear(6, 48) 的权重范围
+    # - gain=1.0: 标准Xavier (std≈0.4), 保守, 训练慢但稳定
+    # - gain=1.5: 推荐值 (std≈0.6), 平衡, 收敛快且稳定
+    # - gain=2.0: 激进 (std≈0.8), 收敛更快但可能过拟合
+    # - gain=0.5: 极度保守 (std≈0.2), 适合极低SNR任务
+    # 原理: W ~ U[-gain*√(6/(fan_in+fan_out)), +gain*√(6/(fan_in+fan_out))]
+    EMBEDDING_INIT_GAIN = 1.5         # Embedding层初始化增益（推荐1.5，范围0.5-2.0）
+
+    # 输出层参数
+    OUTPUT_LAYER_GAIN = 3.0          # 输出层初始化增益（增大logits范围）
+
+# ==================== 训练参数 ====================
+class TrainingConfig:
+    """训练相关参数"""
+    # 基础训练参数（优化训练策略）
+    EPOCHS = 400                     # 训练轮数（增加轮数以充分训练小模型）
+    LEARNING_RATE = 0.001            # 初始学习率（提高学习率）
+
+    # 训练批处理
+    BATCH_SIZE = 512                 # GPU每次并行训练的样本数（增加批大小）
+    BATCHES_PER_EPOCH = 1            # 每轮训练的批次数（调低以适配时间序采样）
+
+    # 优化器参数
+    USE_ADAMW = True                 # 是否使用AdamW优化器
+    USE_MANO = True                  # 是否使用Mano优化器（与AdamW/Adam互斥，优先级最高）
+    WEIGHT_DECAY = 1e-5              # 权重衰减
+    GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
+
+    # Mano优化器参数（当USE_MANO=True时生效）
+    MANO_MOMENTUM = 0.95             # Mano动量系数
+    MANO_ADAMW_BETAS = (0.9, 0.95)   # 混合优化器中AdamW部分的beta参数
+
+    # 余弦退火调度器参数,学习率预热参数
+    COSINE_ETA_MIN = 5e-6            # 余弦退火最小学习率（训练末期的精细微调学习率）
+    WARMUP_RATIO = 0.1               # 预热轮数占比（总轮数的10%）
+    WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
+
+# ==================== 损失函数配置 ====================
+class LossConfig:
+    """损失函数相关配置"""
+
+    LOSS_TYPE = 'task_aligned'  #'task_aligned':任务对齐损失 | 'dynamic_bce':批权重动态平衡 | 'standard_bce':标准二元交叉熵
+    
+    POS_WEIGHT = 4.0  # DynamicWeightedBCE 的正样本权重（同时用于 TaskAlignedLoss 的基础BCE组件）
+
+    # ========== TaskAlignedLoss 参数 ==========
+    # 各子损失的权重
+    RANK_LOSS_WEIGHT = 0.3       # 排序损失权重（确保高收益样本排在前面）
+    RETURN_LOSS_WEIGHT = 0.2     # 收益加权损失权重（收益越高/亏损越大，梯度越强）
+    TOPK_LOSS_WEIGHT = 0.1       # Top-K聚焦损失权重（只关注模型预测最高的那部分）
+
+    # 排序损失参数
+    RANK_MARGIN = 0.1            # 排序损失的margin（要求正负样本对的分数差距至少这么大）
+    RANK_NUM_PAIRS = 64          # 每个batch采样的正负样本对数量
+
+    # 收益加权参数
+    RETURN_ALPHA = 5.0           # 正样本收益率放大系数（收益越高权重越大）
+    RETURN_BETA = 3.0            # 负样本亏损放大系数（亏损越多权重越大）
+    RETURN_CLIP = 0.30           # 收益率裁剪范围（防止极端值主导梯度）
+
+    # Top-K聚焦参数
+    TOPK_RATIO = 0.10            # 每个batch中关注的Top比例（10%）
+
+    @staticmethod
+    def use_dynamic_bce():
+        return LossConfig.LOSS_TYPE.lower() == 'dynamic_bce'
+
+    @staticmethod
+    def use_task_aligned():
+        return LossConfig.LOSS_TYPE.lower() == 'task_aligned'
+
+        
 # ==================== 用户自定义标签生成函数 ====================
 def generate_label(day1_change, day2_change, day3_change):
     """
@@ -212,102 +310,6 @@ def calculate_returns(t1_open, t1_close, t2_open=None, t2_close=None, t3_close=N
     cumulative_return = day1_return + day2_return + day3_return
     return cumulative_return, daily_returns
 
-# ==================== 模型架构参数 ====================
-class ModelConfig:
-    """模型架构相关参数"""
-
-    # ========== 模型类型选择 ==========
-    # 'continuous': 连续值模型 (6维连续输入)
-    # 'tokenized': Token化模型 (将输入离散化为token ID)
-    MODEL_TYPE = 'continuous'  # 可选: 'continuous' 或 'tokenized'
-
-    # 基础模型参数
-    INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
-    D_MODEL = 48                     # 模型维度（Transformer 内部维度）
-    FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
-    NHEAD = 4                        # 注意力头数
-    NUM_LAYERS = 6                   # Transformer 层数
-    OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1 之间）
-
-    # 注意力机制参数
-    DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合
-    ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
-
-    # Token化参数（仅当 MODEL_TYPE='tokenized' 时使用）
-    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
-
-    # ========== 初始化参数 ==========
-    # Embedding层初始化增益
-    # - 控制第一层 Linear(6, 48) 的权重范围
-    # - gain=1.0: 标准Xavier (std≈0.4), 保守, 训练慢但稳定
-    # - gain=1.5: 推荐值 (std≈0.6), 平衡, 收敛快且稳定
-    # - gain=2.0: 激进 (std≈0.8), 收敛更快但可能过拟合
-    # - gain=0.5: 极度保守 (std≈0.2), 适合极低SNR任务
-    # 原理: W ~ U[-gain*√(6/(fan_in+fan_out)), +gain*√(6/(fan_in+fan_out))]
-    EMBEDDING_INIT_GAIN = 1.5         # Embedding层初始化增益（推荐1.5，范围0.5-2.0）
-
-    # 输出层参数
-    OUTPUT_LAYER_GAIN = 3.0          # 输出层初始化增益（增大logits范围）
-
-# ==================== 训练参数 ====================
-class TrainingConfig:
-    """训练相关参数"""
-    # 基础训练参数（优化训练策略）
-    EPOCHS = 400                     # 训练轮数（增加轮数以充分训练小模型）
-    LEARNING_RATE = 0.001            # 初始学习率（提高学习率）
-
-    # 训练批处理
-    BATCH_SIZE = 512                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 1            # 每轮训练的批次数（调低以适配时间序采样）
-
-    # 优化器参数
-    USE_ADAMW = True                 # 是否使用AdamW优化器
-    USE_MANO = True                  # 是否使用Mano优化器（与AdamW/Adam互斥，优先级最高）
-    WEIGHT_DECAY = 1e-5              # 权重衰减
-    GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
-
-    # Mano优化器参数（当USE_MANO=True时生效）
-    MANO_MOMENTUM = 0.95             # Mano动量系数
-    MANO_ADAMW_BETAS = (0.9, 0.95)   # 混合优化器中AdamW部分的beta参数
-
-    # 余弦退火调度器参数,学习率预热参数
-    COSINE_ETA_MIN = 5e-6            # 余弦退火最小学习率（训练末期的精细微调学习率）
-    WARMUP_RATIO = 0.1               # 预热轮数占比（总轮数的10%）
-    WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
-
-# ==================== 损失函数配置 ====================
-class LossConfig:
-    """损失函数相关配置"""
-
-    LOSS_TYPE = 'task_aligned'  #'task_aligned':任务对齐损失 | 'dynamic_bce':批权重动态平衡 | 'standard_bce':标准二元交叉熵
-    
-    POS_WEIGHT = 4.0  # DynamicWeightedBCE 的正样本权重（同时用于 TaskAlignedLoss 的基础BCE组件）
-
-    # ========== TaskAlignedLoss 参数 ==========
-    # 各子损失的权重
-    RANK_LOSS_WEIGHT = 0.3       # 排序损失权重（确保高收益样本排在前面）
-    RETURN_LOSS_WEIGHT = 0.2     # 收益加权损失权重（收益越高/亏损越大，梯度越强）
-    TOPK_LOSS_WEIGHT = 0.1       # Top-K聚焦损失权重（只关注模型预测最高的那部分）
-
-    # 排序损失参数
-    RANK_MARGIN = 0.1            # 排序损失的margin（要求正负样本对的分数差距至少这么大）
-    RANK_NUM_PAIRS = 64          # 每个batch采样的正负样本对数量
-
-    # 收益加权参数
-    RETURN_ALPHA = 5.0           # 正样本收益率放大系数（收益越高权重越大）
-    RETURN_BETA = 3.0            # 负样本亏损放大系数（亏损越多权重越大）
-    RETURN_CLIP = 0.30           # 收益率裁剪范围（防止极端值主导梯度）
-
-    # Top-K聚焦参数
-    TOPK_RATIO = 0.10            # 每个batch中关注的Top比例（10%）
-
-    @staticmethod
-    def use_dynamic_bce():
-        return LossConfig.LOSS_TYPE.lower() == 'dynamic_bce'
-
-    @staticmethod
-    def use_task_aligned():
-        return LossConfig.LOSS_TYPE.lower() == 'task_aligned'
 
 # ==================== 设备配置 ====================
 class DeviceConfig:

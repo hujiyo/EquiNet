@@ -7,16 +7,306 @@ EquiNet 数据处理模块
 - 时间顺序采样器
 - 评估数据集创建
 - 预测函数
+- 特征归一化模块
 """
 
 import os
+import sys
 import random
 import argparse
+import pickle
 import numpy as np
 import pandas as pd
 from config import DataConfig, generate_label, calculate_returns
 from multiprocessing import Pool, cpu_count
-from feature_normalizer import FeatureNormalizer
+from sklearn.preprocessing import QuantileTransformer, StandardScaler
+from typing import Dict, List, Tuple
+
+
+class FeatureNormalizer:
+    """
+    特征归一化器 - 两阶段归一化
+
+    阶段1: QuantileTransformer → 处理偏态和集中度问题
+    阶段2: StandardScaler → 确保均值0方差1
+
+    使用方法：
+        # 训练阶段
+        normalizer = FeatureNormalizer()
+        normalizer.fit(train_stock_info)
+        normalizer.save('normalizer.pkl')
+
+        # 推理阶段
+        normalizer = FeatureNormalizer.load('normalizer.pkl')
+        normalized_data = normalizer.transform(raw_data)
+    """
+
+    def __init__(self,
+                 output_distribution='normal',
+                 n_quantiles=1000,
+                 random_state=42):
+        """
+        Args:
+            output_distribution: 'normal' 或 'uniform'
+                - 'normal': 输出符合标准正态分布（推荐）
+                - 'uniform': 输出符合 [0, 1] 均匀分布
+            n_quantiles: 分位数数量，越多越精确但越慢
+            random_state: 随机种子
+        """
+        self.output_distribution = output_distribution
+        self.n_quantiles = n_quantiles
+        self.random_state = random_state
+
+        # 为每个特征组创建独立的 pipeline
+        self.ohl_pipeline = self._create_pipeline()
+        self.volume_pipeline = self._create_pipeline()
+        self.exchange_pipeline = self._create_pipeline()
+
+        self.is_fitted = False
+
+    def _create_pipeline(self):
+        """
+        创建两阶段归一化 pipeline
+
+        为什么需要 StandardScaler？
+        - QuantileTransformer 的输出虽然是正态分布，但均值和方差可能不是 0 和 1
+        - StandardScaler 确保最终输出严格满足：均值=0，标准差=1
+        """
+        from sklearn.pipeline import Pipeline
+
+        return Pipeline([
+            ('quantile', QuantileTransformer(
+                output_distribution=self.output_distribution,
+                n_quantiles=self.n_quantiles,
+                random_state=self.random_state,
+                subsample=100000
+            )),
+            ('scaler', StandardScaler())
+        ])
+
+    def _collect_training_features(self, train_stock_info: List[Dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        从训练集收集所有特征值（避免数据泄漏）
+
+        关键：只使用每只股票的训练集部分（train_end_idx 之前）
+        
+        使用 data.py 中的 coarse_normalize_context_window() 进行粗处理，
+        确保与训练时的数据处理逻辑完全一致。
+
+        Returns:
+            ohl_data: OHLC 特征 [N_samples * 30 * 4]
+            volume_data: Volume 特征 [N_samples * 30]
+            exchange_data: Exchange 特征 [N_samples * 30]
+        """
+        from data import coarse_normalize_context_window, DataConfig
+        
+        ohl_data = []
+        volume_data = []
+        exchange_data = []
+        
+        context_length = DataConfig.CONTEXT_LENGTH
+
+        for stock in train_stock_info:
+            data = stock['data']
+            train_end_idx = stock.get('train_end_idx', len(data))
+
+            for i in range(1, train_end_idx - context_length):
+                # 使用统一的粗处理函数
+                input_seq = coarse_normalize_context_window(
+                    data, i, context_length,
+                    check_limit_up=False,  # 拟合归一化器时不过滤涨停，使用更多数据
+                    required_length=context_length
+                )
+                
+                if input_seq is None:
+                    continue
+                
+                ohl_data.append(input_seq[:, :4].flatten())
+                volume_data.append(input_seq[:, 4].flatten())
+                exchange_data.append(input_seq[:, 5].flatten())
+
+        ohl_data = np.concatenate(ohl_data) if ohl_data else np.array([])
+        volume_data = np.concatenate(volume_data) if volume_data else np.array([])
+        exchange_data = np.concatenate(exchange_data) if exchange_data else np.array([])
+
+        print(f"[FeatureNormalizer] 收集到的训练数据:")
+        print(f"  OHLC: {len(ohl_data)} 个值")
+        print(f"  Volume: {len(volume_data)} 个值")
+        print(f"  Exchange: {len(exchange_data)} 个值")
+
+        return ohl_data, volume_data, exchange_data
+
+    def fit(self, train_stock_info: List[Dict]):
+        """
+        在训练集上拟合归一化器
+
+        ⚠️ 重要：此函数必须在训练集上调用，且只能调用一次
+        测试集不能调用此函数，否则会导致数据泄漏
+
+        Args:
+            train_stock_info: 训练集股票信息列表
+        """
+        print("\n[FeatureNormalizer] 开始拟合归一化器...")
+        print(f"  输出分布: {self.output_distribution}")
+        print(f"  分位数数量: {self.n_quantiles}")
+
+        # 收集训练数据
+        ohl_data, volume_data, exchange_data = self._collect_training_features(train_stock_info)
+
+        # 拟合每个特征组的 pipeline
+        print("\n[FeatureNormalizer] 拟合 OHLC 特征...")
+        self.ohl_pipeline.fit(ohl_data.reshape(-1, 1))
+
+        print("[FeatureNormalizer] 拟合 Volume 特征...")
+        self.volume_pipeline.fit(volume_data.reshape(-1, 1))
+
+        print("[FeatureNormalizer] 拟合 Exchange 特征...")
+        self.exchange_pipeline.fit(exchange_data.reshape(-1, 1))
+
+        self.is_fitted = True
+
+        # 打印变换后的统计信息
+        self._print_transform_stats(ohl_data, volume_data, exchange_data)
+
+        print("\n[FeatureNormalizer] ✓ 拟合完成！")
+
+    def _print_transform_stats(self, ohl_data, volume_data, exchange_data):
+        """
+        打印变换后的统计信息，验证归一化效果
+        """
+        print("\n[FeatureNormalizer] 变换后的统计信息:")
+
+        # OHLC
+        ohl_transformed = self.ohl_pipeline.transform(ohl_data.reshape(-1, 1)).flatten()
+        print(f"  OHLC:")
+        print(f"    均值: {ohl_transformed.mean():.6f}")
+        print(f"    标准差: {ohl_transformed.std():.6f}")
+        print(f"    范围: [{ohl_transformed.min():.6f}, {ohl_transformed.max():.6f}]")
+
+        # Volume
+        volume_transformed = self.volume_pipeline.transform(volume_data.reshape(-1, 1)).flatten()
+        print(f"  Volume:")
+        print(f"    均值: {volume_transformed.mean():.6f}")
+        print(f"    标准差: {volume_transformed.std():.6f}")
+        print(f"    范围: [{volume_transformed.min():.6f}, {volume_transformed.max():.6f}]")
+
+        # Exchange
+        exchange_transformed = self.exchange_pipeline.transform(exchange_data.reshape(-1, 1)).flatten()
+        print(f"  Exchange:")
+        print(f"    均值: {exchange_transformed.mean():.6f}")
+        print(f"    标准差: {exchange_transformed.std():.6f}")
+        print(f"    范围: [{exchange_transformed.min():.6f}, {exchange_transformed.max():.6f}]")
+
+    def transform(self, input_seq: np.ndarray) -> np.ndarray:
+        """
+        对单个样本应用归一化
+
+        ⚠️ 重要：此函数可以在训练集、验证集、测试集上调用
+        因为它只使用 fit() 时学到的参数，不会产生数据泄漏
+
+        Args:
+            input_seq: [context_length, 6] 原始输入序列
+
+        Returns:
+            normalized_seq: [context_length, 6] 归一化后的序列
+        """
+        if not self.is_fitted:
+            raise RuntimeError("归一化器未拟合！请先调用 fit() 方法")
+
+        normalized = np.empty_like(input_seq, dtype=np.float32)
+
+        # 展平以便转换
+        ohl_flat = input_seq[:, :4].flatten()  # [context_length * 4]
+        volume_flat = input_seq[:, 4].flatten()  # [context_length]
+        exchange_flat = input_seq[:, 5].flatten()  # [context_length]
+
+        # 转换每个特征组
+        normalized_ohl = self.ohl_pipeline.transform(
+            ohl_flat.reshape(-1, 1)
+        ).flatten()
+        normalized_volume = self.volume_pipeline.transform(
+            volume_flat.reshape(-1, 1)
+        ).flatten()
+        normalized_exchange = self.exchange_pipeline.transform(
+            exchange_flat.reshape(-1, 1)
+        ).flatten()
+
+        # 重塑回原始形状
+        normalized[:, :4] = normalized_ohl.reshape(input_seq[:, :4].shape)
+        normalized[:, 4] = normalized_volume
+        normalized[:, 5] = normalized_exchange
+
+        return normalized
+
+    def fit_transform(self, train_stock_info: List[Dict]) -> 'FeatureNormalizer':
+        """
+        拟合并返回归一化器（链式调用）
+
+        Args:
+            train_stock_info: 训练集股票信息列表
+
+        Returns:
+            self: 拟合后的归一化器
+        """
+        self.fit(train_stock_info)
+        return self
+
+    def save(self, path: str):
+        """
+        保存归一化器到文件
+
+        Args:
+            path: 保存路径（例如: './normalizer.pkl'）
+        """
+        if not self.is_fitted:
+            raise RuntimeError("无法保存未拟合的归一化器")
+
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'ohl_pipeline': self.ohl_pipeline,
+                'volume_pipeline': self.volume_pipeline,
+                'exchange_pipeline': self.exchange_pipeline,
+                'is_fitted': self.is_fitted,
+                'output_distribution': self.output_distribution,
+                'n_quantiles': self.n_quantiles,
+                'random_state': self.random_state
+            }, f)
+
+        print(f"[FeatureNormalizer] ✓ 归一化器已保存到: {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'FeatureNormalizer':
+        """
+        从文件加载归一化器
+
+        Args:
+            path: 归一化器文件路径
+
+        Returns:
+            加载的归一化器实例
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"归一化器文件不存在: {path}")
+
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+
+        # 创建新实例
+        normalizer = cls(
+            output_distribution=data['output_distribution'],
+            n_quantiles=data['n_quantiles'],
+            random_state=data['random_state']
+        )
+
+        # 恢复状态
+        normalizer.ohl_pipeline = data['ohl_pipeline']
+        normalizer.volume_pipeline = data['volume_pipeline']
+        normalizer.exchange_pipeline = data['exchange_pipeline']
+        normalizer.is_fitted = data['is_fitted']
+
+        print(f"[FeatureNormalizer] ✓ 归一化器已从 {path} 加载")
+
+        return normalizer
 
 
 def process_single_file(args):
@@ -976,10 +1266,7 @@ def fine_normalize_batch(input_seq, feature_normalizer):
     return feature_normalizer.transform(input_seq)
 
 
-def fit_feature_normalizer(output_path='./feature_normalizer.pkl',
-                           output_distribution='normal',
-                           n_quantiles=1000,
-                           force=False):
+def fit_feature_normalizer(output_path='./normalizer.pkl', output_distribution='normal', n_quantiles=1000):
     """
     在训练集上拟合特征归一化器并保存到文件
 
@@ -987,41 +1274,31 @@ def fit_feature_normalizer(output_path='./feature_normalizer.pkl',
         output_path: 归一化器输出文件路径
         output_distribution: 输出分布类型 ('normal' 或 'uniform')
         n_quantiles: 分位数数量
-        force: 是否强制重新拟合，即使文件已存在
 
     Returns:
         normalizer: 拟合后的 FeatureNormalizer 实例
     """
-    if os.path.exists(output_path) and not force:
+    if os.path.exists(output_path):
         print(f"归一化器文件已存在: {output_path}")
-        print("如需重新拟合，请使用 --force 参数")
-        response = input("是否加载现有归一化器？(y/n): ")
-        if response.lower() == 'y':
-            normalizer = FeatureNormalizer.load(output_path)
-            print("\n✓ 已加载现有归一化器")
-            return normalizer
+        response = input("是否重新训练？(y/n): ")
+        if response.lower() != 'y':
+            sys.exit(0)
 
-    print("\n[步骤1] 加载训练数据...")
-    print("注意：归一化器只在训练集上拟合，避免数据泄漏")
+    print("\n[步骤1] 加载训练集数据...")
 
     # 直接加载数据，不需要通过全局变量控制归一化器
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
-    print(f"\n训练集股票数: {len(train_stock_info)}")
+    print(f"训练集股票数: {len(train_stock_info)}")
     print(f"测试集股票数: {len(test_stock_info)}")
 
     print("\n[步骤2] 创建特征归一化器...")
     print(f"  输出分布: {output_distribution}")
     print(f"  分位数数量: {n_quantiles}")
 
-    normalizer = FeatureNormalizer(
-        output_distribution=output_distribution,
-        n_quantiles=n_quantiles
-    )
+    normalizer = FeatureNormalizer(output_distribution=output_distribution,n_quantiles=n_quantiles)
 
     print("\n[步骤3] 在训练集上拟合归一化器...")
-    print("⏳ 这可能需要几分钟...")
-
     normalizer.fit(train_stock_info)
 
     print("\n[步骤4] 保存归一化器...")
@@ -1031,68 +1308,29 @@ def fit_feature_normalizer(output_path='./feature_normalizer.pkl',
 
 
 def main():
-    """命令行入口函数，支持以下用法："""
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     parser = argparse.ArgumentParser(
-        description='EquiNet 数据处理模块',
+        description='数据处理模块 兼 拟合特征归一化器训练脚本',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 用法示例：
-  python data.py                           # 仅加载数据（默认行为）
-  python data.py --fit-normalizer         # 拟合并保存特征归一化器
-  python data.py --fit-normalizer --force # 强制重新拟合归一化器
-  python data.py --fit-normalizer --output-distribution uniform --n-quantiles 500
+  python data.py                                           # 使用默认参数拟合归一化器
+  python data.py --output-distribution uniform             # 使用均匀分布拟合
+  python data.py --n-quantiles 500                         # 使用500个分位数拟合
+  python data.py --output ./my_normalizer.pkl              # 指定输出文件路径
         '''
     )
-    parser.add_argument('--fit-normalizer', action='store_true',
-                        help='在训练集上拟合特征归一化器并保存到文件')
-    parser.add_argument('--output-distribution', type=str, default='normal',
-                        choices=['normal', 'uniform'],
+    parser.add_argument('--output-distribution', type=str, default='normal',choices=['normal', 'uniform'],
                         help='输出分布类型: normal (标准正态) 或 uniform (均匀分布)，默认 normal')
-    parser.add_argument('--n-quantiles', type=int, default=1000,
-                        help='分位数数量（默认1000，越大越精确但越慢）')
-    parser.add_argument('--output', type=str, default='./feature_normalizer.pkl',
-                        help='归一化器输出文件路径，默认 ./feature_normalizer.pkl')
-    parser.add_argument('--force', action='store_true',
-                        help='强制重新拟合归一化器，即使文件已存在')
+    parser.add_argument('--n-quantiles', type=int, default=1000,help='分位数数量（默认1000，越大越精确但越慢）')
+    parser.add_argument('--output', type=str, default='./normalizer.pkl',
+                        help='归一化器输出文件路径，默认 ./normalizer.pkl')
 
     args = parser.parse_args()
-
-    print("="*70)
-    print("EquiNet 数据处理模块")
-    print("="*70)
-
-    if args.fit_normalizer:
-        print("\n>>> 模式：拟合特征归一化器")
-        print("="*70)
-
-        fit_feature_normalizer(
-            output_path=args.output,
-            output_distribution=args.output_distribution,
-            n_quantiles=args.n_quantiles,
-            force=args.force
-        )
-
-        print("\n" + "="*70)
-        print("✓ 特征归一化器设置完成！")
-        print("="*70)
-
-        print("\n后续使用说明：")
-        print(f"1. 归一化器已保存到: {args.output}")
-        print("2. 在训练脚本中使用：")
-        print("   from feature_normalizer import FeatureNormalizer")
-        print(f"   normalizer = FeatureNormalizer.load('{args.output}')")
-        print("   # 然后将 normalizer 传递给 data.py 中的函数，如：")
-        print("   # generate_sample_from_index(..., feature_normalizer=normalizer)")
-        print("\n3. 在模型中可以考虑移除 LayerNorm，因为预处理已做好")
-        print("   如果保留 LayerNorm，会起到额外的稳定作用")
-    else:
-        print("\n>>> 模式：加载数据（默认）")
-        print("使用 --fit-normalizer 参数来拟合特征归一化器")
-        print("\n输入以下命令查看更多选项：")
-        print("  python data.py --help")
-
+    fit_feature_normalizer(output_path=args.output,
+    output_distribution=args.output_distribution,n_quantiles=args.n_quantiles)
+    print(f"✓ 特征归一化器训练完成！已保存到: {args.output}")
 
 if __name__ == "__main__":
     main()

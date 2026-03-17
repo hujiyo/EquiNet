@@ -770,7 +770,7 @@ def main():
         print(f"  [特征归一化] ✓ 已启用")
     else:
         print(f"\n  ⚠ 错误: 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
-        print(f"  请先运行: python data.py --fit-normalizer")
+        print(f"  请先运行: python data.py")
         raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
 
     train_stock_info, test_stock_info = load_and_preprocess_data()

@@ -563,7 +563,7 @@ class EmbeddingModuleAnalyzer:
             'sorted_indices': sorted_indices.tolist()
         }
     
-    def visualize_sensitivity(self, sample_inputs, save_dir='embedding_eval_results', dimension_contribution_results=None):
+    def visualize_sensitivity(self, sample_inputs, save_dir='out_eval_results', dimension_contribution_results=None):
         """可视化敏感性分析结果
         
         Args:
@@ -734,12 +734,12 @@ class EmbeddingModuleAnalyzer:
             ax.legend()
         
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, 'embedding_module_sensitivity_analysis.png'), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(save_dir, 'embedding_module_analysis.png'), dpi=150, bbox_inches='tight')
         plt.close()
         
-        print(f"  可视化图表已保存到: {save_dir}/embedding_module_sensitivity_analysis.png")
+        print(f"  可视化图表已保存到: {save_dir}/embedding_module_analysis.png")
     
-    def generate_report(self, results, save_dir='embedding_eval_results'):
+    def generate_report(self, results, save_dir='out_eval_results'):
         """生成分析报告"""
         os.makedirs(save_dir, exist_ok=True)
         
@@ -861,7 +861,7 @@ def main():
             print("\n未找到模型文件，将使用随机初始化模型")
             model_path = None
     
-    save_dir = './embedding_eval_results'
+    save_dir = './out_eval_results'
     os.makedirs(save_dir, exist_ok=True)
 
     print("\n" + "="*60)
@@ -876,7 +876,7 @@ def main():
     else:
         print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
         print("请先运行以下命令创建归一化器：")
-        print(f"  python data.py --fit-normalizer")
+        print(f"  python data.py")
         raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
 
     print("="*60)

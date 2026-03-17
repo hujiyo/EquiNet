@@ -625,7 +625,7 @@ if __name__ == "__main__":
     else:
         print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
         print("请先运行以下命令创建归一化器：")
-        print(f"  python data.py --fit-normalizer --output-distribution {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION} --n-quantiles {DataConfig.NORMALIZER_N_QUANTILES}")
+        print(f"  python data.py --output-distribution {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION} --n-quantiles {DataConfig.NORMALIZER_N_QUANTILES}")
         raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
 
     print("="*60)

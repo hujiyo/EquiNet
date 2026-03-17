@@ -116,12 +116,17 @@ def load_model(model_path, device):
     return model, metadata
 
 
-def generate_latest_input(stock_data, file_name):
+def generate_latest_input(stock_data, file_name, feature_normalizer=None):
     """
     为单只股票生成最新一天的模型输入（不需要未来数据）用于预测
     
     使用 data.py 的统一归一化函数，确保与训练时的数据处理逻辑完全一致。
     取数据最后 CONTEXT_LENGTH 天作为输入窗口。
+    
+    Args:
+        stock_data: 股票原始数据
+        file_name: 文件名
+        feature_normalizer: 可选的特征归一化器实例
     
     返回: (input_seq, stock_code) 或 None
     """
@@ -141,7 +146,8 @@ def generate_latest_input(stock_data, file_name):
         start_idx, 
         context_length,
         check_limit_up=True,
-        required_length=context_length  # 只检查上下文窗口（无未来数据）
+        required_length=context_length,  # 只检查上下文窗口（无未来数据）
+        feature_normalizer=feature_normalizer
     )
     
     if input_seq is None:
@@ -178,9 +184,15 @@ def load_all_stock_data(data_dir=DataConfig.DATA_DIR):
     return stock_list
 
 
-def score_all_stocks(model, stock_list, device):
+def score_all_stocks(model, stock_list, device, feature_normalizer=None):
     """
     为所有股票打分
+    
+    Args:
+        model: 模型实例
+        stock_list: 股票数据列表
+        device: 设备
+        feature_normalizer: 可选的特征归一化器实例
     
     返回: [(stock_code, score, latest_date, latest_close, latest_change_pct), ...]
     """
@@ -194,7 +206,7 @@ def score_all_stocks(model, stock_list, device):
     all_changes = []
     
     for fname, data, latest_date in stock_list:
-        result = generate_latest_input(data, fname)
+        result = generate_latest_input(data, fname, feature_normalizer)
         if result is None:
             skipped += 1
             continue
@@ -396,9 +408,15 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     return stats
 
 
-def run_stock_selection(model, threshold, device):
+def run_stock_selection(model, threshold, device, feature_normalizer=None):
     """
     执行选股
+    
+    Args:
+        model: 模型实例
+        threshold: 选股阈值
+        device: 设备
+        feature_normalizer: 可选的特征归一化器实例
     """
     print_section("选股推理")
     print(f"│  正在加载全部股票数据...")
@@ -423,7 +441,7 @@ def run_stock_selection(model, threshold, device):
     print(f"│  使用阈值: {threshold:.10f}")
     print(f"│  正在对所有股票打分...")
     
-    results, skipped = score_all_stocks(model, stock_list, device)
+    results, skipped = score_all_stocks(model, stock_list, device, feature_normalizer)
     
     print(f"│  有效股票: {len(results)} 只，跳过（涨停/数据不足）: {skipped} 只")
     
@@ -592,7 +610,7 @@ def print_recent_days_chart(daily_stats, last_n=10):
     print("╚" + "═"*52 + "╝")
 
 
-def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4, threshold=None):
+def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4, threshold=None, feature_normalizer=None):
     """
     计算最近几天的实战收益率（用于展示，包含临时数据）
     
@@ -601,10 +619,18 @@ def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4,
     - 选股范围：所有样本（包括临时样本），用于展示最近几天的选股情况
     - 临时样本：仅用于展示，方便用户决策，不参与任何阈值计算
     
+    Args:
+        model: 模型实例
+        test_stock_info: 测试集股票信息列表
+        device: 设备
+        top_n_per_day: 每日选股数量
+        threshold: 选股阈值
+        feature_normalizer: 可选的特征归一化器实例
+    
     返回: daily_stats [(count, return, available_days), ...]
     """
     recent_inputs, recent_returns, recent_day_indices, recent_available_days = \
-        create_recent_days_dataset(test_stock_info)
+        create_recent_days_dataset(test_stock_info, feature_normalizer)
     
     if recent_inputs is None or len(recent_inputs) == 0:
         return []
@@ -765,10 +791,10 @@ def main():
         print("  请输入 y 或 n")
     
     # 执行选股
-    results = run_stock_selection(model, threshold, device)
+    results = run_stock_selection(model, threshold, device, feature_normalizer)
     
     # 计算并打印最近10天实战收益率表格（包含临时数据，仅用于展示）
-    recent_stats = calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=DataConfig.TOP_N_PER_DAY, threshold=threshold)
+    recent_stats = calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=DataConfig.TOP_N_PER_DAY, threshold=threshold, feature_normalizer=feature_normalizer)
     if recent_stats:
         print_recent_days_chart(recent_stats, last_n=10)
     

@@ -815,12 +815,17 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
 
 def normalize_and_validate_context_window(stock_data, start_idx, context_length,
                                           check_limit_up=True, required_length=None,
-                                          feature_normalizer=None):
+                                          feature_normalizer=None,
+                                          apply_fine_normalization=True):
     """
     统一的上下文窗口归一化和验证函数
 
     用于消除 run.py 和 data.py 中的代码重复。
     执行完整的数据验证和归一化流程，与 generate_sample_from_index 保持一致。
+
+    数据处理分两阶段：
+        - 粗处理：CSV → OHLE 格式（涨跌幅 -0.1~0.1，Volume 0~1，Exchange 0~1）
+        - 细处理：OHLE → 标准化数据（均值≈0，方差≈1）
 
     Args:
         stock_data: 股票原始数据 [N, 6]
@@ -828,10 +833,13 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         context_length: 上下文窗口长度
         check_limit_up: 是否检查涨停（默认 True）
         required_length: 完整采样窗口长度（用于涨停过滤），如果为 None 则只检查上下文窗口
-        feature_normalizer: 可选的特征归一化器实例，如果提供则应用高级归一化
+        feature_normalizer: 可选的特征归一化器实例，用于细处理阶段
+        apply_fine_normalization: 是否应用细处理（默认 True）。设为 False 时只执行粗处理。
 
     Returns:
         input_seq: [context_length, 6] 归一化后的输入序列，或 None（如果验证失败）
+            - 粗处理后：OHLE: -0.1~0.1, Volume: 0~1, Exchange: 0~1
+            - 细处理后：均值≈0，方差≈1
 
     验证项：
         1. 基准日（start_idx-1）的 OHLC 和 volume 非零
@@ -900,19 +908,72 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     
     input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
 
+    # ========== 粗处理阶段 ==========
+    # OHLE: 涨跌幅，范围 -0.1 ~ 0.1
     np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
+    # Volume: 变化率缩放，范围 0 ~ 1
     np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
     input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
     np.clip(input_seq[:, 4:6], 0.0, 1.0, out=input_seq[:, 4:6])
 
-    # 应用高级特征归一化（如果提供了归一化器）
-    if feature_normalizer is not None:
+    # ========== 细处理阶段（可选）==========
+    # 应用高级特征归一化，将粗处理结果转换为均值≈0、方差≈1的标准化数据
+    if apply_fine_normalization and feature_normalizer is not None:
         input_seq = feature_normalizer.transform(input_seq)
 
     if np.any(~np.isfinite(input_seq)):
         return None
 
     return input_seq
+
+
+def coarse_normalize_context_window(stock_data, start_idx, context_length,
+                                     check_limit_up=True, required_length=None):
+    """
+    粗处理：CSV → OHLE 格式
+
+    只执行粗处理阶段，不应用细处理（特征归一化器）。
+    输出数据范围：
+        - OHLE: -0.1 ~ 0.1（涨跌幅）
+        - Volume: 0 ~ 1（成交量变化率）
+        - Exchange: 0 ~ 1（换手率）
+
+    Args:
+        stock_data: 股票原始数据 [N, 6]
+        start_idx: 上下文窗口起始索引（需要 >= 1，因为需要前一天作为基准）
+        context_length: 上下文窗口长度
+        check_limit_up: 是否检查涨停（默认 True）
+        required_length: 完整采样窗口长度（用于涨停过滤），如果为 None 则只检查上下文窗口
+
+    Returns:
+        input_seq: [context_length, 6] 粗处理后的输入序列，或 None（如果验证失败）
+    """
+    return normalize_and_validate_context_window(
+        stock_data, start_idx, context_length,
+        check_limit_up=check_limit_up,
+        required_length=required_length,
+        feature_normalizer=None,
+        apply_fine_normalization=False
+    )
+
+
+def fine_normalize_batch(input_seq, feature_normalizer):
+    """
+    细处理：OHLE → 标准化数据
+
+    将粗处理后的数据送入细处理阶段，应用特征归一化器。
+    输出数据特性：均值≈0，方差≈1
+
+    Args:
+        input_seq: 粗处理后的数据
+            - 单个样本: [seq_len, 6]
+            - 批量样本: [batch_size, seq_len, 6]
+        feature_normalizer: 特征归一化器实例
+
+    Returns:
+        normalized_seq: 标准化后的数据，形状与输入相同
+    """
+    return feature_normalizer.transform(input_seq)
 
 
 def fit_feature_normalizer(output_path='./feature_normalizer.pkl',

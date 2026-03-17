@@ -85,48 +85,40 @@ class FeatureNormalizer:
 
         关键：只使用每只股票的训练集部分（train_end_idx 之前）
         
-        ⚠️ 重要：此方法的数据预处理逻辑必须与 data.py 中的 
-        normalize_and_validate_context_window() 保持完全一致！
+        使用 data.py 中的 coarse_normalize_context_window() 进行粗处理，
+        确保与训练时的数据处理逻辑完全一致。
 
         Returns:
             ohl_data: OHLC 特征 [N_samples * 30 * 4]
             volume_data: Volume 特征 [N_samples * 30]
             exchange_data: Exchange 特征 [N_samples * 30]
         """
+        from data import coarse_normalize_context_window, DataConfig
+        
         ohl_data = []
         volume_data = []
         exchange_data = []
+        
+        context_length = DataConfig.CONTEXT_LENGTH
 
         for stock in train_stock_info:
             data = stock['data']
             train_end_idx = stock.get('train_end_idx', len(data))
 
-            for i in range(1, train_end_idx - 30):
-                context = data[i:i+30]
-                context_length = len(context)
-
-                prev_close = data[i-1, 3]
-                prev_volume = data[i-1, 4]
-                closes = context[:, 3]
-                volumes = context[:, 4]
-
-                ohlc = np.empty((context_length, 4), dtype=np.float32)
-                ohlc[0, :4] = (context[0, :4] - prev_close) / prev_close
-                if context_length > 1:
-                    ohlc[1:, :4] = (context[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
-                ohlc = np.clip(ohlc, -0.1, 0.1)
-
-                volume = np.empty(context_length, dtype=np.float32)
-                volume[0] = (volumes[0] - prev_volume) / prev_volume
-                if context_length > 1:
-                    volume[1:] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
-                volume = np.clip(volume, -5.0, 5.0) / 10.0 + 0.5
-
-                exchange = context[:, 5] / 100.0
-
-                ohl_data.append(ohlc.flatten())
-                volume_data.append(volume.flatten())
-                exchange_data.append(exchange.flatten())
+            for i in range(1, train_end_idx - context_length):
+                # 使用统一的粗处理函数
+                input_seq = coarse_normalize_context_window(
+                    data, i, context_length,
+                    check_limit_up=False,  # 拟合归一化器时不过滤涨停，使用更多数据
+                    required_length=context_length
+                )
+                
+                if input_seq is None:
+                    continue
+                
+                ohl_data.append(input_seq[:, :4].flatten())
+                volume_data.append(input_seq[:, 4].flatten())
+                exchange_data.append(input_seq[:, 5].flatten())
 
         ohl_data = np.concatenate(ohl_data) if ohl_data else np.array([])
         volume_data = np.concatenate(volume_data) if volume_data else np.array([])

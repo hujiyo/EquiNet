@@ -1,15 +1,15 @@
 """
-Embedding层评估脚本
+Embedding模块评估脚本
 
-核心思路：Embedding层是一个映射函数 f: R^6 → R^48
-评估重点：映射本身的性质，而非下游任务效果
+核心思路：评估"Embedding模块"（细处理 + Embedding层）的映射性质
+评估对象：粗处理后的数据 → 细处理 → Embedding层 → d_model维输出
 
 评估维度：
 1. 局部敏感性分析：输入微小扰动时，输出如何变化
 2. 全局敏感性分析: 不同输入范围，输出变化幅度
-3. Jacobian分析: 每个输入维度对每个输出维度的影响
+3. Jacobian分析: 每个输入维度对每个输出维度的影响（数值方法）
 4. 表示多样性: 不同输入产生的输出是否足够分散
-5. 饱和度分析: GELU激活是否饱和
+5. 饱和度分析: 输出分布特征
 6. 扰动传播: 各输入维度的扰动如何传播到输出
 """
 
@@ -36,15 +36,88 @@ from config import DataConfig, ModelConfig
 from feature_normalizer import FeatureNormalizer
 
 
-class EmbeddingLayerAnalyzer:
-    """Embedding层分析器 - 评估映射函数本身的性质"""
+class EmbeddingModule(nn.Module):
+    """
+    统一的 Embedding 模块
+    
+    将细处理和 Embedding 层封装为一个整体：
+    - 细处理：FeatureNormalizer（训练时学到的变换）
+    - Embedding 层：nn.Linear（训练时学到的映射）
+    
+    注意：粗处理（OHLE变换）在数据加载阶段完成，
+    本模块接收粗处理后的数据作为输入。
+    """
+    
+    def __init__(self, embedding_layer, feature_normalizer):
+        super().__init__()
+        self.embedding_layer = embedding_layer
+        self.feature_normalizer = feature_normalizer
+    
+    def forward(self, x):
+        """
+        Args:
+            x: 粗处理后的数据 [batch, seq_len, 6]
+               范围：OHLE [-0.1, 0.1], Volume [0, 1], Exchange [0, 1]
+        
+        Returns:
+            embedded: [batch, seq_len, d_model]
+        """
+        if self.feature_normalizer is not None:
+            x_np = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else x
+            if x_np.ndim == 3:
+                batch_size, seq_len, n_features = x_np.shape
+                x_normalized = np.empty_like(x_np, dtype=np.float32)
+                for b in range(batch_size):
+                    x_normalized[b] = self.feature_normalizer.transform(x_np[b])
+                x = torch.tensor(x_normalized, dtype=torch.float32, device=self.embedding_layer.weight.device)
+            else:
+                x_normalized = self.feature_normalizer.transform(x_np)
+                x = torch.tensor(x_normalized, dtype=torch.float32, device=self.embedding_layer.weight.device)
+        
+        return self.embedding_layer(x)
+    
+    def transform_numpy(self, x_np):
+        """
+        对 numpy 数组应用细处理（不包含 Embedding 层）
+        
+        Args:
+            x_np: 粗处理后的 numpy 数组 [batch, seq_len, 6] 或 [seq_len, 6]
+        
+        Returns:
+            normalized: 细处理后的 numpy 数组
+        """
+        if self.feature_normalizer is None:
+            return x_np
+        
+        if x_np.ndim == 3:
+            batch_size, seq_len, n_features = x_np.shape
+            x_normalized = np.empty_like(x_np, dtype=np.float32)
+            for b in range(batch_size):
+                x_normalized[b] = self.feature_normalizer.transform(x_np[b])
+            return x_normalized
+        else:
+            return self.feature_normalizer.transform(x_np)
+
+
+class EmbeddingModuleAnalyzer:
+    """Embedding模块分析器 - 评估细处理+Embedding层的映射性质"""
     def __init__(self, model_path=None, device=None):
         self.model_path = model_path
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
-        self.embedding_layer = None
+        self.embedding_module = None
+        self.feature_normalizer = None
         
-    def load_model(self, model_path=None):
+    def load_model(self, model_path=None, feature_normalizer=None):
+        """
+        加载模型并创建 EmbeddingModule
+        
+        Args:
+            model_path: 模型文件路径
+            feature_normalizer: 特征归一化器实例
+        """
+        self.feature_normalizer = feature_normalizer
+        
         if model_path:
             self.model_path = model_path
         if self.model_path and os.path.exists(self.model_path):
@@ -53,11 +126,9 @@ class EmbeddingLayerAnalyzer:
                 model_arch = checkpoint.get('model_arch', {})
                 self.model = create_model(model_arch=model_arch).to(self.device)
                 
-                # 加载权重，允许部分不匹配（新旧模型结构差异）
                 current_state = self.model.state_dict()
                 loaded_state = checkpoint['state_dict']
                 
-                # 只加载匹配的权重
                 matched_state = {}
                 for key in current_state:
                     if key in loaded_state:
@@ -73,7 +144,6 @@ class EmbeddingLayerAnalyzer:
                 print(f"加载训练好的模型: {self.model_path}")
             else:
                 self.model = create_model().to(self.device)
-                # 旧格式checkpoint直接是state_dict
                 current_state = self.model.state_dict()
                 
                 matched_state = {}
@@ -91,7 +161,8 @@ class EmbeddingLayerAnalyzer:
         self.model.eval()
         
         if hasattr(self.model, 'embedding'):
-            self.embedding_layer = self.model.embedding
+            embedding_layer = self.model.embedding
+            self.embedding_module = EmbeddingModule(embedding_layer, self.feature_normalizer)
         else:
             raise AttributeError("模型不包含embedding层")
         
@@ -99,22 +170,22 @@ class EmbeddingLayerAnalyzer:
     
     def analyze_jacobian(self, sample_inputs, n_samples=100, store_matrices=False):
         """
-        Jacobian矩阵分析: 计算 ∂output/∂input
-
-        Jacobian矩阵 J[i,j] = ∂output_j / ∂input_i
-        揭示每个输入维度对每个输出维度的影响
-
+        Jacobian矩阵分析: 使用数值方法计算 ∂output/∂input
+        
+        由于 FeatureNormalizer 不是 PyTorch 模块，使用有限差分法计算 Jacobian
+        
         Args:
-            sample_inputs: 测试样本 (必须提供真实数据,禁止使用随机数据)
+            sample_inputs: 测试样本（粗处理后的数据）
             n_samples: 样本数量
-            store_matrices: 是否存储完整的Jacobian矩阵(可能占用大量内存)
+            store_matrices: 是否存储完整的Jacobian矩阵
         """
-        print("\n[Jacobian矩阵分析]")
+        print("\n[Jacobian矩阵分析 - 数值方法]")
+        print("  评估对象: Embedding模块（细处理 + Embedding层）")
 
         if sample_inputs is None:
-            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估,禁止使用随机数据!")
-        elif isinstance(sample_inputs, np.ndarray):
-            sample_inputs = torch.tensor(sample_inputs[:n_samples], dtype=torch.float32, device=self.device)
+            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估!")
+        
+        sample_inputs = np.array(sample_inputs[:n_samples])
         
         results = {
             'mean_jacobian_norm': [],
@@ -126,30 +197,42 @@ class EmbeddingLayerAnalyzer:
             results['jacobian_matrices'] = []
         
         feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
+        epsilon = 1e-5
         
         for i in range(min(n_samples, len(sample_inputs))):
-            x = sample_inputs[i:i+1].clone().requires_grad_(True)
+            x = sample_inputs[i:i+1]
             
-            output = self.embedding_layer(x)
+            with torch.no_grad():
+                x_tensor = torch.tensor(x, dtype=torch.float32, device=self.device)
+                base_output = self.embedding_module(x_tensor)
             
-            jacobian = torch.zeros(6, 48, device=self.device)
+            jacobian = np.zeros((6, 48))
             
-            for out_dim in range(48):
-                if x.grad is not None:
-                    x.grad.zero_()
+            for j in range(6):
+                x_plus = x.copy()
+                x_plus[0, :, j] += epsilon
+                x_minus = x.copy()
+                x_minus[0, :, j] -= epsilon
                 
-                output[0, :, out_dim].sum().backward(retain_graph=True)
-                jacobian[:, out_dim] = x.grad[0, 0, :].clone()
+                with torch.no_grad():
+                    x_plus_tensor = torch.tensor(x_plus, dtype=torch.float32, device=self.device)
+                    x_minus_tensor = torch.tensor(x_minus, dtype=torch.float32, device=self.device)
+                    
+                    out_plus = self.embedding_module(x_plus_tensor)
+                    out_minus = self.embedding_module(x_minus_tensor)
+                
+                grad = (out_plus - out_minus).cpu().numpy() / (2 * epsilon)
+                jacobian[j, :] = np.abs(grad).mean(axis=1)
             
             if store_matrices:
-                results['jacobian_matrices'].append(jacobian.cpu().numpy())
-            results['mean_jacobian_norm'].append(torch.norm(jacobian).item())
+                results['jacobian_matrices'].append(jacobian)
+            results['mean_jacobian_norm'].append(np.linalg.norm(jacobian))
             
-            input_sensitivity = torch.norm(jacobian, dim=1)
-            results['per_input_sensitivity'].append(input_sensitivity.cpu().numpy())
+            input_sensitivity = np.linalg.norm(jacobian, axis=1)
+            results['per_input_sensitivity'].append(input_sensitivity)
             
-            output_sensitivity = torch.norm(jacobian, dim=0)
-            results['per_output_sensitivity'].append(output_sensitivity.cpu().numpy())
+            output_sensitivity = np.linalg.norm(jacobian, axis=0)
+            results['per_output_sensitivity'].append(output_sensitivity)
         
         avg_input_sens = np.mean(results['per_input_sensitivity'], axis=0)
         avg_output_sens = np.mean(results['per_output_sensitivity'], axis=0)
@@ -172,21 +255,20 @@ class EmbeddingLayerAnalyzer:
     
     def analyze_local_sensitivity(self, sample_inputs, n_samples=50, epsilon=1e-4):
         """
-        局部敏感性分析: 输入微小扰动时，输出如何变化
-
-        对于每个样本，在每个输入维度上添加微小扰动，观察输出变化
-
+        局部敏感性分析: 输入微小扰动时，Embedding模块输出如何变化
+        
         Args:
-            sample_inputs: 测试样本 (必须提供真实数据,禁止使用随机数据)
+            sample_inputs: 测试样本（粗处理后的数据）
             n_samples: 样本数量
             epsilon: 扰动幅度
         """
         print("\n[局部敏感性分析]")
+        print("  评估对象: Embedding模块（细处理 + Embedding层）")
 
         if sample_inputs is None:
-            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估,禁止使用随机数据!")
-        elif isinstance(sample_inputs, np.ndarray):
-            sample_inputs = torch.tensor(sample_inputs[:n_samples], dtype=torch.float32, device=self.device)
+            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估!")
+        
+        sample_inputs = np.array(sample_inputs[:n_samples])
         
         feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
         results = {name: [] for name in feature_names}
@@ -195,20 +277,23 @@ class EmbeddingLayerAnalyzer:
         with torch.no_grad():
             for i in range(min(n_samples, len(sample_inputs))):
                 x = sample_inputs[i:i+1]
-                base_output = self.embedding_layer(x)
+                x_tensor = torch.tensor(x, dtype=torch.float32, device=self.device)
+                base_output = self.embedding_module(x_tensor)
                 
                 for j, name in enumerate(feature_names):
-                    x_perturbed = x.clone()
+                    x_perturbed = x.copy()
                     x_perturbed[0, :, j] += epsilon
                     
-                    perturbed_output = self.embedding_layer(x_perturbed)
+                    x_perturbed_tensor = torch.tensor(x_perturbed, dtype=torch.float32, device=self.device)
+                    perturbed_output = self.embedding_module(x_perturbed_tensor)
                     
                     diff = torch.norm(perturbed_output - base_output).item()
                     results[name].append(diff)
                 
-                x_all_perturbed = x.clone()
+                x_all_perturbed = x.copy()
                 x_all_perturbed += epsilon
-                all_perturbed_output = self.embedding_layer(x_all_perturbed)
+                x_all_perturbed_tensor = torch.tensor(x_all_perturbed, dtype=torch.float32, device=self.device)
+                all_perturbed_output = self.embedding_module(x_all_perturbed_tensor)
                 overall_diff = torch.norm(all_perturbed_output - base_output).item()
                 results['overall'].append(overall_diff)
         
@@ -228,26 +313,22 @@ class EmbeddingLayerAnalyzer:
     
     def analyze_global_sensitivity(self, sample_inputs, n_samples=100):
         """
-        全局敏感性分析: 不同输入范围，输出变化幅度
-
-        将每个输入维度从-0.1到0.1变化，观察输出变化
-
+        全局敏感性分析: 不同输入范围，Embedding模块输出变化幅度
+        
         Args:
-            sample_inputs: 测试样本 (必须提供真实数据,禁止使用随机数据)
+            sample_inputs: 测试样本（粗处理后的数据）
             n_samples: 样本数量
         """
         print("\n[全局敏感性分析]")
+        print("  评估对象: Embedding模块（细处理 + Embedding层）")
 
         if sample_inputs is None:
-            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估,禁止使用随机数据!")
+            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估!")
 
         feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
         results = {name: {'output_range': [], 'output_std': []} for name in feature_names}
 
-        if isinstance(sample_inputs, np.ndarray):
-            base_input = torch.tensor(sample_inputs[:1], dtype=torch.float32, device=self.device)
-        else:
-            base_input = sample_inputs[:1]
+        base_input = np.array(sample_inputs[:1])
         
         with torch.no_grad():
             for j, name in enumerate(feature_names):
@@ -256,9 +337,10 @@ class EmbeddingLayerAnalyzer:
                 values = np.linspace(-0.1, 0.1, 21) if name in ['Open', 'High', 'Low', 'Close'] else np.linspace(0, 1, 21)
                 
                 for v in values:
-                    x = base_input.clone()
+                    x = base_input.copy()
                     x[0, :, j] = v
-                    output = self.embedding_layer(x)
+                    x_tensor = torch.tensor(x, dtype=torch.float32, device=self.device)
+                    output = self.embedding_module(x_tensor)
                     outputs.append(output[0, 0, :].cpu().numpy())
                 
                 outputs = np.array(outputs)
@@ -275,27 +357,26 @@ class EmbeddingLayerAnalyzer:
     
     def analyze_input_output_diversity(self, sample_inputs, n_samples=500):
         """
-        表示多样性分析: 不同输入产生的输出是否足够分散
-
-        计算输入空间和输出空间的距离矩阵相关性
-
+        表示多样性分析: 不同输入产生的Embedding模块输出是否足够分散
+        
         Args:
-            sample_inputs: 测试样本 (必须提供真实数据,禁止使用随机数据)
+            sample_inputs: 测试样本（粗处理后的数据）
             n_samples: 样本数量
         """
         print("\n[表示多样性分析]")
+        print("  评估对象: Embedding模块（细处理 + Embedding层）")
 
         if sample_inputs is None:
-            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估,禁止使用随机数据!")
-        elif isinstance(sample_inputs, np.ndarray):
-            sample_inputs = torch.tensor(sample_inputs[:n_samples], dtype=torch.float32, device=self.device)
+            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估!")
+        
+        sample_inputs = np.array(sample_inputs[:n_samples])
         
         with torch.no_grad():
-            outputs = self.embedding_layer(sample_inputs)
+            sample_inputs_tensor = torch.tensor(sample_inputs, dtype=torch.float32, device=self.device)
+            outputs = self.embedding_module(sample_inputs_tensor)
             
-            inputs_flat = sample_inputs.reshape(len(sample_inputs), -1).cpu().numpy()
+            inputs_flat = sample_inputs.reshape(len(sample_inputs), -1)
             outputs_flat = outputs.reshape(len(outputs), -1).cpu().numpy()
-            
             
             n_pairs = min(1000, len(sample_inputs) * (len(sample_inputs) - 1) // 2)
             input_dists = []
@@ -337,25 +418,23 @@ class EmbeddingLayerAnalyzer:
     
     def analyze_saturation(self, sample_inputs, n_samples=100):
         """
-        饱和度分析: 分析embedding层输出的分布特征
-
-        由于embedding是单层Linear，直接分析其输出分布
-
+        饱和度分析: 分析Embedding模块输出的分布特征
+        
         Args:
-            sample_inputs: 测试样本 (必须提供真实数据,禁止使用随机数据)
+            sample_inputs: 测试样本（粗处理后的数据）
             n_samples: 样本数量
         """
         print("\n[饱和度分析]")
+        print("  评估对象: Embedding模块（细处理 + Embedding层）")
 
         if sample_inputs is None:
-            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估,禁止使用随机数据!")
-        elif isinstance(sample_inputs, np.ndarray):
-            sample_inputs = torch.tensor(sample_inputs[:n_samples], dtype=torch.float32, device=self.device)
+            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估!")
+        
+        sample_inputs = np.array(sample_inputs[:n_samples])
         
         with torch.no_grad():
-            x = sample_inputs
-            
-            hidden = self.embedding_layer(x)
+            x_tensor = torch.tensor(sample_inputs, dtype=torch.float32, device=self.device)
+            hidden = self.embedding_module(x_tensor)
             
             hidden_flat = hidden.cpu().numpy().flatten()
             
@@ -363,7 +442,7 @@ class EmbeddingLayerAnalyzer:
             
             dead_ratio = np.mean(np.abs(hidden_flat) < 0.01)
         
-        print(f"  Embedding层输出:")
+        print(f"  Embedding模块输出:")
         print(f"    均值: {np.mean(hidden_flat):.4f}")
         print(f"    标准差: {np.std(hidden_flat):.4f}")
         print(f"    范围: [{np.min(hidden_flat):.4f}, {np.max(hidden_flat):.4f}]")
@@ -381,20 +460,19 @@ class EmbeddingLayerAnalyzer:
     
     def analyze_critical_points(self, sample_inputs, n_samples=50):
         """
-        临界点分析: 找出哪些输入区域会导致输出剧烈变化
-
-        通过计算二阶导数（Hessian近似）来识别敏感区域
-
+        临界点分析: 找出哪些输入区域会导致Embedding模块输出剧烈变化
+        
         Args:
-            sample_inputs: 测试样本 (必须提供真实数据,禁止使用随机数据)
+            sample_inputs: 测试样本（粗处理后的数据）
             n_samples: 样本数量
         """
         print("\n[临界点分析]")
+        print("  评估对象: Embedding模块（细处理 + Embedding层）")
 
         if sample_inputs is None:
-            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估,禁止使用随机数据!")
-        elif isinstance(sample_inputs, np.ndarray):
-            sample_inputs = torch.tensor(sample_inputs[:n_samples], dtype=torch.float32, device=self.device)
+            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估!")
+        
+        sample_inputs = np.array(sample_inputs[:n_samples])
         
         feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
         
@@ -403,20 +481,22 @@ class EmbeddingLayerAnalyzer:
         epsilon = 1e-3
         
         for i in range(min(n_samples, len(sample_inputs))):
-            x = sample_inputs[i:i+1].clone().requires_grad_(True)
-            
-            output = self.embedding_layer(x)
+            x = sample_inputs[i:i+1]
             
             for j, name in enumerate(feature_names):
-                x_plus = x.clone()
+                x_plus = x.copy()
                 x_plus[0, :, j] += epsilon
-                x_minus = x.clone()
+                x_minus = x.copy()
                 x_minus[0, :, j] -= epsilon
                 
                 with torch.no_grad():
-                    out_plus = self.embedding_layer(x_plus)
-                    out_minus = self.embedding_layer(x_minus)
-                    out_base = self.embedding_layer(x)
+                    x_tensor = torch.tensor(x, dtype=torch.float32, device=self.device)
+                    x_plus_tensor = torch.tensor(x_plus, dtype=torch.float32, device=self.device)
+                    x_minus_tensor = torch.tensor(x_minus, dtype=torch.float32, device=self.device)
+                    
+                    out_plus = self.embedding_module(x_plus_tensor)
+                    out_minus = self.embedding_module(x_minus_tensor)
+                    out_base = self.embedding_module(x_tensor)
                 
                 second_deriv = torch.norm(out_plus - 2*out_base + out_minus) / (epsilon ** 2)
                 second_order_sensitivity[name].append(second_deriv.item())
@@ -434,50 +514,44 @@ class EmbeddingLayerAnalyzer:
     def analyze_dimension_contribution(self, sample_inputs, n_samples=100):
         """
         特征重要性分析（消融实验）
-
-        注意：这里分析的是Embedding层的输出变化，不是最终预测的变化
-        如需分析特征对预测的影响，请使用预测层面的消融实验
-
-        方法：将某个输入特征置零，观察Embedding层输出的相对变化
-
+        
+        分析各特征对Embedding模块输出的影响
+        
         Args:
-            sample_inputs: 测试样本 (必须提供真实数据,禁止使用随机数据)
+            sample_inputs: 测试样本（粗处理后的数据）
             n_samples: 样本数量
         """
-        print("\n[特征重要性分析（Embedding层）]")
+        print("\n[特征重要性分析（Embedding模块）]")
 
         if sample_inputs is None:
-            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估,禁止使用随机数据!")
-        elif isinstance(sample_inputs, np.ndarray):
-            sample_inputs = torch.tensor(sample_inputs[:n_samples], dtype=torch.float32, device=self.device)
+            raise ValueError("必须提供真实数据样本(sample_inputs)进行评估!")
+        
+        sample_inputs = np.array(sample_inputs[:n_samples])
 
         feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
 
         with torch.no_grad():
-            # 基准输出
-            base_output = self.embedding_layer(sample_inputs)
+            sample_inputs_tensor = torch.tensor(sample_inputs, dtype=torch.float32, device=self.device)
+            base_output = self.embedding_module(sample_inputs_tensor)
             base_norm = torch.norm(base_output).item()
 
             importance_scores = []
 
             for j, name in enumerate(feature_names):
-                # 置零该特征
-                masked_input = sample_inputs.clone()
+                masked_input = sample_inputs.copy()
                 masked_input[:, :, j] = 0
 
-                # 重新前向传播
-                masked_output = self.embedding_layer(masked_input)
+                masked_input_tensor = torch.tensor(masked_input, dtype=torch.float32, device=self.device)
+                masked_output = self.embedding_module(masked_input_tensor)
                 masked_norm = torch.norm(masked_output).item()
 
-                # 计算相对变化（统一算法）
                 relative_change = abs(masked_norm - base_norm) / (base_norm + 1e-6)
                 importance_scores.append(relative_change)
 
-        print(f"  各特征对Embedding输出的影响（消融实验）:")
+        print(f"  各特征对Embedding模块输出的影响（消融实验）:")
         for i, name in enumerate(feature_names):
             print(f"    {name}: 相对变化={importance_scores[i]:.4f} ({importance_scores[i]*100:.2f}%)")
 
-        # 排序
         sorted_indices = np.argsort(importance_scores)[::-1]
         print(f"\n  特征重要性排序:")
         for rank, idx in enumerate(sorted_indices, 1):
@@ -485,28 +559,27 @@ class EmbeddingLayerAnalyzer:
 
         return {
             'feature_names': feature_names,
-            'importance_scores': importance_scores,  # 相对变化
+            'importance_scores': importance_scores,
             'sorted_indices': sorted_indices.tolist()
         }
     
     def visualize_sensitivity(self, sample_inputs, save_dir='embedding_eval_results', dimension_contribution_results=None):
         """可视化敏感性分析结果
-
+        
         Args:
-            sample_inputs: 测试样本 (必须提供真实数据,禁止使用随机数据)
+            sample_inputs: 测试样本（粗处理后的数据）
             save_dir: 保存目录
-            dimension_contribution_results: 特征重要性分析结果（如果为None则重新计算）
+            dimension_contribution_results: 特征重要性分析结果
         """
         if sample_inputs is None:
-            raise ValueError("必须提供真实数据样本(sample_inputs)进行可视化,禁止使用随机数据!")
+            raise ValueError("必须提供真实数据样本(sample_inputs)进行可视化!")
 
         os.makedirs(save_dir, exist_ok=True)
 
         feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
 
         n_samples = min(100, len(sample_inputs))
-        if isinstance(sample_inputs, np.ndarray):
-            sample_inputs = torch.tensor(sample_inputs[:n_samples], dtype=torch.float32, device=self.device)
+        sample_inputs = np.array(sample_inputs[:n_samples])
         
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         
@@ -514,15 +587,17 @@ class EmbeddingLayerAnalyzer:
         
         ax = axes[0, 0]
         with torch.no_grad():
-            base_output = self.embedding_layer(sample_inputs)
+            sample_inputs_tensor = torch.tensor(sample_inputs, dtype=torch.float32, device=self.device)
+            base_output = self.embedding_module(sample_inputs_tensor)
             
             sensitivities = []
             for j, name in enumerate(feature_names):
                 diffs = []
                 for eps in [1e-5, 1e-4, 1e-3, 1e-2]:
-                    x_perturbed = sample_inputs.clone()
+                    x_perturbed = sample_inputs.copy()
                     x_perturbed[:, :, j] += eps
-                    perturbed_output = self.embedding_layer(x_perturbed)
+                    x_perturbed_tensor = torch.tensor(x_perturbed, dtype=torch.float32, device=self.device)
+                    perturbed_output = self.embedding_module(x_perturbed_tensor)
                     diff = torch.norm(perturbed_output - base_output).item()
                     diffs.append(diff)
                 sensitivities.append(diffs)
@@ -534,13 +609,13 @@ class EmbeddingLayerAnalyzer:
                 ax.loglog(epsilons, sensitivities[i], 'o-', label=name)
             ax.set_xlabel('Perturbation Size (ε)')
             ax.set_ylabel('Output Change')
-            ax.set_title('Local Sensitivity vs Perturbation Size')
+            ax.set_title('Local Sensitivity vs Perturbation Size\n(Embedding Module)')
             ax.legend()
             ax.grid(True, alpha=0.3)
         
         ax = axes[0, 1]
         with torch.no_grad():
-            base_input = torch.zeros(1, 30, 6, device=self.device)
+            base_input = np.zeros((1, 30, 6), dtype=np.float32)
             
             feature_indices = {'Open': 0, 'High': 1, 'Low': 2, 'Close': 3, 'Volume': 4, 'Exchange': 5}
             
@@ -550,9 +625,10 @@ class EmbeddingLayerAnalyzer:
                 values = np.linspace(-0.1, 0.1, 21) if name != 'Volume' else np.linspace(0, 1, 21)
                 
                 for v in values:
-                    x = base_input.clone()
+                    x = base_input.copy()
                     x[0, :, j] = v
-                    output = self.embedding_layer(x)
+                    x_tensor = torch.tensor(x, dtype=torch.float32, device=self.device)
+                    output = self.embedding_module(x_tensor)
                     norm = torch.norm(output).item()
                     outputs.append(norm)
                 
@@ -560,16 +636,16 @@ class EmbeddingLayerAnalyzer:
             
             ax.set_xlabel('Input Value')
             ax.set_ylabel('Output Norm')
-            ax.set_title('Output Norm vs Input Value')
+            ax.set_title('Output Norm vs Input Value\n(Embedding Module)')
             ax.legend()
             ax.grid(True, alpha=0.3)
         
         ax = axes[0, 2]
         with torch.no_grad():
-            # 使用传入的真实数据进行PCA可视化
             n_pca_samples = min(500, len(sample_inputs))
             test_inputs = sample_inputs[:n_pca_samples]
-            outputs = self.embedding_layer(test_inputs)
+            test_inputs_tensor = torch.tensor(test_inputs, dtype=torch.float32, device=self.device)
+            outputs = self.embedding_module(test_inputs_tensor)
             outputs_flat = outputs.reshape(-1, 48).cpu().numpy()
 
             from sklearn.decomposition import PCA
@@ -579,58 +655,58 @@ class EmbeddingLayerAnalyzer:
             ax.scatter(outputs_2d[:, 0], outputs_2d[:, 1], alpha=0.5, s=5)
             ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})')
             ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})')
-            ax.set_title('Output Space Distribution (PCA)')
+            ax.set_title('Output Space Distribution (PCA)\n(Embedding Module)')
         
         ax = axes[1, 0]
         with torch.no_grad():
             x = sample_inputs[:50]
+            x_tensor = torch.tensor(x, dtype=torch.float32, device=self.device)
             
-            hidden = self.embedding_layer(x)
+            hidden = self.embedding_module(x_tensor)
             
             hidden_flat = hidden.cpu().numpy().flatten()
             
-            ax.hist(hidden_flat, bins=50, alpha=0.7, edgecolor='black', label='Embedding Output')
+            ax.hist(hidden_flat, bins=50, alpha=0.7, edgecolor='black', label='Embedding Module Output')
             ax.axvline(x=-3, color='orange', linestyle='--', label='x=±3')
             ax.axvline(x=3, color='orange', linestyle='--')
             ax.set_xlabel('Value')
             ax.set_ylabel('Frequency')
-            ax.set_title('Embedding Layer Output Distribution')
+            ax.set_title('Embedding Module Output Distribution')
             ax.legend()
         
         ax = axes[1, 1]
         if dimension_contribution_results is not None:
-            # 使用传入的计算结果（和打印一致）
             importance_scores = dimension_contribution_results['importance_scores']
             feature_names_result = dimension_contribution_results['feature_names']
 
             bars = ax.bar(feature_names_result, [s*100 for s in importance_scores],
                         alpha=0.7, color='steelblue')
             ax.set_ylabel('Relative Change (%)')
-            ax.set_title('Feature Importance (Ablation Study)\nEmbedding Layer Output Change')
+            ax.set_title('Feature Importance (Ablation Study)\nEmbedding Module Output Change')
             ax.grid(axis='y', alpha=0.3)
 
-            # 添加数值标签
             for bar, score in zip(bars, importance_scores):
                 ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(importance_scores)*100*0.01,
                        f'{score*100:.2f}%', ha='center', va='bottom', fontsize=9)
         else:
-            # 如果没有传入结果，使用随机数据重新计算（旧逻辑，保持兼容）
             with torch.no_grad():
-                base_output = self.embedding_layer(sample_inputs)
+                sample_inputs_tensor = torch.tensor(sample_inputs, dtype=torch.float32, device=self.device)
+                base_output = self.embedding_module(sample_inputs_tensor)
                 base_norm = torch.norm(base_output).item()
 
                 contributions = []
                 for j, name in enumerate(feature_names):
-                    masked = sample_inputs.clone()
+                    masked = sample_inputs.copy()
                     masked[:, :, j] = 0
-                    masked_output = self.embedding_layer(masked)
+                    masked_tensor = torch.tensor(masked, dtype=torch.float32, device=self.device)
+                    masked_output = self.embedding_module(masked_tensor)
                     masked_norm = torch.norm(masked_output).item()
                     relative_change = abs(masked_norm - base_norm) / (base_norm + 1e-6)
                     contributions.append(relative_change)
 
                 bars = ax.bar(feature_names, [c*100 for c in contributions], alpha=0.7, color='steelblue')
                 ax.set_ylabel('Relative Change (%)')
-                ax.set_title('Feature Importance (Ablation Study)\nEmbedding Layer Output Change')
+                ax.set_title('Feature Importance (Ablation Study)\nEmbedding Module Output Change')
                 ax.grid(axis='y', alpha=0.3)
 
                 for bar, contrib in zip(bars, contributions):
@@ -639,18 +715,18 @@ class EmbeddingLayerAnalyzer:
 
         ax = axes[1, 2]
         with torch.no_grad():
-            # 使用传入的真实数据进行输入-输出范数关系可视化
             n_norm_samples = min(200, len(sample_inputs))
             test_inputs = sample_inputs[:n_norm_samples]
-            outputs = self.embedding_layer(test_inputs)
+            test_inputs_tensor = torch.tensor(test_inputs, dtype=torch.float32, device=self.device)
+            outputs = self.embedding_module(test_inputs_tensor)
 
-            input_norms = torch.norm(test_inputs.reshape(n_norm_samples, -1), dim=1).cpu().numpy()
+            input_norms = np.linalg.norm(test_inputs.reshape(n_norm_samples, -1), axis=1)
             output_norms = torch.norm(outputs.reshape(n_norm_samples, -1), dim=1).cpu().numpy()
 
             ax.scatter(input_norms, output_norms, alpha=0.5)
-            ax.set_xlabel('Input Norm')
+            ax.set_xlabel('Input Norm (Coarse Processed)')
             ax.set_ylabel('Output Norm')
-            ax.set_title('Input-Output Norm Relationship')
+            ax.set_title('Input-Output Norm Relationship\n(Embedding Module)')
 
             z = np.polyfit(input_norms, output_norms, 1)
             p = np.poly1d(z)
@@ -658,10 +734,10 @@ class EmbeddingLayerAnalyzer:
             ax.legend()
         
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, 'embedding_sensitivity_analysis.png'), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(save_dir, 'embedding_module_sensitivity_analysis.png'), dpi=150, bbox_inches='tight')
         plt.close()
         
-        print(f"  可视化图表已保存到: {save_dir}/embedding_sensitivity_analysis.png")
+        print(f"  可视化图表已保存到: {save_dir}/embedding_module_sensitivity_analysis.png")
     
     def generate_report(self, results, save_dir='embedding_eval_results'):
         """生成分析报告"""
@@ -670,11 +746,12 @@ class EmbeddingLayerAnalyzer:
         report = {
             'timestamp': datetime.now().isoformat(),
             'model_path': self.model_path,
+            'evaluation_target': 'Embedding Module (Fine Normalization + Embedding Layer)',
             'analysis_results': results,
             'summary': self._generate_summary(results)
         }
         
-        with open(os.path.join(save_dir, 'embedding_layer_analysis.json'), 'w', encoding='utf-8') as f:
+        with open(os.path.join(save_dir, 'embedding_module_analysis.json'), 'w', encoding='utf-8') as f:
             json.dump(report, f, indent=2, ensure_ascii=False, default=str)
         
         return report
@@ -712,33 +789,32 @@ class EmbeddingLayerAnalyzer:
         
         if 'saturation' in results:
             sat = results['saturation']
-            summary['key_findings'].append(f"GELU饱和比例: {sat['saturation_ratio']*100:.2f}%")
+            summary['key_findings'].append(f"饱和比例: {sat['saturation_ratio']*100:.2f}%")
             summary['key_findings'].append(f"死神经元比例: {sat['dead_neuron_ratio']*100:.2f}%")
             
             if sat['saturation_ratio'] > 0.1:
-                summary['potential_issues'].append(f"GELU激活饱和比例较高 ({sat['saturation_ratio']*100:.1f}%)")
+                summary['potential_issues'].append(f"饱和比例较高 ({sat['saturation_ratio']*100:.1f}%)")
                 summary['recommendations'].append("考虑添加LayerNorm或调整权重初始化")
         
         return summary
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Embedding层专业评估工具')
+    parser = argparse.ArgumentParser(description='Embedding模块专业评估工具')
     parser.add_argument('--model', type=str, default=None,
                         help='指定要分析的模型文件路径（例如: ./out/modelB_xxx.pth）。如果不指定，将自动使用最新的模型')
     parser.add_argument('--list-models', action='store_true',
                         help='列出所有可用的模型文件并退出')
     args = parser.parse_args()
 
-    # 设置工作目录为脚本所在目录，确保所有相对路径都相对于脚本位置
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     print("="*70)
-    print("Embedding层专业评估工具")
-    print("评估映射函数 f: R^6 → R^48 的性质")
+    print("Embedding模块专业评估工具")
+    print("评估对象: 细处理(FeatureNormalizer) + Embedding层")
+    print("数据流: 粗处理数据 → 细处理 → Embedding层 → d_model维输出")
     print("="*70)
 
-    # 列出所有可用模型
     out_dir = './out'
     model_files = []
     if os.path.exists(out_dir):
@@ -752,15 +828,13 @@ def main():
             model_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
             for i, mf in enumerate(model_files, 1):
                 mtime = datetime.fromtimestamp(os.path.getmtime(mf)).strftime('%Y-%m-%d %H:%M:%S')
-                size = os.path.getsize(mf) / (1024 * 1024)  # MB
+                size = os.path.getsize(mf) / (1024 * 1024)
                 print(f"  {i}. {os.path.basename(mf)} ({mtime}, {size:.2f} MB)")
         else:
             print("  未找到任何模型文件")
         return None, None
 
-    # 确定要使用的模型路径
     if args.model:
-        # 如果用户只提供文件名（不含路径），尝试在 ./out 目录中查找
         if os.path.sep not in args.model and '/' not in args.model:
             potential_path = os.path.join(out_dir, args.model)
             if os.path.exists(potential_path):
@@ -779,7 +853,6 @@ def main():
         model_path = args.model
         print(f"\n使用指定的模型: {os.path.basename(model_path)}")
     else:
-        # 按修改时间排序，取最新的模型
         if model_files:
             model_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
             print(f"\n找到 {len(model_files)} 个模型文件，使用最新的: {os.path.basename(model_files[0])}")
@@ -791,7 +864,6 @@ def main():
     save_dir = './embedding_eval_results'
     os.makedirs(save_dir, exist_ok=True)
 
-    # ========== 特征归一化器配置 ==========
     print("\n" + "="*60)
     print("特征归一化器配置")
     print("="*60)
@@ -813,24 +885,24 @@ def main():
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
     print("\n[步骤2] 准备测试样本...")
-    from data import normalize_and_validate_context_window
+    from data import coarse_normalize_context_window
     all_inputs = []
     for stock in test_stock_info[:50]:
         data = stock['data']
         test_split = stock['test_split_point']
         for i in range(test_split, min(test_split + 10, len(data) - 33)):
-            input_seq = normalize_and_validate_context_window(
+            input_seq = coarse_normalize_context_window(
                 data, i, 30, check_limit_up=False, required_length=33
             )
             if input_seq is not None:
                 all_inputs.append(input_seq)
     
     sample_inputs = np.array(all_inputs[:500])
-    print(f"  准备了 {len(sample_inputs)} 个测试样本")
+    print(f"  准备了 {len(sample_inputs)} 个测试样本（粗处理后的数据）")
 
     print("\n[步骤3] 初始化分析器...")
-    analyzer = EmbeddingLayerAnalyzer(model_path=model_path)
-    analyzer.load_model()
+    analyzer = EmbeddingModuleAnalyzer(model_path=model_path)
+    analyzer.load_model(feature_normalizer=feature_normalizer)
     
     print("\n[步骤4] 执行分析...")
     results = {}

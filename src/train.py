@@ -26,9 +26,8 @@ from model import create_model
 from data import (
     load_and_preprocess_data,
     create_sampler, sample_with_pools,
-    create_fixed_evaluation_dataset
+    create_fixed_evaluation_dataset,FeatureNormalizer
 )
-from feature_normalizer import FeatureNormalizer
 
 from training_utils import (
     WarmupScheduler,
@@ -612,16 +611,13 @@ if __name__ == "__main__":
     # ========== 特征归一化器配置 ==========
     print("\n" + "="*60)
     print("特征归一化器配置")
-    print("="*60)
-    print(f"归一化器路径: {DataConfig.NORMALIZER_PATH}")
-    print(f"输出分布: {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION}")
-    print(f"分位数数量: {DataConfig.NORMALIZER_N_QUANTILES}")
+    print(f" 归一化器路径: {DataConfig.NORMALIZER_PATH}")
+    print(f" 输出分布: {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION}")
+    print(f" 分位数数量: {DataConfig.NORMALIZER_N_QUANTILES}")
 
     # 检查归一化器文件是否存在
     if os.path.exists(DataConfig.NORMALIZER_PATH):
-        print(f"\n✓ 检测到归一化器文件，正在加载...")
         feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
-        print("✓ 特征归一化器已启用")
     else:
         print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
         print("请先运行以下命令创建归一化器：")
@@ -631,23 +627,20 @@ if __name__ == "__main__":
     print("="*60)
 
     # 加载数据
-    print("\n正在加载和预处理数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
     # 打印数据集统计
     print("\n" + "="*60)
     print("数据集统计")
-    print("="*60)
-    print(f"训练集: {len(train_stock_info)} 只股票")
-    print(f"测试集: {len(test_stock_info)} 只股票")
-    print("="*60)
+    print(f" 训练集: {len(train_stock_info)} 只股票")
+    print(f" 测试集: {len(test_stock_info)} 只股票")
 
     # 创建模型A
     print("\n正在创建模型A (FP32精度)...")
     model_a = create_model().to(device)
 
     total_params = sum(p.numel() for p in model_a.parameters())
-    print(f"模型A参数数: {total_params:,}")
+    print(f" 模型A参数数: {total_params:,}")
 
     # 开始训练
     print("\n开始克隆模型训练...")

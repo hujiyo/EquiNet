@@ -21,19 +21,17 @@ from scipy.stats import pearsonr
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 import os
-import json
 import warnings
 warnings.filterwarnings('ignore')
 from datetime import datetime
 import argparse
 
 from model import create_model
-from data import load_and_preprocess_data
+from data import load_and_preprocess_data,FeatureNormalizer
 from config import DataConfig, ModelConfig
-from feature_normalizer import FeatureNormalizer
 
 
 class EmbeddingModule(nn.Module):
@@ -304,7 +302,7 @@ class EmbeddingModuleAnalyzer:
             mean_diff = np.mean(results[name])
             std_diff = np.std(results[name])
             summary[name] = {'mean': float(mean_diff), 'std': float(std_diff)}
-            print(f"    {name}: {mean_diff:.6f} ± {std_diff:.6f}")
+            print(f"    {name}: {mean_diff:.6f} +/- {std_diff:.6f}")
         
         print(f"  全维度同时扰动: {np.mean(results['overall']):.6f}")
         summary['overall'] = {'mean': float(np.mean(results['overall'])), 'std': float(np.std(results['overall']))}
@@ -405,7 +403,7 @@ class EmbeddingModuleAnalyzer:
             
         print(f"  输入-输出距离相关性: {correlation:.4f}")
         print(f"  输出向量平均余弦相似度: {np.mean(output_cosine_sims):.4f}")
-        print(f"  输出向量范数: {np.mean(output_norms):.4f} ± {np.std(output_norms):.4f}")
+        print(f"  输出向量范数: {np.mean(output_norms):.4f} +/- {np.std(output_norms):.4f}")
         print(f"  输出向量范数范围: [{np.min(output_norms):.4f}, {np.max(output_norms):.4f}]")
         
         return {
@@ -515,7 +513,11 @@ class EmbeddingModuleAnalyzer:
         """
         特征重要性分析（消融实验）
         
-        分析各特征对Embedding模块输出的影响
+        分析各特征对Embedding模块输出的影响。
+        使用语义正确的"零值"进行消融：
+        - OHLC: 0.0（中间值，涨跌为0）
+        - Volume: 0.5（变化率为0，表示维持不变）
+        - Exchange: 0.01（1%换手率，普通股票日常水平）
         
         Args:
             sample_inputs: 测试样本（粗处理后的数据）
@@ -530,6 +532,15 @@ class EmbeddingModuleAnalyzer:
 
         feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
 
+        zero_values = {
+            'Open': 0.0,
+            'High': 0.0,
+            'Low': 0.0,
+            'Close': 0.0,
+            'Volume': 0.5,
+            'Exchange': 0.01
+        }
+
         with torch.no_grad():
             sample_inputs_tensor = torch.tensor(sample_inputs, dtype=torch.float32, device=self.device)
             base_output = self.embedding_module(sample_inputs_tensor)
@@ -539,7 +550,7 @@ class EmbeddingModuleAnalyzer:
 
             for j, name in enumerate(feature_names):
                 masked_input = sample_inputs.copy()
-                masked_input[:, :, j] = 0
+                masked_input[:, :, j] = zero_values[name]
 
                 masked_input_tensor = torch.tensor(masked_input, dtype=torch.float32, device=self.device)
                 masked_output = self.embedding_module(masked_input_tensor)
@@ -573,6 +584,10 @@ class EmbeddingModuleAnalyzer:
         """
         if sample_inputs is None:
             raise ValueError("必须提供真实数据样本(sample_inputs)进行可视化!")
+
+        # 确保正确的字体和减号显示设置
+        plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
+        plt.rcParams['axes.unicode_minus'] = False
 
         os.makedirs(save_dir, exist_ok=True)
 
@@ -667,7 +682,7 @@ class EmbeddingModuleAnalyzer:
             hidden_flat = hidden.cpu().numpy().flatten()
             
             ax.hist(hidden_flat, bins=50, alpha=0.7, edgecolor='black', label='Embedding Module Output')
-            ax.axvline(x=-3, color='orange', linestyle='--', label='x=±3')
+            ax.axvline(x=-3, color='orange', linestyle='--', label='x=+/-3')
             ax.axvline(x=3, color='orange', linestyle='--')
             ax.set_xlabel('Value')
             ax.set_ylabel('Frequency')
@@ -689,6 +704,14 @@ class EmbeddingModuleAnalyzer:
                 ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(importance_scores)*100*0.01,
                        f'{score*100:.2f}%', ha='center', va='bottom', fontsize=9)
         else:
+            zero_values = {
+                'Open': 0.0,
+                'High': 0.0,
+                'Low': 0.0,
+                'Close': 0.0,
+                'Volume': 0.5,
+                'Exchange': 0.01
+            }
             with torch.no_grad():
                 sample_inputs_tensor = torch.tensor(sample_inputs, dtype=torch.float32, device=self.device)
                 base_output = self.embedding_module(sample_inputs_tensor)
@@ -697,7 +720,7 @@ class EmbeddingModuleAnalyzer:
                 contributions = []
                 for j, name in enumerate(feature_names):
                     masked = sample_inputs.copy()
-                    masked[:, :, j] = 0
+                    masked[:, :, j] = zero_values[name]
                     masked_tensor = torch.tensor(masked, dtype=torch.float32, device=self.device)
                     masked_output = self.embedding_module(masked_tensor)
                     masked_norm = torch.norm(masked_output).item()
@@ -739,24 +762,7 @@ class EmbeddingModuleAnalyzer:
         
         print(f"  可视化图表已保存到: {save_dir}/embedding_module_analysis.png")
     
-    def generate_report(self, results, save_dir='out_eval_results'):
-        """生成分析报告"""
-        os.makedirs(save_dir, exist_ok=True)
-        
-        report = {
-            'timestamp': datetime.now().isoformat(),
-            'model_path': self.model_path,
-            'evaluation_target': 'Embedding Module (Fine Normalization + Embedding Layer)',
-            'analysis_results': results,
-            'summary': self._generate_summary(results)
-        }
-        
-        with open(os.path.join(save_dir, 'embedding_module_analysis.json'), 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, ensure_ascii=False, default=str)
-        
-        return report
-    
-    def _generate_summary(self, results):
+    def print_summary(self, results):
         """生成分析总结"""
         summary = {
             'key_findings': [],
@@ -796,11 +802,27 @@ class EmbeddingModuleAnalyzer:
                 summary['potential_issues'].append(f"饱和比例较高 ({sat['saturation_ratio']*100:.1f}%)")
                 summary['recommendations'].append("考虑添加LayerNorm或调整权重初始化")
         
-        return summary
+        """打印分析总结到屏幕"""
+        print("\n" + "="*70)
+        print("分析总结")
 
+        print("\n关键发现:")
+        for finding in summary['key_findings']:
+            print(f"  • {finding}")
+
+        if summary['potential_issues']:
+            print("\n潜在问题:")
+            for issue in summary['potential_issues']:
+                print(f"  ⚠ {issue}")
+
+        if summary['recommendations']:
+            print("\n优化建议:")
+            for rec in summary['recommendations']:
+                print(f"  💡 {rec}")
+        return
 
 def main():
-    parser = argparse.ArgumentParser(description='Embedding模块专业评估工具')
+    parser = argparse.ArgumentParser(description='Embedding模块评估')
     parser.add_argument('--model', type=str, default=None,
                         help='指定要分析的模型文件路径（例如: ./out/modelB_xxx.pth）。如果不指定，将自动使用最新的模型')
     parser.add_argument('--list-models', action='store_true',
@@ -809,11 +831,8 @@ def main():
 
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-    print("="*70)
-    print("Embedding模块专业评估工具")
+    print("Embedding模块评估...")
     print("评估对象: 细处理(FeatureNormalizer) + Embedding层")
-    print("数据流: 粗处理数据 → 细处理 → Embedding层 → d_model维输出")
-    print("="*70)
 
     out_dir = './out'
     model_files = []
@@ -864,24 +883,14 @@ def main():
     save_dir = './out_eval_results'
     os.makedirs(save_dir, exist_ok=True)
 
-    print("\n" + "="*60)
-    print("特征归一化器配置")
-    print("="*60)
-    print(f"归一化器路径: {DataConfig.NORMALIZER_PATH}")
-
     if os.path.exists(DataConfig.NORMALIZER_PATH):
-        print(f"\n✓ 检测到归一化器文件，正在加载...")
         feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
-        print("✓ 特征归一化器已启用")
     else:
-        print(f"\n⚠ 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
-        print("请先运行以下命令创建归一化器：")
-        print(f"  python data.py")
-        raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
+        print(f"\n⚠ 未找到归一化器文件: {DataConfig.NORMALIZER_PATH}")
+        sys.exit()
 
-    print("="*60)
-
-    print("\n[步骤1] 加载数据...")
+    print("\n"+"="*60)
+    print("[步骤1] 加载数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
     print("\n[步骤2] 准备测试样本...")
@@ -900,11 +909,10 @@ def main():
     sample_inputs = np.array(all_inputs[:500])
     print(f"  准备了 {len(sample_inputs)} 个测试样本（粗处理后的数据）")
 
-    print("\n[步骤3] 初始化分析器...")
     analyzer = EmbeddingModuleAnalyzer(model_path=model_path)
     analyzer.load_model(feature_normalizer=feature_normalizer)
     
-    print("\n[步骤4] 执行分析...")
+    print("\n[步骤3] 执行分析...")
     results = {}
     
     results['jacobian'] = analyzer.analyze_jacobian(sample_inputs, n_samples=50)
@@ -915,38 +923,16 @@ def main():
     results['critical_points'] = analyzer.analyze_critical_points(sample_inputs, n_samples=30)
     results['dimension_contribution'] = analyzer.analyze_dimension_contribution(sample_inputs, n_samples=100)
 
-    print("\n[步骤5] 生成可视化...")
+    print("\n[步骤4] 生成可视化...")
     analyzer.visualize_sensitivity(sample_inputs, save_dir, dimension_contribution_results=results['dimension_contribution'])
-    
-    print("\n[步骤6] 生成报告...")
-    report = analyzer.generate_report(results, save_dir)
-    
-    print("\n" + "="*70)
-    print("分析总结")
-    print("="*70)
-    
-    summary = report['summary']
-    
-    print("\n关键发现:")
-    for finding in summary['key_findings']:
-        print(f"  • {finding}")
-    
-    if summary['potential_issues']:
-        print("\n潜在问题:")
-        for issue in summary['potential_issues']:
-            print(f"  ⚠ {issue}")
 
-    if summary['recommendations']:
-        print("\n优化建议:")
-        for rec in summary['recommendations']:
-            print(f"  💡 {rec}")
+    print("\n[步骤5] 生成总结...")
+    analyzer.print_summary(results)
 
-    print("\n" + "="*70)
-    print(f"分析完成！结果已保存到: {save_dir}")
-    print("="*70)
+    print(f"分析完成！可视化图表已保存到: {save_dir}/embedding_module_analysis.png")
 
-    return results, report
+    return results
 
 
 if __name__ == "__main__":
-    results, report = main()
+    results = main()

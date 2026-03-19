@@ -12,6 +12,7 @@ EquiNet 模型定义文件
 - create_model(): 工厂函数，根据配置创建对应模型
 """
 
+import math
 import torch
 import torch.nn as nn
 from config import ModelConfig, DataConfig
@@ -19,39 +20,45 @@ from tokenizer import TokenConfig
 
 def init_weights(module):
     """
-    Xavier (Glorot) 初始化 - 适合 Transformer 模型
+    当代主流Transformer初始化策略
 
-    初始化范围:
-    - Linear层权重: uniform[-a, +a], a = gain * sqrt(6 / (fan_in + fan_out))
-    - Linear层偏置: 0
-    - Norm层权重: 1
-    - Norm层偏置: 0
+    设计原则：
+    1. Embedding层: Xavier初始化，小增益确保输入方差合理
+    2. FFN第一层: Xavier初始化，gain=1.7补偿GELU压缩
+    3. FFN第二层: Xavier初始化，gain=1.0（无激活函数）
+    4. 输出层: 小增益，避免sigmoid饱和
+    5. LayerNorm: weight=1, bias=0
 
-    特殊处理:
-    - Embedding层: gain=EMBEDDING_INIT_GAIN (可在config.py中调整，推荐1.5)
-    - 输出层: gain=OUTPUT_LAYER_GAIN (确保logits有足够大的范围)
-    - 其他层: gain=1.0 (标准Xavier)
-
-    Embedding层增益说明 (见config.py中的EMBEDDING_INIT_GAIN注释):
-    - 1.0: 标准Xavier (std≈0.4), 保守, 训练慢但稳定
-    - 1.5: 推荐值 (std≈0.6), 平衡, 收敛快且稳定 (201 epoch达到AUC 0.695)
-    - 2.0: 激进 (std≈0.8), 收敛更快但可能过拟合
-    - 0.5: 极度保守 (std≈0.2), 适合极低SNR任务
+    各层初始化范围计算（基于当前模型配置）：
+    - Embedding (6→48): gain=0.5 → 范围±0.167, std≈0.096
+    - 位置编码 (30→48): gain=0.7 → 范围±0.168, std≈0.097
+    - FFN第一层 (48→192): gain=1.7 → 范围±0.270, std≈0.155
+    - FFN第二层 (192→48): gain=1.0 → 范围±0.158, std≈0.091
+    - 输出层 (24→1): gain=0.1 → 范围±0.058, std≈0.034, bias=log(p/(1-p))
     """
+    ffn_hidden_dim = ModelConfig.D_MODEL * ModelConfig.FFN_EXPAND_RATIO
+
     if isinstance(module, nn.Linear):
         if module.out_features == 1:
-            # 输出层：使用大增益
-            gain = ModelConfig.OUTPUT_LAYER_GAIN
+            nn.init.xavier_uniform_(module.weight, gain=ModelConfig.OUTPUT_LAYER_GAIN)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
         elif module.in_features == ModelConfig.INPUT_DIM and module.out_features == ModelConfig.D_MODEL:
-            # Embedding层 (6→48): 从配置读取增益
-            gain = ModelConfig.EMBEDDING_INIT_GAIN
+            nn.init.xavier_uniform_(module.weight, gain=ModelConfig.EMBEDDING_INIT_GAIN)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif module.in_features == ModelConfig.D_MODEL and module.out_features == ffn_hidden_dim:
+            nn.init.xavier_uniform_(module.weight, gain=ModelConfig.FFN_INIT_GAIN)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif module.in_features == ffn_hidden_dim and module.out_features == ModelConfig.D_MODEL:
+            nn.init.xavier_uniform_(module.weight, gain=1.0)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
         else:
-            # 其他层：标准Xavier
-            gain = 1.0
-
-        nn.init.xavier_uniform_(module.weight, gain=gain)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
     elif isinstance(module, nn.LayerNorm):
         nn.init.ones_(module.weight)
         nn.init.zeros_(module.bias)
@@ -65,7 +72,7 @@ class PositionalEncoding(nn.Module):
     """
     def __init__(self, d_model, seq_len=DataConfig.CONTEXT_LENGTH):
         super(PositionalEncoding, self).__init__()        
-        self.pe = nn.Embedding(seq_len, d_model)# 可学习的位置嵌入：每个位置一个d_model维向量
+        self.pe = nn.Embedding(seq_len, d_model)
 
     def forward(self, x):
         #添加位置编码，LayerNorm在后续层中可能使用
@@ -155,8 +162,8 @@ class AttentionPooling(nn.Module):
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
-        # 初始化 query token
-        nn.init.xavier_uniform_(self.query)
+        # 初始化 query token（使用Xavier初始化）
+        nn.init.xavier_uniform_(self.query, gain=ModelConfig.EMBEDDING_INIT_GAIN)
 
     def forward(self, x):
         """

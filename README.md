@@ -192,10 +192,6 @@ python src/train.py
 - 邮箱: hj18914255909@outlook.com || Mhuixs.db@outlook.com hujiyo
 - WeChat: wx17601516389
 
-## 进入炼丹交流群
-
-- 加V：wx17601516389后回复“炼丹交流群”即可
-
 ## 许可证
 
 Apache License 2.0

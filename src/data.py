@@ -304,7 +304,7 @@ class FeatureNormalizer:
         normalizer.exchange_pipeline = data['exchange_pipeline']
         normalizer.is_fitted = data['is_fitted']
 
-        print(f"[FeatureNormalizer] ✓ 归一化器已从 {path} 加载")
+        print(f" ✓ 归一化器已从 {path} 加载")
 
         return normalizer
 

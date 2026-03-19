@@ -19,9 +19,8 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
-from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,
+from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
                   create_recent_days_dataset, normalize_and_validate_context_window)
-from feature_normalizer import FeatureNormalizer
 from training_utils import evaluate_model, calculate_test_loss, DynamicWeightedBCE
 
 

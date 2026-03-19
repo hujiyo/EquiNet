@@ -78,18 +78,25 @@ class ModelConfig:
     # Token化参数（仅当 MODEL_TYPE='tokenized' 时使用）
     TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
 
-    # ========== 初始化参数 ==========
-    # Embedding层初始化增益
-    # - 控制第一层 Linear(6, 48) 的权重范围
-    # - gain=1.0: 标准Xavier (std≈0.4), 保守, 训练慢但稳定
-    # - gain=1.5: 推荐值 (std≈0.6), 平衡, 收敛快且稳定
-    # - gain=2.0: 激进 (std≈0.8), 收敛更快但可能过拟合
-    # - gain=0.5: 极度保守 (std≈0.2), 适合极低SNR任务
-    # 原理: W ~ U[-gain*√(6/(fan_in+fan_out)), +gain*√(6/(fan_in+fan_out))]
-    EMBEDDING_INIT_GAIN = 1.5         # Embedding层初始化增益（推荐1.5，范围0.5-2.0）
+    # ========== Embedding Linear层参数初始化配置 ==========
+    # - gain=1.0: 标准Xavier/Kaiming (std≈0.29), 稳定
+    # - gain=0.5: 主流认为适合小模型和低SNR任务
+    # - gain=1.5: 放大数值差异，主流认为可能放大噪声和信号导致训练不稳定
+    # W ~ U[-gain*√(6/(fan_in+fan_out)), +gain*√(6/(fan_in+fan_out))]
+    EMBEDDING_INIT_GAIN = 1.5         # Embedding层初始化增益（推荐0.5，符合当代最佳实践）
 
-    # 输出层参数
-    OUTPUT_LAYER_GAIN = 3.0          # 输出层初始化增益（增大logits范围）
+    # FFN层初始化配置
+    # - GELU在x~N(0,1)附近的有效增益约为0.588，需要补偿：gain ≈ 1/0.588 ≈ 1.7
+    # - 48→192: gain=1.7 → 范围±0.27, std≈0.155
+    # - 192→48: gain=1.0 → 范围±0.158, std≈0.091 (第二层无激活函数)
+    FFN_INIT_GAIN = 1.7              # FFN第一层初始化增益（补偿GELU压缩）
+
+    # 输出层参数（当代最佳实践：避免sigmoid饱和）
+    # - 输出层使用sigmoid，如果logits范围太大会导致饱和、梯度消失
+    # - 目标值在[0,1]范围，初始输出应接近先验概率
+    # - gain=0.1: 很小范围 (±0.06), 让初始预测logits接近0
+    # - prior=0.25: data.py中定义的正样本比例（25%）
+    OUTPUT_LAYER_GAIN = 1.0          # 输出层权重初始化增益
 
 # ==================== 训练参数 ====================
 class TrainingConfig:
@@ -313,15 +320,12 @@ def calculate_returns(t1_open, t1_close, t2_open=None, t2_close=None, t3_close=N
 
 # ==================== 设备配置 ====================
 class DeviceConfig:
-    """设备相关配置"""
     @staticmethod
     def get_device():
-        """获取训练设备"""
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @staticmethod
     def print_device_info():
-        """打印设备信息"""
         device = DeviceConfig.get_device()
         if device.type == "cuda":
             print(f"使用{torch.cuda.get_device_name()}进行训练")

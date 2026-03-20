@@ -96,7 +96,7 @@ class ModelConfig:
     # - 目标值在[0,1]范围，初始输出应接近先验概率
     # - gain=0.1: 很小范围 (±0.06), 让初始预测logits接近0
     # - prior=0.25: data.py中定义的正样本比例（25%）
-    OUTPUT_LAYER_GAIN = 1.0          # 输出层权重初始化增益
+    OUTPUT_LAYER_GAIN = 3.0          # 输出层权重初始化增益
 
 # ==================== 训练参数 ====================
 class TrainingConfig:

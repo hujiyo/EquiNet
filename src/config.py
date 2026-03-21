@@ -118,6 +118,8 @@ class TrainingConfig:
     # Mano优化器参数（当USE_MANO=True时生效）
     MANO_MOMENTUM = 0.95             # Mano动量系数
     MANO_ADAMW_BETAS = (0.9, 0.95)   # 混合优化器中AdamW部分的beta参数
+    MANO_NESTEROV = True             # 是否使用Nesterov动量（v2默认True）
+    MANO_DUAL_DIM_PROJECTION = True  # 是否使用双维度投影（v2新功能，默认True）
 
     # 余弦退火调度器参数,学习率预热参数
     COSINE_ETA_MIN = 5e-6            # 余弦退火最小学习率（训练末期的精细微调学习率）

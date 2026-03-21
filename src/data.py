@@ -24,43 +24,18 @@ from typing import Dict, List, Tuple
 
 
 class FeatureNormalizer:
-    """
-    特征归一化器 - 两阶段归一化
-
-    阶段1: QuantileTransformer → 处理偏态和集中度问题
-    阶段2: StandardScaler → 确保均值0方差1
-
-    使用方法：
-        # 训练阶段
-        normalizer = FeatureNormalizer()
-        normalizer.fit(train_stock_info)
-        normalizer.save('normalizer.pkl')
-
-        # 推理阶段
-        normalizer = FeatureNormalizer.load('normalizer.pkl')
-        normalized_data = normalizer.transform(raw_data)
-    """
-
     def __init__(self,
                  output_distribution='normal',
                  n_quantiles=1000,
                  random_state=42):
-        """
-        Args:
-            output_distribution: 'normal' 或 'uniform'
-                - 'normal': 输出符合标准正态分布（推荐）
-                - 'uniform': 输出符合 [0, 1] 均匀分布
-            n_quantiles: 分位数数量，越多越精确但越慢
-            random_state: 随机种子
-        """
         self.output_distribution = output_distribution
         self.n_quantiles = n_quantiles
         self.random_state = random_state
 
-        # 为每个特征组创建独立的 pipeline
         self.ohl_pipeline = self._create_pipeline()
         self.volume_pipeline = self._create_pipeline()
         self.exchange_pipeline = self._create_pipeline()
+        self.index_pipeline = self._create_pipeline()
 
         self.is_fitted = False
 
@@ -84,76 +59,59 @@ class FeatureNormalizer:
             ('scaler', StandardScaler())
         ])
 
-    def _collect_training_features(self, train_stock_info: List[Dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        从训练集收集所有特征值（避免数据泄漏）
-
-        关键：只使用每只股票的训练集部分（train_end_idx 之前）
-        
-        使用 data.py 中的 coarse_normalize_context_window() 进行粗处理，
-        确保与训练时的数据处理逻辑完全一致。
-
-        Returns:
-            ohl_data: OHLC 特征 [N_samples * 30 * 4]
-            volume_data: Volume 特征 [N_samples * 30]
-            exchange_data: Exchange 特征 [N_samples * 30]
-        """
+    def _collect_training_features(self, train_stock_info: List[Dict], index_data: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         from data import coarse_normalize_context_window, DataConfig
-        
+
         ohl_data = []
         volume_data = []
         exchange_data = []
-        
+        index_data_list = []
+
         context_length = DataConfig.CONTEXT_LENGTH
 
         for stock in train_stock_info:
             data = stock['data']
+            train_start_idx = stock.get('train_start_idx', 1)
             train_end_idx = stock.get('train_end_idx', len(data))
+            times = stock.get('times', None)
 
-            for i in range(1, train_end_idx - context_length):
-                # 使用统一的粗处理函数
+            for i in range(train_start_idx, train_end_idx - context_length):
                 input_seq = coarse_normalize_context_window(
                     data, i, context_length,
-                    check_limit_up=False,  # 拟合归一化器时不过滤涨停，使用更多数据
-                    required_length=context_length
+                    check_limit_up=False,
+                    required_length=context_length,
+                    index_data=index_data,
+                    times=times
                 )
-                
+
                 if input_seq is None:
                     continue
-                
+
                 ohl_data.append(input_seq[:, :4].flatten())
                 volume_data.append(input_seq[:, 4].flatten())
                 exchange_data.append(input_seq[:, 5].flatten())
+                index_data_list.append(input_seq[:, 6].flatten())
 
         ohl_data = np.concatenate(ohl_data) if ohl_data else np.array([])
         volume_data = np.concatenate(volume_data) if volume_data else np.array([])
         exchange_data = np.concatenate(exchange_data) if exchange_data else np.array([])
+        index_data_list = np.concatenate(index_data_list) if index_data_list else np.array([])
 
         print(f"[FeatureNormalizer] 收集到的训练数据:")
         print(f"  OHLC: {len(ohl_data)} 个值")
         print(f"  Volume: {len(volume_data)} 个值")
         print(f"  Exchange: {len(exchange_data)} 个值")
+        print(f"  Index: {len(index_data_list)} 个值")
 
-        return ohl_data, volume_data, exchange_data
+        return ohl_data, volume_data, exchange_data, index_data_list
 
-    def fit(self, train_stock_info: List[Dict]):
-        """
-        在训练集上拟合归一化器
-
-        ⚠️ 重要：此函数必须在训练集上调用，且只能调用一次
-        测试集不能调用此函数，否则会导致数据泄漏
-
-        Args:
-            train_stock_info: 训练集股票信息列表
-        """
+    def fit(self, train_stock_info: List[Dict], index_data: np.ndarray = None):
         print("\n[FeatureNormalizer] 开始拟合归一化器...")
         print(f"  输出分布: {self.output_distribution}")
         print(f"  分位数数量: {self.n_quantiles}")
 
-        # 收集训练数据
-        ohl_data, volume_data, exchange_data = self._collect_training_features(train_stock_info)
+        ohl_data, volume_data, exchange_data, index_data_list = self._collect_training_features(train_stock_info, index_data)
 
-        # 拟合每个特征组的 pipeline
         print("\n[FeatureNormalizer] 拟合 OHLC 特征...")
         self.ohl_pipeline.fit(ohl_data.reshape(-1, 1))
 
@@ -163,64 +121,54 @@ class FeatureNormalizer:
         print("[FeatureNormalizer] 拟合 Exchange 特征...")
         self.exchange_pipeline.fit(exchange_data.reshape(-1, 1))
 
+        print("[FeatureNormalizer] 拟合 Index 特征...")
+        self.index_pipeline.fit(index_data_list.reshape(-1, 1))
+
         self.is_fitted = True
 
-        # 打印变换后的统计信息
-        self._print_transform_stats(ohl_data, volume_data, exchange_data)
+        self._print_transform_stats(ohl_data, volume_data, exchange_data, index_data_list)
 
         print("\n[FeatureNormalizer] ✓ 拟合完成！")
 
-    def _print_transform_stats(self, ohl_data, volume_data, exchange_data):
-        """
-        打印变换后的统计信息，验证归一化效果
-        """
+    def _print_transform_stats(self, ohl_data, volume_data, exchange_data, index_data=None):
         print("\n[FeatureNormalizer] 变换后的统计信息:")
 
-        # OHLC
         ohl_transformed = self.ohl_pipeline.transform(ohl_data.reshape(-1, 1)).flatten()
         print(f"  OHLC:")
         print(f"    均值: {ohl_transformed.mean():.6f}")
         print(f"    标准差: {ohl_transformed.std():.6f}")
         print(f"    范围: [{ohl_transformed.min():.6f}, {ohl_transformed.max():.6f}]")
 
-        # Volume
         volume_transformed = self.volume_pipeline.transform(volume_data.reshape(-1, 1)).flatten()
         print(f"  Volume:")
         print(f"    均值: {volume_transformed.mean():.6f}")
         print(f"    标准差: {volume_transformed.std():.6f}")
         print(f"    范围: [{volume_transformed.min():.6f}, {volume_transformed.max():.6f}]")
 
-        # Exchange
         exchange_transformed = self.exchange_pipeline.transform(exchange_data.reshape(-1, 1)).flatten()
         print(f"  Exchange:")
         print(f"    均值: {exchange_transformed.mean():.6f}")
         print(f"    标准差: {exchange_transformed.std():.6f}")
         print(f"    范围: [{exchange_transformed.min():.6f}, {exchange_transformed.max():.6f}]")
 
+        if index_data is not None and len(index_data) > 0:
+            index_transformed = self.index_pipeline.transform(index_data.reshape(-1, 1)).flatten()
+            print(f"  Index:")
+            print(f"    均值: {index_transformed.mean():.6f}")
+            print(f"    标准差: {index_transformed.std():.6f}")
+            print(f"    范围: [{index_transformed.min():.6f}, {index_transformed.max():.6f}]")
+
     def transform(self, input_seq: np.ndarray) -> np.ndarray:
-        """
-        对单个样本应用归一化
-
-        ⚠️ 重要：此函数可以在训练集、验证集、测试集上调用
-        因为它只使用 fit() 时学到的参数，不会产生数据泄漏
-
-        Args:
-            input_seq: [context_length, 6] 原始输入序列
-
-        Returns:
-            normalized_seq: [context_length, 6] 归一化后的序列
-        """
         if not self.is_fitted:
             raise RuntimeError("归一化器未拟合！请先调用 fit() 方法")
 
         normalized = np.empty_like(input_seq, dtype=np.float32)
 
-        # 展平以便转换
-        ohl_flat = input_seq[:, :4].flatten()  # [context_length * 4]
-        volume_flat = input_seq[:, 4].flatten()  # [context_length]
-        exchange_flat = input_seq[:, 5].flatten()  # [context_length]
+        ohl_flat = input_seq[:, :4].flatten()
+        volume_flat = input_seq[:, 4].flatten()
+        exchange_flat = input_seq[:, 5].flatten()
+        index_flat = input_seq[:, 6].flatten()
 
-        # 转换每个特征组
         normalized_ohl = self.ohl_pipeline.transform(
             ohl_flat.reshape(-1, 1)
         ).flatten()
@@ -230,34 +178,22 @@ class FeatureNormalizer:
         normalized_exchange = self.exchange_pipeline.transform(
             exchange_flat.reshape(-1, 1)
         ).flatten()
+        normalized_index = self.index_pipeline.transform(
+            index_flat.reshape(-1, 1)
+        ).flatten()
 
-        # 重塑回原始形状
         normalized[:, :4] = normalized_ohl.reshape(input_seq[:, :4].shape)
         normalized[:, 4] = normalized_volume
         normalized[:, 5] = normalized_exchange
+        normalized[:, 6] = normalized_index
 
         return normalized
 
-    def fit_transform(self, train_stock_info: List[Dict]) -> 'FeatureNormalizer':
-        """
-        拟合并返回归一化器（链式调用）
-
-        Args:
-            train_stock_info: 训练集股票信息列表
-
-        Returns:
-            self: 拟合后的归一化器
-        """
-        self.fit(train_stock_info)
+    def fit_transform(self, train_stock_info: List[Dict], index_data: np.ndarray = None) -> 'FeatureNormalizer':
+        self.fit(train_stock_info, index_data)
         return self
 
     def save(self, path: str):
-        """
-        保存归一化器到文件
-
-        Args:
-            path: 保存路径（例如: './normalizer.pkl'）
-        """
         if not self.is_fitted:
             raise RuntimeError("无法保存未拟合的归一化器")
 
@@ -266,6 +202,7 @@ class FeatureNormalizer:
                 'ohl_pipeline': self.ohl_pipeline,
                 'volume_pipeline': self.volume_pipeline,
                 'exchange_pipeline': self.exchange_pipeline,
+                'index_pipeline': self.index_pipeline,
                 'is_fitted': self.is_fitted,
                 'output_distribution': self.output_distribution,
                 'n_quantiles': self.n_quantiles,
@@ -276,37 +213,66 @@ class FeatureNormalizer:
 
     @classmethod
     def load(cls, path: str) -> 'FeatureNormalizer':
-        """
-        从文件加载归一化器
-
-        Args:
-            path: 归一化器文件路径
-
-        Returns:
-            加载的归一化器实例
-        """
         if not os.path.exists(path):
             raise FileNotFoundError(f"归一化器文件不存在: {path}")
 
         with open(path, 'rb') as f:
             data = pickle.load(f)
 
-        # 创建新实例
         normalizer = cls(
             output_distribution=data['output_distribution'],
             n_quantiles=data['n_quantiles'],
             random_state=data['random_state']
         )
 
-        # 恢复状态
         normalizer.ohl_pipeline = data['ohl_pipeline']
         normalizer.volume_pipeline = data['volume_pipeline']
         normalizer.exchange_pipeline = data['exchange_pipeline']
+        if 'index_pipeline' in data:
+            normalizer.index_pipeline = data['index_pipeline']
+        else:
+            normalizer.index_pipeline = normalizer._create_pipeline()
         normalizer.is_fitted = data['is_fitted']
 
         print(f" ✓ 归一化器已从 {path} 加载")
 
         return normalizer
+
+
+def load_index_data(data_dir=DataConfig.DATA_DIR):
+    """
+    加载上证指数数据并构建日期到收盘价的映射
+
+    Args:
+        data_dir: 数据目录
+
+    Returns:
+        index_data: dict，key为time(int)，value为当日收盘价
+        index_times: np.ndarray，所有可用日期
+    """
+    index_file = os.path.join(data_dir, DataConfig.INDEX_FILE)
+
+    if not os.path.exists(index_file):
+        print(f"警告：大盘数据文件不存在: {index_file}")
+        return None, None
+
+    try:
+        df = pd.read_csv(index_file)
+        df = df.sort_values('time', ascending=True).reset_index(drop=True)
+
+        index_data = {}
+        times = df['time'].values
+        closes = df['end'].values
+
+        for t, c in zip(times, closes):
+            index_data[int(t)] = float(c)
+
+        print(f"大盘数据已加载：{len(index_data)} 条记录")
+
+        return index_data, times
+    except Exception as e:
+        print(f"加载大盘数据失败：{e}")
+        return None, None
 
 
 def process_single_file(args):
@@ -375,16 +341,17 @@ def process_single_file(args):
         
         train_data = data.copy()
         test_data = data.copy()
-        
+
         stock_info = {
-            'file_name': file_name,              # 股票文件名，用于识别不同股票
-            'data_length': data_length,          # 总数据长度（天数），用于验证数据充足性
-            'train_data': train_data,            # 完整数据副本，训练时根据[train_start_idx:train_end_idx]切片访问
-            'test_data': test_data,              # 完整数据副本，测试时根据[test_split_point:]切片访问
-            'train_start_idx': train_start_idx,  # 训练集起始索引，根据train_start_year计算得出
-            'train_end_idx': train_end_idx,      # 训练集结束索引，确保与测试集有缓冲区
-            'train_length': train_length,        # 可用训练数据长度，用于验证训练集是否充足
-            'test_split_point': test_split_point # 测试集起始索引，固定为最后test_days天的开始位置
+            'file_name': file_name,
+            'data_length': data_length,
+            'train_data': train_data,
+            'test_data': test_data,
+            'train_start_idx': train_start_idx,
+            'train_end_idx': train_end_idx,
+            'train_length': train_length,
+            'test_split_point': test_split_point,
+            'times': times
         }
         
         return stock_info
@@ -431,13 +398,15 @@ def load_and_preprocess_data(data_dir=DataConfig.DATA_DIR, test_days=DataConfig.
             'data_length': stock_info['data_length'],
             'train_start_idx': stock_info['train_start_idx'],
             'train_end_idx': stock_info['train_end_idx'],
+            'times': stock_info['times'],
         })
         
         test_stock_info.append({
             'file_name': stock_info['file_name'],
             'data': stock_info['test_data'],
             'data_length': stock_info['data_length'],
-            'test_split_point': stock_info['test_split_point']
+            'test_split_point': stock_info['test_split_point'],
+            'times': stock_info['times'],
         })
     
     print(f"训练集: {len(train_stock_info)} 只股票")
@@ -676,42 +645,20 @@ def create_sampler(stock_info_list, strategy=None):
         return TemporalSampler(stock_info_list)
 
 
-def generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_normalizer=None):
-    """
-    根据预生成的索引生成单个样本（向量化优化版）
-
-    参数:
-        stock_info_list: 股票信息列表
-        stock_idx: 股票索引
-        start_idx: 样本起始索引
-        feature_normalizer: 可选的特征归一化器实例
-
-    返回: (input_seq, target, cumulative_return, daily_returns) 或 None（如果样本无效）
-    
-    核心概念区分：
-        【涨跌幅】用于标签生成，判断股票走势强弱
-            - 基准是前一日收盘价
-            - Day1涨跌幅 = (T+1收盘 - T日收盘) / T日收盘
-            - Day2涨跌幅 = (T+2收盘 - T+1收盘) / T+1收盘
-            - Day3涨跌幅 = (T+3收盘 - T+2收盘) / T+2收盘
-
-        【收益率】用于计算投资回报，评估模型表现，支持智能止损：
-            - 基准是买入价（T+1开盘价）
-            - Day1 ≤ -3% → 第二天开盘止损
-            - Day1+Day2 < -2% 或 Day1,Day2都<1% → 第二天收盘止损
-            - 否则持有满3天，第三天收盘卖出
-            - cumulative_return 为实际累计收益率（调用方应优先使用此值）       
-    """
+def generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_normalizer=None, index_data=None, times=None):
     stock_info = stock_info_list[stock_idx]
     stock_data = stock_info['data']
     context_length = DataConfig.CONTEXT_LENGTH
     required_length = DataConfig.REQUIRED_LENGTH
 
-    # 使用统一归一化函数，消除重复代码
+    stock_times = times if times is not None else stock_info.get('times', None)
+
     input_seq = normalize_and_validate_context_window(
         stock_data, start_idx, context_length,
         check_limit_up=True, required_length=required_length,
-        feature_normalizer=feature_normalizer
+        feature_normalizer=feature_normalizer,
+        index_data=index_data,
+        times=stock_times
     )
     
     if input_seq is None:
@@ -764,32 +711,22 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_no
     return input_seq, target, cumulative_return, daily_returns
 
 
-def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx, feature_normalizer=None):
-    """
-    生成样本，支持不完整的未来数据（用于最近几天的临时评估）
-
-    与generate_sample_from_index的区别：
-    - 由run.py使用，与模型训练阶段脚本无关
-    - 允许未来数据不足3天
-    - 返回可用天数信息
-    - 不生成标签（仅用于推理展示）
-
-    返回: (input_seq, cumulative_return, daily_returns, available_days) 或 None
-        available_days: 可用的未来天数 (1, 2, 或 3)
-    """
+def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx, feature_normalizer=None, index_data=None, times=None):
     stock_info = stock_info_list[stock_idx]
     stock_data = stock_info['data']
     context_length = DataConfig.CONTEXT_LENGTH
     data_length = len(stock_data)
 
-    # 计算实际可用的样本窗口长度（用于涨停过滤）
+    stock_times = times if times is not None else stock_info.get('times', None)
+
     required_length = min(DataConfig.REQUIRED_LENGTH, data_length - start_idx)
-    
-    # 使用统一归一化函数，消除重复代码
+
     input_seq = normalize_and_validate_context_window(
         stock_data, start_idx, context_length,
         check_limit_up=True, required_length=required_length,
-        feature_normalizer=feature_normalizer
+        feature_normalizer=feature_normalizer,
+        index_data=index_data,
+        times=stock_times
     )
     
     if input_seq is None:
@@ -859,24 +796,7 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx, fe
     return input_seq, cumulative_return, daily_returns, available_days
 
 
-def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng, feature_normalizer=None):
-    """
-    使用样本池机制采样（流式处理版）：
-    1. 按时间顺序遍历样本索引
-    2. 实时填充正负样本池
-    3. 一旦正样本达到配额且负样本足够，立即生成Batch并清空负样本池
-    4. 确保Batch之间的时间有序性，严格防止未来数据泄露到过去的Batch中
-    5. 支持循环采样：数据到达末尾后自动循环回起点
-    6. 动态生成索引：按需生成，直到batch数量满足要求
-
-    Args:
-        sampler: 采样器实例
-        stock_info_list: 股票信息列表
-        batch_size: 批次大小
-        batches_per_epoch: 每个epoch的batch数量
-        rng: 随机数生成器
-        feature_normalizer: 可选的特征归一化器实例
-    """
+def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng, feature_normalizer=None, index_data=None, times=None):
     positive_ratio = 0.25
     pos_quota = max(1, int(batch_size * positive_ratio))
     neg_quota = batch_size - pos_quota
@@ -893,31 +813,31 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
     all_batch_returns = []
 
     batches_generated = 0
-    
+
     initial_rounds = 50
     total_rounds_generated = 0
     total_indices_generated = 0
-    
+
     print(f"    动态采样策略：按需生成索引，直到满足{batches_per_epoch}个batch...")
-    
+
     while batches_generated < batches_per_epoch:
         if isinstance(sampler, RandomSampler):
             sample_indices = sampler.sample_batch_rounds(initial_rounds, rng)
         else:
             sample_indices = sampler.sample_batch_rounds(initial_rounds)
-        
+
         if len(sample_indices) == 0:
             print(f"\n    ⚠ 警告：采样头已到达所有股票终点且无法循环，停止采样")
             break
-        
+
         total_rounds_generated += initial_rounds
         total_indices_generated += len(sample_indices)
-        
+
         for stock_idx, start_idx in sample_indices:
             if batches_generated >= batches_per_epoch:
                 break
 
-            sample = generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_normalizer)
+            sample = generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_normalizer, index_data, times)
             if sample is None:
                 continue
 
@@ -983,28 +903,7 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
     return np.asarray(all_batch_inputs), np.asarray(all_batch_targets), np.asarray(all_batch_returns)
 
 
-def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
-    """
-    创建固定评估数据集（涨停样本已在generate_sample_from_index中过滤）
-    
-    只包含完整样本（available_days == 3），用于模型评估
-    
-    Args:
-        test_stock_info: 测试集股票信息列表
-        feature_normalizer: 可选的特征归一化器实例
-    
-    返回:
-        eval_inputs: 输入序列
-        eval_targets: 标签
-        eval_cumulative_returns: 累计收益率 = (T+3收盘 - T+1开盘) / T+1开盘
-        eval_day_indices: 每个样本对应的预测日在测试集中的相对偏移量（用于实战收益率按天分组）
-        eval_daily_returns: 每日收益率列表 [[r1, r2, r3], ...]
-            - 基准是买入价（T+1开盘价），用于计算投资回报
-            - r1 = (T+1收盘 - T+1开盘) / T+1开盘（Day1日内收益）
-            - r2 = (T+2收盘 - T+1收盘) / T+1开盘（Day2收益贡献）
-            - r3 = (T+3收盘 - T+2收盘) / T+1开盘（Day3收益贡献）
-            - r1 + r2 + r3 = 累计收益率
-    """
+def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None, index_data=None, times=None):
     eval_inputs = []
     eval_targets = []
     eval_cumulative_returns = []
@@ -1018,12 +917,14 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
 
         start_min = max(1, test_split_point)
         start_max = data_length - DataConfig.REQUIRED_LENGTH
-        
+
         if start_max < start_min:
             continue
 
+        stock_times = times if times is not None else stock_info.get('times', None)
+
         for start_idx in range(start_min, start_max + 1):
-            sample = generate_sample_from_index([stock_info], 0, start_idx, feature_normalizer)
+            sample = generate_sample_from_index([stock_info], 0, start_idx, feature_normalizer, index_data, stock_times)
             if sample is None:
                 continue
 
@@ -1032,7 +933,7 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
             eval_targets.append(target)
             eval_cumulative_returns.append(float(cumulative_return))
             eval_daily_returns.append(daily_returns)
-            
+
             predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
             day_index = predict_day_idx - test_split_point
             eval_day_indices.append(day_index)
@@ -1040,29 +941,12 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
     if len(eval_inputs) == 0:
         raise ValueError("固定评估集为空：test_stock_info中没有可用样本")
 
-    return (np.asarray(eval_inputs), np.asarray(eval_targets), 
+    return (np.asarray(eval_inputs), np.asarray(eval_targets),
             np.asarray(eval_cumulative_returns), np.asarray(eval_day_indices),
             eval_daily_returns)
 
 
-def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
-    """
-    创建最近几天的临时评估数据集（用于run.py中显示最近几天的实战收益率）
-    
-    包含完整样本和临时样本，用于展示最近几天的选股情况
-    - 完整样本（available_days == 3）：与 create_fixed_evaluation_dataset 一致
-    - 临时样本（available_days < 3）：仅用于展示，方便用户决策
-
-    Args:
-        test_stock_info: 测试集股票信息列表
-        feature_normalizer: 可选的特征归一化器实例
-    
-    返回:
-        recent_inputs: 输入序列
-        recent_cumulative_returns: 累计收益率（可能不完整）
-        recent_day_indices: 预测日索引
-        recent_available_days: 可用天数 (1, 2, 或 3)
-    """
+def create_recent_days_dataset(test_stock_info, feature_normalizer=None, index_data=None, times=None):
     recent_inputs = []
     recent_cumulative_returns = []
     recent_day_indices = []
@@ -1072,78 +956,49 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
         stock_data = stock_info['data']
         data_length = len(stock_data)
         test_split_point = stock_info.get('test_split_point', max(0, data_length - DataConfig.TEST_DAYS))
-        
-        # 和 create_fixed_evaluation_dataset 一样的起点，但扩展到包含最近的临时数据
+
         start_min = max(1, test_split_point)
         start_max = data_length - DataConfig.CONTEXT_LENGTH - 1
-        
+
         if start_max < start_min:
             continue
 
+        stock_times = times if times is not None else stock_info.get('times', None)
+
         for start_idx in range(start_min, start_max + 1):
-            sample = generate_sample_from_index_partial([stock_info], 0, start_idx, feature_normalizer)
+            sample = generate_sample_from_index_partial([stock_info], 0, start_idx, feature_normalizer, index_data, stock_times)
             if sample is None:
                 continue
 
             input_seq, cumulative_return, daily_returns, available_days = sample
-            
+
             predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
-            
+
             recent_inputs.append(input_seq)
             recent_cumulative_returns.append(float(cumulative_return))
             recent_available_days.append(available_days)
-            
+
             day_index = predict_day_idx - test_split_point
             recent_day_indices.append(day_index)
 
     if len(recent_inputs) == 0:
         return None, None, None, None
 
-    return (np.asarray(recent_inputs), np.asarray(recent_cumulative_returns), 
+    return (np.asarray(recent_inputs), np.asarray(recent_cumulative_returns),
             np.asarray(recent_day_indices), np.asarray(recent_available_days))
 
 
 def normalize_and_validate_context_window(stock_data, start_idx, context_length,
                                           check_limit_up=True, required_length=None,
                                           feature_normalizer=None,
-                                          apply_fine_normalization=True):
-    """
-    统一的上下文窗口归一化和验证函数
-
-    用于消除 run.py 和 data.py 中的代码重复。
-    执行完整的数据验证和归一化流程，与 generate_sample_from_index 保持一致。
-
-    数据处理分两阶段：
-        - 粗处理：CSV → OHLE 格式（涨跌幅 -0.1~0.1，Volume 0~1，Exchange 0~1）
-        - 细处理：OHLE → 标准化数据（均值≈0，方差≈1）
-
-    Args:
-        stock_data: 股票原始数据 [N, 6]
-        start_idx: 上下文窗口起始索引（需要 >= 1，因为需要前一天作为基准）
-        context_length: 上下文窗口长度
-        check_limit_up: 是否检查涨停（默认 True）
-        required_length: 完整采样窗口长度（用于涨停过滤），如果为 None 则只检查上下文窗口
-        feature_normalizer: 可选的特征归一化器实例，用于细处理阶段
-        apply_fine_normalization: 是否应用细处理（默认 True）。设为 False 时只执行粗处理。
-
-    Returns:
-        input_seq: [context_length, 6] 归一化后的输入序列，或 None（如果验证失败）
-            - 粗处理后：OHLE: -0.1~0.1, Volume: 0~1, Exchange: 0~1
-            - 细处理后：均值≈0，方差≈1
-
-    验证项：
-        1. 基准日（start_idx-1）的 OHLC 和 volume 非零
-        2. 上下文窗口的 close 和 volume 非零
-        3. 涨停过滤：窗口内任何一天涨跌幅不超过 11%
-        4. 上下文最后一天涨停过滤（可选，通过 DataConfig 控制）
-        5. 归一化后无 nan/inf
-    """
+                                          apply_fine_normalization=True,
+                                          index_data=None, times=None):
     if start_idx < 1:
         return None
-    
+
     if required_length is None:
         required_length = context_length
-    
+
     input_seq_raw = stock_data[start_idx:start_idx + context_length]
     prev_day_data = stock_data[start_idx - 1]
 
@@ -1151,7 +1006,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     prev_volume = prev_day_data[4]
     if prev_close == 0 or prev_volume == 0 or np.any(prev_day_data[:4] == 0):
         return None
-    
+
     closes = input_seq_raw[:, 3]
     volumes = input_seq_raw[:, 4]
     if np.any(closes == 0) or np.any(volumes == 0):
@@ -1173,7 +1028,6 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
             if abs(daily_return) > limit_threshold:
                 return None
 
-    # 上下文最后一天涨停过滤（独立于 check_limit_up，仅受 DataConfig 控制）
     if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP:
         last_day_idx = start_idx + context_length - 1
         prev_day_idx = start_idx + context_length - 2
@@ -1186,28 +1040,47 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         if last_day_return >= 0.095:
             return None
 
-    input_seq = np.empty((context_length, 6), dtype=np.float32)
-    
+    input_seq = np.empty((context_length, 7), dtype=np.float32)
+
     input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
     if context_length > 1:
         input_seq[1:, :4] = (input_seq_raw[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
-    
+
     input_seq[0, 4] = (volumes[0] - prev_volume) / prev_volume
     if context_length > 1:
         input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
-    
+
     input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
 
-    # ========== 粗处理阶段 ==========
-    # OHLE: 涨跌幅，范围 -0.1 ~ 0.1
+    if index_data is not None and times is not None:
+        for i in range(context_length):
+            if i == 0:
+                day_time = int(times[start_idx])
+                prev_day_time = int(times[start_idx - 1])
+            else:
+                day_time = int(times[start_idx + i])
+                prev_day_time = int(times[start_idx + i - 1])
+
+            if prev_day_time in index_data and day_time in index_data:
+                prev_index_close = index_data[prev_day_time]
+                current_index_close = index_data[day_time]
+                if prev_index_close > 0:
+                    index_change = (current_index_close - prev_index_close) / prev_index_close
+                else:
+                    index_change = 0.0
+            else:
+                index_change = 0.0
+
+            input_seq[i, 6] = index_change
+    else:
+        input_seq[:, 6] = 0.0
+
     np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
-    # Volume: 变化率缩放，范围 0 ~ 1
     np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
     input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
-    np.clip(input_seq[:, 4:6], 0.0, 1.0, out=input_seq[:, 4:6])
+    np.clip(input_seq[:, 5], 0.0, 1.0, out=input_seq[:, 5])
+    np.clip(input_seq[:, 6], -0.1, 0.1, out=input_seq[:, 6])
 
-    # ========== 细处理阶段（可选）==========
-    # 应用高级特征归一化，将粗处理结果转换为均值≈0、方差≈1的标准化数据
     if apply_fine_normalization and feature_normalizer is not None:
         input_seq = feature_normalizer.transform(input_seq)
 
@@ -1218,32 +1091,16 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
 
 
 def coarse_normalize_context_window(stock_data, start_idx, context_length,
-                                     check_limit_up=True, required_length=None):
-    """
-    粗处理：CSV → OHLE 格式
-
-    只执行粗处理阶段，不应用细处理（特征归一化器）。
-    输出数据范围：
-        - OHLE: -0.1 ~ 0.1（涨跌幅）
-        - Volume: 0 ~ 1（成交量变化率）
-        - Exchange: 0 ~ 1（换手率）
-
-    Args:
-        stock_data: 股票原始数据 [N, 6]
-        start_idx: 上下文窗口起始索引（需要 >= 1，因为需要前一天作为基准）
-        context_length: 上下文窗口长度
-        check_limit_up: 是否检查涨停（默认 True）
-        required_length: 完整采样窗口长度（用于涨停过滤），如果为 None 则只检查上下文窗口
-
-    Returns:
-        input_seq: [context_length, 6] 粗处理后的输入序列，或 None（如果验证失败）
-    """
+                                     check_limit_up=True, required_length=None,
+                                     index_data=None, times=None):
     return normalize_and_validate_context_window(
         stock_data, start_idx, context_length,
         check_limit_up=check_limit_up,
         required_length=required_length,
         feature_normalizer=None,
-        apply_fine_normalization=False
+        apply_fine_normalization=False,
+        index_data=index_data,
+        times=times
     )
 
 
@@ -1256,8 +1113,8 @@ def fine_normalize_batch(input_seq, feature_normalizer):
 
     Args:
         input_seq: 粗处理后的数据
-            - 单个样本: [seq_len, 6]
-            - 批量样本: [batch_size, seq_len, 6]
+            - 单个样本: [seq_len, 7]
+            - 批量样本: [batch_size, seq_len, 7]
         feature_normalizer: 特征归一化器实例
 
     Returns:
@@ -1286,11 +1143,15 @@ def fit_feature_normalizer(output_path='./normalizer.pkl', output_distribution='
 
     print("\n[步骤1] 加载训练集数据...")
 
-    # 直接加载数据，不需要通过全局变量控制归一化器
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
     print(f"训练集股票数: {len(train_stock_info)}")
     print(f"测试集股票数: {len(test_stock_info)}")
+
+    print("\n[步骤1.5] 加载大盘数据...")
+    index_data, index_times = load_index_data(DataConfig.DATA_DIR)
+    if index_data is None:
+        print("警告：大盘数据不存在，归一化器将无法学习大盘特征")
 
     print("\n[步骤2] 创建特征归一化器...")
     print(f"  输出分布: {output_distribution}")
@@ -1299,7 +1160,7 @@ def fit_feature_normalizer(output_path='./normalizer.pkl', output_distribution='
     normalizer = FeatureNormalizer(output_distribution=output_distribution,n_quantiles=n_quantiles)
 
     print("\n[步骤3] 在训练集上拟合归一化器...")
-    normalizer.fit(train_stock_info)
+    normalizer.fit(train_stock_info, index_data)
 
     print("\n[步骤4] 保存归一化器...")
     normalizer.save(output_path)

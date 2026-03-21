@@ -20,7 +20,8 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
-                  create_recent_days_dataset, normalize_and_validate_context_window)
+                  create_recent_days_dataset, normalize_and_validate_context_window,
+                  load_index_data)
 from training_utils import evaluate_model, calculate_test_loss, DynamicWeightedBCE
 
 
@@ -321,19 +322,12 @@ def select_model(models):
             print(f"  ✗ 无效输入，请输入数字")
 
 
-def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
-    """
-    执行模型评估（与 train.py 中对模型A的评估完全一致）
-    返回评估统计字典
-
-    Args:
-        feature_normalizer: 可选的特征归一化器实例
-    """
+def run_evaluation(model, test_stock_info, device, feature_normalizer=None, index_data=None):
     print_section("模型评估")
     print(f"│  正在创建评估数据集...")
 
     eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = \
-        create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
+        create_fixed_evaluation_dataset(test_stock_info, feature_normalizer, index_data)
     
     print(f"│  评估样本数: {len(eval_inputs)}")
     print(f"│  正在评估模型...")
@@ -407,16 +401,7 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     return stats
 
 
-def run_stock_selection(model, threshold, device, feature_normalizer=None):
-    """
-    执行选股
-    
-    Args:
-        model: 模型实例
-        threshold: 选股阈值
-        device: 设备
-        feature_normalizer: 可选的特征归一化器实例
-    """
+def run_stock_selection(model, threshold, device, feature_normalizer=None, index_data=None):
     print_section("选股推理")
     print(f"│  正在加载全部股票数据...")
     
@@ -609,27 +594,9 @@ def print_recent_days_chart(daily_stats, last_n=10):
     print("╚" + "═"*52 + "╝")
 
 
-def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4, threshold=None, feature_normalizer=None):
-    """
-    计算最近几天的实战收益率（用于展示，包含临时数据）
-    
-    关键设计：
-    - 阈值来源：直接使用传入的阈值（由 run_evaluation 计算，基于固定评估集）
-    - 选股范围：所有样本（包括临时样本），用于展示最近几天的选股情况
-    - 临时样本：仅用于展示，方便用户决策，不参与任何阈值计算
-    
-    Args:
-        model: 模型实例
-        test_stock_info: 测试集股票信息列表
-        device: 设备
-        top_n_per_day: 每日选股数量
-        threshold: 选股阈值
-        feature_normalizer: 可选的特征归一化器实例
-    
-    返回: daily_stats [(count, return, available_days), ...]
-    """
+def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4, threshold=None, feature_normalizer=None, index_data=None):
     recent_inputs, recent_returns, recent_day_indices, recent_available_days = \
-        create_recent_days_dataset(test_stock_info, feature_normalizer)
+        create_recent_days_dataset(test_stock_info, feature_normalizer, index_data)
     
     if recent_inputs is None or len(recent_inputs) == 0:
         return []
@@ -774,8 +741,12 @@ def main():
 
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
+    index_data, index_times = load_index_data(DataConfig.DATA_DIR)
+    if index_data is None:
+        print("警告：大盘数据加载失败，推理将使用零值作为大盘特征")
+
     # 运行评估
-    stats = run_evaluation(model, test_stock_info, device, feature_normalizer)
+    stats = run_evaluation(model, test_stock_info, device, feature_normalizer, index_data)
     threshold = stats['top_threshold']
     
     # 询问是否选股
@@ -790,10 +761,10 @@ def main():
         print("  请输入 y 或 n")
     
     # 执行选股
-    results = run_stock_selection(model, threshold, device, feature_normalizer)
-    
+    results = run_stock_selection(model, threshold, device, feature_normalizer, index_data)
+
     # 计算并打印最近10天实战收益率表格（包含临时数据，仅用于展示）
-    recent_stats = calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=DataConfig.TOP_N_PER_DAY, threshold=threshold, feature_normalizer=feature_normalizer)
+    recent_stats = calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=DataConfig.TOP_N_PER_DAY, threshold=threshold, feature_normalizer=feature_normalizer, index_data=index_data)
     if recent_stats:
         print_recent_days_chart(recent_stats, last_n=10)
     

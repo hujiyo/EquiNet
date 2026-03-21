@@ -8,95 +8,58 @@ import torch
 # ==================== 数据参数 ====================
 class DataConfig:
     """数据相关参数"""
-    # 数据路径
-    DATA_DIR = './data'              # 数据目录
-    OUTPUT_DIR = './out'             # 输出目录
+    DATA_DIR = './data'
+    OUTPUT_DIR = './out'
 
-    # 数据分割参数（按时间划分）
-    TEST_DAYS = 110                   # 测试集天数（每只股票的最近N天作为测试集）
-    RANDOM_SEED = 42                 # 随机种子
-    
-    # 训练集时间范围限制
-    TRAIN_START_YEAR = 2016          # 训练集起始年份（2020年及以前的数据不参与训练）
-    
-    # 样本生成参数
-    CONTEXT_LENGTH = 30              # 历史数据长度（这是核心参数，其他地方应引用这个值）,TEST_DAYS - CONTEXT_LENGTH = 80
-    FUTURE_DAYS = 3                  # 未来预测天数
-    REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS  # 每样本总需求长度
+    TEST_DAYS = 110
+    RANDOM_SEED = 42
 
-    # 采样策略配置
-    # 'temporal': 时间顺序采样（指针在训练集上循环滑动）
-    # 'random': 随机采样（每次随机选择股票和位置）
+    TRAIN_START_YEAR = 2016
+
+    CONTEXT_LENGTH = 30
+    FUTURE_DAYS = 3
+    REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS
+
     SAMPLING_STRATEGY = 'temporal'
 
-    # 是否过滤上下文最后一天接近涨停的样本
-    # True: 过滤最后一天涨停的样本（防止模型过度依赖涨停信号，避免追涨策略）
-    # False: 保留所有样本（让模型自己学习涨停后的走势规律）
     FILTER_CONTEXT_LAST_DAY_LIMIT_UP = True
 
-    # 评估参数
-    EVAL_BATCH_SIZE = 256            # 评估批处理大小（分批处理，减少显存占用）
+    EVAL_BATCH_SIZE = 256
 
-    # ========== 特征归一化配置 ==========
-    # 使用 QuantileTransformer + StandardScaler 进行高级特征归一化
-    # 优点：
-    #   1. 统一所有特征到均值0、标准差1的分布
-    #   2. 自动处理特征范围不同（Volume/Exchange vs OHLC）
-    #   3. 自动处理特征集中度不同（Volume 99%集中在小范围）
-    #   4. 自动处理异常值和偏态分布
+    INDEX_FILE = '000000.csv'
+    INDEX_CODE = 'sh.000001'
 
-    # 归一化器配置
-    NORMALIZER_OUTPUT_DISTRIBUTION = 'normal'  # 'normal' (标准正态) 或 'uniform' (均匀分布)
-    NORMALIZER_N_QUANTILES = 1000            # 分位数数量（越大越精确但越慢）
-    NORMALIZER_PATH = './normalizer.pkl'  # 归一化器保存/加载路径
+    NORMALIZER_OUTPUT_DISTRIBUTION = 'normal'
+    NORMALIZER_N_QUANTILES = 1000
+    NORMALIZER_PATH = './normalizer.pkl'
 
-    TOP_K = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
-    TOP_N_PER_DAY = 0                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
-    MAX_SELECT_PER_DAY = 4             # 全局阈值模式下每天最多选股数量（0表示不限制）
+    TOP_K = 1
+    TOP_N_PER_DAY = 0
+    MAX_SELECT_PER_DAY = 4
 
 # ==================== 模型架构参数 ====================
 class ModelConfig:
     """模型架构相关参数"""
 
-    # ========== 模型类型选择 ==========
-    # 'continuous': 连续值模型 (6维连续输入)
-    # 'tokenized': Token化模型 (将输入离散化为token ID)
-    MODEL_TYPE = 'continuous'  # 可选: 'continuous' 或 'tokenized'
+    MODEL_TYPE = 'continuous'
 
-    # 基础模型参数
-    INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
-    D_MODEL = 48                     # 模型维度（Transformer 内部维度）
-    FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
-    NHEAD = 4                        # 注意力头数
-    NUM_LAYERS = 6                   # Transformer 层数
-    OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1 之间）
+    INPUT_DIM = 7
+    D_MODEL = 48
+    FFN_EXPAND_RATIO = 4
+    NHEAD = 4
+    NUM_LAYERS = 6
+    OUTPUT_DIM = 1
 
-    # 注意力机制参数
-    DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合
-    ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
+    DROPOUT_RATE = 0
+    ATTENTION_DROPOUT = 0
 
-    # Token化参数（仅当 MODEL_TYPE='tokenized' 时使用）
-    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
+    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM
 
-    # ========== Embedding Linear层参数初始化配置 ==========
-    # - gain=1.0: 标准Xavier/Kaiming (std≈0.29), 稳定
-    # - gain=0.5: 主流认为适合小模型和低SNR任务
-    # - gain=1.5: 放大数值差异，主流认为可能放大噪声和信号导致训练不稳定
-    # W ~ U[-gain*√(6/(fan_in+fan_out)), +gain*√(6/(fan_in+fan_out))]
-    EMBEDDING_INIT_GAIN = 1.5         # Embedding层初始化增益（推荐0.5，符合当代最佳实践）
+    EMBEDDING_INIT_GAIN = 1.5
 
-    # FFN层初始化配置
-    # - GELU在x~N(0,1)附近的有效增益约为0.588，需要补偿：gain ≈ 1/0.588 ≈ 1.7
-    # - 48→192: gain=1.7 → 范围±0.27, std≈0.155
-    # - 192→48: gain=1.0 → 范围±0.158, std≈0.091 (第二层无激活函数)
-    FFN_INIT_GAIN = 1.7              # FFN第一层初始化增益（补偿GELU压缩）
+    FFN_INIT_GAIN = 1.7
 
-    # 输出层参数（当代最佳实践：避免sigmoid饱和）
-    # - 输出层使用sigmoid，如果logits范围太大会导致饱和、梯度消失
-    # - 目标值在[0,1]范围，初始输出应接近先验概率
-    # - gain=0.1: 很小范围 (±0.06), 让初始预测logits接近0
-    # - prior=0.25: data.py中定义的正样本比例（25%）
-    OUTPUT_LAYER_GAIN = 3.0          # 输出层权重初始化增益
+    OUTPUT_LAYER_GAIN = 3.0
 
 # ==================== 训练参数 ====================
 class TrainingConfig:

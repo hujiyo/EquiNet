@@ -79,7 +79,7 @@ class EmbeddingModule(nn.Module):
         对 numpy 数组应用细处理（不包含 Embedding 层）
         
         Args:
-            x_np: 粗处理后的 numpy 数组 [batch, seq_len, 6] 或 [seq_len, 6]
+            x_np: 粗处理后的 numpy 数组 [batch, seq_len, 7] 或 [seq_len, 7]
         
         Returns:
             normalized: 细处理后的 numpy 数组

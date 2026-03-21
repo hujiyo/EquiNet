@@ -29,7 +29,8 @@ from model import create_model
 from data import (
     load_and_preprocess_data,
     create_sampler, sample_with_pools,
-    create_fixed_evaluation_dataset
+    create_fixed_evaluation_dataset,
+    load_index_data
 )
 
 from training_utils import (
@@ -130,16 +131,9 @@ def train_dft_model(model, train_stock_info, test_stock_info,
                     batches_per_epoch=TrainingConfig.BATCHES_PER_EPOCH,
                     dft_w_min=0.1,
                     dft_w_max=1.0,
-                    seed=DataConfig.RANDOM_SEED):
-    """
-    DFT模型训练函数（自引导模式）
-
-    训练策略：
-    - 加载已有模型，使用自引导DFT继续微调
-    - 样本权重基于模型自身的预测排名分位数：中间排名高权值，头尾低权值
-    - w = w_min + (w_max - w_min) * 4 * rank * (1 - rank)
-    - 支持TaskAlignedLoss：DFT权重调制基础BCE分量，排序/收益/TopK子损失照常计算
-    """
+                    seed=DataConfig.RANDOM_SEED,
+                    feature_normalizer=None,
+                    index_data=None):
     print("\n" + "="*60)
     print("DFT自引导微调训练")
     print("="*60)
@@ -157,7 +151,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         torch.cuda.manual_seed_all(seed)
 
     # 创建评估数据集
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info)
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer, index_data)
 
     # 初始模型评估
     stats_init = evaluate_model(
@@ -288,7 +282,8 @@ def train_dft_model(model, train_stock_info, test_stock_info,
 
         # 采样训练数据（包含cumulative_returns以支持TaskAlignedLoss）
         epoch_inputs, epoch_targets, epoch_cum_returns = sample_with_pools(
-            sampler, train_stock_info, batch_size, batches_per_epoch, train_rng
+            sampler, train_stock_info, batch_size, batches_per_epoch, train_rng,
+            feature_normalizer, index_data
         )
 
         # 打印循环统计
@@ -568,6 +563,12 @@ if __name__ == "__main__":
     print("正在加载和预处理数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
+    data_dir = os.path.join(os.path.dirname(__file__), '..', DataConfig.DATA_DIR)
+    data_dir = os.path.normpath(data_dir)
+    index_data, index_times = load_index_data(data_dir)
+    if index_data is None:
+        print("警告：大盘数据加载失败，训练将使用零值作为大盘特征")
+
     print("\n" + "="*60)
     print("数据集统计")
     print("="*60)
@@ -590,7 +591,8 @@ if __name__ == "__main__":
         epochs=args.epochs,
         dft_w_min=args.w_min,
         dft_w_max=args.w_max,
-        seed=args.seed
+        seed=args.seed,
+        index_data=index_data
     )
 
     print(f"\n最终结果:")

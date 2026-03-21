@@ -16,8 +16,8 @@ Token化方案（每个特征独立token空间，范围与连续版一致）：
     - 区间二 [0.2, 1.0]: 20个桶，步长4%（原始值20-100%）
 
 总词表大小: 176个token
-输入: [seq_len, 6] 连续值
-输出: [seq_len * 6] token ID (展平后)
+输入: [seq_len, 7] 连续值
+输出: [seq_len * 7] token ID (展平后)
 """
 
 import numpy as np
@@ -27,51 +27,39 @@ from config import DataConfig, ModelConfig
 
 # Token化配置
 class TokenConfig:
-    """Token化相关参数 - 每个特征独立设计"""
-    
-    # ========== 特征0-3: OHLC价格特征 ==========
-    # 范围[-0.1, 0.1]对应±10%涨跌幅，20个桶，步长1%
     OHLC_NUM_BUCKETS = 20
     OHLC_MIN = -0.1
     OHLC_MAX = 0.1
-    # 每个OHLC特征独立的token空间
-    OPEN_OFFSET = 0      # token 0-19
-    HIGH_OFFSET = 20     # token 20-39
-    LOW_OFFSET = 40      # token 40-59
-    CLOSE_OFFSET = 60    # token 60-79
-    
-    # ========== 特征4: volume成交量变化（非均匀分桶，两段式） ==========
-    # 归一化后范围[0, 1]，其中0.5对应0%变化
-    # 原始相对变化：(V_t - V_{t-1}) / V_{t-1}，clip到[-5, 5]后映射为 x/10+0.5
-    # 区间一[0, 0.6]: 20个桶，步长3%（原始-100%到+100%，步长10%）
-    # 区间二[0.6, 1.0]: 16个桶，步长2.5%（原始+100%到+500%，步长25%）
-    VOLUME_NUM_BUCKETS = 36  # 20 + 16
+    OPEN_OFFSET = 0
+    HIGH_OFFSET = 20
+    LOW_OFFSET = 40
+    CLOSE_OFFSET = 60
+
+    VOLUME_NUM_BUCKETS = 36
     VOLUME_MIN = 0.0
     VOLUME_MAX = 1.0
-    VOLUME_ZONE1_MAX = 0.6   # 区间一边界（原始+100%变化）
-    VOLUME_ZONE1_BUCKETS = 20  # 区间一桶数（-100%到+100%，步长10%）
-    VOLUME_ZONE2_BUCKETS = 16  # 区间二桶数（+100%到+500%，步长25%）
-    VOLUME_OFFSET = 80   # token 80-115
-    
-    # ========== 特征5: exchange换手率（非均匀分桶） ==========
-    # 原始值0-100%，归一化后0-1，与连续版范围一致
-    # 区间一[0, 0.2]: 40个桶，步长0.5%（原始值0-20%）
-    # 区间二[0.2, 1.0]: 20个桶，步长4%（原始值20-100%）
-    EXCHANGE_NUM_BUCKETS = 60  # 40 + 20
+    VOLUME_ZONE1_MAX = 0.6
+    VOLUME_ZONE1_BUCKETS = 20
+    VOLUME_ZONE2_BUCKETS = 16
+    VOLUME_OFFSET = 80
+
+    EXCHANGE_NUM_BUCKETS = 60
     EXCHANGE_MIN = 0.0
-    EXCHANGE_MAX = 1.0   # 与连续版一致
-    EXCHANGE_ZONE1_MAX = 0.2   # 区间一边界（原始值20%）
-    EXCHANGE_ZONE1_BUCKETS = 40  # 区间一桶数（0-20%，步长0.5%）
-    EXCHANGE_ZONE2_BUCKETS = 20  # 区间二桶数（20-100%，步长4%）
-    EXCHANGE_OFFSET = 116  # token 116-175
-    
-    # ========== 汇总 ==========
-    # 总词表大小 = 4*20 + 36 + 60 = 176
-    VOCAB_SIZE = (4 * OHLC_NUM_BUCKETS + VOLUME_NUM_BUCKETS + 
-                  EXCHANGE_NUM_BUCKETS)  # 176个token
-    
-    # token化后的序列长度
-    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * ModelConfig.INPUT_DIM  # 60 * 6 = 360
+    EXCHANGE_MAX = 1.0
+    EXCHANGE_ZONE1_MAX = 0.2
+    EXCHANGE_ZONE1_BUCKETS = 40
+    EXCHANGE_ZONE2_BUCKETS = 20
+    EXCHANGE_OFFSET = 116
+
+    INDEX_NUM_BUCKETS = 20
+    INDEX_MIN = -0.1
+    INDEX_MAX = 0.1
+    INDEX_OFFSET = 176
+
+    VOCAB_SIZE = (4 * OHLC_NUM_BUCKETS + VOLUME_NUM_BUCKETS +
+                  EXCHANGE_NUM_BUCKETS + INDEX_NUM_BUCKETS)
+
+    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * ModelConfig.INPUT_DIM
 
 
 def _value_to_bucket(value: float, min_val: float, max_val: float, num_buckets: int) -> int:
@@ -170,205 +158,180 @@ def _nonuniform_bucket_exchange(value: float) -> int:
 
 
 def tokenize_features(input_seq: np.ndarray, flatten: bool = True) -> np.ndarray:
-    """
-    将连续特征序列转换为token ID序列
-    
-    Args:
-        input_seq: [seq_len, 6] 连续值数组（已预处理）
-                   特征0-3: OHLC，范围[-0.1, 0.1]
-                   特征4: volume，范围[0, 1]
-                   特征5: exchange，范围[0, 1]（非均匀分桶）
-        flatten: 是否展平为一维数组
-    
-    Returns:
-        token_ids: [seq_len * 6] 或 [seq_len, 6] token ID数组 (int64)
-    """
     seq_len, num_features = input_seq.shape
-    assert num_features == ModelConfig.INPUT_DIM, f"期望{ModelConfig.INPUT_DIM}个特征，实际{num_features}"
-    
+
     token_ids = np.empty((seq_len, num_features), dtype=np.int64)
-    
-    for t in range(seq_len):
-        # 特征0-3: OHLC（均匀分桶）
-        ohlc_offsets = [TokenConfig.OPEN_OFFSET, TokenConfig.HIGH_OFFSET, 
-                        TokenConfig.LOW_OFFSET, TokenConfig.CLOSE_OFFSET]
-        for f in range(4):
-            value = input_seq[t, f]
-            bucket = _value_to_bucket(value, TokenConfig.OHLC_MIN, TokenConfig.OHLC_MAX, TokenConfig.OHLC_NUM_BUCKETS)
-            token_ids[t, f] = ohlc_offsets[f] + bucket
-        
-        # 特征4: volume（非均匀分桶）
-        value = input_seq[t, 4]
-        bucket = _nonuniform_bucket_volume(value)
-        token_ids[t, 4] = TokenConfig.VOLUME_OFFSET + bucket
-        
-        # 特征5: exchange（非均匀分桶）
-        value = input_seq[t, 5]
-        bucket = _nonuniform_bucket_exchange(value)
-        token_ids[t, 5] = TokenConfig.EXCHANGE_OFFSET + bucket
-    
+
+    ohlc_offsets = [TokenConfig.OPEN_OFFSET, TokenConfig.HIGH_OFFSET,
+                    TokenConfig.LOW_OFFSET, TokenConfig.CLOSE_OFFSET]
+    for f in range(4):
+        value = input_seq[:, f]
+        clipped = np.clip(value, TokenConfig.OHLC_MIN, TokenConfig.OHLC_MAX)
+        normalized = (clipped - TokenConfig.OHLC_MIN) / (TokenConfig.OHLC_MAX - TokenConfig.OHLC_MIN)
+        buckets = np.minimum((normalized * TokenConfig.OHLC_NUM_BUCKETS).astype(np.int64),
+                            TokenConfig.OHLC_NUM_BUCKETS - 1)
+        token_ids[:, f] = buckets + ohlc_offsets[f]
+
+    vol = input_seq[:, 4]
+    vol_clipped = np.clip(vol, 0.0, 1.0)
+    vol_buckets = np.zeros(seq_len, dtype=np.int64)
+    zone1_mask = vol_clipped <= TokenConfig.VOLUME_ZONE1_MAX
+    vol_buckets[zone1_mask] = np.minimum(
+        (vol_clipped[zone1_mask] / TokenConfig.VOLUME_ZONE1_MAX * TokenConfig.VOLUME_ZONE1_BUCKETS).astype(np.int64),
+        TokenConfig.VOLUME_ZONE1_BUCKETS - 1
+    )
+    zone2_mask = vol_clipped > TokenConfig.VOLUME_ZONE1_MAX
+    vol_buckets[zone2_mask] = TokenConfig.VOLUME_ZONE1_BUCKETS + np.minimum(
+        ((vol_clipped[zone2_mask] - TokenConfig.VOLUME_ZONE1_MAX) / (1.0 - TokenConfig.VOLUME_ZONE1_MAX) * TokenConfig.VOLUME_ZONE2_BUCKETS).astype(np.int64),
+        TokenConfig.VOLUME_ZONE2_BUCKETS - 1
+    )
+    token_ids[:, 4] = vol_buckets + TokenConfig.VOLUME_OFFSET
+
+    exc = input_seq[:, 5]
+    exc_clipped = np.clip(exc, 0.0, 1.0)
+    zone1_mask = exc_clipped <= TokenConfig.EXCHANGE_ZONE1_MAX
+    exc_buckets = np.zeros(seq_len, dtype=np.int64)
+    exc_buckets[zone1_mask] = np.minimum(
+        (exc_clipped[zone1_mask] / TokenConfig.EXCHANGE_ZONE1_MAX * TokenConfig.EXCHANGE_ZONE1_BUCKETS).astype(np.int64),
+        TokenConfig.EXCHANGE_ZONE1_BUCKETS - 1
+    )
+    exc_buckets[~zone1_mask] = TokenConfig.EXCHANGE_ZONE1_BUCKETS + np.minimum(
+        ((exc_clipped[~zone1_mask] - TokenConfig.EXCHANGE_ZONE1_MAX) / (1.0 - TokenConfig.EXCHANGE_ZONE1_MAX) * TokenConfig.EXCHANGE_ZONE2_BUCKETS).astype(np.int64),
+        TokenConfig.EXCHANGE_ZONE2_BUCKETS - 1
+    )
+    token_ids[:, 5] = exc_buckets + TokenConfig.EXCHANGE_OFFSET
+
+    idx = input_seq[:, 6]
+    clipped = np.clip(idx, TokenConfig.INDEX_MIN, TokenConfig.INDEX_MAX)
+    normalized = (clipped - TokenConfig.INDEX_MIN) / (TokenConfig.INDEX_MAX - TokenConfig.INDEX_MIN)
+    buckets = np.minimum((normalized * TokenConfig.INDEX_NUM_BUCKETS).astype(np.int64),
+                        TokenConfig.INDEX_NUM_BUCKETS - 1)
+    token_ids[:, 6] = buckets + TokenConfig.INDEX_OFFSET
+
     if flatten:
         return token_ids.reshape(-1)
     return token_ids
 
 
 def tokenize_features_vectorized(input_seq: np.ndarray, flatten: bool = True) -> np.ndarray:
-    """
-    向量化版本：将连续特征序列转换为token ID序列
-    
-    Args:
-        input_seq: [seq_len, 6] 连续值数组（已预处理）
-        flatten: 是否展平为一维数组
-    
-    Returns:
-        token_ids: [seq_len * 6] 或 [seq_len, 6] token ID数组 (int64)
-    """
     seq_len, num_features = input_seq.shape
     token_ids = np.empty((seq_len, num_features), dtype=np.int64)
-    
-    # 特征0-3: OHLC，每个特征独立token空间（均匀分桶）
-    ohlc_offsets = [TokenConfig.OPEN_OFFSET, TokenConfig.HIGH_OFFSET, 
+
+    ohlc_offsets = [TokenConfig.OPEN_OFFSET, TokenConfig.HIGH_OFFSET,
                     TokenConfig.LOW_OFFSET, TokenConfig.CLOSE_OFFSET]
     for i in range(4):
         col = input_seq[:, i]
         clipped = np.clip(col, TokenConfig.OHLC_MIN, TokenConfig.OHLC_MAX)
         normalized = (clipped - TokenConfig.OHLC_MIN) / (TokenConfig.OHLC_MAX - TokenConfig.OHLC_MIN)
-        buckets = np.minimum((normalized * TokenConfig.OHLC_NUM_BUCKETS).astype(np.int64), 
+        buckets = np.minimum((normalized * TokenConfig.OHLC_NUM_BUCKETS).astype(np.int64),
                             TokenConfig.OHLC_NUM_BUCKETS - 1)
         token_ids[:, i] = buckets + ohlc_offsets[i]
-    
-    # 特征4: volume成交量变化（非均匀分桶，两段式，范围[0, 1]）
+
     vol = input_seq[:, 4]
     vol_clipped = np.clip(vol, 0.0, 1.0)
     vol_buckets = np.zeros(seq_len, dtype=np.int64)
-    # 区间一 [0, 0.6]: 20个桶
     zone1_mask = vol_clipped <= TokenConfig.VOLUME_ZONE1_MAX
-    # 区间二 [0.6, 1.0]: 16个桶
-    zone2_mask = vol_clipped > TokenConfig.VOLUME_ZONE1_MAX
-
     vol_buckets[zone1_mask] = np.minimum(
         (vol_clipped[zone1_mask] / TokenConfig.VOLUME_ZONE1_MAX * TokenConfig.VOLUME_ZONE1_BUCKETS).astype(np.int64),
         TokenConfig.VOLUME_ZONE1_BUCKETS - 1
     )
+    zone2_mask = vol_clipped > TokenConfig.VOLUME_ZONE1_MAX
     vol_buckets[zone2_mask] = TokenConfig.VOLUME_ZONE1_BUCKETS + np.minimum(
         ((vol_clipped[zone2_mask] - TokenConfig.VOLUME_ZONE1_MAX) / (1.0 - TokenConfig.VOLUME_ZONE1_MAX) * TokenConfig.VOLUME_ZONE2_BUCKETS).astype(np.int64),
         TokenConfig.VOLUME_ZONE2_BUCKETS - 1
     )
     token_ids[:, 4] = vol_buckets + TokenConfig.VOLUME_OFFSET
-    
-    # 特征5: exchange换手率（非均匀分桶，两段式，范围[0, 1]）
+
     exc = input_seq[:, 5]
     exc_clipped = np.clip(exc, 0.0, 1.0)
-    # 区间一 [0, 0.2]: 40个桶
     zone1_mask = exc_clipped <= TokenConfig.EXCHANGE_ZONE1_MAX
     exc_buckets = np.zeros(seq_len, dtype=np.int64)
-    # 区间一
     exc_buckets[zone1_mask] = np.minimum(
         (exc_clipped[zone1_mask] / TokenConfig.EXCHANGE_ZONE1_MAX * TokenConfig.EXCHANGE_ZONE1_BUCKETS).astype(np.int64),
         TokenConfig.EXCHANGE_ZONE1_BUCKETS - 1
     )
-    # 区间二 [0.2, 1.0]: 20个桶
     exc_buckets[~zone1_mask] = TokenConfig.EXCHANGE_ZONE1_BUCKETS + np.minimum(
         ((exc_clipped[~zone1_mask] - TokenConfig.EXCHANGE_ZONE1_MAX) / (1.0 - TokenConfig.EXCHANGE_ZONE1_MAX) * TokenConfig.EXCHANGE_ZONE2_BUCKETS).astype(np.int64),
         TokenConfig.EXCHANGE_ZONE2_BUCKETS - 1
     )
     token_ids[:, 5] = exc_buckets + TokenConfig.EXCHANGE_OFFSET
-    
+
+    idx = input_seq[:, 6]
+    clipped = np.clip(idx, TokenConfig.INDEX_MIN, TokenConfig.INDEX_MAX)
+    normalized = (clipped - TokenConfig.INDEX_MIN) / (TokenConfig.INDEX_MAX - TokenConfig.INDEX_MIN)
+    buckets = np.minimum((normalized * TokenConfig.INDEX_NUM_BUCKETS).astype(np.int64),
+                        TokenConfig.INDEX_NUM_BUCKETS - 1)
+    token_ids[:, 6] = buckets + TokenConfig.INDEX_OFFSET
+
     if flatten:
-        return token_ids.reshape(-1)  # [seq_len * 6]
-    return token_ids  # [seq_len, 6]
+        return token_ids.reshape(-1)
+    return token_ids
 
 
 def tokenize_batch(batch_input: np.ndarray, flatten: bool = True) -> np.ndarray:
-    """
-    批量token化
-    
-    Args:
-        batch_input: [batch_size, seq_len, 6] 连续值数组
-        flatten: 是否展平最后两维
-    
-    Returns:
-        token_ids: [batch_size, seq_len * 6] 或 [batch_size, seq_len, 6] token ID数组
-    """
     batch_size, seq_len, num_features = batch_input.shape
     token_ids = np.empty((batch_size, seq_len, num_features), dtype=np.int64)
-    
-    # 特征0-3: OHLC，每个特征独立token空间
-    ohlc_offsets = [TokenConfig.OPEN_OFFSET, TokenConfig.HIGH_OFFSET, 
+
+    ohlc_offsets = [TokenConfig.OPEN_OFFSET, TokenConfig.HIGH_OFFSET,
                     TokenConfig.LOW_OFFSET, TokenConfig.CLOSE_OFFSET]
     for i in range(4):
         col = batch_input[:, :, i]
         clipped = np.clip(col, TokenConfig.OHLC_MIN, TokenConfig.OHLC_MAX)
         normalized = (clipped - TokenConfig.OHLC_MIN) / (TokenConfig.OHLC_MAX - TokenConfig.OHLC_MIN)
-        buckets = np.minimum((normalized * TokenConfig.OHLC_NUM_BUCKETS).astype(np.int64), 
+        buckets = np.minimum((normalized * TokenConfig.OHLC_NUM_BUCKETS).astype(np.int64),
                             TokenConfig.OHLC_NUM_BUCKETS - 1)
         token_ids[:, :, i] = buckets + ohlc_offsets[i]
-    
-    # 特征4: volume成交量变化（非均匀分桶，两段式，范围[0, 1]）
+
     vol = batch_input[:, :, 4]
     vol_clipped = np.clip(vol, 0.0, 1.0)
     vol_buckets = np.zeros((batch_size, seq_len), dtype=np.int64)
-    # 区间一 [0, 0.6]: 20个桶
     zone1_mask = vol_clipped <= TokenConfig.VOLUME_ZONE1_MAX
-    # 区间二 [0.6, 1.0]: 16个桶
-    zone2_mask = vol_clipped > TokenConfig.VOLUME_ZONE1_MAX
-
     vol_buckets[zone1_mask] = np.minimum(
         (vol_clipped[zone1_mask] / TokenConfig.VOLUME_ZONE1_MAX * TokenConfig.VOLUME_ZONE1_BUCKETS).astype(np.int64),
         TokenConfig.VOLUME_ZONE1_BUCKETS - 1
     )
+    zone2_mask = vol_clipped > TokenConfig.VOLUME_ZONE1_MAX
     vol_buckets[zone2_mask] = TokenConfig.VOLUME_ZONE1_BUCKETS + np.minimum(
         ((vol_clipped[zone2_mask] - TokenConfig.VOLUME_ZONE1_MAX) / (1.0 - TokenConfig.VOLUME_ZONE1_MAX) * TokenConfig.VOLUME_ZONE2_BUCKETS).astype(np.int64),
         TokenConfig.VOLUME_ZONE2_BUCKETS - 1
     )
     token_ids[:, :, 4] = vol_buckets + TokenConfig.VOLUME_OFFSET
-    
-    # 特征5: exchange换手率（非均匀分桶，两段式，范围[0, 1]）
+
     exc = batch_input[:, :, 5]
     exc_clipped = np.clip(exc, 0.0, 1.0)
-    # 区间一 [0, 0.2]: 40个桶
     zone1_mask = exc_clipped <= TokenConfig.EXCHANGE_ZONE1_MAX
     exc_buckets = np.zeros((batch_size, seq_len), dtype=np.int64)
     exc_buckets[zone1_mask] = np.minimum(
         (exc_clipped[zone1_mask] / TokenConfig.EXCHANGE_ZONE1_MAX * TokenConfig.EXCHANGE_ZONE1_BUCKETS).astype(np.int64),
         TokenConfig.EXCHANGE_ZONE1_BUCKETS - 1
     )
-    # 区间二 [0.2, 1.0]: 20个桶
     exc_buckets[~zone1_mask] = TokenConfig.EXCHANGE_ZONE1_BUCKETS + np.minimum(
         ((exc_clipped[~zone1_mask] - TokenConfig.EXCHANGE_ZONE1_MAX) / (1.0 - TokenConfig.EXCHANGE_ZONE1_MAX) * TokenConfig.EXCHANGE_ZONE2_BUCKETS).astype(np.int64),
         TokenConfig.EXCHANGE_ZONE2_BUCKETS - 1
     )
     token_ids[:, :, 5] = exc_buckets + TokenConfig.EXCHANGE_OFFSET
-    
+
+    idx = batch_input[:, :, 6]
+    clipped = np.clip(idx, TokenConfig.INDEX_MIN, TokenConfig.INDEX_MAX)
+    normalized = (clipped - TokenConfig.INDEX_MIN) / (TokenConfig.INDEX_MAX - TokenConfig.INDEX_MIN)
+    buckets = np.minimum((normalized * TokenConfig.INDEX_NUM_BUCKETS).astype(np.int64),
+                        TokenConfig.INDEX_NUM_BUCKETS - 1)
+    token_ids[:, :, 6] = buckets + TokenConfig.INDEX_OFFSET
+
     if flatten:
-        return token_ids.reshape(batch_size, -1)  # [batch, seq_len * 6]
-    return token_ids  # [batch, seq_len, 6]
+        return token_ids.reshape(batch_size, -1)
+    return token_ids
 
 
 def tokenize_batch_torch(batch_input: torch.Tensor, flatten: bool = True) -> torch.Tensor:
-    """
-    PyTorch版本的批量token化（可用于GPU加速）
-
-    重要：本函数强制使用 FP32 进行离散化计算，确保数值精度。
-
-    Args:
-        batch_input: [batch_size, seq_len, 6] 连续值张量（任意精度）
-        flatten: 是否展平最后两维
-
-    Returns:
-        token_ids: [batch_size, seq_len * 6] 或 [batch_size, seq_len, 6] token ID张量 (long)
-    """
     batch_size, seq_len, num_features = batch_input.shape
     device = batch_input.device
 
-    # 初始化输出张量
     token_ids = torch.empty((batch_size, seq_len, num_features), dtype=torch.long, device=device)
 
-    # 强制转换为 FP32 进行离散化计算，确保数值精度
     if batch_input.dtype != torch.float32:
         batch_input = batch_input.to(torch.float32)
 
-    # 特征0-3: OHLC，每个特征独立token空间
     ohlc_offsets = [TokenConfig.OPEN_OFFSET, TokenConfig.HIGH_OFFSET,
                     TokenConfig.LOW_OFFSET, TokenConfig.CLOSE_OFFSET]
     for i in range(4):
@@ -378,16 +341,11 @@ def tokenize_batch_torch(batch_input: torch.Tensor, flatten: bool = True) -> tor
         buckets = torch.clamp((normalized * TokenConfig.OHLC_NUM_BUCKETS).long(),
                              max=TokenConfig.OHLC_NUM_BUCKETS - 1)
         token_ids[:, :, i] = buckets + ohlc_offsets[i]
-    
-    # 特征4: volume成交量变化（非均匀分桶，两段式，范围[0, 1]）
+
     vol = batch_input[:, :, 4]
     vol_clipped = torch.clamp(vol, 0.0, 1.0)
-    # 区间一 [0, 0.6]: 20个桶
     zone1_mask = vol_clipped <= TokenConfig.VOLUME_ZONE1_MAX
-    # 区间二 [0.6, 1.0]: 16个桶
-    zone2_mask = vol_clipped > TokenConfig.VOLUME_ZONE1_MAX
 
-    # 计算各区间的桶索引
     zone1_buckets = torch.clamp((vol_clipped / TokenConfig.VOLUME_ZONE1_MAX * TokenConfig.VOLUME_ZONE1_BUCKETS).long(),
                                 max=TokenConfig.VOLUME_ZONE1_BUCKETS - 1)
     zone2_buckets = TokenConfig.VOLUME_ZONE1_BUCKETS + torch.clamp(
@@ -395,14 +353,11 @@ def tokenize_batch_torch(batch_input: torch.Tensor, flatten: bool = True) -> tor
         max=TokenConfig.VOLUME_ZONE2_BUCKETS - 1
     )
 
-    # 使用where选择正确的桶
     vol_buckets = torch.where(zone1_mask, zone1_buckets, zone2_buckets)
     token_ids[:, :, 4] = vol_buckets + TokenConfig.VOLUME_OFFSET
-    
-    # 特征5: exchange换手率（非均匀分桶，两段式，范围[0, 1]）
+
     exc = batch_input[:, :, 5]
     exc_clipped = torch.clamp(exc, 0.0, 1.0)
-    # 区间一 [0, 0.2]: 40个桶
     zone1_mask = exc_clipped <= TokenConfig.EXCHANGE_ZONE1_MAX
     exc_buckets = torch.where(
         zone1_mask,
@@ -414,140 +369,128 @@ def tokenize_batch_torch(batch_input: torch.Tensor, flatten: bool = True) -> tor
         )
     )
     token_ids[:, :, 5] = exc_buckets + TokenConfig.EXCHANGE_OFFSET
-    
+
+    idx = batch_input[:, :, 6]
+    clipped = torch.clamp(idx, TokenConfig.INDEX_MIN, TokenConfig.INDEX_MAX)
+    normalized = (clipped - TokenConfig.INDEX_MIN) / (TokenConfig.INDEX_MAX - TokenConfig.INDEX_MIN)
+    buckets = torch.clamp((normalized * TokenConfig.INDEX_NUM_BUCKETS).long(),
+                         max=TokenConfig.INDEX_NUM_BUCKETS - 1)
+    token_ids[:, :, 6] = buckets + TokenConfig.INDEX_OFFSET
+
     if flatten:
-        return token_ids.reshape(batch_size, -1)  # [batch, seq_len * 6]
-    return token_ids  # [batch, seq_len, 6]
+        return token_ids.reshape(batch_size, -1)
+    return token_ids
 
 
 def detokenize_features(token_ids: np.ndarray, unflatten: bool = True) -> np.ndarray:
-    """
-    将token ID序列转换回连续特征序列（逆向转换，返回桶中心值）
-    
-    Args:
-        token_ids: [seq_len * 6] 或 [seq_len, 6] token ID数组
-        unflatten: 是否需要将一维数组重塑为二维（如果输入已是二维则忽略）
-    
-    Returns:
-        continuous_values: [seq_len, 6] 连续值数组（桶中心值）
-    """
-    # 处理输入形状
     if token_ids.ndim == 1:
         if unflatten:
-            seq_len = len(token_ids) // 6
-            token_ids = token_ids.reshape(seq_len, 6)
+            seq_len = len(token_ids) // 7
+            token_ids = token_ids.reshape(seq_len, 7)
         else:
             raise ValueError("一维token_ids需要unflatten=True")
-    
+
     seq_len, num_features = token_ids.shape
     continuous_values = np.zeros((seq_len, num_features), dtype=np.float32)
-    
-    for t in range(seq_len):
-        # 特征0-3: OHLC
-        ohlc_offsets = [TokenConfig.OPEN_OFFSET, TokenConfig.HIGH_OFFSET, 
-                        TokenConfig.LOW_OFFSET, TokenConfig.CLOSE_OFFSET]
-        for f in range(4):
-            token_id = token_ids[t, f]
-            bucket = token_id - ohlc_offsets[f]
-            continuous_values[t, f] = _bucket_to_value(
-                bucket, TokenConfig.OHLC_MIN, TokenConfig.OHLC_MAX, TokenConfig.OHLC_NUM_BUCKETS
-            )
-        
-        # 特征4: volume（非均匀分桶逆向）
-        token_id = token_ids[t, 4]
-        bucket = token_id - TokenConfig.VOLUME_OFFSET
-        if bucket < TokenConfig.VOLUME_ZONE1_BUCKETS:  # 区间一
-            bucket_width = TokenConfig.VOLUME_ZONE1_MAX / TokenConfig.VOLUME_ZONE1_BUCKETS
-            continuous_values[t, 4] = (bucket + 0.5) * bucket_width
-        else:  # 区间二
-            zone2_bucket = bucket - TokenConfig.VOLUME_ZONE1_BUCKETS
-            bucket_width = (1.0 - TokenConfig.VOLUME_ZONE1_MAX) / TokenConfig.VOLUME_ZONE2_BUCKETS
-            continuous_values[t, 4] = TokenConfig.VOLUME_ZONE1_MAX + (zone2_bucket + 0.5) * bucket_width
-        
-        # 特征5: exchange（非均匀分桶逆向）
-        token_id = token_ids[t, 5]
-        bucket = token_id - TokenConfig.EXCHANGE_OFFSET
-        if bucket < TokenConfig.EXCHANGE_ZONE1_BUCKETS:  # 区间一
-            bucket_width = TokenConfig.EXCHANGE_ZONE1_MAX / TokenConfig.EXCHANGE_ZONE1_BUCKETS
-            continuous_values[t, 5] = (bucket + 0.5) * bucket_width
-        else:  # 区间二
-            zone2_bucket = bucket - TokenConfig.EXCHANGE_ZONE1_BUCKETS
-            bucket_width = (1.0 - TokenConfig.EXCHANGE_ZONE1_MAX) / TokenConfig.EXCHANGE_ZONE2_BUCKETS
-            continuous_values[t, 5] = TokenConfig.EXCHANGE_ZONE1_MAX + (zone2_bucket + 0.5) * bucket_width
-    
+
+    ohlc_offsets = [TokenConfig.OPEN_OFFSET, TokenConfig.HIGH_OFFSET,
+                    TokenConfig.LOW_OFFSET, TokenConfig.CLOSE_OFFSET]
+    for f in range(4):
+        token_id_col = token_ids[:, f]
+        bucket = token_id_col - ohlc_offsets[f]
+        bucket_width = (TokenConfig.OHLC_MAX - TokenConfig.OHLC_MIN) / TokenConfig.OHLC_NUM_BUCKETS
+        continuous_values[:, f] = TokenConfig.OHLC_MIN + (bucket + 0.5) * bucket_width
+
+    vol_bucket = token_ids[:, 4] - TokenConfig.VOLUME_OFFSET
+    zone1_mask = vol_bucket < TokenConfig.VOLUME_ZONE1_BUCKETS
+    zone1_bucket_width = TokenConfig.VOLUME_ZONE1_MAX / TokenConfig.VOLUME_ZONE1_BUCKETS
+    continuous_values[zone1_mask, 4] = (vol_bucket[zone1_mask] + 0.5) * zone1_bucket_width
+    zone2_bucket = vol_bucket[~zone1_mask] - TokenConfig.VOLUME_ZONE1_BUCKETS
+    zone2_bucket_width = (1.0 - TokenConfig.VOLUME_ZONE1_MAX) / TokenConfig.VOLUME_ZONE2_BUCKETS
+    continuous_values[~zone1_mask, 4] = TokenConfig.VOLUME_ZONE1_MAX + (zone2_bucket + 0.5) * zone2_bucket_width
+
+    exc_bucket = token_ids[:, 5] - TokenConfig.EXCHANGE_OFFSET
+    zone1_mask = exc_bucket < TokenConfig.EXCHANGE_ZONE1_BUCKETS
+    zone1_bucket_width = TokenConfig.EXCHANGE_ZONE1_MAX / TokenConfig.EXCHANGE_ZONE1_BUCKETS
+    continuous_values[zone1_mask, 5] = (exc_bucket[zone1_mask] + 0.5) * zone1_bucket_width
+    zone2_bucket = exc_bucket[~zone1_mask] - TokenConfig.EXCHANGE_ZONE1_BUCKETS
+    zone2_bucket_width = (1.0 - TokenConfig.EXCHANGE_ZONE1_MAX) / TokenConfig.EXCHANGE_ZONE2_BUCKETS
+    continuous_values[~zone1_mask, 5] = TokenConfig.EXCHANGE_ZONE1_MAX + (zone2_bucket + 0.5) * zone2_bucket_width
+
+    idx_bucket = token_ids[:, 6] - TokenConfig.INDEX_OFFSET
+    bucket_width = (TokenConfig.INDEX_MAX - TokenConfig.INDEX_MIN) / TokenConfig.INDEX_NUM_BUCKETS
+    continuous_values[:, 6] = TokenConfig.INDEX_MIN + (idx_bucket + 0.5) * bucket_width
+
     return continuous_values
 
 
 def get_token_info(token_id: int) -> dict:
-    """
-    获取token的详细信息（用于调试）
-    
-    Args:
-        token_id: token ID
-    
-    Returns:
-        包含特征索引、桶索引、值范围的字典
-    """
-    feature_names = ['open', 'high', 'low', 'close', 'volume', 'exchange']
-    
-    # 根据token_id确定特征和桶索引
-    if token_id < TokenConfig.HIGH_OFFSET:  # 0-19: open
+    feature_names = ['open', 'high', 'low', 'close', 'volume', 'exchange', 'index']
+
+    if token_id < TokenConfig.HIGH_OFFSET:
         feature_idx = 0
         bucket_idx = token_id - TokenConfig.OPEN_OFFSET
         min_val, max_val, num_buckets = TokenConfig.OHLC_MIN, TokenConfig.OHLC_MAX, TokenConfig.OHLC_NUM_BUCKETS
         bucket_width = (max_val - min_val) / num_buckets
         bucket_start = min_val + bucket_idx * bucket_width
         bucket_end = bucket_start + bucket_width
-    elif token_id < TokenConfig.LOW_OFFSET:  # 20-39: high
+    elif token_id < TokenConfig.LOW_OFFSET:
         feature_idx = 1
         bucket_idx = token_id - TokenConfig.HIGH_OFFSET
         min_val, max_val, num_buckets = TokenConfig.OHLC_MIN, TokenConfig.OHLC_MAX, TokenConfig.OHLC_NUM_BUCKETS
         bucket_width = (max_val - min_val) / num_buckets
         bucket_start = min_val + bucket_idx * bucket_width
         bucket_end = bucket_start + bucket_width
-    elif token_id < TokenConfig.CLOSE_OFFSET:  # 40-59: low
+    elif token_id < TokenConfig.CLOSE_OFFSET:
         feature_idx = 2
         bucket_idx = token_id - TokenConfig.LOW_OFFSET
         min_val, max_val, num_buckets = TokenConfig.OHLC_MIN, TokenConfig.OHLC_MAX, TokenConfig.OHLC_NUM_BUCKETS
         bucket_width = (max_val - min_val) / num_buckets
         bucket_start = min_val + bucket_idx * bucket_width
         bucket_end = bucket_start + bucket_width
-    elif token_id < TokenConfig.VOLUME_OFFSET:  # 60-79: close
+    elif token_id < TokenConfig.VOLUME_OFFSET:
         feature_idx = 3
         bucket_idx = token_id - TokenConfig.CLOSE_OFFSET
         min_val, max_val, num_buckets = TokenConfig.OHLC_MIN, TokenConfig.OHLC_MAX, TokenConfig.OHLC_NUM_BUCKETS
         bucket_width = (max_val - min_val) / num_buckets
         bucket_start = min_val + bucket_idx * bucket_width
         bucket_end = bucket_start + bucket_width
-    elif token_id < TokenConfig.EXCHANGE_OFFSET:  # 80-115: volume（非均匀分桶，两段式）
+    elif token_id < TokenConfig.EXCHANGE_OFFSET:
         feature_idx = 4
         bucket_idx = token_id - TokenConfig.VOLUME_OFFSET
-        if bucket_idx < TokenConfig.VOLUME_ZONE1_BUCKETS:  # 区间一 [0, 0.6]
+        if bucket_idx < TokenConfig.VOLUME_ZONE1_BUCKETS:
             bucket_width = TokenConfig.VOLUME_ZONE1_MAX / TokenConfig.VOLUME_ZONE1_BUCKETS
             bucket_start = bucket_idx * bucket_width
             bucket_end = bucket_start + bucket_width
-        else:  # 区间二 [0.6, 1.0]
+        else:
             zone2_bucket_idx = bucket_idx - TokenConfig.VOLUME_ZONE1_BUCKETS
             bucket_width = (1.0 - TokenConfig.VOLUME_ZONE1_MAX) / TokenConfig.VOLUME_ZONE2_BUCKETS
             bucket_start = TokenConfig.VOLUME_ZONE1_MAX + zone2_bucket_idx * bucket_width
             bucket_end = bucket_start + bucket_width
-    elif token_id < TokenConfig.VOCAB_SIZE:  # 116-175: exchange（非均匀分桶，两段式）
+    elif token_id < TokenConfig.INDEX_OFFSET:
         feature_idx = 5
         bucket_idx = token_id - TokenConfig.EXCHANGE_OFFSET
-        if bucket_idx < TokenConfig.EXCHANGE_ZONE1_BUCKETS:  # 区间一 [0, 0.2]
+        if bucket_idx < TokenConfig.EXCHANGE_ZONE1_BUCKETS:
             bucket_width = TokenConfig.EXCHANGE_ZONE1_MAX / TokenConfig.EXCHANGE_ZONE1_BUCKETS
             bucket_start = bucket_idx * bucket_width
             bucket_end = bucket_start + bucket_width
-        else:  # 区间二 [0.2, 1.0]
+        else:
             zone2_bucket_idx = bucket_idx - TokenConfig.EXCHANGE_ZONE1_BUCKETS
             bucket_width = (1.0 - TokenConfig.EXCHANGE_ZONE1_MAX) / TokenConfig.EXCHANGE_ZONE2_BUCKETS
             bucket_start = TokenConfig.EXCHANGE_ZONE1_MAX + zone2_bucket_idx * bucket_width
             bucket_end = bucket_start + bucket_width
-    else:  # 无效token
+    elif token_id < TokenConfig.VOCAB_SIZE:
+        feature_idx = 6
+        bucket_idx = token_id - TokenConfig.INDEX_OFFSET
+        min_val, max_val, num_buckets = TokenConfig.INDEX_MIN, TokenConfig.INDEX_MAX, TokenConfig.INDEX_NUM_BUCKETS
+        bucket_width = (max_val - min_val) / num_buckets
+        bucket_start = min_val + bucket_idx * bucket_width
+        bucket_end = bucket_start + bucket_width
+    else:
         raise ValueError(f"无效的token_id: {token_id}，超出词表范围[0, {TokenConfig.VOCAB_SIZE-1}]")
-    
+
     center_value = (bucket_start + bucket_end) / 2
-    
+
     return {
         'token_id': token_id,
         'feature_idx': feature_idx,

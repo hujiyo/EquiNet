@@ -2,6 +2,15 @@
 Mano: Restriking Manifold Optimization for LLM Training
 
 Based on arXiv:2601.23000 Algorithm 1
+
+v2 Updates (2026.3.14):
+- Removed parameter normalization (p_unit), directly use p.data for tangent projection
+- Changed eps handling from clamp(min=eps) to addition (+ eps)
+- Nesterov momentum now defaults to True for better data scaling performance
+- Implemented dual-dimension projection for improved performance
+
+References:
+- https://github.com/xie-lab-ml/Mano-Restriking-Manifold-Optimization-for-LLM-Training
 """
 
 import torch
@@ -13,24 +22,38 @@ class ManoOptimizer(optim.Optimizer):
     """
     Mano Optimizer: Manifold-based optimizer for 2D matrix parameters
 
-    Algorithm 1 from the paper:
+    v2 Algorithm:
     1. Update momentum: M_t = μ * M_{t-1} + g_t
     2. Rotating manifold: k = t mod 2
-    3. Manifold normalization: θ̂_t = θ_t ⊘ ‖θ_t‖_{2,k}
-    4. Tangent space projection: v_t = M_t - θ̂_t ⊙ ⟨M_t, θ̂_t⟩_k
-    5. Update vector normalization: v̂_t = v_t ⊘ ‖v_t‖_{2,k}
-    6. Parameter update: θ_{t+1} = θ_t * (1 - η_t*λ) - η_t * 0.2*√(n_k)*v̂_t
+    3. Tangent space projection (v2): v_t = M_t - p_t ⊙ ⟨M_t, p_t⟩_k
+    4. Update vector normalization (v2): v̂_t = v_t / (‖v_t‖_{2,k} + eps)
+    5. Parameter update: θ_{t+1} = θ_t * (1 - η_t*λ) - η_t * 0.2*√(n_k)*v̂_t
+
+    Dual-dimension projection (optional, enabled by default):
+    - Project on both dimensions at each step for improved performance
+    - u = g - (g · p) * p  on dim 0, then on dim 1
+    - Normalize on both dimensions
 
     Args:
         params (iterable): iterable of parameters to optimize
-        lr (float): learning rate (default: 5e-4)
+        lr (float): learning rate (default: 1e-3)
         momentum (float): momentum coefficient (default: 0.95)
         weight_decay (float): weight decay (default: 0.1)
-        nesterov (bool): whether to use Nesterov-style momentum (default: False)
+        nesterov (bool): whether to use Nesterov-style momentum (default: True)
         eps (float): epsilon for numerical stability (default: 1e-8)
+        dual_dim_projection (bool): whether to use dual-dimension projection (default: True)
     """
 
-    def __init__(self, params, lr=5e-4, momentum=0.95, weight_decay=0.1, nesterov=False, eps=1e-8):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        momentum=0.95,
+        weight_decay=0.1,
+        nesterov=True,
+        eps=1e-8,
+        dual_dim_projection=True
+    ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= momentum < 1.0:
@@ -38,66 +61,68 @@ class ManoOptimizer(optim.Optimizer):
         if not 0.0 <= weight_decay:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
 
-        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay,
-                        nesterov=nesterov, eps=eps, steps=0)
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            eps=eps,
+            dual_dim_projection=dual_dim_projection,
+            steps=0
+        )
         super().__init__(params, defaults)
 
-    def _manifold_normalization(self, param, k, eps=1e-8):
+    def _tangent_projection_single_dim(self, g, p, dim):
         """
-        Manifold normalization: N_OB(A) = A ⊘ ‖A‖_{2,k}
+        Single-dimension tangent projection: v = g - p * <g, p>_dim
 
         Args:
-            param (Tensor): input tensor of shape [m, n]
-            k (int): normalization dimension
-                - k=0: column-wise normalization
-                - k=1: row-wise normalization
-            eps (float): epsilon for numerical stability
-
-        Returns:
-            Tensor: normalized tensor
-        """
-        if k == 0:  # Column normalization
-            norm = param.norm(dim=0, keepdim=True)
-        else:  # Row normalization
-            norm = param.norm(dim=1, keepdim=True)
-
-        # Avoid division by zero
-        return param / norm.clamp(min=eps)
-
-    def _dimension_wise_inner_product(self, A, B, k):
-        """
-        Dimension-wise inner product: ⟨A, B⟩_k
-
-        Args:
-            A, B (Tensor): input tensors of shape [m, n]
-            k (int): dimension for inner product
-                - k=0: column-wise inner product
-                - k=1: row-wise inner product
-
-        Returns:
-            Tensor: inner product result
-        """
-        if k == 0:  # Column-wise
-            return (A * B).sum(dim=0, keepdim=True)
-        else:  # Row-wise
-            return (A * B).sum(dim=1, keepdim=True)
-
-    def _tangent_projection(self, M, theta_hat, k):
-        """
-        Tangent space projection: v_t = M_t - θ̂_t ⊙ ⟨M_t, θ̂_t⟩_k
-
-        Projects momentum M onto the tangent space of theta_hat on Oblique manifold
-
-        Args:
-            M (Tensor): momentum tensor
-            theta_hat (Tensor): manifold-normalized parameters
-            k (int): projection dimension
+            g (Tensor): gradient/momentum tensor
+            p (Tensor): parameter tensor
+            dim (int): dimension for projection (0 or 1)
 
         Returns:
             Tensor: projected tangent vector
         """
-        inner_prod = self._dimension_wise_inner_product(M, theta_hat, k)
-        return M - theta_hat * inner_prod
+        inner_prod = torch.sum(g * p, dim=dim, keepdim=True)
+        return g - p * inner_prod
+
+    def _normalize_single_dim(self, v, dim, eps):
+        """
+        Single-dimension normalization: v / (||v||_dim + eps)
+
+        Args:
+            v (Tensor): vector to normalize
+            dim (int): dimension for normalization
+            eps (float): epsilon for numerical stability
+
+        Returns:
+            Tensor: normalized vector
+        """
+        norm = torch.norm(v, p=2, dim=dim, keepdim=True)
+        return v / (norm + eps)
+
+    def _dual_dim_projection_and_normalize(self, g, p, eps):
+        """
+        Dual-dimension projection and normalization (v2 improvement)
+
+        Project on both dimensions at each step for improved performance.
+
+        Args:
+            g (Tensor): gradient/momentum tensor
+            p (Tensor): parameter tensor
+            eps (float): epsilon for numerical stability
+
+        Returns:
+            Tensor: projected and normalized update vector
+        """
+        u = g - (torch.sum(g * p, dim=0, keepdim=True) * p)
+        u = u - (torch.sum(u * p, dim=1, keepdim=True) * p)
+
+        u = u / (torch.norm(u, p=2, dim=0, keepdim=True) + eps)
+        u = u / (torch.norm(u, p=2, dim=1, keepdim=True) + eps)
+
+        return u
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -122,56 +147,39 @@ class ManoOptimizer(optim.Optimizer):
             lr = group['lr']
             nesterov = group['nesterov']
             eps = group['eps']
+            dual_dim = group['dual_dim_projection']
+
+            dim = int(group['steps'] % 2)
 
             for p in group['params']:
                 if p.grad is None:
                     continue
 
-                grad = p.grad.data
-
-                # Mano only supports 2D matrix parameters
-                if p.dim() != 2:
-                    raise ValueError(
-                        f"Mano optimizer only supports 2D tensor parameters, "
-                        f"but parameter shape is {p.shape}"
-                    )
+                g = p.grad.data
+                assert g.ndim == 2, f"Mano only supports 2D parameters, got {g.ndim}D"
 
                 state = self.state[p]
 
-                # Initialize momentum buffer
                 if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = torch.zeros_like(p)
+                    state['momentum_buffer'] = torch.zeros_like(g)
 
                 buf = state['momentum_buffer']
+                buf.mul_(mu).add_(g)
 
-                # Step 1: Update momentum M_t = μ * M_{t-1} + g_t
-                buf.mul_(mu).add_(grad)
+                g = g.add(buf, alpha=mu) if nesterov else buf
 
-                # Use Nesterov accelerated gradient if enabled
-                g = grad.add(buf, alpha=mu) if nesterov else buf
+                if dual_dim:
+                    u = self._dual_dim_projection_and_normalize(g, p.data, eps)
+                else:
+                    v = self._tangent_projection_single_dim(g, p.data, dim)
+                    u = self._normalize_single_dim(v, dim, eps)
 
-                # Step 2: Rotating manifold k = steps mod 2
-                # (steps increments per-parameter, matching official implementation)
-                k = int(group['steps'] % 2)
-
-                # Step 3: Manifold normalization θ̂_t = θ_t ⊘ ‖θ_t‖_{2,k}
-                theta_hat = self._manifold_normalization(p.data, k, eps)
-
-                # Step 4: Tangent projection v_t = g - θ̂_t ⊙ ⟨g, θ̂_t⟩_k
-                v_t = self._tangent_projection(g, theta_hat, k)
-
-                # Step 5: Update vector normalization v̂_t = v_t ⊘ ‖v_t‖_{2,k}
-                v_hat = self._manifold_normalization(v_t, k, eps)
-
-                # Step 6: Decoupled weight decay (multiply first, then update)
                 p.data.mul_(1 - lr * weight_decay)
 
-                # Step 7: Parameter update with rescaled RMS
-                adjusted_lr = lr * 0.2 * math.sqrt(g.shape[k])
-                p.data.add_(v_hat, alpha=-adjusted_lr)
+                adjusted_lr = lr * 0.2 * math.sqrt(g.shape[dim])
+                p.data.add_(u, alpha=-adjusted_lr)
 
-                # Increment step counter per-parameter (matching official implementation)
-                group['steps'] += 1
+            group['steps'] += 1
 
         return loss
 
@@ -184,29 +192,49 @@ class HybridManoAdamW(optim.Optimizer):
     - Mano for matrix parameters (Transformer weight matrices)
     - AdamW for embeddings, LayerNorm, and 1D parameters (bias, LayerNorm weight)
 
+    v2 Updates:
+    - Nesterov momentum defaults to True
+    - Dual-dimension projection enabled by default
+
     Args:
         mano_params (list): parameters for Mano optimization (2D matrices)
         adamw_params (list): parameters for AdamW optimization (1D vectors)
         lr (float): learning rate
         momentum (float): Mano momentum coefficient
         weight_decay (float): weight decay
-        nesterov (bool): whether to use Nesterov-style momentum (default: False)
+        nesterov (bool): whether to use Nesterov-style momentum (default: True)
         eps (float): epsilon for numerical stability (default: 1e-8)
         betas (tuple): AdamW beta parameters (default: (0.9, 0.95))
+        dual_dim_projection (bool): whether to use dual-dimension projection (default: True)
     """
 
-    def __init__(self, mano_params, adamw_params, lr, momentum, weight_decay, nesterov=False, eps=1e-8, betas=(0.9, 0.95)):
-        # Filter out empty parameter lists
+    def __init__(
+        self,
+        mano_params,
+        adamw_params,
+        lr,
+        momentum,
+        weight_decay,
+        nesterov=True,
+        eps=1e-8,
+        betas=(0.9, 0.95),
+        dual_dim_projection=True
+    ):
         mano_params = [p for p in mano_params if p is not None]
         adamw_params = [p for p in adamw_params if p is not None]
 
-        # Build parameter groups for parent class initialization
         all_params = mano_params + adamw_params
-        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay,
-                        nesterov=nesterov, eps=eps, betas=betas)
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            eps=eps,
+            betas=betas,
+            dual_dim_projection=dual_dim_projection
+        )
         super().__init__(all_params, defaults)
 
-        # Mano optimizer (only create if 2D params exist)
         if len(mano_params) > 0:
             self.mano_optim = ManoOptimizer(
                 mano_params,
@@ -214,12 +242,12 @@ class HybridManoAdamW(optim.Optimizer):
                 momentum=momentum,
                 weight_decay=weight_decay,
                 nesterov=nesterov,
-                eps=eps
+                eps=eps,
+                dual_dim_projection=dual_dim_projection
             )
         else:
             self.mano_optim = None
 
-        # AdamW optimizer (only create if 1D params exist)
         if len(adamw_params) > 0:
             self.adamw_optim = optim.AdamW(
                 adamw_params,
@@ -230,7 +258,6 @@ class HybridManoAdamW(optim.Optimizer):
         else:
             self.adamw_optim = None
 
-        # Reorganize param_groups to merge both optimizers' groups
         self.param_groups = []
         if self.mano_optim:
             self.param_groups.extend(self.mano_optim.param_groups)
@@ -255,15 +282,17 @@ class HybridManoAdamW(optim.Optimizer):
         Returns:
             loss (Tensor or None): loss value from closure
         """
-        loss_mano = None
-        loss_adamw = None
+        loss = None
+
+        if closure is not None:
+            loss = closure()
 
         if self.mano_optim:
-            loss_mano = self.mano_optim.step(closure)
+            self.mano_optim.step(None)
         if self.adamw_optim:
-            loss_adamw = self.adamw_optim.step(closure)
+            self.adamw_optim.step(None)
 
-        return loss_mano if loss_mano is not None else loss_adamw
+        return loss
 
     def state_dict(self):
         """
@@ -292,7 +321,16 @@ class HybridManoAdamW(optim.Optimizer):
             self.adamw_optim.load_state_dict(state_dict['adamw'])
 
 
-def create_optimizer(model, optimizer_type='mano', lr=1e-3, momentum=0.95, weight_decay=1e-5, betas=(0.9, 0.95)):
+def create_optimizer(
+    model,
+    optimizer_type='mano',
+    lr=1e-3,
+    momentum=0.95,
+    weight_decay=0.1,
+    betas=(0.9, 0.95),
+    nesterov=True,
+    dual_dim_projection=True
+):
     """
     Factory function to create optimizer based on type
 
@@ -303,6 +341,8 @@ def create_optimizer(model, optimizer_type='mano', lr=1e-3, momentum=0.95, weigh
         momentum (float): Mano momentum coefficient
         weight_decay (float): weight decay
         betas (tuple): AdamW beta parameters
+        nesterov (bool): whether to use Nesterov-style momentum (default: True)
+        dual_dim_projection (bool): whether to use dual-dimension projection (default: True)
 
     Returns:
         optimizer: created optimizer
@@ -319,9 +359,11 @@ def create_optimizer(model, optimizer_type='mano', lr=1e-3, momentum=0.95, weigh
             else:
                 adamw_params.append(param)
 
-        print(f"Optimizer: HybridManoAdamW (Mano for 2D matrices, AdamW for 1D & 3D+ params)")
+        print(f"Optimizer: HybridManoAdamW (Mano for 2D matrices, AdamW for 1D params)")
         print(f"  2D params: {len(mano_params)}")
-        print(f"  1D & 3D+ params: {len(adamw_params)}")
+        print(f"  1D params: {len(adamw_params)}")
+        print(f"  Nesterov: {nesterov}")
+        print(f"  Dual-dimension projection: {dual_dim_projection}")
 
         return HybridManoAdamW(
             mano_params=mano_params,
@@ -329,7 +371,9 @@ def create_optimizer(model, optimizer_type='mano', lr=1e-3, momentum=0.95, weigh
             lr=lr,
             momentum=momentum,
             weight_decay=weight_decay,
-            betas=betas
+            betas=betas,
+            nesterov=nesterov,
+            dual_dim_projection=dual_dim_projection
         )
     else:
         if optimizer_type == 'adamw':

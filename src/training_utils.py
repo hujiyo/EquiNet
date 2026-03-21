@@ -995,7 +995,9 @@ def create_optimizer_from_config(model, lr=None):
             lr=actual_lr,
             momentum=TrainingConfig.MANO_MOMENTUM,
             weight_decay=TrainingConfig.WEIGHT_DECAY,
-            betas=TrainingConfig.MANO_ADAMW_BETAS
+            betas=TrainingConfig.MANO_ADAMW_BETAS,
+            nesterov=TrainingConfig.MANO_NESTEROV,
+            dual_dim_projection=TrainingConfig.MANO_DUAL_DIM_PROJECTION
         )
     elif TrainingConfig.USE_ADAMW:
         optimizer = optim.AdamW(model.parameters(), lr=actual_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)

@@ -241,38 +241,48 @@ class FeatureNormalizer:
 
 def load_index_data(data_dir=DataConfig.DATA_DIR):
     """
-    加载上证指数数据并构建日期到收盘价的映射
+    加载上证指数数据并构建日期到涨跌幅的映射
 
     Args:
         data_dir: 数据目录
 
     Returns:
-        index_data: dict，key为time(int)，value为当日收盘价
-        index_times: np.ndarray，所有可用日期
+        index_changes: dict，key为time(int)，value为当日涨跌幅
+                       涨跌幅 = (当日收盘 - 前一日收盘) / 前一日收盘
     """
     index_file = os.path.join(data_dir, DataConfig.INDEX_FILE)
 
     if not os.path.exists(index_file):
         print(f"警告：大盘数据文件不存在: {index_file}")
-        return None, None
+        return None
 
     try:
         df = pd.read_csv(index_file)
         df = df.sort_values('time', ascending=True).reset_index(drop=True)
 
-        index_data = {}
         times = df['time'].values
         closes = df['end'].values
 
-        for t, c in zip(times, closes):
-            index_data[int(t)] = float(c)
+        index_changes = {}
+        for i in range(1, len(times)):
+            today = int(times[i])
+            yesterday = int(times[i - 1])
+            today_close = closes[i]
+            yesterday_close = closes[i - 1]
 
-        print(f"大盘数据已加载：{len(index_data)} 条记录")
+            if yesterday_close > 0:
+                change = (today_close - yesterday_close) / yesterday_close
+            else:
+                change = 0.0
 
-        return index_data, times
+            index_changes[today] = float(change)
+
+        print(f"大盘涨跌幅数据已加载：{len(index_changes)} 条记录")
+
+        return index_changes
     except Exception as e:
         print(f"加载大盘数据失败：{e}")
-        return None, None
+        return None
 
 
 def process_single_file(args):
@@ -1054,23 +1064,8 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
 
     if index_data is not None and times is not None:
         for i in range(context_length):
-            if i == 0:
-                day_time = int(times[start_idx])
-                prev_day_time = int(times[start_idx - 1])
-            else:
-                day_time = int(times[start_idx + i])
-                prev_day_time = int(times[start_idx + i - 1])
-
-            if prev_day_time in index_data and day_time in index_data:
-                prev_index_close = index_data[prev_day_time]
-                current_index_close = index_data[day_time]
-                if prev_index_close > 0:
-                    index_change = (current_index_close - prev_index_close) / prev_index_close
-                else:
-                    index_change = 0.0
-            else:
-                index_change = 0.0
-
+            day_time = int(times[start_idx + i])
+            index_change = index_data.get(day_time, 0.0)
             input_seq[i, 6] = index_change
     else:
         input_seq[:, 6] = 0.0
@@ -1149,7 +1144,7 @@ def fit_feature_normalizer(output_path='./normalizer.pkl', output_distribution='
     print(f"测试集股票数: {len(test_stock_info)}")
 
     print("\n[步骤1.5] 加载大盘数据...")
-    index_data, index_times = load_index_data(DataConfig.DATA_DIR)
+    index_data = load_index_data(DataConfig.DATA_DIR)
     if index_data is None:
         print("警告：大盘数据不存在，归一化器将无法学习大盘特征")
 

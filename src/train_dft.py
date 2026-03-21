@@ -565,7 +565,7 @@ if __name__ == "__main__":
 
     data_dir = os.path.join(os.path.dirname(__file__), '..', DataConfig.DATA_DIR)
     data_dir = os.path.normpath(data_dir)
-    index_data, index_times = load_index_data(data_dir)
+    index_data = load_index_data(data_dir)
     if index_data is None:
         print("警告：大盘数据加载失败，训练将使用零值作为大盘特征")
 

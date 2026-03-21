@@ -896,7 +896,7 @@ def main():
     train_stock_info, test_stock_info = load_and_preprocess_data()
     
     from data import load_index_data
-    index_data, index_times = load_index_data(DataConfig.DATA_DIR)
+    index_data = load_index_data(DataConfig.DATA_DIR)
     if index_data is None:
         print("警告：大盘数据不存在，评估将使用全0的大盘维度")
 

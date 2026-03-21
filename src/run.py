@@ -166,7 +166,7 @@ def load_all_stock_data(data_dir=DataConfig.DATA_DIR):
     """
     import pandas as pd
     
-    all_files = sorted([f for f in os.listdir(data_dir) if f.endswith('.csv')])
+    all_files = sorted([f for f in os.listdir(data_dir) if f.endswith('.csv') and f != DataConfig.INDEX_FILE])
     stock_list = []
     
     for fname in all_files:

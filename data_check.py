@@ -104,8 +104,8 @@ class DataChecker:
             print(f"✗ 备份失败：{e}")
     
     def get_all_csv_files(self) -> List[Path]:
-        """获取所有 CSV 文件"""
-        return sorted(self.data_dir.glob("*.csv"))
+        """获取所有 CSV 文件（排除大盘指数文件）"""
+        return sorted([f for f in self.data_dir.glob("*.csv") if f.name != self.index_file])
     
     def get_last_date_in_file(self, file_path: Path) -> Optional[str]:
         """获取文件中最新日期"""

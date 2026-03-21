@@ -370,7 +370,7 @@ def load_and_preprocess_data(data_dir=DataConfig.DATA_DIR, test_days=DataConfig.
     - 最低数据要求：test_days + REQUIRED_LENGTH
     """
     
-    all_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
+    all_files = [f for f in os.listdir(data_dir) if f.endswith('.csv') and f != DataConfig.INDEX_FILE]
     all_files.sort()
     
     print(f"总共 {len(all_files)} 只股票文件")

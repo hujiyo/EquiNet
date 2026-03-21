@@ -194,7 +194,7 @@ class EmbeddingModuleAnalyzer:
         if store_matrices:
             results['jacobian_matrices'] = []
         
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
         epsilon = 1e-5
         
         for i in range(min(n_samples, len(sample_inputs))):
@@ -204,9 +204,9 @@ class EmbeddingModuleAnalyzer:
                 x_tensor = torch.tensor(x, dtype=torch.float32, device=self.device)
                 base_output = self.embedding_module(x_tensor)
             
-            jacobian = np.zeros((6, 48))
+            jacobian = np.zeros((7, 48))
             
-            for j in range(6):
+            for j in range(7):
                 x_plus = x.copy()
                 x_plus[0, :, j] += epsilon
                 x_minus = x.copy()
@@ -268,7 +268,7 @@ class EmbeddingModuleAnalyzer:
         
         sample_inputs = np.array(sample_inputs[:n_samples])
         
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
         results = {name: [] for name in feature_names}
         results['overall'] = []
         
@@ -323,7 +323,7 @@ class EmbeddingModuleAnalyzer:
         if sample_inputs is None:
             raise ValueError("必须提供真实数据样本(sample_inputs)进行评估!")
 
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
         results = {name: {'output_range': [], 'output_std': []} for name in feature_names}
 
         base_input = np.array(sample_inputs[:1])
@@ -472,7 +472,7 @@ class EmbeddingModuleAnalyzer:
         
         sample_inputs = np.array(sample_inputs[:n_samples])
         
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
         
         second_order_sensitivity = {name: [] for name in feature_names}
         
@@ -530,7 +530,7 @@ class EmbeddingModuleAnalyzer:
         
         sample_inputs = np.array(sample_inputs[:n_samples])
 
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
 
         zero_values = {
             'Open': 0.0,
@@ -538,7 +538,8 @@ class EmbeddingModuleAnalyzer:
             'Low': 0.0,
             'Close': 0.0,
             'Volume': 0.5,
-            'Exchange': 0.01
+            'Exchange': 0.01,
+            'Index': 0.0
         }
 
         with torch.no_grad():
@@ -591,8 +592,8 @@ class EmbeddingModuleAnalyzer:
 
         os.makedirs(save_dir, exist_ok=True)
 
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
-
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
+        
         n_samples = min(100, len(sample_inputs))
         sample_inputs = np.array(sample_inputs[:n_samples])
         
@@ -630,9 +631,9 @@ class EmbeddingModuleAnalyzer:
         
         ax = axes[0, 1]
         with torch.no_grad():
-            base_input = np.zeros((1, 30, 6), dtype=np.float32)
+            base_input = np.zeros((1, 30, 7), dtype=np.float32)
             
-            feature_indices = {'Open': 0, 'High': 1, 'Low': 2, 'Close': 3, 'Volume': 4, 'Exchange': 5}
+            feature_indices = {'Open': 0, 'High': 1, 'Low': 2, 'Close': 3, 'Volume': 4, 'Exchange': 5, 'Index': 6}
             
             for name in ['Open', 'Close', 'Volume']:
                 outputs = []
@@ -710,7 +711,8 @@ class EmbeddingModuleAnalyzer:
                 'Low': 0.0,
                 'Close': 0.0,
                 'Volume': 0.5,
-                'Exchange': 0.01
+                'Exchange': 0.01,
+                'Index': 0.0
             }
             with torch.no_grad():
                 sample_inputs_tensor = torch.tensor(sample_inputs, dtype=torch.float32, device=self.device)
@@ -772,7 +774,7 @@ class EmbeddingModuleAnalyzer:
         
         if 'local_sensitivity' in results:
             ls = results['local_sensitivity']
-            sensitivities = [(name, ls[name]['mean']) for name in ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']]
+            sensitivities = [(name, ls[name]['mean']) for name in ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']]
             sensitivities.sort(key=lambda x: x[1], reverse=True)
             
             max_sens = sensitivities[0]
@@ -892,6 +894,11 @@ def main():
     print("\n"+"="*60)
     print("[步骤1] 加载数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
+    
+    from data import load_index_data
+    index_data, index_times = load_index_data(DataConfig.DATA_DIR)
+    if index_data is None:
+        print("警告：大盘数据不存在，评估将使用全0的大盘维度")
 
     print("\n[步骤2] 准备测试样本...")
     from data import coarse_normalize_context_window
@@ -899,9 +906,11 @@ def main():
     for stock in test_stock_info[:50]:
         data = stock['data']
         test_split = stock['test_split_point']
+        times = stock['times']
         for i in range(test_split, min(test_split + 10, len(data) - 33)):
             input_seq = coarse_normalize_context_window(
-                data, i, 30, check_limit_up=False, required_length=33
+                data, i, 30, check_limit_up=False, required_length=33,
+                index_data=index_data, times=times
             )
             if input_seq is not None:
                 all_inputs.append(input_seq)

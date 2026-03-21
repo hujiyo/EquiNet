@@ -61,9 +61,11 @@ class StockDataUpdater:
             self.login_success = False
     
     def get_existing_stocks(self) -> set:
-        """获取已存在的股票代码集合"""
+        """获取已存在的股票代码集合（排除大盘指数文件）"""
         existing_stocks = set()
         for file in self.data_dir.glob("*.csv"):
+            if file.name == self.index_file:
+                continue
             stock_code = file.stem
             existing_stocks.add(stock_code)
         return existing_stocks

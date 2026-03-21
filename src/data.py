@@ -59,13 +59,12 @@ class FeatureNormalizer:
             ('scaler', StandardScaler())
         ])
 
-    def _collect_training_features(self, train_stock_info: List[Dict], index_data: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _collect_training_features(self, train_stock_info: List[Dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         from data import coarse_normalize_context_window, DataConfig
 
         ohl_data = []
         volume_data = []
         exchange_data = []
-        index_data_list = []
 
         context_length = DataConfig.CONTEXT_LENGTH
 
@@ -73,15 +72,12 @@ class FeatureNormalizer:
             data = stock['data']
             train_start_idx = stock.get('train_start_idx', 1)
             train_end_idx = stock.get('train_end_idx', len(data))
-            times = stock.get('times', None)
 
             for i in range(train_start_idx, train_end_idx - context_length):
                 input_seq = coarse_normalize_context_window(
                     data, i, context_length,
                     check_limit_up=False,
-                    required_length=context_length,
-                    index_data=index_data,
-                    times=times
+                    required_length=context_length
                 )
 
                 if input_seq is None:
@@ -90,27 +86,24 @@ class FeatureNormalizer:
                 ohl_data.append(input_seq[:, :4].flatten())
                 volume_data.append(input_seq[:, 4].flatten())
                 exchange_data.append(input_seq[:, 5].flatten())
-                index_data_list.append(input_seq[:, 6].flatten())
 
         ohl_data = np.concatenate(ohl_data) if ohl_data else np.array([])
         volume_data = np.concatenate(volume_data) if volume_data else np.array([])
         exchange_data = np.concatenate(exchange_data) if exchange_data else np.array([])
-        index_data_list = np.concatenate(index_data_list) if index_data_list else np.array([])
 
         print(f"[FeatureNormalizer] 收集到的训练数据:")
         print(f"  OHLC: {len(ohl_data)} 个值")
         print(f"  Volume: {len(volume_data)} 个值")
         print(f"  Exchange: {len(exchange_data)} 个值")
-        print(f"  Index: {len(index_data_list)} 个值")
 
-        return ohl_data, volume_data, exchange_data, index_data_list
+        return ohl_data, volume_data, exchange_data
 
-    def fit(self, train_stock_info: List[Dict], index_data: np.ndarray = None):
+    def fit(self, train_stock_info: List[Dict], index_data: Dict = None):
         print("\n[FeatureNormalizer] 开始拟合归一化器...")
         print(f"  输出分布: {self.output_distribution}")
         print(f"  分位数数量: {self.n_quantiles}")
 
-        ohl_data, volume_data, exchange_data, index_data_list = self._collect_training_features(train_stock_info, index_data)
+        ohl_data, volume_data, exchange_data = self._collect_training_features(train_stock_info)
 
         print("\n[FeatureNormalizer] 拟合 OHLC 特征...")
         self.ohl_pipeline.fit(ohl_data.reshape(-1, 1))
@@ -122,11 +115,14 @@ class FeatureNormalizer:
         self.exchange_pipeline.fit(exchange_data.reshape(-1, 1))
 
         print("[FeatureNormalizer] 拟合 Index 特征...")
-        self.index_pipeline.fit(index_data_list.reshape(-1, 1))
+        if index_data is None or len(index_data) == 0:
+            raise RuntimeError("大盘数据为空！无法拟合 Index 特征归一化器。请确保大盘数据已正确加载。")
+        index_values = np.array(list(index_data.values()))
+        self.index_pipeline.fit(index_values.reshape(-1, 1))
 
         self.is_fitted = True
 
-        self._print_transform_stats(ohl_data, volume_data, exchange_data, index_data_list)
+        self._print_transform_stats(ohl_data, volume_data, exchange_data, index_data)
 
         print("\n[FeatureNormalizer] ✓ 拟合完成！")
 
@@ -152,7 +148,8 @@ class FeatureNormalizer:
         print(f"    范围: [{exchange_transformed.min():.6f}, {exchange_transformed.max():.6f}]")
 
         if index_data is not None and len(index_data) > 0:
-            index_transformed = self.index_pipeline.transform(index_data.reshape(-1, 1)).flatten()
+            index_values = np.array(list(index_data.values()))
+            index_transformed = self.index_pipeline.transform(index_values.reshape(-1, 1)).flatten()
             print(f"  Index:")
             print(f"    均值: {index_transformed.mean():.6f}")
             print(f"    标准差: {index_transformed.std():.6f}")

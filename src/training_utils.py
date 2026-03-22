@@ -714,7 +714,6 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
 
     checkpoint = {
         'model_arch': {
-            'model_type':       ModelConfig.MODEL_TYPE,
             'input_dim':        ModelConfig.INPUT_DIM,
             'd_model':          ModelConfig.D_MODEL,
             'ffn_expand_ratio': ModelConfig.FFN_EXPAND_RATIO,

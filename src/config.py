@@ -40,26 +40,37 @@ class DataConfig:
 # ==================== 模型架构参数 ====================
 class ModelConfig:
     """模型架构相关参数"""
+    # 基础模型参数
+    INPUT_DIM = 7                    # 输入特征维度数（OHLC + volume + exchange）
+    D_MODEL = 48                     # 模型维度（Transformer 内部维度）
+    FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
+    NHEAD = 4                        # 注意力头数
+    NUM_LAYERS = 6                   # Transformer 层数
+    OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1 之间）
 
-    MODEL_TYPE = 'continuous'
+    # 注意力机制参数
+    DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合
+    ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
 
-    INPUT_DIM = 7
-    D_MODEL = 48
-    FFN_EXPAND_RATIO = 4
-    NHEAD = 4
-    NUM_LAYERS = 6
-    OUTPUT_DIM = 1
+    # ========== Embedding Linear层参数初始化配置 ==========
+    # - gain=1.0: 标准Xavier/Kaiming (std≈0.29), 稳定
+    # - gain=0.5: 主流认为适合小模型和低SNR任务
+    # - gain=1.5: 放大数值差异，主流认为可能放大噪声和信号导致训练不稳定
+    # W ~ U[-gain*√(6/(fan_in+fan_out)), +gain*√(6/(fan_in+fan_out))]
+    EMBEDDING_INIT_GAIN = 1.5         # Embedding层初始化增益（推荐0.5，符合当代最佳实践）
 
-    DROPOUT_RATE = 0
-    ATTENTION_DROPOUT = 0
+    # FFN层初始化配置
+    # - GELU在x~N(0,1)附近的有效增益约为0.588，需要补偿：gain ≈ 1/0.588 ≈ 1.7
+    # - 48→192: gain=1.7 → 范围±0.27, std≈0.155
+    # - 192→48: gain=1.0 → 范围±0.158, std≈0.091 (第二层无激活函数)
+    FFN_INIT_GAIN = 1.7              # FFN第一层初始化增益（补偿GELU压缩）
 
-    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM
-
-    EMBEDDING_INIT_GAIN = 1.5
-
-    FFN_INIT_GAIN = 1.7
-
-    OUTPUT_LAYER_GAIN = 3.0
+    # 输出层参数（当代最佳实践：避免sigmoid饱和）
+    # - 输出层使用sigmoid，如果logits范围太大会导致饱和、梯度消失
+    # - 目标值在[0,1]范围，初始输出应接近先验概率
+    # - gain=0.1: 很小范围 (±0.06), 让初始预测logits接近0
+    # - prior=0.25: data.py中定义的正样本比例（25%）
+    OUTPUT_LAYER_GAIN = 3.0          # 输出层权重初始化增益
 
 # ==================== 训练参数 ====================
 class TrainingConfig:

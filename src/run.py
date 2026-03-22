@@ -742,7 +742,7 @@ def main():
         tp   = metadata.get('train_params') or {}
         es   = metadata.get('eval_stats') or {}
         print(f"  ┌── 模型内嵌元数据 ──────────────────────────────")
-        print(f"  │  架构: {arch.get('model_type','?')}  "
+        print(f"  │  架构: "
               f"d_model={arch.get('d_model','?')}  "
               f"layers={arch.get('num_layers','?')}  "
               f"heads={arch.get('nhead','?')}  "

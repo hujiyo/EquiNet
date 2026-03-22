@@ -57,12 +57,6 @@ class DataConfig:
 # ==================== 模型架构参数 ====================
 class ModelConfig:
     """模型架构相关参数"""
-
-    # ========== 模型类型选择 ==========
-    # 'continuous': 连续值模型 (6维连续输入)
-    # 'tokenized': Token化模型 (将输入离散化为token ID)
-    MODEL_TYPE = 'continuous'  # 可选: 'continuous' 或 'tokenized'
-
     # 基础模型参数
     INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
     D_MODEL = 48                     # 模型维度（Transformer 内部维度）
@@ -74,9 +68,6 @@ class ModelConfig:
     # 注意力机制参数
     DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合
     ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
-
-    # Token化参数（仅当 MODEL_TYPE='tokenized' 时使用）
-    TOKEN_SEQ_LEN = DataConfig.CONTEXT_LENGTH * INPUT_DIM  # Token序列长度 = 60 * 6 = 360
 
     # ========== Embedding Linear层参数初始化配置 ==========
     # - gain=1.0: 标准Xavier/Kaiming (std≈0.29), 稳定

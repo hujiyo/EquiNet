@@ -401,6 +401,36 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
         print(f"│  │  Day1止损: {se['stop_loss_day1_count']}次, 累计止损: {se['stop_loss_cum_count']}次, 止盈: {se['take_profit_count']}次")
         print(f"│  │")
     
+    if stats.get('portfolio_stats') is not None:
+        ps = stats['portfolio_stats']
+        if ps['total_days'] > 0:
+            print(f"│  │  【实战资金模拟（串行逐日买卖）】")
+            print(f"│  │  总交易日: {ps['total_days']}天")
+            print(f"│  │  总交易笔数: {ps['trade_count']}笔（买入{ps['buy_count']}, 卖出{ps['sell_count']}）")
+            print(f"│  │  最终资金: {ps['final_value']:.4f}")
+            print(f"│  │  总收益率: {ps['total_return_pct']:+.2f}%")
+            print(f"│  │  最大回撤: {ps['max_drawdown']*100:.2f}%")
+            
+            dt = ps['daily_trades']
+            sample_step = max(1, len(dt) // 10)
+            print(f"│  │  ┌── 逐日交易明细（每{sample_step}天抽样 + 首尾） ──┐")
+            
+            indices_to_show = [0]
+            for i in range(sample_step, len(dt) - 1, sample_step):
+                indices_to_show.append(i)
+            if len(dt) > 1:
+                indices_to_show.append(len(dt) - 1)
+            indices_to_show = sorted(set(indices_to_show))
+            
+            for i in indices_to_show:
+                d = dt[i]
+                cash_pct = d['cash_ratio'] * 100
+                pv = d['portfolio_value']
+                print(f"│  │  │  Day{d['day']:>3}: 买{d['buys']} 卖{d['open_sells']+d['close_sells']} "
+                      f"资金={pv:.4f} (现金{cash_pct:.0f}%)")
+            print(f"│  │  └───────────────────────────────────────┘")
+            print(f"│  │")
+    
     print(f"│  └───────────────────────────────────────────────┘")
     print_section_end()
     

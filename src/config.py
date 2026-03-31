@@ -22,7 +22,12 @@ class DataConfig:
     # 样本生成参数
     CONTEXT_LENGTH = 30              # 历史数据长度（这是核心参数，其他地方应引用这个值）,TEST_DAYS - CONTEXT_LENGTH = 80
     FUTURE_DAYS = 3                  # 未来预测天数
-    REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS  # 每样本总需求长度
+    BUFFER_DAY = True                # 额外采集1天安全余量（用于跌停推迟判断）
+    REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS + (1 if BUFFER_DAY else 0)
+
+    # 涨跌停配置
+    LIMIT_THRESHOLD = 0.095          # 涨跌停判断阈值（9.5%，覆盖普通板±10%）
+    LIMIT_CHECK_MODE = 'ohlc'        # 'simple': 仅看涨跌幅 | 'ohlc': 通过OHLC判断是否开板
 
     # 采样策略配置
     # 'temporal': 时间顺序采样（指针在训练集上循环滑动）

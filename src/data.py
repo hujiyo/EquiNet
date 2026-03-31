@@ -686,28 +686,28 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_no
         start_idx: 样本起始索引
         feature_normalizer: 可选的特征归一化器实例
 
-    返回: (input_seq, target, cumulative_return, daily_returns) 或 None（如果样本无效）
+    返回: dict 或 None（如果样本无效），字典包含：
+        input_seq: 输入序列
+        target: 标签（0或1）
+        cumulative_return: 累计收益率（考虑止损）
+        daily_returns: 每日收益率列表
+        daily_price_changes: 每日涨跌幅列表 [day1, day2, day3]
+        daily_opens: 每日开盘价列表 [t1_open, t2_open, ...]
+        daily_highs: 每日最高价列表 [t1_high, t2_high, ...]
+        daily_lows: 每日最低价列表 [t1_low, t2_low, ...]
     
     核心概念区分：
         【涨跌幅】用于标签生成，判断股票走势强弱
             - 基准是前一日收盘价
-            - Day1涨跌幅 = (T+1收盘 - T日收盘) / T日收盘
-            - Day2涨跌幅 = (T+2收盘 - T+1收盘) / T+1收盘
-            - Day3涨跌幅 = (T+3收盘 - T+2收盘) / T+2收盘
-
-        【收益率】用于计算投资回报，评估模型表现，支持智能止损：
+        【收益率】用于计算投资回报，评估模型表现，支持智能止损
             - 基准是买入价（T+1开盘价）
-            - Day1 ≤ -3% → 第二天开盘止损
-            - Day1+Day2 < -2% 或 Day1,Day2都<1% → 第二天收盘止损
-            - 否则持有满3天，第三天收盘卖出
-            - cumulative_return 为实际累计收益率（调用方应优先使用此值）       
     """
     stock_info = stock_info_list[stock_idx]
     stock_data = stock_info['data']
     context_length = DataConfig.CONTEXT_LENGTH
+    future_days = DataConfig.FUTURE_DAYS
     required_length = DataConfig.REQUIRED_LENGTH
 
-    # 使用统一归一化函数，消除重复代码
     input_seq = normalize_and_validate_context_window(
         stock_data, start_idx, context_length,
         check_limit_up=True, required_length=required_length,
@@ -717,51 +717,80 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_no
     if input_seq is None:
         return None
 
-    # 提取未来数据并验证零值
-    t1_open = stock_data[start_idx + context_length, 0]
-    t1_close = stock_data[start_idx + context_length, 3]
-    t2_open = stock_data[start_idx + context_length + 1, 0]
-    t2_close = stock_data[start_idx + context_length + 1, 3]
-    t3_close = stock_data[start_idx + context_length + 2, 3]
-
-    if t1_open == 0 or t1_close == 0 or t2_open == 0 or t2_close == 0 or t3_close == 0:
-        return None
-
-    # 获取上下文最后一天收盘价（用于计算涨跌幅）
     input_seq_raw = stock_data[start_idx:start_idx + context_length]
     closes = input_seq_raw[:, 3]
+    prev_close = closes[-1]
 
-    # ========== 涨跌幅计算（用于标签生成和止损判断）==========
-    # 基准是前一日收盘价，用于判断股票走势强弱
+    daily_opens = []
+    daily_highs = []
+    daily_lows = []
+    daily_closes = []
     daily_price_changes = []
-    day1_price_change = (t1_close - closes[-1]) / closes[-1]  # (T+1收盘 - T日收盘) / T日收盘
-    daily_price_changes.append(day1_price_change)
-    day2_price_change = (t2_close - t1_close) / t1_close      # (T+2收盘 - T+1收盘) / T+1收盘
-    daily_price_changes.append(day2_price_change)
-    day3_price_change = (t3_close - t2_close) / t2_close      # (T+3收盘 - T+2收盘) / T+2收盘
-    daily_price_changes.append(day3_price_change)
 
-    # ========== 收益率计算（用于评估模型表现，含智能止损）==========
-    # 使用 config 中的统一函数，传入涨跌幅用于止损判断
+    for d in range(future_days):
+        idx = start_idx + context_length + d
+        day_open = stock_data[idx, 0]
+        day_high = stock_data[idx, 1]
+        day_low = stock_data[idx, 2]
+        day_close = stock_data[idx, 3]
+
+        if day_open == 0 or day_close == 0:
+            return None
+
+        daily_opens.append(day_open)
+        daily_highs.append(day_high)
+        daily_lows.append(day_low)
+        daily_closes.append(day_close)
+
+        base_close = prev_close if d == 0 else daily_closes[d - 1]
+        daily_price_changes.append((day_close - base_close) / base_close)
+
     cumulative_return, daily_returns = calculate_returns(
-        t1_open=t1_open,
-        t1_close=t1_close,
-        t2_open=t2_open,
-        t2_close=t2_close,
-        t3_close=t3_close,
+        t1_open=daily_opens[0],
+        t1_close=daily_closes[0],
+        t2_open=daily_opens[1] if future_days >= 2 else None,
+        t2_close=daily_closes[1] if future_days >= 2 else None,
+        t3_close=daily_closes[2] if future_days >= 3 else None,
         day1_change=daily_price_changes[0],
-        day2_change=daily_price_changes[1],
-        day3_change=daily_price_changes[2]
+        day2_change=daily_price_changes[1] if future_days >= 2 else None,
+        day3_change=daily_price_changes[2] if future_days >= 3 else None
     )
 
-    # 标签生成使用涨跌幅，直接调用 config.generate_label()
     target = float(generate_label(
         day1_change=daily_price_changes[0],
-        day2_change=daily_price_changes[1],
-        day3_change=daily_price_changes[2]
+        day2_change=daily_price_changes[1] if future_days >= 2 else 0.0,
+        day3_change=daily_price_changes[2] if future_days >= 3 else 0.0
     ))
 
-    return input_seq, target, cumulative_return, daily_returns
+    buffer_day_open = None
+    buffer_day_high = None
+    buffer_day_low = None
+    buffer_day_change = None
+    if DataConfig.BUFFER_DAY:
+        buf_idx = start_idx + context_length + future_days
+        if buf_idx < len(stock_data):
+            buffer_day_open = stock_data[buf_idx, 0]
+            buffer_day_high = stock_data[buf_idx, 1]
+            buffer_day_low = stock_data[buf_idx, 2]
+            buf_close = stock_data[buf_idx, 3]
+            if buffer_day_open == 0 or buf_close == 0:
+                return None
+            buffer_day_change = (buf_close - daily_closes[-1]) / daily_closes[-1]
+
+    return {
+        'input_seq': input_seq,
+        'target': target,
+        'cumulative_return': cumulative_return,
+        'daily_returns': daily_returns,
+        'daily_price_changes': daily_price_changes,
+        'daily_opens': daily_opens,
+        'daily_highs': daily_highs,
+        'daily_lows': daily_lows,
+        'buffer_day_open': buffer_day_open,
+        'buffer_day_high': buffer_day_high,
+        'buffer_day_low': buffer_day_low,
+        'buffer_day_change': buffer_day_change,
+    }
 
 
 def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx, feature_normalizer=None):
@@ -770,22 +799,28 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx, fe
 
     与generate_sample_from_index的区别：
     - 由run.py使用，与模型训练阶段脚本无关
-    - 允许未来数据不足3天
+    - 允许未来数据不足 FUTURE_DAYS 天
     - 返回可用天数信息
     - 不生成标签（仅用于推理展示）
 
-    返回: (input_seq, cumulative_return, daily_returns, available_days) 或 None
-        available_days: 可用的未来天数 (1, 2, 或 3)
+    返回: dict 或 None，字典包含：
+        input_seq: 输入序列
+        cumulative_return: 累计收益率（考虑止损）
+        daily_returns: 每日收益率列表
+        available_days: 可用的未来天数 (1 ~ FUTURE_DAYS)
+        daily_price_changes: 每日涨跌幅列表（不足的为None）
+        daily_opens: 每日开盘价列表（不足的为None）
+        daily_highs: 每日最高价列表（不足的为None）
+        daily_lows: 每日最低价列表（不足的为None）
     """
     stock_info = stock_info_list[stock_idx]
     stock_data = stock_info['data']
     context_length = DataConfig.CONTEXT_LENGTH
+    future_days = DataConfig.FUTURE_DAYS
     data_length = len(stock_data)
 
-    # 计算实际可用的样本窗口长度（用于涨停过滤）
     required_length = min(DataConfig.REQUIRED_LENGTH, data_length - start_idx)
     
-    # 使用统一归一化函数，消除重复代码
     input_seq = normalize_and_validate_context_window(
         stock_data, start_idx, context_length,
         check_limit_up=True, required_length=required_length,
@@ -795,68 +830,82 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx, fe
     if input_seq is None:
         return None
 
-    # 计算可用的未来天数
-    t1_idx = start_idx + context_length
-    t2_idx = start_idx + context_length + 1
-    t3_idx = start_idx + context_length + 2
-    
     available_days = 0
-    if t1_idx < data_length:
-        available_days = 1
-    if t2_idx < data_length:
-        available_days = 2
-    if t3_idx < data_length:
-        available_days = 3
+    for d in range(future_days):
+        idx = start_idx + context_length + d
+        if idx < data_length:
+            available_days = d + 1
+        else:
+            break
     
     if available_days == 0:
         return None
     
-    t1_open = stock_data[t1_idx, 0]
-    t1_close = stock_data[t1_idx, 3]
-
-    if t1_open == 0 or t1_close == 0:
-        return None
-
-    # ========== 涨跌幅计算（用于止损判断）==========
-    # 获取 T 日收盘价用于计算 Day1 涨跌幅
     t_day_close = stock_data[start_idx + context_length - 1, 3]
 
-    day1_change = None
-    day2_change = None
-    day3_change = None
+    daily_opens = [None] * future_days
+    daily_highs = [None] * future_days
+    daily_lows = [None] * future_days
+    daily_closes = [None] * future_days
+    daily_price_changes = [None] * future_days
 
-    day1_change = (t1_close - t_day_close) / t_day_close
+    for d in range(available_days):
+        idx = start_idx + context_length + d
+        day_open = stock_data[idx, 0]
+        day_high = stock_data[idx, 1]
+        day_low = stock_data[idx, 2]
+        day_close = stock_data[idx, 3]
 
-    # ========== 收益率计算（用于评估模型表现，含智能止损）==========
-    t2_open = None
-    t2_close = None
-    t3_close = None
-
-    if available_days >= 2:
-        t2_open = stock_data[t2_idx, 0]
-        t2_close = stock_data[t2_idx, 3]
-        if t2_open == 0 or t2_close == 0:
+        if day_open == 0 or day_close == 0:
             return None
-        day2_change = (t2_close - t1_close) / t1_close
 
-    if available_days >= 3:
-        t3_close = stock_data[t3_idx, 3]
-        if t3_close == 0:
-            return None
-        day3_change = (t3_close - t2_close) / t2_close
+        daily_opens[d] = day_open
+        daily_highs[d] = day_high
+        daily_lows[d] = day_low
+        daily_closes[d] = day_close
+
+        base_close = t_day_close if d == 0 else daily_closes[d - 1]
+        daily_price_changes[d] = (day_close - base_close) / base_close
 
     cumulative_return, daily_returns = calculate_returns(
-        t1_open=t1_open,
-        t1_close=t1_close,
-        t2_open=t2_open,
-        t2_close=t2_close,
-        t3_close=t3_close,
-        day1_change=day1_change,
-        day2_change=day2_change,
-        day3_change=day3_change
+        t1_open=daily_opens[0],
+        t1_close=daily_closes[0],
+        t2_open=daily_opens[1] if available_days >= 2 else None,
+        t2_close=daily_closes[1] if available_days >= 2 else None,
+        t3_close=daily_closes[2] if available_days >= 3 else None,
+        day1_change=daily_price_changes[0],
+        day2_change=daily_price_changes[1] if available_days >= 2 else None,
+        day3_change=daily_price_changes[2] if available_days >= 3 else None
     )
 
-    return input_seq, cumulative_return, daily_returns, available_days
+    buffer_day_open = None
+    buffer_day_high = None
+    buffer_day_low = None
+    buffer_day_change = None
+    if DataConfig.BUFFER_DAY and available_days == future_days:
+        buf_idx = start_idx + context_length + future_days
+        if buf_idx < data_length:
+            buffer_day_open = stock_data[buf_idx, 0]
+            buffer_day_high = stock_data[buf_idx, 1]
+            buffer_day_low = stock_data[buf_idx, 2]
+            buf_close = stock_data[buf_idx, 3]
+            if buffer_day_open != 0 and buf_close != 0 and daily_closes[future_days - 1] is not None:
+                buffer_day_change = (buf_close - daily_closes[future_days - 1]) / daily_closes[future_days - 1]
+
+    return {
+        'input_seq': input_seq,
+        'cumulative_return': cumulative_return,
+        'daily_returns': daily_returns,
+        'available_days': available_days,
+        'daily_price_changes': daily_price_changes,
+        'daily_opens': daily_opens,
+        'daily_highs': daily_highs,
+        'daily_lows': daily_lows,
+        'buffer_day_open': buffer_day_open,
+        'buffer_day_high': buffer_day_high,
+        'buffer_day_low': buffer_day_low,
+        'buffer_day_change': buffer_day_change,
+    }
 
 
 def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng, feature_normalizer=None):
@@ -921,7 +970,9 @@ def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, r
             if sample is None:
                 continue
 
-            input_seq, target, cumulative_return, _ = sample
+            input_seq = sample['input_seq']
+            target = sample['target']
+            cumulative_return = sample['cumulative_return']
 
             if target >= 0.5:
                 pos_pool_inputs.append(input_seq)
@@ -987,29 +1038,40 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
     """
     创建固定评估数据集（涨停样本已在generate_sample_from_index中过滤）
     
-    只包含完整样本（available_days == 3），用于模型评估
+    只包含完整样本（available_days == FUTURE_DAYS），用于模型评估
     
     Args:
         test_stock_info: 测试集股票信息列表
         feature_normalizer: 可选的特征归一化器实例
     
-    返回:
-        eval_inputs: 输入序列
-        eval_targets: 标签
-        eval_cumulative_returns: 累计收益率 = (T+3收盘 - T+1开盘) / T+1开盘
-        eval_day_indices: 每个样本对应的预测日在测试集中的相对偏移量（用于实战收益率按天分组）
-        eval_daily_returns: 每日收益率列表 [[r1, r2, r3], ...]
-            - 基准是买入价（T+1开盘价），用于计算投资回报
-            - r1 = (T+1收盘 - T+1开盘) / T+1开盘（Day1日内收益）
-            - r2 = (T+2收盘 - T+1收盘) / T+1开盘（Day2收益贡献）
-            - r3 = (T+3收盘 - T+2收盘) / T+1开盘（Day3收益贡献）
-            - r1 + r2 + r3 = 累计收益率
+    返回: dict，包含：
+        inputs: 输入序列
+        targets: 标签
+        cumulative_returns: 累计收益率
+        day_indices: 预测日在测试集中的相对偏移量
+        daily_returns: 每日收益率列表
+        daily_price_changes: 每日涨跌幅列表
+        daily_opens: 每日开盘价列表
+        daily_highs: 每日最高价列表
+        daily_lows: 每日最低价列表
+        buffer_day_opens: buffer day 开盘价列表
+        buffer_day_highs: buffer day 最高价列表
+        buffer_day_lows: buffer day 最低价列表
+        buffer_day_changes: buffer day 涨跌幅列表
     """
     eval_inputs = []
     eval_targets = []
     eval_cumulative_returns = []
     eval_day_indices = []
     eval_daily_returns = []
+    eval_daily_price_changes = []
+    eval_daily_opens = []
+    eval_daily_highs = []
+    eval_daily_lows = []
+    eval_buffer_day_opens = []
+    eval_buffer_day_highs = []
+    eval_buffer_day_lows = []
+    eval_buffer_day_changes = []
 
     for stock_info in test_stock_info:
         stock_data = stock_info['data']
@@ -1027,11 +1089,18 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
             if sample is None:
                 continue
 
-            input_seq, target, cumulative_return, daily_returns = sample
-            eval_inputs.append(input_seq)
-            eval_targets.append(target)
-            eval_cumulative_returns.append(float(cumulative_return))
-            eval_daily_returns.append(daily_returns)
+            eval_inputs.append(sample['input_seq'])
+            eval_targets.append(sample['target'])
+            eval_cumulative_returns.append(float(sample['cumulative_return']))
+            eval_daily_returns.append(sample['daily_returns'])
+            eval_daily_price_changes.append(sample['daily_price_changes'])
+            eval_daily_opens.append(sample['daily_opens'])
+            eval_daily_highs.append(sample['daily_highs'])
+            eval_daily_lows.append(sample['daily_lows'])
+            eval_buffer_day_opens.append(sample.get('buffer_day_open'))
+            eval_buffer_day_highs.append(sample.get('buffer_day_high'))
+            eval_buffer_day_lows.append(sample.get('buffer_day_low'))
+            eval_buffer_day_changes.append(sample.get('buffer_day_change'))
             
             predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
             day_index = predict_day_idx - test_split_point
@@ -1040,9 +1109,21 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
     if len(eval_inputs) == 0:
         raise ValueError("固定评估集为空：test_stock_info中没有可用样本")
 
-    return (np.asarray(eval_inputs), np.asarray(eval_targets), 
-            np.asarray(eval_cumulative_returns), np.asarray(eval_day_indices),
-            eval_daily_returns)
+    return {
+        'inputs': np.asarray(eval_inputs),
+        'targets': np.asarray(eval_targets),
+        'cumulative_returns': np.asarray(eval_cumulative_returns),
+        'day_indices': np.asarray(eval_day_indices),
+        'daily_returns': eval_daily_returns,
+        'daily_price_changes': eval_daily_price_changes,
+        'daily_opens': eval_daily_opens,
+        'daily_highs': eval_daily_highs,
+        'daily_lows': eval_daily_lows,
+        'buffer_day_opens': eval_buffer_day_opens,
+        'buffer_day_highs': eval_buffer_day_highs,
+        'buffer_day_lows': eval_buffer_day_lows,
+        'buffer_day_changes': eval_buffer_day_changes,
+    }
 
 
 def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
@@ -1050,8 +1131,8 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
     创建最近几天的临时评估数据集（用于run.py中显示最近几天的实战收益率）
     
     包含完整样本和临时样本，用于展示最近几天的选股情况
-    - 完整样本（available_days == 3）：与 create_fixed_evaluation_dataset 一致
-    - 临时样本（available_days < 3）：仅用于展示，方便用户决策
+    - 完整样本（available_days == FUTURE_DAYS）：与 create_fixed_evaluation_dataset 一致
+    - 临时样本（available_days < FUTURE_DAYS）：仅用于展示，方便用户决策
 
     Args:
         test_stock_info: 测试集股票信息列表
@@ -1061,7 +1142,7 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
         recent_inputs: 输入序列
         recent_cumulative_returns: 累计收益率（可能不完整）
         recent_day_indices: 预测日索引
-        recent_available_days: 可用天数 (1, 2, 或 3)
+        recent_available_days: 可用天数 (1 ~ FUTURE_DAYS)
     """
     recent_inputs = []
     recent_cumulative_returns = []
@@ -1073,7 +1154,6 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
         data_length = len(stock_data)
         test_split_point = stock_info.get('test_split_point', max(0, data_length - DataConfig.TEST_DAYS))
         
-        # 和 create_fixed_evaluation_dataset 一样的起点，但扩展到包含最近的临时数据
         start_min = max(1, test_split_point)
         start_max = data_length - DataConfig.CONTEXT_LENGTH - 1
         
@@ -1085,14 +1165,11 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
             if sample is None:
                 continue
 
-            input_seq, cumulative_return, daily_returns, available_days = sample
+            recent_inputs.append(sample['input_seq'])
+            recent_cumulative_returns.append(float(sample['cumulative_return']))
+            recent_available_days.append(sample['available_days'])
             
             predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
-            
-            recent_inputs.append(input_seq)
-            recent_cumulative_returns.append(float(cumulative_return))
-            recent_available_days.append(available_days)
-            
             day_index = predict_day_idx - test_split_point
             recent_day_indices.append(day_index)
 
@@ -1183,7 +1260,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         if prev_day_close == 0:
             return None
         last_day_return = (last_day_close - prev_day_close) / prev_day_close
-        if last_day_return >= 0.095:
+        if last_day_return >= DataConfig.LIMIT_THRESHOLD:
             return None
 
     input_seq = np.empty((context_length, 6), dtype=np.float32)

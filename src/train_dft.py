@@ -157,14 +157,35 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         torch.cuda.manual_seed_all(seed)
 
     # 创建评估数据集
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info)
+    eval_data = create_fixed_evaluation_dataset(test_stock_info)
+    eval_inputs = eval_data['inputs']
+    eval_targets = eval_data['targets']
+    eval_cumulative_returns = eval_data['cumulative_returns']
+    eval_day_indices = eval_data['day_indices']
+    eval_daily_returns = eval_data['daily_returns']
+    eval_daily_price_changes = eval_data['daily_price_changes']
+    eval_daily_opens = eval_data['daily_opens']
+    eval_daily_highs = eval_data['daily_highs']
+    eval_daily_lows = eval_data['daily_lows']
+    eval_buffer_day_opens = eval_data['buffer_day_opens']
+    eval_buffer_day_highs = eval_data['buffer_day_highs']
+    eval_buffer_day_lows = eval_data['buffer_day_lows']
+    eval_buffer_day_changes = eval_data['buffer_day_changes']
 
     # 初始模型评估
     stats_init = evaluate_model(
         model, eval_inputs, eval_targets, eval_cumulative_returns,
         device, model_name="初始模型",
         eval_day_indices=eval_day_indices,
-        eval_daily_returns=eval_daily_returns
+        eval_daily_returns=eval_daily_returns,
+        eval_daily_price_changes=eval_daily_price_changes,
+        eval_daily_opens=eval_daily_opens,
+        eval_daily_highs=eval_daily_highs,
+        eval_daily_lows=eval_daily_lows,
+        eval_buffer_day_opens=eval_buffer_day_opens,
+        eval_buffer_day_highs=eval_buffer_day_highs,
+        eval_buffer_day_lows=eval_buffer_day_lows,
+        eval_buffer_day_changes=eval_buffer_day_changes
     )
     print(f"初始模型评估: AUC={stats_init['auc']:.4f}, Top{DataConfig.TOP_K}%收益={stats_init['top_return']*100:+.2f}%")
     if stats_init['realistic_stats'] is not None:
@@ -377,7 +398,15 @@ def train_dft_model(model, train_stock_info, test_stock_info,
             model, eval_inputs, eval_targets, eval_cumulative_returns,
             device, model_name="DFT",
             eval_day_indices=eval_day_indices,
-            eval_daily_returns=eval_daily_returns
+            eval_daily_returns=eval_daily_returns,
+            eval_daily_price_changes=eval_daily_price_changes,
+            eval_daily_opens=eval_daily_opens,
+            eval_daily_highs=eval_daily_highs,
+            eval_daily_lows=eval_daily_lows,
+            eval_buffer_day_opens=eval_buffer_day_opens,
+            eval_buffer_day_highs=eval_buffer_day_highs,
+            eval_buffer_day_lows=eval_buffer_day_lows,
+            eval_buffer_day_changes=eval_buffer_day_changes
         )
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0

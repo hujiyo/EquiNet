@@ -340,7 +340,9 @@ class TaskAlignedLoss(nn.Module):
 
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
-                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None):
+                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None,
+                   eval_daily_price_changes=None, eval_daily_opens=None, eval_daily_highs=None, eval_daily_lows=None,
+                   eval_buffer_day_opens=None, eval_buffer_day_highs=None, eval_buffer_day_lows=None, eval_buffer_day_changes=None):
     """
     模型评估函数
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
@@ -432,7 +434,9 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         
         if eval_daily_returns is not None:
             stats['portfolio_stats'] = calculate_portfolio_simulation(
-                all_preds, all_returns, eval_daily_returns, eval_day_indices, percent, actual_top_n)
+                all_preds, all_returns, eval_daily_returns, eval_day_indices, percent, actual_top_n,
+                eval_daily_price_changes, eval_daily_opens, eval_daily_highs, eval_daily_lows,
+                eval_buffer_day_opens, eval_buffer_day_highs, eval_buffer_day_lows, eval_buffer_day_changes)
         else:
             stats['portfolio_stats'] = None
     else:
@@ -524,8 +528,31 @@ def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_perc
     }
 
 
+def _is_sealed_limit_up(day_change, day_open, day_low, threshold, ohlc=True):
+    if day_change is None or day_change <= threshold:
+        return False
+    if not ohlc:
+        return True
+    if day_open is None or day_low is None:
+        return True
+    return day_low == day_open
+
+def _is_sealed_limit_down(day_change, day_open, day_high, threshold, ohlc=True):
+    if day_change is None or day_change >= -threshold:
+        return False
+    if not ohlc:
+        return True
+    if day_open is None or day_high is None:
+        return True
+    return day_high == day_open
+
+
 def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_returns,
-                                    all_day_indices, top_percent=1.0, top_n_per_day=None):
+                                    all_day_indices, top_percent=1.0, top_n_per_day=None,
+                                    eval_daily_price_changes=None, eval_daily_opens=None,
+                                    eval_daily_highs=None, eval_daily_lows=None,
+                                    eval_buffer_day_opens=None, eval_buffer_day_highs=None,
+                                    eval_buffer_day_lows=None, eval_buffer_day_changes=None):
     """
     实战资金管理模拟（串行逐日模拟买卖过程）
     
@@ -540,12 +567,26 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
     4. 第D+1天收盘：处理收盘卖出，资金累计到次日
     5. 如果某天推荐列表为空（模型无推荐），则该天空仓，资金闲置
     
+    涨跌停规则（OHLC开板检测）：
+    6. 涨停无法买入：买入日涨跌幅 > 阈值 且 最低价==开盘价（封死涨停）时跳过
+       - 若最低价 < 开盘价（盘中开板），允许买入
+    7. 跌停无法卖出：卖出日涨跌幅 < -阈值 且 最高价==开盘价（封死跌停）时推迟卖出
+       - 若最高价 > 开盘价（盘中开板），允许卖出
+    
     卖出时机（从 daily_returns 长度推导）：
     - len=1: Day1大跌止损 → 买入次日开盘卖出
     - len=2: 累计亏损/弱势止损 → 买入次日收盘卖出
-    - len=3: 正常持有满3天 → 买入第3天收盘卖出
+    - len>=FUTURE_DAYS: 正常持有满期 → 买入第FUTURE_DAYS天收盘卖出
     """
+    future_days = DataConfig.FUTURE_DAYS
+    limit_threshold = DataConfig.LIMIT_THRESHOLD
+    limit_check_ohlc = DataConfig.LIMIT_CHECK_MODE == 'ohlc'
     max_holdings = DataConfig.MAX_SELECT_PER_DAY if DataConfig.MAX_SELECT_PER_DAY > 0 else 4
+    
+    has_limit_data = (eval_daily_price_changes is not None and
+                      eval_daily_opens is not None and
+                      eval_daily_highs is not None and
+                      eval_daily_lows is not None)
     
     unique_days = np.sort(np.unique(all_day_indices))
     
@@ -598,8 +639,55 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
                 sell_day = buy_day + 1
                 sell_type = 'close'
             else:
-                sell_day = buy_day + 2
+                sell_day = buy_day + future_days - 1
                 sell_type = 'close'
+            
+            day1_chg = None
+            day1_open = None
+            day1_low = None
+            full_period_return = None
+            sell_day_chg = None
+            sell_day_open = None
+            sell_day_high = None
+            buf_day_chg = None
+            buf_day_open = None
+            buf_day_high = None
+            
+            if has_limit_data:
+                day1_chg = eval_daily_price_changes[idx][0]
+                day1_open = eval_daily_opens[idx][0]
+                day1_low = eval_daily_lows[idx][0]
+
+                if all(v is not None for v in eval_daily_price_changes[idx][:future_days]):
+                    buy_open = eval_daily_opens[idx][0]
+                    prev_close = buy_open
+                    for d in range(future_days):
+                        cur_close = prev_close * (1 + eval_daily_price_changes[idx][d])
+                        prev_close = cur_close
+                    full_period_return = (prev_close - buy_open) / buy_open
+
+                if sell_type == 'open' and dr_len <= 1:
+                    if future_days >= 2 and eval_daily_price_changes[idx][1] is not None:
+                        t2_open = eval_daily_opens[idx][1]
+                        t1_close_val = day1_open * (1 + day1_chg) if day1_chg is not None and day1_open is not None and day1_open != 0 else None
+                        if t1_close_val is not None and t1_close_val != 0:
+                            sell_day_chg = (t2_open - t1_close_val) / t1_close_val if t2_open is not None else None
+                        sell_day_open = eval_daily_opens[idx][1] if future_days >= 2 else None
+                        sell_day_high = eval_daily_highs[idx][1] if future_days >= 2 else None
+                elif sell_type == 'close' and dr_len == 2:
+                    if future_days >= 2:
+                        sell_day_chg = eval_daily_price_changes[idx][1]
+                        sell_day_open = eval_daily_opens[idx][1]
+                        sell_day_high = eval_daily_highs[idx][1]
+                elif sell_type == 'close' and dr_len >= future_days:
+                    sell_day_chg = eval_daily_price_changes[idx][future_days - 1]
+                    sell_day_open = eval_daily_opens[idx][future_days - 1]
+                    sell_day_high = eval_daily_highs[idx][future_days - 1]
+
+                if eval_buffer_day_changes is not None and idx < len(eval_buffer_day_changes):
+                    buf_day_chg = eval_buffer_day_changes[idx]
+                    buf_day_open = eval_buffer_day_opens[idx] if eval_buffer_day_opens is not None else None
+                    buf_day_high = eval_buffer_day_highs[idx] if eval_buffer_day_highs is not None else None
             
             all_trade_info.append({
                 'sample_idx': idx,
@@ -608,6 +696,16 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
                 'sell_day': sell_day,
                 'sell_type': sell_type,
                 'return': all_cumulative_returns[idx],
+                'day1_change': day1_chg,
+                'day1_open': day1_open,
+                'day1_low': day1_low,
+                'full_period_return': full_period_return,
+                'sell_day_change': sell_day_chg,
+                'sell_day_open': sell_day_open,
+                'sell_day_high': sell_day_high,
+                'buffer_day_change': buf_day_chg,
+                'buffer_day_open': buf_day_open,
+                'buffer_day_high': buf_day_high,
             })
     
     if not all_trade_info:
@@ -649,6 +747,8 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
     
     total_buy_count = 0
     total_sell_count = 0
+    limit_up_skipped = 0
+    limit_down_delayed = 0
     
     for current_day in range(min_event_day, max_event_day + 1):
         day_open_sells = 0
@@ -659,19 +759,27 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
         remaining = []
         for h in holdings:
             if h['sell_day'] == current_day and h['sell_type'] == 'open':
-                released = h['amount'] * (1.0 + h['return'])
-                open_sell_released += released
-                day_open_sells += 1
-                total_sell_count += 1
+                is_sealed = (has_limit_data and
+                             _is_sealed_limit_down(h['sell_day_change'], h.get('sell_day_open'), h.get('sell_day_high'), limit_threshold, ohlc=limit_check_ohlc))
+
+                if is_sealed:
+                    h['sell_type'] = 'close'
+                    h['sell_day'] = current_day
+                    h['return'] = h.get('full_period_return', h['return'])
+                    limit_down_delayed += 1
+                    remaining.append(h)
+                else:
+                    released = h['amount'] * (1.0 + h['return'])
+                    open_sell_released += released
+                    day_open_sells += 1
+                    total_sell_count += 1
             else:
                 remaining.append(h)
         holdings = remaining
         
-        # 开盘卖出的资金当天不能买入，放入 pending_cash
         pending_cash += open_sell_released
         
         # === Phase 2: 开盘买入 ===
-        # 前一天的 predict_day = current_day - 1
         predict_day = current_day - 1
         recommendations = recommendation_map.get(predict_day, [])
         
@@ -680,40 +788,69 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
         invested_today = 0.0
         
         if available_slots > 0 and len(recommendations) > 0 and cash > 1e-10:
-            buy_count = min(available_slots, len(recommendations))
-            amount_per_stock = cash / buy_count
+            buyable = []
+            for t in recommendations:
+                is_sealed = (has_limit_data and
+                             _is_sealed_limit_up(t['day1_change'], t.get('day1_open'), t.get('day1_low'), limit_threshold, ohlc=limit_check_ohlc))
+
+                if is_sealed:
+                    limit_up_skipped += 1
+                    continue
+                buyable.append(t)
+                if len(buyable) >= available_slots:
+                    break
             
-            for i in range(buy_count):
-                t = recommendations[i]
-                holdings.append({
-                    'amount': amount_per_stock,
-                    'return': t['return'],
-                    'sell_day': t['sell_day'],
-                    'sell_type': t['sell_type'],
-                })
-                invested_today += amount_per_stock
-                actual_buys += 1
-                total_buy_count += 1
-            cash = 0.0
+            buy_count = len(buyable)
+            if buy_count > 0:
+                amount_per_stock = cash / buy_count
+                for t in buyable:
+                    holdings.append({
+                        'amount': amount_per_stock,
+                        'return': t['return'],
+                        'sell_day': t['sell_day'],
+                        'sell_type': t['sell_type'],
+                        'sell_day_change': t.get('sell_day_change'),
+                        'sell_day_open': t.get('sell_day_open'),
+                        'sell_day_high': t.get('sell_day_high'),
+                        'full_period_return': t.get('full_period_return'),
+                        'buffer_day_change': t.get('buffer_day_change'),
+                        'buffer_day_open': t.get('buffer_day_open'),
+                        'buffer_day_high': t.get('buffer_day_high'),
+                    })
+                    invested_today += amount_per_stock
+                    actual_buys += 1
+                    total_buy_count += 1
+                cash = 0.0
         
         # === Phase 3: 收盘卖出 ===
         close_sell_released = 0.0
         remaining = []
         for h in holdings:
             if h['sell_day'] == current_day and h['sell_type'] == 'close':
-                released = h['amount'] * (1.0 + h['return'])
-                close_sell_released += released
-                day_close_sells += 1
-                total_sell_count += 1
+                is_sealed = (has_limit_data and
+                             _is_sealed_limit_down(h['sell_day_change'], h.get('sell_day_open'), h.get('sell_day_high'), limit_threshold, ohlc=limit_check_ohlc))
+
+                if is_sealed:
+                    h['sell_day'] = current_day + 1
+                    h['sell_type'] = 'open'
+                    h['return'] = h.get('full_period_return', h['return'])
+                    h['sell_day_change'] = h.get('buffer_day_change')
+                    h['sell_day_open'] = h.get('buffer_day_open')
+                    h['sell_day_high'] = h.get('buffer_day_high')
+                    limit_down_delayed += 1
+                    remaining.append(h)
+                else:
+                    released = h['amount'] * (1.0 + h['return'])
+                    close_sell_released += released
+                    day_close_sells += 1
+                    total_sell_count += 1
             else:
                 remaining.append(h)
         holdings = remaining
         
-        # 收盘卖出的资金次日可用，放入 pending_cash
         pending_cash += close_sell_released
         
         # === Phase 4: 日终结算 ===
-        # pending_cash 转为明日可用的 cash
         cash += pending_cash
         pending_cash = 0.0
         
@@ -758,6 +895,8 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
         'daily_portfolio_values': daily_portfolio_values,
         'daily_trades': daily_trades,
         'max_drawdown': _calculate_max_drawdown(daily_portfolio_values),
+        'limit_up_skipped': limit_up_skipped,
+        'limit_down_delayed': limit_down_delayed,
     }
 
 
@@ -784,6 +923,7 @@ def calculate_smart_exit_return(all_preds, all_daily_returns, all_day_indices, t
     """
     unique_days = np.unique(all_day_indices)
     unique_days = np.sort(unique_days)
+    future_days = DataConfig.FUTURE_DAYS
     
     daily_stats = []
     daily_returns = []
@@ -818,39 +958,36 @@ def calculate_smart_exit_return(all_preds, all_daily_returns, all_day_indices, t
                 continue
 
             available = len(daily_ret)
-            r1 = daily_ret[0]
-            r2 = daily_ret[1] if available >= 2 else 0.0
-            r3 = daily_ret[2] if available >= 3 else 0.0
-            has_day2 = available >= 2
-            has_day3 = available >= 3
+            daily_r = [daily_ret[d] if d < available else 0.0 for d in range(future_days)]
+            has_days = [available > d for d in range(future_days)]
 
             total_trades += 1
             
-            if r1 < stop_loss_day1:
-                if has_day2:
-                    final_ret = r1 + (r2 if sell_at_day2_close else 0.0)
+            if daily_r[0] < stop_loss_day1:
+                if has_days[1]:
+                    final_ret = daily_r[0] + (daily_r[1] if sell_at_day2_close else 0.0)
                     stop_loss_day1_count += 1
                     day_exit_types['stop_day1'] += 1
                 else:
-                    final_ret = r1
+                    final_ret = daily_r[0]
                     day_exit_types['partial'] += 1
-            elif has_day2 and (r1 + r2) < stop_loss_cum:
-                final_ret = r1 + r2
+            elif has_days[1] and (daily_r[0] + daily_r[1]) < stop_loss_cum:
+                final_ret = daily_r[0] + daily_r[1]
                 stop_loss_cum_count += 1
                 day_exit_types['stop_cum'] += 1
-            elif has_day3 and (r1 + r2 + r3) >= take_profit:
-                final_ret = r1 + r2 + r3
+            elif has_days[-1] and sum(daily_r) >= take_profit:
+                final_ret = sum(daily_r)
                 take_profit_count += 1
                 day_exit_types['profit'] += 1
-            elif has_day3:
-                final_ret = r1 + r2 + r3
+            elif has_days[-1]:
+                final_ret = sum(daily_r)
                 normal_exit_count += 1
                 day_exit_types['normal'] += 1
-            elif has_day2:
-                final_ret = r1 + r2
+            elif has_days[1]:
+                final_ret = daily_r[0] + daily_r[1]
                 day_exit_types['partial'] += 1
             else:
-                final_ret = r1
+                final_ret = daily_r[0]
                 day_exit_types['partial'] += 1
             
             day_trade_returns.append(final_ret)

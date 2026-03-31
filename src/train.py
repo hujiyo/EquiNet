@@ -89,7 +89,20 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
 
     # 创建评估数据集
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
+    eval_data = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
+    eval_inputs = eval_data['inputs']
+    eval_targets = eval_data['targets']
+    eval_cumulative_returns = eval_data['cumulative_returns']
+    eval_day_indices = eval_data['day_indices']
+    eval_daily_returns = eval_data['daily_returns']
+    eval_daily_price_changes = eval_data['daily_price_changes']
+    eval_daily_opens = eval_data['daily_opens']
+    eval_daily_highs = eval_data['daily_highs']
+    eval_daily_lows = eval_data['daily_lows']
+    eval_buffer_day_opens = eval_data['buffer_day_opens']
+    eval_buffer_day_highs = eval_data['buffer_day_highs']
+    eval_buffer_day_lows = eval_data['buffer_day_lows']
+    eval_buffer_day_changes = eval_data['buffer_day_changes']
 
     # 模型B初始化为None
     model_b = None
@@ -344,7 +357,15 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             model_a, eval_inputs, eval_targets, eval_cumulative_returns,
             device, model_name="A",
             eval_day_indices=eval_day_indices,
-            eval_daily_returns=eval_daily_returns
+            eval_daily_returns=eval_daily_returns,
+            eval_daily_price_changes=eval_daily_price_changes,
+            eval_daily_opens=eval_daily_opens,
+            eval_daily_highs=eval_daily_highs,
+            eval_daily_lows=eval_daily_lows,
+            eval_buffer_day_opens=eval_buffer_day_opens,
+            eval_buffer_day_highs=eval_buffer_day_highs,
+            eval_buffer_day_lows=eval_buffer_day_lows,
+            eval_buffer_day_changes=eval_buffer_day_changes
         )
 
         # 计算训练集平均损失（除以样本数，与测试损失保持一致）
@@ -449,7 +470,15 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 model_b, eval_inputs, eval_targets, eval_cumulative_returns,
                 device, model_name="B",
                 eval_day_indices=eval_day_indices,
-                eval_daily_returns=eval_daily_returns
+                eval_daily_returns=eval_daily_returns,
+                eval_daily_price_changes=eval_daily_price_changes,
+                eval_daily_opens=eval_daily_opens,
+                eval_daily_highs=eval_daily_highs,
+                eval_daily_lows=eval_daily_lows,
+                eval_buffer_day_opens=eval_buffer_day_opens,
+                eval_buffer_day_highs=eval_buffer_day_highs,
+                eval_buffer_day_lows=eval_buffer_day_lows,
+                eval_buffer_day_changes=eval_buffer_day_changes
             )
 
             # 计算训练集平均损失（除以样本数，与测试损失保持一致）

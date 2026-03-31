@@ -332,8 +332,20 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     print_section("模型评估")
     print(f"│  正在创建评估数据集...")
 
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = \
-        create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
+    eval_data = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
+    eval_inputs = eval_data['inputs']
+    eval_targets = eval_data['targets']
+    eval_cumulative_returns = eval_data['cumulative_returns']
+    eval_day_indices = eval_data['day_indices']
+    eval_daily_returns = eval_data['daily_returns']
+    eval_daily_price_changes = eval_data['daily_price_changes']
+    eval_daily_opens = eval_data['daily_opens']
+    eval_daily_highs = eval_data['daily_highs']
+    eval_daily_lows = eval_data['daily_lows']
+    eval_buffer_day_opens = eval_data['buffer_day_opens']
+    eval_buffer_day_highs = eval_data['buffer_day_highs']
+    eval_buffer_day_lows = eval_data['buffer_day_lows']
+    eval_buffer_day_changes = eval_data['buffer_day_changes']
     
     print(f"│  评估样本数: {len(eval_inputs)}")
     print(f"│  正在评估模型...")
@@ -342,7 +354,15 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
         model, eval_inputs, eval_targets, eval_cumulative_returns,
         device, model_name="选中模型",
         eval_day_indices=eval_day_indices,
-        eval_daily_returns=eval_daily_returns
+        eval_daily_returns=eval_daily_returns,
+        eval_daily_price_changes=eval_daily_price_changes,
+        eval_daily_opens=eval_daily_opens,
+        eval_daily_highs=eval_daily_highs,
+        eval_daily_lows=eval_daily_lows,
+        eval_buffer_day_opens=eval_buffer_day_opens,
+        eval_buffer_day_highs=eval_buffer_day_highs,
+        eval_buffer_day_lows=eval_buffer_day_lows,
+        eval_buffer_day_changes=eval_buffer_day_changes
     )
     
     # 创建评估损失函数（与 train.py 一致）
@@ -410,6 +430,8 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
             print(f"│  │  最终资金: {ps['final_value']:.4f}")
             print(f"│  │  总收益率: {ps['total_return_pct']:+.2f}%")
             print(f"│  │  最大回撤: {ps['max_drawdown']*100:.2f}%")
+            if ps.get('limit_up_skipped', 0) > 0 or ps.get('limit_down_delayed', 0) > 0:
+                print(f"│  │  涨停无法买入: {ps.get('limit_up_skipped', 0)}次, 跌停推迟卖出: {ps.get('limit_down_delayed', 0)}次")
             
             dt = ps['daily_trades']
             sample_step = max(1, len(dt) // 10)
@@ -623,10 +645,10 @@ def print_recent_days_chart(daily_stats, last_n=10):
         else:
             relative_date = f"T-{day_num}"
         
-        if available_days == 3:
+        if available_days == DataConfig.FUTURE_DAYS:
             data_status = "完整"
-        elif available_days == 2:
-            data_status = "临时(2天)"
+        elif available_days == DataConfig.FUTURE_DAYS - 1:
+            data_status = f"临时({available_days}天)"
         elif available_days == 1:
             data_status = "临时(1天)"
         else:

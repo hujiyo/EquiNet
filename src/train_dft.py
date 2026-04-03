@@ -30,7 +30,7 @@ from data import (
     load_and_preprocess_data,
     create_sampler, sample_with_pools,
     create_fixed_evaluation_dataset,
-    load_index_data
+    init_index_data
 )
 
 from training_utils import (
@@ -132,8 +132,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
                     dft_w_min=0.1,
                     dft_w_max=1.0,
                     seed=DataConfig.RANDOM_SEED,
-                    feature_normalizer=None,
-                    index_data=None):
+                    feature_normalizer=None):
     """
     DFT模型训练函数（自引导模式）
 
@@ -160,22 +159,14 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         torch.cuda.manual_seed_all(seed)
 
     # 创建评估数据集
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer, index_data)
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
 
     # 初始模型评估
     stats_init = evaluate_model(
         model, eval_inputs, eval_targets, eval_cumulative_returns,
         device, model_name="初始模型",
         eval_day_indices=eval_day_indices,
-        eval_daily_returns=eval_daily_returns,
-        eval_daily_price_changes=eval_daily_price_changes,
-        eval_daily_opens=eval_daily_opens,
-        eval_daily_highs=eval_daily_highs,
-        eval_daily_lows=eval_daily_lows,
-        eval_buffer_day_opens=eval_buffer_day_opens,
-        eval_buffer_day_highs=eval_buffer_day_highs,
-        eval_buffer_day_lows=eval_buffer_day_lows,
-        eval_buffer_day_changes=eval_buffer_day_changes
+        eval_daily_returns=eval_daily_returns
     )
     print(f"初始模型评估: AUC={stats_init['auc']:.4f}, Top{DataConfig.TOP_K}%收益={stats_init['top_return']*100:+.2f}%")
     if stats_init['realistic_stats'] is not None:
@@ -300,7 +291,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         # 采样训练数据（包含cumulative_returns以支持TaskAlignedLoss）
         epoch_inputs, epoch_targets, epoch_cum_returns = sample_with_pools(
             sampler, train_stock_info, batch_size, batches_per_epoch, train_rng,
-            feature_normalizer, index_data
+            feature_normalizer
         )
 
         # 打印循环统计
@@ -389,15 +380,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
             model, eval_inputs, eval_targets, eval_cumulative_returns,
             device, model_name="DFT",
             eval_day_indices=eval_day_indices,
-            eval_daily_returns=eval_daily_returns,
-            eval_daily_price_changes=eval_daily_price_changes,
-            eval_daily_opens=eval_daily_opens,
-            eval_daily_highs=eval_daily_highs,
-            eval_daily_lows=eval_daily_lows,
-            eval_buffer_day_opens=eval_buffer_day_opens,
-            eval_buffer_day_highs=eval_buffer_day_highs,
-            eval_buffer_day_lows=eval_buffer_day_lows,
-            eval_buffer_day_changes=eval_buffer_day_changes
+            eval_daily_returns=eval_daily_returns
         )
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
@@ -590,9 +573,7 @@ if __name__ == "__main__":
 
     data_dir = os.path.join(os.path.dirname(__file__), '..', DataConfig.DATA_DIR)
     data_dir = os.path.normpath(data_dir)
-    index_data = load_index_data(data_dir)
-    if index_data is None:
-        print("警告：大盘数据加载失败，训练将使用零值作为大盘特征")
+    init_index_data(data_dir)
 
     print("\n" + "="*60)
     print("数据集统计")
@@ -617,7 +598,7 @@ if __name__ == "__main__":
         dft_w_min=args.w_min,
         dft_w_max=args.w_max,
         seed=args.seed,
-        index_data=index_data
+        feature_normalizer=feature_normalizer
     )
 
     print(f"\n最终结果:")

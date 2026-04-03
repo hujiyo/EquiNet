@@ -21,7 +21,7 @@ from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
                   create_recent_days_dataset, normalize_and_validate_context_window,
-                  load_index_data)
+                  init_index_data)
 from training_utils import evaluate_model, calculate_test_loss, DynamicWeightedBCE
 
 
@@ -116,7 +116,7 @@ def load_model(model_path, device):
     return model, metadata
 
 
-def generate_latest_input(stock_data, file_name, feature_normalizer=None):
+def generate_latest_input(stock_data, file_name, feature_normalizer=None, times=None):
     """
     为单只股票生成最新一天的模型输入（不需要未来数据）用于预测
     
@@ -127,7 +127,7 @@ def generate_latest_input(stock_data, file_name, feature_normalizer=None):
         stock_data: 股票原始数据
         file_name: 文件名
         feature_normalizer: 可选的特征归一化器实例
-    
+        times: 股票时间戳数组（用于大盘数据日期对齐）
     返回: (input_seq, stock_code) 或 None
     """
     context_length = DataConfig.CONTEXT_LENGTH
@@ -142,12 +142,13 @@ def generate_latest_input(stock_data, file_name, feature_normalizer=None):
     
     # 使用 data.py 的统一归一化和验证函数
     input_seq = normalize_and_validate_context_window(
-        stock_data, 
-        start_idx, 
+        stock_data,
+        start_idx,
         context_length,
         check_limit_up=True,
         required_length=context_length,  # 只检查上下文窗口（无未来数据）
-        feature_normalizer=feature_normalizer
+        feature_normalizer=feature_normalizer,
+        times=times
     )
     
     if input_seq is None:
@@ -162,7 +163,7 @@ def generate_latest_input(stock_data, file_name, feature_normalizer=None):
 def load_all_stock_data(data_dir=DataConfig.DATA_DIR):
     """
     加载所有股票原始数据（用于选股推理）
-    返回: [(file_name, data_array, latest_date), ...]
+    返回: [(file_name, data_array, latest_date, times_array), ...]
     """
     import pandas as pd
     
@@ -177,7 +178,8 @@ def load_all_stock_data(data_dir=DataConfig.DATA_DIR):
             df = df.iloc[::-1].reset_index(drop=True)
             data = df[['start', 'max', 'min', 'end', 'volume', 'exchange']].values
             latest_date = str(df['time'].iloc[-1])  # 最新交易日期
-            stock_list.append((fname, data, latest_date))
+            times = df['time'].values  # 时间戳数组
+            stock_list.append((fname, data, latest_date, times))
         except Exception as e:
             pass  # 静默跳过异常文件
     
@@ -205,8 +207,9 @@ def score_all_stocks(model, stock_list, device, feature_normalizer=None):
     all_closes = []
     all_changes = []
     
-    for fname, data, latest_date in stock_list:
-        result = generate_latest_input(data, fname, feature_normalizer)
+    for item in stock_list:
+        fname, data, latest_date, times = item
+        result = generate_latest_input(data, fname, feature_normalizer, times)
         if result is None:
             skipped += 1
             continue
@@ -322,7 +325,7 @@ def select_model(models):
             print(f"  ✗ 无效输入，请输入数字")
 
 
-def run_evaluation(model, test_stock_info, device, feature_normalizer=None, index_data=None):
+def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     """
     执行模型评估（与 train.py 中对模型A的评估完全一致）
     返回评估统计字典
@@ -334,7 +337,7 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None, inde
     print(f"│  正在创建评估数据集...")
 
     eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = \
-        create_fixed_evaluation_dataset(test_stock_info, feature_normalizer, index_data)
+        create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
     
     print(f"│  评估样本数: {len(eval_inputs)}")
     print(f"│  正在评估模型...")
@@ -343,15 +346,7 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None, inde
         model, eval_inputs, eval_targets, eval_cumulative_returns,
         device, model_name="选中模型",
         eval_day_indices=eval_day_indices,
-        eval_daily_returns=eval_daily_returns,
-        eval_daily_price_changes=eval_daily_price_changes,
-        eval_daily_opens=eval_daily_opens,
-        eval_daily_highs=eval_daily_highs,
-        eval_daily_lows=eval_daily_lows,
-        eval_buffer_day_opens=eval_buffer_day_opens,
-        eval_buffer_day_highs=eval_buffer_day_highs,
-        eval_buffer_day_lows=eval_buffer_day_lows,
-        eval_buffer_day_changes=eval_buffer_day_changes
+        eval_daily_returns=eval_daily_returns
     )
     
     # 创建评估损失函数（与 train.py 一致）
@@ -446,7 +441,7 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None, inde
     return stats
 
 
-def run_stock_selection(model, threshold, device, feature_normalizer=None, index_data=None):
+def run_stock_selection(model, threshold, device, feature_normalizer=None):
     """
     执行选股
     
@@ -648,7 +643,7 @@ def print_recent_days_chart(daily_stats, last_n=10):
     print("╚" + "═"*52 + "╝")
 
 
-def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4, threshold=None, feature_normalizer=None, index_data=None):
+def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4, threshold=None, feature_normalizer=None):
     """
     计算最近几天的实战收益率（用于展示，包含临时数据）
     
@@ -668,7 +663,7 @@ def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4,
     返回: daily_stats [(count, return, available_days), ...]
     """
     recent_inputs, recent_returns, recent_day_indices, recent_available_days = \
-        create_recent_days_dataset(test_stock_info, feature_normalizer, index_data)
+        create_recent_days_dataset(test_stock_info, feature_normalizer)
     
     if recent_inputs is None or len(recent_inputs) == 0:
         return []
@@ -813,12 +808,11 @@ def main():
 
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
-    index_data = load_index_data(DataConfig.DATA_DIR)
-    if index_data is None:
-        print("警告：大盘数据加载失败，推理将使用零值作为大盘特征")
+    # 初始化大盘数据
+    init_index_data(DataConfig.DATA_DIR)
 
     # 运行评估
-    stats = run_evaluation(model, test_stock_info, device, feature_normalizer, index_data)
+    stats = run_evaluation(model, test_stock_info, device, feature_normalizer)
     threshold = stats['top_threshold']
     
     # 询问是否选股
@@ -833,10 +827,10 @@ def main():
         print("  请输入 y 或 n")
     
     # 执行选股
-    results = run_stock_selection(model, threshold, device, feature_normalizer, index_data)
+    results = run_stock_selection(model, threshold, device, feature_normalizer)
     
     # 计算并打印最近10天实战收益率表格（包含临时数据，仅用于展示）
-    recent_stats = calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=DataConfig.TOP_N_PER_DAY, threshold=threshold, feature_normalizer=feature_normalizer, index_data=index_data)
+    recent_stats = calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=DataConfig.TOP_N_PER_DAY, threshold=threshold, feature_normalizer=feature_normalizer)
     if recent_stats:
         print_recent_days_chart(recent_stats, last_n=10)
     

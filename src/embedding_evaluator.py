@@ -894,11 +894,9 @@ def main():
     print("\n"+"="*60)
     print("[步骤1] 加载数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
-    
-    from data import load_index_data
-    index_data = load_index_data(DataConfig.DATA_DIR)
-    if index_data is None:
-        print("警告：大盘数据不存在，评估将使用全0的大盘维度")
+
+    from data import init_index_data
+    init_index_data(DataConfig.DATA_DIR)
 
     print("\n[步骤2] 准备测试样本...")
     from data import coarse_normalize_context_window
@@ -910,7 +908,7 @@ def main():
         for i in range(test_split, min(test_split + 10, len(data) - 33)):
             input_seq = coarse_normalize_context_window(
                 data, i, 30, check_limit_up=False, required_length=33,
-                index_data=index_data, times=times
+                times=times
             )
             if input_seq is not None:
                 all_inputs.append(input_seq)

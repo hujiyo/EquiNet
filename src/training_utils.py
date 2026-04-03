@@ -340,9 +340,7 @@ class TaskAlignedLoss(nn.Module):
 
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
-                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None,
-                   eval_daily_price_changes=None, eval_daily_opens=None, eval_daily_highs=None, eval_daily_lows=None,
-                   eval_buffer_day_opens=None, eval_buffer_day_highs=None, eval_buffer_day_lows=None, eval_buffer_day_changes=None):
+                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None):
     """
     模型评估函数
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤

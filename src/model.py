@@ -20,18 +20,20 @@ def init_weights(module):
     当代主流Transformer初始化策略
 
     设计原则：
-    1. Embedding层: Xavier初始化，小增益确保输入方差合理
+    1. Embedding层: 根据层类型和维度计算gain，统一输出std=0.2
     2. FFN第一层: Xavier初始化，gain=1.7补偿GELU压缩
     3. FFN第二层: Xavier初始化，gain=1.0（无激活函数）
     4. 输出层: 小增益，避免sigmoid饱和
     5. LayerNorm: weight=1, bias=0
 
-    各层初始化范围计算（基于当前模型配置）：
-    - Embedding (6→48): gain=0.5 → 范围±0.167, std≈0.096
-    - 位置编码 (30→48): gain=0.7 → 范围±0.168, std≈0.097
-    - FFN第一层 (48→192): gain=1.7 → 范围±0.270, std≈0.155
-    - FFN第二层 (192→48): gain=1.0 → 范围±0.158, std≈0.091
-    - 输出层 (24→1): gain=0.1 → 范围±0.058, std≈0.034, bias=log(p/(1-p))
+    Embedding初始化计算（目标std=0.2）：
+    - Linear层: 输出std = σ_input × gain × sqrt(2×fan_in/(fan_in+fan_out))
+    - Embedding层: 输出std = gain × sqrt(2/(vocab_size+embedding_dim))
+
+    各层gain计算结果：
+    - Token Embedding (Linear 7→48): gain=0.40
+    - Position Embedding (Embedding 30→48): gain=1.25
+    - Query Token (Parameter 48): gain=1.4
     """
     ffn_hidden_dim = ModelConfig.D_MODEL * ModelConfig.FFN_EXPAND_RATIO
 
@@ -59,6 +61,13 @@ def init_weights(module):
     elif isinstance(module, nn.LayerNorm):
         nn.init.ones_(module.weight)
         nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        # Position Embedding初始化
+        # vocab_size = CONTEXT_LENGTH = 30
+        if module.weight.shape[0] == DataConfig.CONTEXT_LENGTH:
+            nn.init.xavier_uniform_(module.weight, gain=ModelConfig.POSITION_EMBEDDING_INIT_GAIN)
+        else:
+            nn.init.xavier_uniform_(module.weight, gain=1.0)
 
 
 class PositionalEncoding(nn.Module):
@@ -160,7 +169,7 @@ class AttentionPooling(nn.Module):
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
         # 初始化 query token（使用Xavier初始化）
-        nn.init.xavier_uniform_(self.query, gain=ModelConfig.EMBEDDING_INIT_GAIN)
+        nn.init.xavier_uniform_(self.query, gain=ModelConfig.QUERY_INIT_GAIN)
 
     def forward(self, x):
         """

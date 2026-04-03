@@ -42,6 +42,8 @@ class DataConfig:
     # 评估参数
     EVAL_BATCH_SIZE = 256            # 评估批处理大小（分批处理，减少显存占用）
 
+    INDEX_FILE = '000000.csv'
+    INDEX_CODE = 'sh.000001'
     # ========== 特征归一化配置 ==========
     # 使用 QuantileTransformer + StandardScaler 进行高级特征归一化
     # 优点：
@@ -63,7 +65,7 @@ class DataConfig:
 class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
-    INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
+    INPUT_DIM = 7                    # 输入特征维度数（OHLC + volume + exchange）
     D_MODEL = 48                     # 模型维度（Transformer 内部维度）
     FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数
@@ -74,12 +76,21 @@ class ModelConfig:
     DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合
     ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
 
-    # ========== Embedding Linear层参数初始化配置 ==========
-    # - gain=1.0: 标准Xavier/Kaiming (std≈0.29), 稳定
-    # - gain=0.5: 主流认为适合小模型和低SNR任务
-    # - gain=1.5: 放大数值差异，主流认为可能放大噪声和信号导致训练不稳定
-    # W ~ U[-gain*√(6/(fan_in+fan_out)), +gain*√(6/(fan_in+fan_out))]
-    EMBEDDING_INIT_GAIN = 1.5         # Embedding层初始化增益（推荐0.5，符合当代最佳实践）
+    # ========== Embedding 参数初始化配置 ==========
+    # 目标：让Token和Position embedding的输出std统一为0.2，确保训练初期信息势均力敌
+    #
+    # Linear层计算公式：输出std = σ_input × gain × sqrt(2×fan_in/(fan_in+fan_out))
+    # Embedding层计算公式：输出std = gain × sqrt(2/(vocab_size+embedding_dim))
+    #
+    # 假设：输入数据经过归一化后std≈1.0
+    #
+    # 计算过程：
+    # - Token Embedding (Linear 7→48): gain = 0.2 / sqrt(14/55) ≈ 0.40
+    # - Position Embedding (Embedding 30→48): gain = 0.2 / sqrt(2/78) ≈ 1.25
+    # - Query Token (Parameter 48): gain = 0.2 / sqrt(2/96) ≈ 1.39 → 取1.4
+    EMBEDDING_INIT_GAIN = 0.40           # Token Embedding (Linear 7→48)
+    POSITION_EMBEDDING_INIT_GAIN = 1.25  # Position Embedding (Embedding 30→48)
+    QUERY_INIT_GAIN = 1.4                # Query Token (AttentionPooling)
 
     # FFN层初始化配置
     # - GELU在x~N(0,1)附近的有效增益约为0.588，需要补偿：gain ≈ 1/0.588 ≈ 1.7

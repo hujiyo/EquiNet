@@ -26,7 +26,8 @@ from model import create_model
 from data import (
     load_and_preprocess_data,
     create_sampler, sample_with_pools,
-    create_fixed_evaluation_dataset,FeatureNormalizer
+    create_fixed_evaluation_dataset,FeatureNormalizer,
+    load_index_data
 )
 
 from training_utils import (
@@ -53,7 +54,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                       pseudo_pos_ratio=0.01,
                       pseudo_neg_ratio=0.05,
                       enable_model_b=True,
-                      feature_normalizer=None):
+                      feature_normalizer=None,
+                      index_data=None):
     """
     克隆模型训练函数
 
@@ -89,20 +91,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
 
     # 创建评估数据集
-    eval_data = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
-    eval_inputs = eval_data['inputs']
-    eval_targets = eval_data['targets']
-    eval_cumulative_returns = eval_data['cumulative_returns']
-    eval_day_indices = eval_data['day_indices']
-    eval_daily_returns = eval_data['daily_returns']
-    eval_daily_price_changes = eval_data['daily_price_changes']
-    eval_daily_opens = eval_data['daily_opens']
-    eval_daily_highs = eval_data['daily_highs']
-    eval_daily_lows = eval_data['daily_lows']
-    eval_buffer_day_opens = eval_data['buffer_day_opens']
-    eval_buffer_day_highs = eval_data['buffer_day_highs']
-    eval_buffer_day_lows = eval_data['buffer_day_lows']
-    eval_buffer_day_changes = eval_data['buffer_day_changes']
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer, index_data)
 
     # 模型B初始化为None
     model_b = None
@@ -246,7 +235,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         # 使用时间顺序采样器生成训练数据（与主训练流程统一）
         epoch_inputs, epoch_targets, epoch_cum_returns = sample_with_pools(
             sampler, train_stock_info, batch_size, batches_per_epoch, train_rng,
-            feature_normalizer
+            feature_normalizer, index_data
         )
 
         # 打印循环统计
@@ -655,6 +644,13 @@ if __name__ == "__main__":
 
     print("="*60)
 
+    # 加载大盘数据
+    data_dir = os.path.join(os.path.dirname(__file__), '..', DataConfig.DATA_DIR)
+    data_dir = os.path.normpath(data_dir)
+    index_data = load_index_data(data_dir)
+    if index_data is None:
+        print("警告：大盘数据加载失败，训练将使用零值作为大盘特征")
+
     # 加载数据
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
@@ -680,7 +676,8 @@ if __name__ == "__main__":
         pseudo_pos_ratio=0.01,
         pseudo_neg_ratio=0.05,
         enable_model_b=False,
-        feature_normalizer=feature_normalizer
+        feature_normalizer=feature_normalizer,
+        index_data=index_data
     )
 
     print(f"\n最终结果:")

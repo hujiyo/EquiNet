@@ -31,7 +31,7 @@ import argparse
 
 from model import create_model
 from data import load_and_preprocess_data,FeatureNormalizer
-from config import DataConfig, ModelConfig
+from config import DataConfig, ModelConfig, PROJECT_ROOT
 
 
 class EmbeddingModule(nn.Module):
@@ -575,7 +575,7 @@ class EmbeddingModuleAnalyzer:
             'sorted_indices': sorted_indices.tolist()
         }
     
-    def visualize_sensitivity(self, sample_inputs, save_dir='out_eval_results', dimension_contribution_results=None):
+    def visualize_sensitivity(self, sample_inputs, save_dir=None, dimension_contribution_results=None):
         """可视化敏感性分析结果
         
         Args:
@@ -583,6 +583,8 @@ class EmbeddingModuleAnalyzer:
             save_dir: 保存目录
             dimension_contribution_results: 特征重要性分析结果
         """
+        if save_dir is None:
+            save_dir = os.path.join(PROJECT_ROOT, 'out_eval_results')
         if sample_inputs is None:
             raise ValueError("必须提供真实数据样本(sample_inputs)进行可视化!")
 
@@ -831,12 +833,10 @@ def main():
                         help='列出所有可用的模型文件并退出')
     args = parser.parse_args()
 
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
     print("Embedding模块评估...")
     print("评估对象: 细处理(FeatureNormalizer) + Embedding层")
 
-    out_dir = './out'
+    out_dir = DataConfig.OUTPUT_DIR
     model_files = []
     if os.path.exists(out_dir):
         for f in os.listdir(out_dir):
@@ -882,7 +882,7 @@ def main():
             print("\n未找到模型文件，将使用随机初始化模型")
             model_path = None
     
-    save_dir = './out_eval_results'
+    save_dir = os.path.join(PROJECT_ROOT, 'out_eval_results')
     os.makedirs(save_dir, exist_ok=True)
 
     if os.path.exists(DataConfig.NORMALIZER_PATH):
@@ -896,7 +896,7 @@ def main():
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
     from data import init_index_data
-    init_index_data(DataConfig.DATA_DIR)
+    init_index_data()
 
     print("\n[步骤2] 准备测试样本...")
     from data import coarse_normalize_context_window

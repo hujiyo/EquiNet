@@ -556,8 +556,6 @@ if __name__ == "__main__":
                         help=f'随机种子（默认: {DataConfig.RANDOM_SEED}）')
     args = parser.parse_args()
 
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
     if not os.path.exists(args.model):
         print(f"错误：模型文件不存在: {args.model}")
         exit(1)
@@ -571,9 +569,7 @@ if __name__ == "__main__":
     print("正在加载和预处理数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
-    data_dir = os.path.join(os.path.dirname(__file__), '..', DataConfig.DATA_DIR)
-    data_dir = os.path.normpath(data_dir)
-    init_index_data(data_dir)
+    init_index_data()
 
     print("\n" + "="*60)
     print("数据集统计")

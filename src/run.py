@@ -14,9 +14,6 @@ EquiNet 模型推理与选股脚本
 import os, sys, torch, numpy as np, glob, re
 from datetime import datetime
 
-# 设置工作目录
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
 from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
@@ -809,7 +806,7 @@ def main():
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
     # 初始化大盘数据
-    init_index_data(DataConfig.DATA_DIR)
+    init_index_data()
 
     # 运行评估
     stats = run_evaluation(model, test_stock_info, device, feature_normalizer)

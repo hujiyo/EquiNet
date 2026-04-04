@@ -1347,7 +1347,7 @@ def fit_feature_normalizer(output_path='./normalizer.pkl', output_distribution='
     print(f"测试集股票数: {len(test_stock_info)}")
 
     print("\n[步骤1.5] 初始化大盘数据...")
-    init_index_data(DataConfig.DATA_DIR)
+    init_index_data()
 
     print("\n[步骤2] 创建特征归一化器...")
     print(f"  输出分布: {output_distribution}")
@@ -1365,8 +1365,6 @@ def fit_feature_normalizer(output_path='./normalizer.pkl', output_distribution='
 
 
 def main():
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
     parser = argparse.ArgumentParser(
         description='数据处理模块 兼 拟合特征归一化器训练脚本',
         formatter_class=argparse.RawDescriptionHelpFormatter,

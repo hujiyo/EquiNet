@@ -622,7 +622,7 @@ class StockDataUpdater:
 
 def main():
     parser = argparse.ArgumentParser(description='EquiNet股票数据更新工具')
-    parser.add_argument('--data-dir', type=str, default=r'src\data',help='数据存储目录 (默认：src\\data)')
+    parser.add_argument('--data-dir', type=str, default='data',help='数据存储目录 (默认：data)')
     parser.add_argument('--mode', type=str, choices=['incremental', 'full'], default='incremental',
                        help='更新模式：incremental(增量) 或 full(全量)')
     parser.add_argument('--stocks', type=str, nargs='+',help='指定要更新的股票代码列表')

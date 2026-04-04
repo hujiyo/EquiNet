@@ -108,7 +108,7 @@ class StockDataUpdater:
         try:
             df = pd.read_csv(file_path)
             if len(df) > 0:
-                latest_date = df.iloc[0]['time']
+                latest_date = df.iloc[0]['date']
                 if isinstance(latest_date, (int, float)):
                     latest_date = str(int(latest_date))
                 else:
@@ -149,7 +149,7 @@ class StockDataUpdater:
         Returns:
             DataFrame 或 None
         """
-        columns = ['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']
+        columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']
 
         try:
             code_with_prefix = self._format_stock_code(stock_code)
@@ -187,34 +187,25 @@ class StockDataUpdater:
             
             df = pd.DataFrame(data_list, columns=rs.fields)
             
-            df = df.rename(columns={
-                'date': 'time',
-                'open': 'start',
-                'high': 'max',
-                'low': 'min',
-                'close': 'end'
-            })
-            
-            df['time'] = df['time'].str.replace('-', '')
-            df = df[df['time'] != '']
+            df['date'] = df['date'].str.replace('-', '')
+            df = df[df['date'] != '']
             if len(df) == 0:
                 return pd.DataFrame(columns=columns)
-            df['time'] = df['time'].astype(int)
+            df['date'] = df['date'].astype(int)
             
-            df['start'] = pd.to_numeric(df['start'], errors='coerce')
-            df['max'] = pd.to_numeric(df['max'], errors='coerce')
-            df['min'] = pd.to_numeric(df['min'], errors='coerce')
-            df['end'] = pd.to_numeric(df['end'], errors='coerce')
+            df['open'] = pd.to_numeric(df['open'], errors='coerce')
+            df['high'] = pd.to_numeric(df['high'], errors='coerce')
+            df['low'] = pd.to_numeric(df['low'], errors='coerce')
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
             
-            # 原始数据的 volume 字段存储的是成交额，因此这里使用成交额（amount）而非成交量（volume）,单位是"千元"
             if 'amount' in df.columns:
                 df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-                df['volume'] = (df['amount'] / 1000.0).fillna(0.0) # Baostock 的 amount 单位是元，需要除以 1000
+                df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
             else:
                 print(f"⚠ {stock_code} 警告：Baostock 未返回 amount 字段，volume 将设为 0")
                 df['volume'] = pd.Series([0.0] * len(df), dtype=float)
             
-            df = df.dropna(subset=['start', 'max', 'min', 'end'])
+            df = df.dropna(subset=['open', 'high', 'low', 'close'])
             
             if len(df) == 0:
                 return None
@@ -225,7 +216,7 @@ class StockDataUpdater:
             else:
                 df['exchange'] = 0.0
             
-            df = df[['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']]
+            df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']]
             df = df.iloc[::-1].reset_index(drop=True)
             return df
             
@@ -242,7 +233,7 @@ class StockDataUpdater:
         Returns:
             DataFrame 或 None
         """
-        columns = ['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']
+        columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']
 
         try:
             end_date = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -276,24 +267,16 @@ class StockDataUpdater:
 
             df = pd.DataFrame(data_list, columns=rs.fields)
 
-            df = df.rename(columns={
-                'date': 'time',
-                'open': 'start',
-                'high': 'max',
-                'low': 'min',
-                'close': 'end'
-            })
-
-            df['time'] = df['time'].str.replace('-', '')
-            df = df[df['time'] != '']
+            df['date'] = df['date'].str.replace('-', '')
+            df = df[df['date'] != '']
             if len(df) == 0:
                 return pd.DataFrame(columns=columns)
-            df['time'] = df['time'].astype(int)
+            df['date'] = df['date'].astype(int)
 
-            df['start'] = pd.to_numeric(df['start'], errors='coerce')
-            df['max'] = pd.to_numeric(df['max'], errors='coerce')
-            df['min'] = pd.to_numeric(df['min'], errors='coerce')
-            df['end'] = pd.to_numeric(df['end'], errors='coerce')
+            df['open'] = pd.to_numeric(df['open'], errors='coerce')
+            df['high'] = pd.to_numeric(df['high'], errors='coerce')
+            df['low'] = pd.to_numeric(df['low'], errors='coerce')
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
 
             if 'amount' in df.columns:
                 df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
@@ -301,7 +284,7 @@ class StockDataUpdater:
             else:
                 df['volume'] = pd.Series([0.0] * len(df), dtype=float)
 
-            df = df.dropna(subset=['start', 'max', 'min', 'end'])
+            df = df.dropna(subset=['open', 'high', 'low', 'close'])
 
             if len(df) == 0:
                 return None
@@ -312,7 +295,7 @@ class StockDataUpdater:
             else:
                 df['exchange'] = 0.0
 
-            df = df[['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']]
+            df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']]
             df = df.iloc[::-1].reset_index(drop=True)
             return df
 
@@ -381,21 +364,21 @@ class StockDataUpdater:
             if file_path.exists():
                 old_df = pd.read_csv(file_path)
 
-                new_dates = set(df['time'].astype(str))
-                old_dates = set(old_df['time'].astype(str))
+                new_dates = set(df['date'].astype(str))
+                old_dates = set(old_df['date'].astype(str))
 
                 existing_dates = new_dates & old_dates
                 if existing_dates:
-                    df = df[~df['time'].astype(str).isin(existing_dates)]
+                    df = df[~df['date'].astype(str).isin(existing_dates)]
 
                 if len(df) == 0:
                     return True
 
                 combined_df = pd.concat([df, old_df], ignore_index=True)
-                combined_df = combined_df.sort_values('time', ascending=False).reset_index(drop=True)
+                combined_df = combined_df.sort_values('date', ascending=False).reset_index(drop=True)
                 combined_df.to_csv(file_path, index=False)
 
-                new_latest = str(int(combined_df.iloc[0]['time']))
+                new_latest = str(int(combined_df.iloc[0]['date']))
                 if old_latest_date:
                     print(f"✓ 上证指数 增量更新：{old_latest_date} → {new_latest} (新增 {len(df)} 条，总计 {len(combined_df)} 条)")
                 else:
@@ -403,7 +386,7 @@ class StockDataUpdater:
                 return True
             else:
                 df.to_csv(file_path, index=False)
-                new_latest = str(int(df.iloc[0]['time'])) if len(df) > 0 else 'N/A'
+                new_latest = str(int(df.iloc[0]['date'])) if len(df) > 0 else 'N/A'
                 print(f"✓ 上证指数 全量保存：{len(df)} 条 (最新：{new_latest})")
                 return True
 
@@ -446,21 +429,21 @@ class StockDataUpdater:
             if incremental and file_path.exists():
                 old_df = pd.read_csv(file_path)
                 
-                new_dates = set(df['time'].astype(str))
-                old_dates = set(old_df['time'].astype(str))
+                new_dates = set(df['date'].astype(str))
+                old_dates = set(old_df['date'].astype(str))
                 
                 existing_dates = new_dates & old_dates
                 if existing_dates:
-                    df = df[~df['time'].astype(str).isin(existing_dates)]
+                    df = df[~df['date'].astype(str).isin(existing_dates)]
                 
                 if len(df) == 0:
                     return True
                 
                 combined_df = pd.concat([df, old_df], ignore_index=True)
-                combined_df = combined_df.sort_values('time', ascending=False).reset_index(drop=True)
+                combined_df = combined_df.sort_values('date', ascending=False).reset_index(drop=True)
                 combined_df.to_csv(file_path, index=False)
                 
-                new_latest = str(int(combined_df.iloc[0]['time']))
+                new_latest = str(int(combined_df.iloc[0]['date']))
                 if old_latest_date:
                     print(f"✓ {stock_code} 增量更新：{old_latest_date} → {new_latest} (新增 {len(df)} 条，总计 {len(combined_df)} 条)")
                 else:
@@ -468,7 +451,7 @@ class StockDataUpdater:
                 return True
             else:
                 df.to_csv(file_path, index=False)
-                new_latest = str(int(df.iloc[0]['time'])) if len(df) > 0 else 'N/A'
+                new_latest = str(int(df.iloc[0]['date'])) if len(df) > 0 else 'N/A'
                 print(f"✓ {stock_code} 全量保存：{len(df)} 条 (最新：{new_latest})")
                 return True
                 

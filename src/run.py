@@ -173,9 +173,9 @@ def load_all_stock_data(data_dir=DataConfig.DATA_DIR):
             df = pd.read_csv(fpath)
             # 原始数据按时间倒序，翻转为正序（早→晚）
             df = df.iloc[::-1].reset_index(drop=True)
-            data = df[['start', 'max', 'min', 'end', 'volume', 'exchange']].values
-            latest_date = str(df['time'].iloc[-1])  # 最新交易日期
-            times = df['time'].values  # 时间戳数组
+            data = df[['open', 'high', 'low', 'close', 'volume', 'exchange']].values
+            latest_date = str(df['date'].iloc[-1])  # 最新交易日期
+            times = df['date'].values  # 时间戳数组
             stock_list.append((fname, data, latest_date, times))
         except Exception as e:
             pass  # 静默跳过异常文件

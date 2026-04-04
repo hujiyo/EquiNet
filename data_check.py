@@ -111,7 +111,7 @@ class DataChecker:
         try:
             df = pd.read_csv(file_path)
             if len(df) > 0:
-                latest_date = df.iloc[0]['time']
+                latest_date = df.iloc[0]['date']
                 if isinstance(latest_date, (int, float)):
                     latest_date = str(int(latest_date))
                 else:
@@ -137,10 +137,10 @@ class DataChecker:
             if len(df) == 0:
                 return None
             
-            df = df.sort_values('time', ascending=False)
+            df = df.sort_values('date', ascending=False)
             recent_data = df.head(days).copy()
             
-            recent_data['time'] = recent_data['time'].astype(str)
+            recent_data['date'] = recent_data['date'].astype(str)
             return recent_data
         except Exception as e:
             print(f"读取本地数据失败：{e}")
@@ -184,27 +184,18 @@ class DataChecker:
             
             df = pd.DataFrame(data_list, columns=rs.fields)
             
-            df = df.rename(columns={
-                'date': 'time',
-                'open': 'start',
-                'high': 'max',
-                'low': 'min',
-                'close': 'end'
-            })
-            
-            df['time'] = df['time'].str.replace('-', '')
-            df = df[df['time'] != '']
+            df['date'] = df['date'].str.replace('-', '')
+            df = df[df['date'] != '']
             
             if len(df) == 0:
                 return None
             
-            df['time'] = df['time'].astype(str)
-            df['start'] = pd.to_numeric(df['start'], errors='coerce')
-            df['max'] = pd.to_numeric(df['max'], errors='coerce')
-            df['min'] = pd.to_numeric(df['min'], errors='coerce')
-            df['end'] = pd.to_numeric(df['end'], errors='coerce')
+            df['date'] = df['date'].astype(str)
+            df['open'] = pd.to_numeric(df['open'], errors='coerce')
+            df['high'] = pd.to_numeric(df['high'], errors='coerce')
+            df['low'] = pd.to_numeric(df['low'], errors='coerce')
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
             
-            # 本地数据的 volume 字段存储的是成交额（单位：千元）,Baostock中的amount 单位是元
             if 'amount' in df.columns:
                 df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
                 df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
@@ -214,9 +205,9 @@ class DataChecker:
             
             df['turn'] = pd.to_numeric(df['turn'], errors='coerce')
             
-            df = df.dropna(subset=['start', 'max', 'min', 'end'])
+            df = df.dropna(subset=['open', 'high', 'low', 'close'])
 
-            return df[['time', 'start', 'max', 'min', 'end', 'volume', 'turn']]
+            return df[['date', 'open', 'high', 'low', 'close', 'volume', 'turn']]
 
         except Exception as e:
             print(f"获取 Baostock 数据失败：{e}")
@@ -255,25 +246,17 @@ class DataChecker:
 
             df = pd.DataFrame(data_list, columns=rs.fields)
 
-            df = df.rename(columns={
-                'date': 'time',
-                'open': 'start',
-                'high': 'max',
-                'low': 'min',
-                'close': 'end'
-            })
-
-            df['time'] = df['time'].str.replace('-', '')
-            df = df[df['time'] != '']
+            df['date'] = df['date'].str.replace('-', '')
+            df = df[df['date'] != '']
 
             if len(df) == 0:
                 return None
 
-            df['time'] = df['time'].astype(str)
-            df['start'] = pd.to_numeric(df['start'], errors='coerce')
-            df['max'] = pd.to_numeric(df['max'], errors='coerce')
-            df['min'] = pd.to_numeric(df['min'], errors='coerce')
-            df['end'] = pd.to_numeric(df['end'], errors='coerce')
+            df['date'] = df['date'].astype(str)
+            df['open'] = pd.to_numeric(df['open'], errors='coerce')
+            df['high'] = pd.to_numeric(df['high'], errors='coerce')
+            df['low'] = pd.to_numeric(df['low'], errors='coerce')
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
 
             if 'amount' in df.columns:
                 df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
@@ -283,9 +266,9 @@ class DataChecker:
 
             df['turn'] = pd.to_numeric(df['turn'], errors='coerce')
 
-            df = df.dropna(subset=['start', 'max', 'min', 'end'])
+            df = df.dropna(subset=['open', 'high', 'low', 'close'])
 
-            return df[['time', 'start', 'max', 'min', 'end', 'volume', 'turn']]
+            return df[['date', 'open', 'high', 'low', 'close', 'volume', 'turn']]
 
         except Exception as e:
             print(f"获取上证指数 Baostock 数据失败：{e}")
@@ -353,8 +336,8 @@ class DataChecker:
                 details={'latest_date': local_latest}
             )
 
-        local_dates = set(local_recent['time'])
-        bs_dates = set(bs_data['time'])
+        local_dates = set(local_recent['date'])
+        bs_dates = set(bs_data['date'])
 
         missing_dates = bs_dates - local_dates
 
@@ -367,28 +350,28 @@ class DataChecker:
             )
 
         for _, bs_row in bs_data.iterrows():
-            bs_time = bs_row['time']
-            local_row = local_recent[local_recent['time'] == bs_time]
+            bs_time = bs_row['date']
+            local_row = local_recent[local_recent['date'] == bs_time]
 
             if len(local_row) == 0:
                 continue
 
             local_row = local_row.iloc[0]
 
-            if abs(local_row['start'] - bs_row['start']) > 0.01:
+            if abs(local_row['open'] - bs_row['open']) > 0.01:
                 return CheckResult(
                     stock_code=self.index_file,
                     status=CheckStatus.FAIL,
-                    message=f"开盘价不匹配 ({bs_time}): 本地={local_row['start']}, Baostock={bs_row['start']}",
-                    details={'date': bs_time, 'field': 'start'}
+                    message=f"开盘价不匹配 ({bs_time}): 本地={local_row['open']}, Baostock={bs_row['open']}",
+                    details={'date': bs_time, 'field': 'open'}
                 )
 
-            if abs(local_row['end'] - bs_row['end']) > 0.01:
+            if abs(local_row['close'] - bs_row['close']) > 0.01:
                 return CheckResult(
                     stock_code=self.index_file,
                     status=CheckStatus.FAIL,
-                    message=f"收盘价不匹配 ({bs_time}): 本地={local_row['end']}, Baostock={bs_row['end']}",
-                    details={'date': bs_time, 'field': 'end'}
+                    message=f"收盘价不匹配 ({bs_time}): 本地={local_row['close']}, Baostock={bs_row['close']}",
+                    details={'date': bs_time, 'field': 'close'}
                 )
 
         return CheckResult(
@@ -468,8 +451,8 @@ class DataChecker:
                 details={'latest_date': local_latest}
             )
         
-        local_dates = set(local_recent['time'])
-        bs_dates = set(bs_data['time'])
+        local_dates = set(local_recent['date'])
+        bs_dates = set(bs_data['date'])
         
         missing_dates = bs_dates - local_dates
         extra_dates = local_dates - bs_dates
@@ -487,28 +470,28 @@ class DataChecker:
                 print(f"  ⚠ {stock_code} 多余 {len(extra_dates)} 个日期（可能是未来数据）")
         
         for _, bs_row in bs_data.iterrows():
-            bs_time = bs_row['time']
-            local_row = local_recent[local_recent['time'] == bs_time]
+            bs_time = bs_row['date']
+            local_row = local_recent[local_recent['date'] == bs_time]
             
             if len(local_row) == 0:
                 continue
             
             local_row = local_row.iloc[0]
             
-            if abs(local_row['start'] - bs_row['start']) > 0.01:
+            if abs(local_row['open'] - bs_row['open']) > 0.01:
                 return CheckResult(
                     stock_code=stock_code,
                     status=CheckStatus.FAIL,
-                    message=f"开盘价不匹配 ({bs_time}): 本地={local_row['start']}, Baostock={bs_row['start']}",
-                    details={'date': bs_time, 'field': 'start'}
+                    message=f"开盘价不匹配 ({bs_time}): 本地={local_row['open']}, Baostock={bs_row['open']}",
+                    details={'date': bs_time, 'field': 'open'}
                 )
             
-            if abs(local_row['end'] - bs_row['end']) > 0.01:
+            if abs(local_row['close'] - bs_row['close']) > 0.01:
                 return CheckResult(
                     stock_code=stock_code,
                     status=CheckStatus.FAIL,
-                    message=f"收盘价不匹配 ({bs_time}): 本地={local_row['end']}, Baostock={bs_row['end']}",
-                    details={'date': bs_time, 'field': 'end'}
+                    message=f"收盘价不匹配 ({bs_time}): 本地={local_row['close']}, Baostock={bs_row['close']}",
+                    details={'date': bs_time, 'field': 'close'}
                 )
             
             if abs(local_row['volume'] - bs_row['volume']) / max(bs_row['volume'], 1) > 0.05:
@@ -545,31 +528,31 @@ class DataChecker:
                     message="数据为空"
                 )
             
-            df = df.sort_values('time', ascending=False).head(check_days)
+            df = df.sort_values('date', ascending=False).head(check_days)
             
             for idx, row in df.iterrows():
-                if row['max'] < row['min']:
+                if row['high'] < row['low']:
                     return CheckResult(
                         stock_code=file_path.stem,
                         status=CheckStatus.FAIL,
-                        message=f"最高价 < 最低价 ({row['time']})",
-                        details={'date': row['time'], 'max': row['max'], 'min': row['min']}
+                        message=f"最高价 < 最低价 ({row['date']})",
+                        details={'date': row['date'], 'high': row['high'], 'low': row['low']}
                     )
                 
-                if row['start'] < row['min'] or row['start'] > row['max']:
+                if row['open'] < row['low'] or row['open'] > row['high']:
                     return CheckResult(
                         stock_code=file_path.stem,
                         status=CheckStatus.FAIL,
-                        message=f"开盘价超出范围 ({row['time']})",
-                        details={'date': row['time'], 'start': row['start'], 'max': row['max'], 'min': row['min']}
+                        message=f"开盘价超出范围 ({row['date']})",
+                        details={'date': row['date'], 'open': row['open'], 'high': row['high'], 'low': row['low']}
                     )
                 
-                if row['end'] < row['min'] or row['end'] > row['max']:
+                if row['close'] < row['low'] or row['close'] > row['high']:
                     return CheckResult(
                         stock_code=file_path.stem,
                         status=CheckStatus.FAIL,
-                        message=f"收盘价超出范围 ({row['time']})",
-                        details={'date': row['time'], 'end': row['end'], 'max': row['max'], 'min': row['min']}
+                        message=f"收盘价超出范围 ({row['date']})",
+                        details={'date': row['date'], 'close': row['close'], 'high': row['high'], 'low': row['low']}
                     )
             
             return CheckResult(
@@ -604,13 +587,13 @@ class DataChecker:
                     message="数据不足"
                 )
             
-            df = df.sort_values('time', ascending=False).head(check_days)
+            df = df.sort_values('date', ascending=False).head(check_days)
             
             df = df.reset_index(drop=True)
             
             for i in range(1, len(df)):
-                prev_close = df.iloc[i-1]['end']
-                curr_close = df.iloc[i]['end']
+                prev_close = df.iloc[i-1]['close']
+                curr_close = df.iloc[i]['close']
                 
                 if prev_close > 0:
                     change_pct = (curr_close - prev_close) / prev_close
@@ -619,8 +602,8 @@ class DataChecker:
                         return CheckResult(
                             stock_code=file_path.stem,
                             status=CheckStatus.WARNING,
-                            message=f"涨跌幅异常 ({df.iloc[i]['time']}): {change_pct*100:.2f}%",
-                            details={'date': df.iloc[i]['time'], 'change': change_pct}
+                            message=f"涨跌幅异常 ({df.iloc[i]['date']}): {change_pct*100:.2f}%",
+                            details={'date': df.iloc[i]['date'], 'change': change_pct}
                         )
             
             return CheckResult(
@@ -666,17 +649,17 @@ class DataChecker:
                 return False
             try:
                 old_df = pd.read_csv(file_path)
-                old_df['time'] = old_df['time'].astype(str)
-                patch_df['time'] = patch_df['time'].astype(str)
+                old_df['date'] = old_df['date'].astype(str)
+                patch_df['date'] = patch_df['date'].astype(str)
                 patch_df = patch_df.rename(columns={'turn': 'exchange'})
-                patch_df = patch_df[['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']]
-                existing = set(old_df['time'])
-                patch_df = patch_df[~patch_df['time'].isin(existing)]
+                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']]
+                existing = set(old_df['date'])
+                patch_df = patch_df[~patch_df['date'].isin(existing)]
                 if len(patch_df) == 0:
                     print(f"  ⚠ 补丁数据已存在，无需写入")
                     return True
                 combined = pd.concat([old_df, patch_df], ignore_index=True)
-                combined = combined.sort_values('time', ascending=False).reset_index(drop=True)
+                combined = combined.sort_values('date', ascending=False).reset_index(drop=True)
                 combined.to_csv(file_path, index=False)
                 print(f"  ✓ 补入 {len(patch_df)} 条，总计 {len(combined)} 条")
                 return True
@@ -707,27 +690,24 @@ class DataChecker:
                 return False
             try:
                 df = pd.DataFrame(data_list, columns=rs.fields)
-                df = df.rename(columns={'date': 'time', 'open': 'start', 'high': 'max',
-                                        'low': 'min', 'close': 'end'})
-                df['time'] = df['time'].str.replace('-', '')
-                df = df[df['time'] != '']
-                df['time'] = df['time'].astype(int)
-                for col in ['start', 'max', 'min', 'end']:
+                df['date'] = df['date'].str.replace('-', '')
+                df = df[df['date'] != '']
+                df['date'] = df['date'].astype(int)
+                for col in ['open', 'high', 'low', 'close']:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
-                df = df.dropna(subset=['start', 'max', 'min', 'end'])
+                df = df.dropna(subset=['open', 'high', 'low', 'close'])
                 if 'amount' in df.columns:
                     df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
                     df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
                 else:
                     df['volume'] = 0.0
-                # 优先使用 turnover 字段，如果不存在则使用 turn 字段
                 if 'turnover' in df.columns:
                     df['exchange'] = pd.to_numeric(df['turnover'], errors='coerce').fillna(0.0)
                 elif 'turn' in df.columns:
                     df['exchange'] = pd.to_numeric(df['turn'], errors='coerce').fillna(0.0)
                 else:
                     df['exchange'] = 0.0
-                df = df[['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']]
+                df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']]
                 df = df.iloc[::-1].reset_index(drop=True)
                 df.to_csv(file_path, index=False)
                 print(f"  ✓ 全量写入 {len(df)} 条")
@@ -753,19 +733,19 @@ class DataChecker:
                 return True
             try:
                 old_df = pd.read_csv(file_path)
-                old_df['time'] = old_df['time'].astype(str)
-                patch_df['time'] = patch_df['time'].astype(str)
+                old_df['date'] = old_df['date'].astype(str)
+                patch_df['date'] = patch_df['date'].astype(str)
                 patch_df = patch_df.rename(columns={'turn': 'exchange'})
-                patch_df = patch_df[['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']]
-                existing = set(old_df['time'])
-                patch_df = patch_df[~patch_df['time'].isin(existing)]
+                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']]
+                existing = set(old_df['date'])
+                patch_df = patch_df[~patch_df['date'].isin(existing)]
                 if len(patch_df) == 0:
                     print(f"  ⚠ 补丁数据已存在，无需写入")
                     return True
                 combined = pd.concat([patch_df, old_df], ignore_index=True)
-                combined = combined.sort_values('time', ascending=False).reset_index(drop=True)
+                combined = combined.sort_values('date', ascending=False).reset_index(drop=True)
                 combined.to_csv(file_path, index=False)
-                new_latest = str(int(combined.iloc[0]['time']))
+                new_latest = str(int(combined.iloc[0]['date']))
                 print(f"  ✓ 补入 {len(patch_df)} 条，最新：{new_latest}")
                 return True
             except Exception as e:
@@ -798,15 +778,15 @@ class DataChecker:
                 return False
             try:
                 old_df = pd.read_csv(file_path)
-                old_df['time'] = old_df['time'].astype(str)
-                patch_df['time'] = patch_df['time'].astype(str)
-                existing = set(old_df['time'])
-                patch_df = patch_df[~patch_df['time'].isin(existing)]
+                old_df['date'] = old_df['date'].astype(str)
+                patch_df['date'] = patch_df['date'].astype(str)
+                existing = set(old_df['date'])
+                patch_df = patch_df[~patch_df['date'].isin(existing)]
                 if len(patch_df) == 0:
                     print(f"  ⚠ 补丁数据已存在，无需写入")
                     return True
                 combined = pd.concat([old_df, patch_df], ignore_index=True)
-                combined = combined.sort_values('time', ascending=False).reset_index(drop=True)
+                combined = combined.sort_values('date', ascending=False).reset_index(drop=True)
                 combined.to_csv(file_path, index=False)
                 print(f"  ✓ 补入 {len(patch_df)} 条，总计 {len(combined)} 条")
                 return True
@@ -836,27 +816,24 @@ class DataChecker:
                 return False
             try:
                 df = pd.DataFrame(data_list, columns=rs.fields)
-                df = df.rename(columns={'date': 'time', 'open': 'start', 'high': 'max',
-                                        'low': 'min', 'close': 'end'})
-                df['time'] = df['time'].str.replace('-', '')
-                df = df[df['time'] != '']
-                df['time'] = df['time'].astype(int)
-                for col in ['start', 'max', 'min', 'end']:
+                df['date'] = df['date'].str.replace('-', '')
+                df = df[df['date'] != '']
+                df['date'] = df['date'].astype(int)
+                for col in ['open', 'high', 'low', 'close']:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
-                df = df.dropna(subset=['start', 'max', 'min', 'end'])
+                df = df.dropna(subset=['open', 'high', 'low', 'close'])
                 if 'amount' in df.columns:
                     df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
                     df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
                 else:
                     df['volume'] = 0.0
-                # 优先使用 turnover 字段，如果不存在则使用 turn 字段
                 if 'turnover' in df.columns:
                     df['exchange'] = pd.to_numeric(df['turnover'], errors='coerce').fillna(0.0)
                 elif 'turn' in df.columns:
                     df['exchange'] = pd.to_numeric(df['turn'], errors='coerce').fillna(0.0)
                 else:
                     df['exchange'] = 0.0
-                df = df[['time', 'start', 'max', 'min', 'end', 'volume', 'exchange']]
+                df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']]
                 df = df.iloc[::-1].reset_index(drop=True)
                 df.to_csv(file_path, index=False)
                 print(f"  ✓ 全量写入 {len(df)} 条")
@@ -879,17 +856,17 @@ class DataChecker:
                 return True
             try:
                 old_df = pd.read_csv(file_path)
-                old_df['time'] = old_df['time'].astype(str)
-                patch_df['time'] = patch_df['time'].astype(str)
-                existing = set(old_df['time'])
-                patch_df = patch_df[~patch_df['time'].isin(existing)]
+                old_df['date'] = old_df['date'].astype(str)
+                patch_df['date'] = patch_df['date'].astype(str)
+                existing = set(old_df['date'])
+                patch_df = patch_df[~patch_df['date'].isin(existing)]
                 if len(patch_df) == 0:
                     print(f"  ⚠ 补丁数据已存在，无需写入")
                     return True
                 combined = pd.concat([patch_df, old_df], ignore_index=True)
-                combined = combined.sort_values('time', ascending=False).reset_index(drop=True)
+                combined = combined.sort_values('date', ascending=False).reset_index(drop=True)
                 combined.to_csv(file_path, index=False)
-                new_latest = str(int(combined.iloc[0]['time']))
+                new_latest = str(int(combined.iloc[0]['date']))
                 print(f"  ✓ 补入 {len(patch_df)} 条，最新：{new_latest}")
                 return True
             except Exception as e:

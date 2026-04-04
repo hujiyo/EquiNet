@@ -49,10 +49,10 @@ def init_index_data(data_dir=DataConfig.DATA_DIR):
 
     try:
         df = pd.read_csv(index_file)
-        df = df.sort_values('time', ascending=True).reset_index(drop=True)
+        df = df.sort_values('date', ascending=True).reset_index(drop=True)
 
-        times = df['time'].values
-        closes = df['end'].values
+        times = df['date'].values
+        closes = df['close'].values
 
         _global_index_data = {}
         for i in range(1, len(times)):
@@ -408,7 +408,7 @@ def process_single_file(args):
     
     数据处理流程：
     1. 读取CSV并反转时间顺序
-    2. 提取OHLCV数据：['start', 'max', 'min', 'end', 'volume', 'exchange']
+    2. 提取OHLCV数据：['open', 'high', 'low', 'close', 'volume', 'exchange']
     3. 验证数据长度是否满足最低要求
     
     数据分割策略（确保训练集和测试集严格分离）：
@@ -436,8 +436,8 @@ def process_single_file(args):
         df = pd.read_csv(file_path)
         df = df.iloc[::-1].reset_index(drop=True)
                 
-        data = df[['start', 'max', 'min', 'end', 'volume', 'exchange']].values
-        times = df['time'].values
+        data = df[['open', 'high', 'low', 'close', 'volume', 'exchange']].values
+        times = df['date'].values
         
         data_length = len(data)
         required_length = DataConfig.REQUIRED_LENGTH

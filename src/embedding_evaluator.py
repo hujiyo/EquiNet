@@ -194,7 +194,7 @@ class EmbeddingModuleAnalyzer:
         if store_matrices:
             results['jacobian_matrices'] = []
         
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index', 'IdxVol']
         epsilon = 1e-5
         
         for i in range(min(n_samples, len(sample_inputs))):
@@ -204,9 +204,9 @@ class EmbeddingModuleAnalyzer:
                 x_tensor = torch.tensor(x, dtype=torch.float32, device=self.device)
                 base_output = self.embedding_module(x_tensor)
             
-            jacobian = np.zeros((7, 48))
-            
-            for j in range(7):
+            jacobian = np.zeros((8, 48))
+
+            for j in range(8):
                 x_plus = x.copy()
                 x_plus[0, :, j] += epsilon
                 x_minus = x.copy()
@@ -268,7 +268,7 @@ class EmbeddingModuleAnalyzer:
         
         sample_inputs = np.array(sample_inputs[:n_samples])
         
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index', 'IdxVol']
         results = {name: [] for name in feature_names}
         results['overall'] = []
         
@@ -323,7 +323,7 @@ class EmbeddingModuleAnalyzer:
         if sample_inputs is None:
             raise ValueError("必须提供真实数据样本(sample_inputs)进行评估!")
 
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index', 'IdxVol']
         results = {name: {'output_range': [], 'output_std': []} for name in feature_names}
 
         base_input = np.array(sample_inputs[:1])
@@ -472,7 +472,7 @@ class EmbeddingModuleAnalyzer:
         
         sample_inputs = np.array(sample_inputs[:n_samples])
         
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index', 'IdxVol']
         
         second_order_sensitivity = {name: [] for name in feature_names}
         
@@ -530,7 +530,7 @@ class EmbeddingModuleAnalyzer:
         
         sample_inputs = np.array(sample_inputs[:n_samples])
 
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index', 'IdxVol']
 
         zero_values = {
             'Open': 0.0,
@@ -539,7 +539,8 @@ class EmbeddingModuleAnalyzer:
             'Close': 0.0,
             'Volume': 0.5,
             'Exchange': 0.01,
-            'Index': 0.0
+            'Index': 0.0,
+            'IdxVol': 0.0
         }
 
         with torch.no_grad():
@@ -594,7 +595,7 @@ class EmbeddingModuleAnalyzer:
 
         os.makedirs(save_dir, exist_ok=True)
 
-        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index']
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index', 'IdxVol']
 
         n_samples = min(100, len(sample_inputs))
         sample_inputs = np.array(sample_inputs[:n_samples])
@@ -633,9 +634,9 @@ class EmbeddingModuleAnalyzer:
         
         ax = axes[0, 1]
         with torch.no_grad():
-            base_input = np.zeros((1, 30, 7), dtype=np.float32)
+            base_input = np.zeros((1, 30, 8), dtype=np.float32)
             
-            feature_indices = {'Open': 0, 'High': 1, 'Low': 2, 'Close': 3, 'Volume': 4, 'Exchange': 5, 'Index': 6}
+            feature_indices = {'Open': 0, 'High': 1, 'Low': 2, 'Close': 3, 'Volume': 4, 'Exchange': 5, 'Index': 6, 'IdxVol': 7}
             
             for name in ['Open', 'Close', 'Volume']:
                 outputs = []
@@ -714,7 +715,8 @@ class EmbeddingModuleAnalyzer:
                 'Close': 0.0,
                 'Volume': 0.5,
                 'Exchange': 0.01,
-                'Index': 0.0
+                'Index': 0.0,
+                'IdxVol': 0.0
             }
             with torch.no_grad():
                 sample_inputs_tensor = torch.tensor(sample_inputs, dtype=torch.float32, device=self.device)

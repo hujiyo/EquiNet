@@ -68,7 +68,7 @@ class DataConfig:
 class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
-    INPUT_DIM = 7                    # 输入特征维度数（OHLC + volume + exchange）
+    INPUT_DIM = 8                    # 输入特征维度数（OHLC + volume + exchange + 大盘涨跌幅 + 大盘量能涨跌幅）
     D_MODEL = 48                     # 模型维度（Transformer 内部维度）
     FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数
@@ -88,10 +88,10 @@ class ModelConfig:
     # 假设：输入数据经过归一化后std≈1.0
     #
     # 计算过程：
-    # - Token Embedding (Linear 7→48): gain = 0.2 / sqrt(14/55) ≈ 0.40
+    # - Token Embedding (Linear 8→48): gain = 0.2 / sqrt(16/56) ≈ 0.37
     # - Position Embedding (Embedding 30→48): gain = 0.2 / sqrt(2/78) ≈ 1.25
     # - Query Token (Parameter 48): gain = 0.2 / sqrt(2/96) ≈ 1.39 → 取1.4
-    EMBEDDING_INIT_GAIN = 0.40           # Token Embedding (Linear 7→48)
+    EMBEDDING_INIT_GAIN = 0.37           # Token Embedding (Linear 8→48)
     POSITION_EMBEDDING_INIT_GAIN = 1.25  # Position Embedding (Embedding 30→48)
     QUERY_INIT_GAIN = 1.4                # Query Token (AttentionPooling)
 

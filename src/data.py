@@ -24,20 +24,23 @@ from typing import Dict, List, Tuple
 
 
 # ========== 大盘数据全局变量 ==========
-_global_index_data = None  # {date_int: change_rate_float}
+_global_index_data = None  # {date_int: change_rate_float} 大盘价格涨跌幅
+_global_index_volume_data = None  # {date_int: volume_change_float} 大盘量能涨跌幅
 
 
 def init_index_data(data_dir=DataConfig.DATA_DIR):
     """
     初始化大盘数据（幂等，重复调用不重复加载）
 
-    从 INDEX_FILE 加载上证指数数据，构建 {日期: 涨跌幅} 映射。
+    从 INDEX_FILE 加载上证指数数据，构建：
+    - {日期: 价格涨跌幅} 映射
+    - {日期: 量能涨跌幅} 映射
     必须在训练/评估开始前调用一次。
 
     Args:
         data_dir: 数据目录
     """
-    global _global_index_data
+    global _global_index_data, _global_index_volume_data
     if _global_index_data is not None:
         return
 
@@ -53,20 +56,31 @@ def init_index_data(data_dir=DataConfig.DATA_DIR):
 
         times = df['date'].values
         closes = df['close'].values
+        volumes = df['volume'].values
 
         _global_index_data = {}
+        _global_index_volume_data = {}
         for i in range(1, len(times)):
             today = int(times[i])
             yesterday_close = closes[i - 1]
+            yesterday_volume = volumes[i - 1]
 
+            # 价格涨跌幅
             if yesterday_close > 0:
                 change = (closes[i] - yesterday_close) / yesterday_close
             else:
                 change = 0.0
-
             _global_index_data[today] = float(change)
 
+            # 量能涨跌幅
+            if yesterday_volume > 0:
+                vol_change = (volumes[i] - yesterday_volume) / yesterday_volume
+            else:
+                vol_change = 0.0
+            _global_index_volume_data[today] = float(vol_change)
+
         print(f"大盘涨跌幅数据已加载：{len(_global_index_data)} 条记录")
+        print(f"大盘量能涨跌幅数据已加载：{len(_global_index_volume_data)} 条记录")
     except Exception as e:
         print(f"加载大盘数据失败：{e}")
 
@@ -84,6 +98,21 @@ def get_index_change(date):
     if _global_index_data is None:
         return 0.0
     return _global_index_data.get(date, 0.0)
+
+
+def get_index_volume_change(date):
+    """
+    查询指定日期的大盘量能涨跌幅
+
+    Args:
+        date: 日期 (YYYYMMDD 格式的整数)
+
+    Returns:
+        当日大盘量能涨跌幅，如果未初始化或日期不存在则返回 0.0
+    """
+    if _global_index_volume_data is None:
+        return 0.0
+    return _global_index_volume_data.get(date, 0.0)
 
 
 class FeatureNormalizer:
@@ -125,6 +154,7 @@ class FeatureNormalizer:
         self.volume_pipeline = self._create_pipeline()
         self.exchange_pipeline = self._create_pipeline()
         self.index_pipeline = self._create_pipeline()
+        self.index_volume_pipeline = self._create_pipeline()
 
         self.is_fitted = False
 
@@ -148,28 +178,31 @@ class FeatureNormalizer:
             ('scaler', StandardScaler())
         ])
 
-    def _collect_training_features(self, train_stock_info: List[Dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _collect_training_features(self, train_stock_info: List[Dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         从训练集收集所有特征值（避免数据泄漏）
 
         关键：只使用每只股票的训练集部分（train_end_idx 之前）
-        
+
         使用 data.py 中的 coarse_normalize_context_window() 进行粗处理，
         确保与训练时的数据处理逻辑完全一致。
+
+        注意：Index和IndexVolume是市场级别特征，直接从全局变量获取，
+              不从每只股票样本中重复收集（避免数据重复800+倍）
 
         Returns:
             ohl_data: OHLC 特征 [N_samples * 30 * 4]
             volume_data: Volume 特征 [N_samples * 30]
             exchange_data: Exchange 特征 [N_samples * 30]
-            index_data_collected: Index 特征 [N_samples * 30]
+            index_data_collected: Index 特征 [N_unique_dates]
+            index_volume_data: Index Volume 特征 [N_unique_dates]
         """
         from data import coarse_normalize_context_window, DataConfig
-        
+
         ohl_data = []
         volume_data = []
         exchange_data = []
-        index_data_collected = []
-        
+
         context_length = DataConfig.CONTEXT_LENGTH
 
         for stock in train_stock_info:
@@ -185,27 +218,37 @@ class FeatureNormalizer:
                     required_length=context_length,
                     times=stock_times
                 )
-                
+
                 if input_seq is None:
                     continue
-                
+
                 ohl_data.append(input_seq[:, :4].flatten())
                 volume_data.append(input_seq[:, 4].flatten())
                 exchange_data.append(input_seq[:, 5].flatten())
-                index_data_collected.append(input_seq[:, 6].flatten())
 
         ohl_data = np.concatenate(ohl_data) if ohl_data else np.array([])
         volume_data = np.concatenate(volume_data) if volume_data else np.array([])
         exchange_data = np.concatenate(exchange_data) if exchange_data else np.array([])
-        index_data_collected = np.concatenate(index_data_collected) if index_data_collected else np.array([])
+
+        global _global_index_data, _global_index_volume_data
+        if _global_index_data is not None and len(_global_index_data) > 0:
+            index_data_collected = np.array(list(_global_index_data.values()), dtype=np.float32)
+        else:
+            index_data_collected = np.array([], dtype=np.float32)
+
+        if _global_index_volume_data is not None and len(_global_index_volume_data) > 0:
+            index_volume_data = np.array(list(_global_index_volume_data.values()), dtype=np.float32)
+        else:
+            index_volume_data = np.array([], dtype=np.float32)
 
         print(f"[FeatureNormalizer] 收集到的训练数据:")
         print(f"  OHLC: {len(ohl_data)} 个值")
         print(f"  Volume: {len(volume_data)} 个值")
         print(f"  Exchange: {len(exchange_data)} 个值")
-        print(f"  Index: {len(index_data_collected)} 个值")
+        print(f"  Index: {len(index_data_collected)} 个值 (市场级别，{len(_global_index_data) if _global_index_data else 0} 个交易日)")
+        print(f"  IndexVolume: {len(index_volume_data)} 个值 (市场级别，{len(_global_index_volume_data) if _global_index_volume_data else 0} 个交易日)")
 
-        return ohl_data, volume_data, exchange_data, index_data_collected
+        return ohl_data, volume_data, exchange_data, index_data_collected, index_volume_data
 
     def fit(self, train_stock_info: List[Dict]):
         """
@@ -222,7 +265,7 @@ class FeatureNormalizer:
         print(f"  分位数数量: {self.n_quantiles}")
 
         # 收集训练数据
-        ohl_data, volume_data, exchange_data, index_data_collected = self._collect_training_features(
+        ohl_data, volume_data, exchange_data, index_data_collected, index_volume_data = self._collect_training_features(
             train_stock_info
         )
 
@@ -241,13 +284,18 @@ class FeatureNormalizer:
             raise RuntimeError("Index特征数据为空！请确保大盘数据已正确加载。")
         self.index_pipeline.fit(index_data_collected.reshape(-1, 1))
 
+        print("[FeatureNormalizer] 拟合 IndexVolume 特征...")
+        if len(index_volume_data) == 0:
+            raise RuntimeError("IndexVolume特征数据为空！请确保大盘数据已正确加载。")
+        self.index_volume_pipeline.fit(index_volume_data.reshape(-1, 1))
+
         self.is_fitted = True
 
-        self._print_transform_stats(ohl_data, volume_data, exchange_data, index_data_collected)
+        self._print_transform_stats(ohl_data, volume_data, exchange_data, index_data_collected, index_volume_data)
 
         print("\n[FeatureNormalizer] ✓ 拟合完成！")
 
-    def _print_transform_stats(self, ohl_data, volume_data, exchange_data, index_data_collected=None):
+    def _print_transform_stats(self, ohl_data, volume_data, exchange_data, index_data_collected=None, index_volume_data=None):
         """
         打印变换后的统计信息，验证归一化效果
         """
@@ -280,6 +328,13 @@ class FeatureNormalizer:
             print(f"    均值: {index_transformed.mean():.6f}")
             print(f"    标准差: {index_transformed.std():.6f}")
             print(f"    范围: [{index_transformed.min():.6f}, {index_transformed.max():.6f}]")
+
+        if index_volume_data is not None and len(index_volume_data) > 0:
+            index_vol_transformed = self.index_volume_pipeline.transform(index_volume_data.reshape(-1, 1)).flatten()
+            print(f"  IndexVolume:")
+            print(f"    均值: {index_vol_transformed.mean():.6f}")
+            print(f"    标准差: {index_vol_transformed.std():.6f}")
+            print(f"    范围: [{index_vol_transformed.min():.6f}, {index_vol_transformed.max():.6f}]")
     def transform(self, input_seq: np.ndarray) -> np.ndarray:
         """
         对单个样本应用归一化
@@ -288,10 +343,10 @@ class FeatureNormalizer:
         因为它只使用 fit() 时学到的参数，不会产生数据泄漏
 
         Args:
-            input_seq: [context_length, 6] 原始输入序列
+            input_seq: [context_length, 8] 原始输入序列
 
         Returns:
-            normalized_seq: [context_length, 6] 归一化后的序列
+            normalized_seq: [context_length, 8] 归一化后的序列
         """
         if not self.is_fitted:
             raise RuntimeError("归一化器未拟合！请先调用 fit() 方法")
@@ -303,6 +358,7 @@ class FeatureNormalizer:
         volume_flat = input_seq[:, 4].flatten()  # [context_length]
         exchange_flat = input_seq[:, 5].flatten()  # [context_length]
         index_flat = input_seq[:, 6].flatten()  # [context_length]
+        index_volume_flat = input_seq[:, 7].flatten()  # [context_length]
         # 转换每个特征组
         normalized_ohl = self.ohl_pipeline.transform(
             ohl_flat.reshape(-1, 1)
@@ -316,12 +372,16 @@ class FeatureNormalizer:
         normalized_index = self.index_pipeline.transform(
             index_flat.reshape(-1, 1)
         ).flatten()
+        normalized_index_volume = self.index_volume_pipeline.transform(
+            index_volume_flat.reshape(-1, 1)
+        ).flatten()
 
         # 重塑回原始形状
         normalized[:, :4] = normalized_ohl.reshape(input_seq[:, :4].shape)
         normalized[:, 4] = normalized_volume
         normalized[:, 5] = normalized_exchange
         normalized[:, 6] = normalized_index
+        normalized[:, 7] = normalized_index_volume
 
         return normalized
 
@@ -354,6 +414,7 @@ class FeatureNormalizer:
                 'volume_pipeline': self.volume_pipeline,
                 'exchange_pipeline': self.exchange_pipeline,
                 'index_pipeline': self.index_pipeline,
+                'index_volume_pipeline': self.index_volume_pipeline,
                 'is_fitted': self.is_fitted,
                 'output_distribution': self.output_distribution,
                 'n_quantiles': self.n_quantiles,
@@ -390,10 +451,8 @@ class FeatureNormalizer:
         normalizer.ohl_pipeline = data['ohl_pipeline']
         normalizer.volume_pipeline = data['volume_pipeline']
         normalizer.exchange_pipeline = data['exchange_pipeline']
-        if 'index_pipeline' in data:
-            normalizer.index_pipeline = data['index_pipeline']
-        else:
-            normalizer.index_pipeline = normalizer._create_pipeline()
+        normalizer.index_pipeline = data['index_pipeline']
+        normalizer.index_volume_pipeline = data['index_volume_pipeline']
         normalizer.is_fitted = data['is_fitted']
 
         print(f" ✓ 归一化器已从 {path} 加载")
@@ -1171,7 +1230,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         times: 股票时间戳数组（用于大盘数据日期对齐），如果为 None 则大盘特征填 0
 
     Returns:
-        input_seq: [context_length, 7] 归一化后的输入序列，或 None（如果验证失败）
+        input_seq: [context_length, 8] 归一化后的输入序列，或 None（如果验证失败）
             - 粗处理后：OHLE: -0.1~0.1, Volume: 0~1, Exchange: 0~1
             - 细处理后：均值≈0，方差≈1
 
@@ -1230,24 +1289,26 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         if last_day_return >= DataConfig.LIMIT_THRESHOLD:
             return None
 
-    input_seq = np.empty((context_length, 7), dtype=np.float32)
+    input_seq = np.empty((context_length, 8), dtype=np.float32)
 
     input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
     if context_length > 1:
         input_seq[1:, :4] = (input_seq_raw[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
-    
+
     input_seq[0, 4] = (volumes[0] - prev_volume) / prev_volume
     if context_length > 1:
         input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
-    
+
     input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
 
     if times is not None:
         for i in range(context_length):
             day_time = int(times[start_idx + i])
             input_seq[i, 6] = get_index_change(day_time)
+            input_seq[i, 7] = get_index_volume_change(day_time)
     else:
         input_seq[:, 6] = 0.0
+        input_seq[:, 7] = 0.0
     # ========== 粗处理阶段 ==========
     # OHLE: 涨跌幅，范围 -0.1 ~ 0.1
     np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
@@ -1256,6 +1317,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
     np.clip(input_seq[:, 5], 0.0, 1.0, out=input_seq[:, 5])
     np.clip(input_seq[:, 6], -0.1, 0.1, out=input_seq[:, 6])
+    np.clip(input_seq[:, 7], -0.1, 0.1, out=input_seq[:, 7])
 
     # ========== 细处理阶段（可选）==========
     # 应用高级特征归一化，将粗处理结果转换为均值≈0、方差≈1的标准化数据
@@ -1280,6 +1342,7 @@ def coarse_normalize_context_window(stock_data, start_idx, context_length,
         - Volume: 0 ~ 1（成交量变化率）
         - Exchange: 0 ~ 1（换手率）
         - Index: -0.1 ~ 0.1（大盘涨跌幅）
+        - IndexVolume: -0.1 ~ 0.1（大盘量能涨跌幅）
 
     Args:
         stock_data: 股票原始数据 [N, 6]
@@ -1290,7 +1353,7 @@ def coarse_normalize_context_window(stock_data, start_idx, context_length,
         times: 股票时间戳数组（用于大盘数据日期对齐）
 
     Returns:
-        input_seq: [context_length, 7] 粗处理后的输入序列，或 None（如果验证失败）
+        input_seq: [context_length, 8] 粗处理后的输入序列，或 None（如果验证失败）
     """
     return normalize_and_validate_context_window(
         stock_data, start_idx, context_length,
@@ -1321,18 +1384,20 @@ def fine_normalize_batch(input_seq, feature_normalizer):
     return feature_normalizer.transform(input_seq)
 
 
-def fit_feature_normalizer(output_path='./normalizer.pkl', output_distribution='normal', n_quantiles=1000):
+def fit_feature_normalizer(output_path=None, output_distribution='normal', n_quantiles=1000):
     """
     在训练集上拟合特征归一化器并保存到文件
 
     Args:
-        output_path: 归一化器输出文件路径
+        output_path: 归一化器输出文件路径（默认使用 DataConfig.NORMALIZER_PATH）
         output_distribution: 输出分布类型 ('normal' 或 'uniform')
         n_quantiles: 分位数数量
 
     Returns:
         normalizer: 拟合后的 FeatureNormalizer 实例
     """
+    if output_path is None:
+        output_path = DataConfig.NORMALIZER_PATH
     if os.path.exists(output_path):
         print(f"归一化器文件已存在: {output_path}")
         response = input("是否重新训练？(y/n): ")
@@ -1373,19 +1438,18 @@ def main():
   python data.py                                           # 使用默认参数拟合归一化器
   python data.py --output-distribution uniform             # 使用均匀分布拟合
   python data.py --n-quantiles 500                         # 使用500个分位数拟合
-  python data.py --output ./my_normalizer.pkl              # 指定输出文件路径
         '''
     )
     parser.add_argument('--output-distribution', type=str, default='normal',choices=['normal', 'uniform'],
                         help='输出分布类型: normal (标准正态) 或 uniform (均匀分布)，默认 normal')
     parser.add_argument('--n-quantiles', type=int, default=1000,help='分位数数量（默认1000，越大越精确但越慢）')
-    parser.add_argument('--output', type=str, default='./normalizer.pkl',
-                        help='归一化器输出文件路径，默认 ./normalizer.pkl')
 
     args = parser.parse_args()
-    fit_feature_normalizer(output_path=args.output,
-    output_distribution=args.output_distribution,n_quantiles=args.n_quantiles)
-    print(f"✓ 特征归一化器训练完成！已保存到: {args.output}")
+    fit_feature_normalizer(
+        output_distribution=args.output_distribution,
+        n_quantiles=args.n_quantiles
+    )
+    print(f"✓ 特征归一化器训练完成！已保存到: {DataConfig.NORMALIZER_PATH}")
 
 if __name__ == "__main__":
     main()

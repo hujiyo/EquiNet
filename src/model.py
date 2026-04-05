@@ -31,7 +31,8 @@ def init_weights(module):
     - Embedding层: 输出std = gain × sqrt(2/(vocab_size+embedding_dim))
 
     各层gain计算结果：
-    - Token Embedding (Linear 7→48): gain=0.40
+    - Token Embedding (Linear 8→48): gain=0.37
+
     - Position Embedding (Embedding 30→48): gain=1.25
     - Query Token (Parameter 48): gain=1.4
     """
@@ -203,7 +204,7 @@ class StockTransformer(nn.Module):
     Transformer 模型（Pre-Norm 架构 + Linear-Embedding）
 
     核心设计：回归主流 Transformer 架构
-    - 6 个输入特征 (OHLC + Volume + Exchange) -> 单一线性层映射到 d_model 维
+    - 8 个输入特征 (OHLC + Volume + Exchange + 大盘涨跌幅 + 大盘量能涨跌幅) -> 单一线性层映射到 d_model 维
     - 遵循 BERT/GPT/LLaMA 等主流模型的设计：embedding = nn.Linear(input_dim, d_model)
     - 简化结构，减少不必要的非线性变换，让模型更容易训练
 
@@ -249,9 +250,9 @@ class StockTransformer(nn.Module):
         self.apply(init_weights)
 
     def forward(self, x):
-        # x: [batch_size, seq_len, 6] (OHLC + volume + exchange)
+        # x: [batch_size, seq_len, 8] (OHLC + volume + exchange + 大盘涨跌幅 + 大盘量能涨跌幅)
 
-        # 1. 统一Embedding：6个特征一起映射到d_model维
+        # 1. 统一Embedding：8个特征一起映射到d_model维
         x = self.embedding(x)  # [batch_size, seq_len, d_model]
 
         # 2. 位置编码

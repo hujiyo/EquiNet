@@ -38,7 +38,6 @@ from training_utils import (
     DynamicWeightedBCE,
     TaskAlignedLoss,
     EarlyStopping,
-    calculate_test_loss,
     print_dispersion_sparkline,
     create_optimizer_from_config,
     create_scheduler_from_config
@@ -340,12 +339,13 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         if not warmup_scheduler_a.is_warmup_phase():
             main_scheduler_a.step()
 
-        # 评估模型A（使用统一的评估函数）
+        # 评估模型A（使用统一的评估函数，同时计算测试损失）
         stats_a = evaluate_model(
             model_a, eval_inputs, eval_targets, eval_cumulative_returns,
             device, model_name="A",
             eval_day_indices=eval_day_indices,
-            eval_daily_returns=eval_daily_returns
+            eval_daily_returns=eval_daily_returns,
+            criterion=eval_criterion
         )
 
         # 计算训练集平均损失（除以样本数，与测试损失保持一致）
@@ -353,8 +353,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         total_samples_a = len(epoch_inputs)
         avg_loss_a = total_loss_a / total_samples_a if total_samples_a > 0 else 0
 
-        # 计算测试集损失（用于早停检测）
-        test_loss_a = calculate_test_loss(model_a, eval_inputs, eval_targets, eval_criterion, device)
+        # 测试损失已在评估中计算
+        test_loss_a = stats_a['test_loss']
 
         # 打印模型A结果
         print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
@@ -450,7 +450,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 model_b, eval_inputs, eval_targets, eval_cumulative_returns,
                 device, model_name="B",
                 eval_day_indices=eval_day_indices,
-                eval_daily_returns=eval_daily_returns
+                eval_daily_returns=eval_daily_returns,
+                criterion=eval_criterion
             )
 
             # 计算训练集平均损失（除以样本数，与测试损失保持一致）
@@ -458,8 +459,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             total_samples_b = len(epoch_inputs)
             avg_loss_b = total_loss_b / total_samples_b if total_samples_b > 0 else 0
 
-            # 计算测试集损失
-            test_loss_b = calculate_test_loss(model_b, eval_inputs, eval_targets, eval_criterion, device)
+            # 测试损失已在评估中计算
+            test_loss_b = stats_b['test_loss']
 
             print(f'  [模型B] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')

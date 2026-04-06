@@ -40,7 +40,6 @@ from training_utils import (
     DynamicWeightedBCE,
     TaskAlignedLoss,
     EarlyStopping,
-    calculate_test_loss,
     print_dispersion_sparkline,
     create_optimizer_from_config,
     create_scheduler_from_config
@@ -375,16 +374,17 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         if not warmup_scheduler.is_warmup_phase():
             main_scheduler.step()
 
-        # 评估模型
+        # 评估模型（同时计算测试损失）
         stats = evaluate_model(
             model, eval_inputs, eval_targets, eval_cumulative_returns,
             device, model_name="DFT",
             eval_day_indices=eval_day_indices,
-            eval_daily_returns=eval_daily_returns
+            eval_daily_returns=eval_daily_returns,
+            criterion=eval_criterion
         )
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
-        test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device)
+        test_loss = stats['test_loss']
 
         print(f'  [DFT模型] 训练损失: {avg_loss:.4f}, 测试损失: {test_loss:.4f}, AUC: {stats["auc"]:.4f}')
         print(f'            预测均值: {stats["pred_mean"]:.3f}, 高置信(>0.7): {stats["high_conf_count"]}, 低置信(<0.2): {stats["low_conf_count"]}')

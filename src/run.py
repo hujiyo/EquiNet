@@ -19,7 +19,7 @@ from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
                   create_recent_days_dataset, normalize_and_validate_context_window,
                   init_index_data)
-from training_utils import evaluate_model, calculate_test_loss, DynamicWeightedBCE
+from training_utils import evaluate_model, DynamicWeightedBCE
 
 
 # ==================== 工具函数 ====================
@@ -338,18 +338,11 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     
     print(f"│  评估样本数: {len(eval_inputs)}")
     print(f"│  正在评估模型...")
-    
-    stats = evaluate_model(
-        model, eval_inputs, eval_targets, eval_cumulative_returns,
-        device, model_name="选中模型",
-        eval_day_indices=eval_day_indices,
-        eval_daily_returns=eval_daily_returns
-    )
-    
+
     # 创建评估损失函数（与 train.py 一致）
     if LossConfig.use_dynamic_bce():
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
-        
+
         # 测试集权重
         test_targets = np.array(eval_targets)
         test_pos_count = np.sum(test_targets >= 0.5)
@@ -364,9 +357,16 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     else:
         import torch.nn as nn
         eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
-    
-    # 计算测试集损失
-    test_loss = calculate_test_loss(model, eval_inputs, eval_targets, eval_criterion, device)
+
+    # 评估模型（同时计算测试损失，避免冗余前向传播）
+    stats = evaluate_model(
+        model, eval_inputs, eval_targets, eval_cumulative_returns,
+        device, model_name="选中模型",
+        eval_day_indices=eval_day_indices,
+        eval_daily_returns=eval_daily_returns,
+        criterion=eval_criterion
+    )
+    test_loss = stats['test_loss']
     
     # 打印评估结果（与 train.py 格式一致）
     print(f"│")

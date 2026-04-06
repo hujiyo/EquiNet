@@ -8,7 +8,6 @@
 - TaskAlignedLoss: 任务对齐损失函数
 - EarlyStopping: 早停机制
 - evaluate_model: 模型评估函数
-- calculate_test_loss: 计算测试集损失
 - generate_pseudo_labels: 伪标签生成
 - save_model_with_metadata: 带元数据的模型保存
 - print_dispersion_sparkline: 预测值分布可视化
@@ -340,7 +339,8 @@ class TaskAlignedLoss(nn.Module):
 
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
-                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None):
+                   device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None,
+                   criterion=None):
     """
     模型评估函数
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
@@ -359,6 +359,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         filtered_count：被过滤的涨停样本数（始终为0，因已在生成阶段过滤）
         realistic_stats：实战收益率统计（如果提供了eval_day_indices）
         smart_exit_stats：智能止损策略统计（如果提供了eval_daily_returns）
+        test_loss：测试集损失（如果提供了criterion）
     """
     model.eval()
 
@@ -366,23 +367,32 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     if num_samples == 0:
         return {
             'auc': 0.5, 'top_return': 0.0, 'top_count': 0, 'top_threshold': 0.0,
-            'high_conf_count': 0, 'low_conf_count': 0, 'pred_mean': 0.0, 
-            'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None, 'smart_exit_stats': None
+            'high_conf_count': 0, 'low_conf_count': 0, 'pred_mean': 0.0,
+            'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None, 'smart_exit_stats': None,
+            'test_loss': None
         }
 
     all_preds = []
+    total_loss = 0.0
     num_batches = (num_samples + batch_size - 1) // batch_size
-    
+
     with torch.no_grad():
         for i in range(num_batches):
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, num_samples)
-            
+
             batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], dtype=torch.float32, device=device)
-            batch_preds = torch.sigmoid(model(batch_inputs))
-            all_preds.append(batch_preds.cpu().numpy().flatten())
-            del batch_inputs
-    
+            logits = model(batch_inputs)
+            all_preds.append(torch.sigmoid(logits).cpu().numpy().flatten())
+
+            if criterion is not None:
+                batch_targets = torch.tensor(eval_targets[start_idx:end_idx], dtype=torch.float32, device=device)
+                loss = criterion(logits.squeeze(-1), batch_targets)
+                total_loss += loss.item() * (end_idx - start_idx)
+                del batch_targets
+
+            del batch_inputs, logits
+
     all_preds = np.concatenate(all_preds)
     all_targets = np.array(eval_targets)
     all_returns = np.array(eval_cumulative_returns)
@@ -417,6 +427,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         'dispersion_std': float(np.std(all_preds)),
         'dispersion_range': float(np.max(all_preds) - np.min(all_preds)),
         'dispersion_iqr': float(np.percentile(all_preds, 75) - np.percentile(all_preds, 25)),
+        'test_loss': total_loss / num_samples if criterion is not None else None,
     }
 
     if eval_day_indices is not None:
@@ -1006,40 +1017,6 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
     torch.save(checkpoint, save_path)
 
     return save_path
-
-def calculate_test_loss(model, eval_inputs, eval_targets, criterion, device, batch_size=1024):
-    """
-    计算测试集损失（官方标准：除以样本数）
-
-    优化版本：
-    - 权重在训练开始时已设置，此处直接使用
-    - 支持大batch_size，提高GPU利用率
-    """
-    model.eval()
-    total_loss = 0.0
-    num_samples = len(eval_inputs)
-    
-    if num_samples == 0:
-        return 0.0
-    
-    num_batches = (num_samples + batch_size - 1) // batch_size
-
-    with torch.no_grad():
-        for i in range(num_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, num_samples)
-
-            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx],
-                                       dtype=torch.float32).to(device)
-            batch_targets = torch.tensor(eval_targets[start_idx:end_idx],
-                                        dtype=torch.float32).to(device)
-
-            outputs = model(batch_inputs)
-            loss = criterion(outputs.squeeze(-1), batch_targets)
-            total_loss += loss.item() * (end_idx - start_idx)
-
-    return total_loss / num_samples
-
 
 class EarlyStopping:
     """

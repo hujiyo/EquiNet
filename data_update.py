@@ -2,7 +2,7 @@
 股票数据更新脚本
 
 使用 Baostock 获取 A 股历史行情数据，自动更新到最新交易日
-支持增量更新和全量更新两种模式
+支持增量更新、全量更新、训练数据更新三种模式
 
 功能特性：
 - 自动识别已有数据，支持增量更新
@@ -11,11 +11,18 @@
 - 支持指定股票或批量更新所有股票
 - 详细的更新日志和错误处理
 
+更新模式说明：
+- incremental (默认)：增量更新 data_all/ 中已有股票的最新数据，适合日常维护
+- full：从 Baostock 获取全部 A 股列表，重新拉取完整历史数据，适合初始化或添加新股
+- train：增量更新 data/ 中已筛选的股票（由 data_select.py 生成），适合训练前快速刷新
+  由于 data/ 中的股票数量远少于 data_all/，train 模式速度很快，适合频繁使用
+
 使用方法:
-python data_update.py # 增量更新所有股票 (默认模式)
-python data_update.py --mode full # 全量更新所有股票   
-python data_update.py --stocks 000001 600000 300750 # 更新指定股票    
-python data_update.py --no-backup # 禁用备份
+python data_update.py                              # 增量更新 data_all/ 全量股票池 (默认)
+python data_update.py --mode full                  # 全量更新 data_all/ 所有 A 股
+python data_update.py --mode train                 # 增量更新 data/ 训练数据（快速）
+python data_update.py --stocks 000001 600000       # 更新指定股票
+python data_update.py --no-backup                  # 禁用备份
 """
 
 import time
@@ -605,22 +612,33 @@ class StockDataUpdater:
 
 def main():
     parser = argparse.ArgumentParser(description='EquiNet股票数据更新工具')
-    parser.add_argument('--data-dir', type=str, default='data',help='数据存储目录 (默认：data)')
-    parser.add_argument('--mode', type=str, choices=['incremental', 'full'], default='incremental',
-                       help='更新模式：incremental(增量) 或 full(全量)')
+    parser.add_argument('--data-dir', type=str, default=None,
+                       help='数据存储目录 (默认：由 --mode 决定)')
+    parser.add_argument('--mode', type=str, choices=['incremental', 'full', 'train'], default='incremental',
+                       help='更新模式：incremental(增量更新data_all) | full(全量更新data_all) | train(增量更新data)')
     parser.add_argument('--stocks', type=str, nargs='+',help='指定要更新的股票代码列表')
     parser.add_argument('--no-backup', action='store_true',help='禁用备份')
     parser.add_argument('--no-index', action='store_true',help='不更新上证指数数据')
     args = parser.parse_args()
-    
-    data_dir = Path(args.data_dir)
-    if not data_dir.is_absolute():
-        script_dir = Path(__file__).parent
-        data_dir = script_dir / data_dir
-    
+
+    script_dir = Path(__file__).parent
+
+    if args.data_dir:
+        data_dir = Path(args.data_dir)
+        if not data_dir.is_absolute():
+            data_dir = script_dir / data_dir
+    else:
+        if args.mode == 'train':
+            data_dir = script_dir / 'data'
+        else:
+            data_dir = script_dir / 'data_all'
+
+    print(f"数据目录：{data_dir}")
+    print(f"更新模式：{args.mode}")
+
     updater = StockDataUpdater(str(data_dir), backup=not args.no_backup)
-    
-    incremental = (args.mode == 'incremental')
+
+    incremental = (args.mode != 'full')
     updater.update_all_stocks(incremental=incremental, stock_codes=args.stocks, include_index=not args.no_index)
 
 

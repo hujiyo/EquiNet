@@ -14,35 +14,83 @@
 
 ```
 EquiNet/
+├── data_all/                 # 全量股票池
+├── data/                     # 训练数据
+├── out/                      # 模型权重输出
 ├── src/
-│   ├── data/                	# 存放数据文件
-│   ├── out/                 	# 模型权重输出
-│   ├── train.py         	    # 主训练脚本
+│   ├── train.py              # 主训练脚本
+│   ├── run.py                # 推理/选股脚本
 │   ├── training_utils.py     # 训练工具模块
 │   ├── train_dft.py          # DFT微调训练脚本
 │   ├── config.py        	    # 统一配置文件
 │   └── ...              	    # 其他可能的脚本/目录
 ├── LICENSE                   # Apache-2.0许可证
-├── README.md
-└── ...                       # 其他可能的脚本/目录
+└── README.md
 ```
 
 ## 数据格式说明
 
-- 数据目录：`./data`
-- 每个`.csv`文件对应一只股票，不复权
-- 字段说明：
-  - `time`：日期（如`20230627`）
-  - `start`：开盘价
-  - `max`：最高价
-  - `min`：最低价
-  - `end`：收盘价
-  - `volume`：股票成交量
-  - `exchange`：换手率
-  - ... 其它字段
+- 全量数据目录：`data_all/`，训练数据目录：`data/`
+- 每个 `.csv` 文件对应一只股票（不复权），`000000.csv` 为上证指数
+- 字段：`date, open, high, low, close, volume, exchange`
+- volume 为成交量（千元），exchange 为换手率
 
 v1参考数据集:https://huggingface.co/datasets/Mhuixs/EquiNet-v1-319_420
 v2参考数据将会找时间发布到huggingface
+
+## 数据管理
+
+采用两级架构：全量股票池（`data_all/`）→ 筛选训练数据（`data/`）
+
+```
+data_update.py ──更新──> data_all/ (全量股票池)
+data_check.py  ──检查──> data_all/
+data_select.py ──筛选──> data/     (训练数据)
+data_update.py --mode train ──增量更新──> data/
+```
+
+### 1. 更新全量股票池（慢，偶尔做）
+
+```bash
+python data_update.py                 # 增量更新已有股票的最新数据（默认）
+python data_update.py --mode full     # 全量更新：拉取所有A股完整历史（首次/添加新股）
+```
+
+### 2. 筛选训练数据（慢，偶尔做）
+
+```bash
+python data_select.py                 # 使用默认配置筛选（市值<MARKET_CAP_MAX and > MARKET_CAP_MIN）
+python data_select.py --dry-run       # 仅查看结果，不复制文件
+python data_select.py --market-cap 200e8  # 自定义市值上限
+```
+
+筛选条件：主板股票 → 排除ST → 排除退市/停牌 → 市值 < MARKET_CAP_MAX and > MARKET_CAP_MIN
+
+### 3. 更新训练数据（快，训练前做）
+
+```bash
+python data_update.py --mode train    # 增量更新 data/ 中的股票（快，推荐频繁使用）
+```
+
+### 4. 检查数据质量（按需）
+
+```bash
+python data_check.py                  # 检查全量股票池最近100天数据
+python data_check.py --days 50        # 指定检查天数
+```
+
+### 典型工作流
+
+```bash
+# 首次使用 / 偶尔维护
+python data_update.py --mode full     # 1. 拉取全量数据（首次需要数小时）
+python data_select.py                 # 2. 筛选训练股票（约数小时）
+
+# 日常训练（快速）
+python data_update.py --mode train    # 3. 刷新训练数据（几小时）
+python src/train.py                   # 4. 开始训练
+python src/run.py                     # 5. 选股推理
+```
 
 ## 模型文件名格式说明示例
 
@@ -71,27 +119,21 @@ ep29 - 第29轮
 - 环境配置：environment.yaml
 
 ## 快速开始
-<details>
-<summary><strong>EquiNet! Start!</strong></summary>
-
-### 项目使用流程
 
 1. **克隆项目**
    ```bash
    git clone https://gitee.com/hujiyo/EquiNet.git
    ```
-2. **数据准备**
-   将数据集放在`./data`目录下。每个`.csv`文件对应一只股票
-   或者使用`data_update.py`脚本获得数据
 2. **创建虚拟环境**
    ```bash
    conda env create -f environment.yaml && conda activate equinet
    ```
-4. **运行训练脚本**
+3. **准备数据**（详见上方「数据管理」）
+4. **训练**
    ```bash
    python src/train.py
    ```
-5. **使用模型进行选股**
+5. **选股**
    ```bash
    python src/run.py
    ```
@@ -126,8 +168,6 @@ Epoch 229/400, LR: 0.000468 (正常训练) [A+B训练]
           伪标签来源: 最佳A(第39轮, 收益+1.69%)
           伪标签统计: 伪正=5, 伪负=25, 不变=482
 ```
-
-</details>
 
 ## 注意
 

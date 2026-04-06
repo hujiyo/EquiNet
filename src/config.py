@@ -14,6 +14,10 @@ class DataConfig:
     """数据相关参数"""
     DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out')
+    DATA_ALL_DIR = os.path.join(PROJECT_ROOT, 'data_all')  # 全量股票池目录（data_update incremental/full 模式、data_check 管理此目录）
+    MARKET_CAP_MAX = 200e8  # 市值上限（元），200亿
+    MARKET_CAP_MIN = 10e8   # 市值下限（元），10亿
+    VALID_STOCK_PREFIXES = ['600', '601', '603', '605', '000', '001', '002', '003']  # 主板股票代码前缀
 
     # 数据分割参数（按时间划分）
     TEST_DAYS = 110                   # 测试集天数（每只股票的最近N天作为测试集）
@@ -116,7 +120,7 @@ class TrainingConfig:
     LEARNING_RATE = 0.001            # 初始学习率（提高学习率）
 
     # 训练批处理
-    BATCH_SIZE = 512                 # GPU每次并行训练的样本数（增加批大小）
+    BATCH_SIZE = 1024                 # GPU每次并行训练的样本数（增加批大小）
     BATCHES_PER_EPOCH = 1            # 每轮训练的批次数（调低以适配时间序采样）
 
     # 优化器参数

@@ -995,11 +995,12 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
         },
         'train_params': {
             'epochs':           TrainingConfig.EPOCHS,
-            'learning_rate':    TrainingConfig.LEARNING_RATE,
+            'learning_rate':    TrainingConfig.get_base_lr(),
             'batch_size':       TrainingConfig.BATCH_SIZE,
-            'use_adamw':        TrainingConfig.USE_ADAMW,
-            'use_mano':         TrainingConfig.USE_MANO,
-            'weight_decay':     TrainingConfig.WEIGHT_DECAY,
+            'use_adamw':        TrainingConfig.OPTIMIZER_TYPE in ('adamw', 'sam'),
+            'use_mano':         TrainingConfig.OPTIMIZER_TYPE == 'mano',
+            'optimizer_type':   TrainingConfig.OPTIMIZER_TYPE,
+            'weight_decay':     TrainingConfig.get_base_wd(),
             'loss_type':        LossConfig.LOSS_TYPE,
             'pos_weight':       LossConfig.POS_WEIGHT,
         },
@@ -1207,36 +1208,239 @@ class GradientMonitor:
         return exploding, vanishing, abnormal
 
 
+class Lion(torch.optim.Optimizer):
+    """
+    Lion (EvoLved Sign Momentum) 优化器
+
+    Google Research 2023 通过程序搜索发现的优化器。
+    核心特点：使用梯度符号（sign）而非幅度更新参数，内存效率高，泛化好。
+    相比Adam：只维护一个动量buffer（Adam需要两个），内存减半。
+
+    论文: "Symbolic Discovery of Optimization Algorithms" (Chen et al., 2023)
+    """
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
+        """
+        Args:
+            params: 模型参数
+            lr: 学习率（Lion通常需要比Adam小3-10倍的学习率）
+            betas: (beta1, beta2) 动量系数
+            weight_decay: 权重衰减（Lion推荐1e-2量级，比Adam的1e-4大）
+        """
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state[p]
+
+                # 初始化状态
+                if len(state) == 0:
+                    state['exp_avg'] = torch.zeros_like(p)
+
+                exp_avg = state['exp_avg']
+                beta1, beta2 = group['betas']
+
+                # 权重衰减（解耦方式，与AdamW一致）
+                if group['weight_decay'] > 0:
+                    p.data.mul_(1 - group['lr'] * group['weight_decay'])
+
+                # Lion核心：sign(c * momentum + (1-c) * gradient)
+                update = exp_avg * beta1 + grad * (1 - beta1)
+                p.add_(torch.sign(update), alpha=-group['lr'])
+
+                # 更新动量（用当前梯度的EMA）
+                exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
+
+        return loss
+
+
+class SAM(torch.optim.Optimizer):
+    """
+    Sharpness-Aware Minimization (SAM) 优化器包装器
+
+    在每步训练中寻找平坦极小值，提升泛化能力。
+    每步需要两次前向+反向传播（约2倍训练时间）。
+
+    论文: "Sharpness-Aware Minimization for Efficiently Improving Generalization" (Foret et al., 2020)
+    """
+    def __init__(self, base_optimizer, model, rho=0.05):
+        """
+        Args:
+            base_optimizer: 基础优化器（如AdamW）
+            model: 要训练的模型
+            rho: 扰动半径，越大越倾向平坦区域
+        """
+        self.base_optimizer = base_optimizer
+        self.model = model
+        self.rho = rho
+        # 初始化Optimizer基类，确保isinstance检查和LR调度器兼容
+        super().__init__(base_optimizer.param_groups, {})
+        # 覆盖为base_optimizer的共享引用，使调度器LR变更正确传播
+        self.param_groups = base_optimizer.param_groups
+        self.state = base_optimizer.state
+        self.defaults = base_optimizer.defaults
+        self._old_params = {}  # 独立存储原始参数，避免与base_optimizer的state冲突
+
+    @torch.no_grad()
+    def first_step(self, zero_grad=False):
+        """第一步：计算梯度后，沿梯度方向扰动参数到邻域最差点"""
+        grad_norm = self._grad_norm()
+        scale = self.rho / (grad_norm + 1e-12)
+
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            # 保存原始位置
+            self._old_params[p] = p.data.clone()
+            # 扰动到最差点
+            e_w = p.grad * scale
+            p.add_(e_w)
+
+        if zero_grad:
+            self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad=False):
+        """第二步：在最差点计算梯度后，恢复参数并执行基础优化器更新"""
+        # 恢复原始参数
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            if p in self._old_params:
+                p.data = self._old_params[p]
+
+        # 用当前（最差点的）梯度执行基础优化器更新
+        self.base_optimizer.step()
+
+        if zero_grad:
+            self.zero_grad()
+
+    def _grad_norm(self):
+        shared_device = self.param_groups[0]['params'][0].device
+        norm = torch.norm(
+            torch.stack([
+                p.grad.norm(p=2).to(shared_device)
+                for p in self.model.parameters()
+                if p.grad is not None
+            ]),
+            p=2
+        )
+        return norm
+
+    def zero_grad(self):
+        self.base_optimizer.zero_grad()
+
+    def step(self, closure=None):
+        """标准step接口（不推荐直接使用，应使用first_step/second_step）"""
+        raise RuntimeError("SAM请使用 first_step() + second_step() 代替 step()")
+
+    def state_dict(self):
+        return self.base_optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.base_optimizer.load_state_dict(state_dict)
+
+
+def training_step(model, optimizer, loss_fn):
+    """
+    通用训练步，自动处理SAM两步优化和梯度裁剪。
+
+    统一封装前向-反向-更新流程：
+    - 非SAM: zero_grad → loss_fn → backward → clip → step
+    - SAM:   zero_grad → loss_fn → backward → first_step
+             → loss_fn → backward → clip → second_step
+
+    梯度裁剪仅在真正更新参数前执行，不在SAM first_step前裁剪，
+    以保证SAM扰动方向基于原始梯度（参见SAM论文Appendix A）。
+
+    Args:
+        model: PyTorch模型
+        optimizer: 优化器实例（SAM、AdamW、Lion、Mano等）
+        loss_fn: 无参回调函数，返回 (loss_tensor, output_tensor)。
+                 调用方在闭包中封装具体的loss计算逻辑。
+
+    Returns:
+        tuple: (loss_value, output) — loss_value为Python float，output为首次前向输出
+    """
+    is_sam = isinstance(optimizer, SAM)
+
+    # 第一次前向-反向
+    optimizer.zero_grad()
+    loss, output = loss_fn()
+    loss.backward()
+
+    if is_sam:
+        # SAM第一步：沿梯度方向扰动参数到邻域最差点
+        # 不在first_step前裁剪——需要原始梯度方向计算正确扰动
+        optimizer.first_step(zero_grad=True)
+
+        # 在扰动后的参数处重新计算loss和梯度
+        loss_2, _ = loss_fn()
+        loss_2.backward()
+
+        # 仅在真正更新前裁剪
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
+        optimizer.second_step(zero_grad=True)
+    else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
+        optimizer.step()
+
+    return loss.item(), output
+
+
 def create_optimizer_from_config(model, lr=None):
     """
     根据配置创建优化器（统一入口）
 
     Args:
         model: PyTorch模型
-        lr: 学习率，如果为None则使用 TrainingConfig.LEARNING_RATE
+        lr: 学习率，如果为None则自动使用当前优化器的默认学习率
 
     Returns:
-        optimizer: 创建的优化器实例
+        optimizer: 创建的优化器实例（SAM模式返回SAM包装器，含base_optimizer属性）
     """
     from optimizers import create_optimizer
 
-    actual_lr = lr if lr is not None else TrainingConfig.LEARNING_RATE
+    actual_lr = lr if lr is not None else TrainingConfig.get_base_lr()
+    wd = TrainingConfig.get_base_wd()
+    optimizer_type = TrainingConfig.OPTIMIZER_TYPE.lower()
 
-    if TrainingConfig.USE_MANO:
+    if optimizer_type == 'mano':
         optimizer = create_optimizer(
             model,
             optimizer_type='mano',
             lr=actual_lr,
             momentum=TrainingConfig.MANO_MOMENTUM,
-            weight_decay=TrainingConfig.WEIGHT_DECAY,
+            weight_decay=wd,
             betas=TrainingConfig.MANO_ADAMW_BETAS,
             nesterov=TrainingConfig.MANO_NESTEROV,
             dual_dim_projection=TrainingConfig.MANO_DUAL_DIM_PROJECTION
         )
-    elif TrainingConfig.USE_ADAMW:
-        optimizer = optim.AdamW(model.parameters(), lr=actual_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
-    else:
-        optimizer = optim.Adam(model.parameters(), lr=actual_lr, weight_decay=TrainingConfig.WEIGHT_DECAY)
+    elif optimizer_type == 'lion':
+        optimizer = Lion(model.parameters(), lr=actual_lr, betas=TrainingConfig.LION_BETAS, weight_decay=wd)
+        print(f"优化器: Lion (lr={actual_lr}, wd={wd}, betas={TrainingConfig.LION_BETAS})")
+    elif optimizer_type == 'lion_sam':
+        base_optimizer = Lion(model.parameters(), lr=actual_lr, betas=TrainingConfig.LION_BETAS, weight_decay=wd)
+        optimizer = SAM(base_optimizer, model, rho=TrainingConfig.SAM_RHO)
+        print(f"优化器: Lion + SAM (lr={actual_lr}, wd={wd}, rho={TrainingConfig.SAM_RHO})")
+    elif optimizer_type == 'sam':
+        base_optimizer = optim.AdamW(model.parameters(), lr=actual_lr, weight_decay=wd)
+        optimizer = SAM(base_optimizer, model, rho=TrainingConfig.SAM_RHO)
+        print(f"优化器: AdamW + SAM (lr={actual_lr}, wd={wd}, rho={TrainingConfig.SAM_RHO})")
+    else:  # 'adamw' 或其他
+        optimizer = optim.AdamW(model.parameters(), lr=actual_lr, weight_decay=wd)
+        print(f"优化器: AdamW (lr={actual_lr}, wd={wd})")
 
     return optimizer
 
@@ -1248,7 +1452,7 @@ def create_scheduler_from_config(optimizer, epochs, lr=None, eta_min=None, warmu
     Args:
         optimizer: PyTorch优化器
         epochs: 总训练轮数
-        lr: 目标学习率，如果为None则使用 TrainingConfig.LEARNING_RATE
+        lr: 目标学习率，如果为None则自动使用当前优化器的默认学习率
         eta_min: 余弦退火最小学习率，如果为None则使用 TrainingConfig.COSINE_ETA_MIN
         warmup_start_lr: 预热起始学习率，如果为None则使用 TrainingConfig.WARMUP_START_LR
 
@@ -1258,7 +1462,7 @@ def create_scheduler_from_config(optimizer, epochs, lr=None, eta_min=None, warmu
             - main_scheduler: 余弦退火调度器
             - warmup_epochs: 预热轮数（用于打印状态）
     """
-    actual_lr = lr if lr is not None else TrainingConfig.LEARNING_RATE
+    actual_lr = lr if lr is not None else TrainingConfig.get_base_lr()
     actual_eta_min = eta_min if eta_min is not None else TrainingConfig.COSINE_ETA_MIN
     actual_warmup_start_lr = warmup_start_lr if warmup_start_lr is not None else TrainingConfig.WARMUP_START_LR
 

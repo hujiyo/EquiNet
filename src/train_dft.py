@@ -42,7 +42,9 @@ from training_utils import (
     EarlyStopping,
     print_dispersion_sparkline,
     create_optimizer_from_config,
-    create_scheduler_from_config
+    create_scheduler_from_config,
+    SAM,
+    training_step
 )
 
 
@@ -124,7 +126,7 @@ def weighted_task_aligned_loss(logits, targets, returns, dft_weights, task_loss_
 
 def train_dft_model(model, train_stock_info, test_stock_info,
                     epochs=TrainingConfig.EPOCHS,
-                    learning_rate=TrainingConfig.LEARNING_RATE,
+                    learning_rate=None,
                     device=None,
                     batch_size=TrainingConfig.BATCH_SIZE,
                     batches_per_epoch=TrainingConfig.BATCHES_PER_EPOCH,
@@ -156,6 +158,10 @@ def train_dft_model(model, train_stock_info, test_stock_info,
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+
+    # 解析学习率（None时自动使用当前优化器的默认值）
+    if learning_rate is None:
+        learning_rate = TrainingConfig.get_base_lr()
 
     # 创建评估数据集
     eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
@@ -322,41 +328,35 @@ def train_dft_model(model, train_stock_info, test_stock_info,
             batch_targets = epoch_targets_tensor[start_idx:end_idx]
             batch_returns = epoch_returns_tensor[start_idx:end_idx]
 
-            optimizer.zero_grad()
-
-            output = model(batch_inputs)
-
-            # 计算DFT自引导权重
-            with torch.no_grad():
-                pred_prob = torch.sigmoid(output)
-                dft_weights = compute_dft_weights(pred_prob, w_min=dft_w_min, w_max=dft_w_max)
-
+            # DFT训练步：闭包封装前向+DFT权重+loss计算
+            def _dft_loss_fn():
+                output = model(batch_inputs)
+                # 每次前向后重新计算DFT自引导权重（SAM第二步时参数已扰动，权重需更新）
+                with torch.no_grad():
+                    dft_w = compute_dft_weights(torch.sigmoid(output), w_min=dft_w_min, w_max=dft_w_max)
             # 根据损失函数类型选择计算方式
-            if use_task_aligned:
+                if use_task_aligned:
                 # 刷新正负样本动态权重（task_loss_fn内部BCE + 独立的dft_train_bce同步更新）
-                task_loss_fn.update_weights(batch_targets)
-                dft_train_bce.update_weights(batch_targets)
-                loss = weighted_task_aligned_loss(
-                    output, batch_targets, batch_returns, dft_weights, task_loss_fn, dft_train_bce
-                )
-            elif dft_train_bce is not None:
+                    task_loss_fn.update_weights(batch_targets)
+                    dft_train_bce.update_weights(batch_targets)
+                    loss = weighted_task_aligned_loss(
+                        output, batch_targets, batch_returns, dft_w, task_loss_fn, dft_train_bce
+                    )
+                elif dft_train_bce is not None:
                 # DynamicWeightedBCE路径：刷新正负样本动态权重，再叠加DFT权重
-                dft_train_bce.update_weights(batch_targets)
-                loss = weighted_bce_with_dft(output, batch_targets, dft_weights, dft_train_bce)
-            else:
+                    dft_train_bce.update_weights(batch_targets)
+                    loss = weighted_bce_with_dft(output, batch_targets, dft_w, dft_train_bce)
+                else:
                 # 标准BCE路径：裸BCE × DFT权重
-                logits = output.squeeze(-1)
-                bce_per_sample = F.binary_cross_entropy_with_logits(
-                    logits.float(), batch_targets.float(), reduction='none'
-                )
-                dft_w = dft_weights.to(dtype=bce_per_sample.dtype)
-                loss = (bce_per_sample * dft_w).mean()
+                    logits = output.squeeze(-1)
+                    bce_per_sample = F.binary_cross_entropy_with_logits(
+                        logits.float(), batch_targets.float(), reduction='none'
+                    )
+                    loss = (bce_per_sample * dft_w.to(dtype=bce_per_sample.dtype)).mean()
+                return loss, output
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
-            optimizer.step()
-
-            total_loss += loss.item() * (end_idx - start_idx)
+            loss_val, _ = training_step(model, optimizer, _dft_loss_fn)
+            total_loss += loss_val * (end_idx - start_idx)
             total_samples += (end_idx - start_idx)
 
             progress = (step + 1) / actual_batches * 100

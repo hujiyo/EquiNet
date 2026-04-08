@@ -117,19 +117,39 @@ class TrainingConfig:
     """训练相关参数"""
     # 基础训练参数（优化训练策略）
     EPOCHS = 400                     # 训练轮数（增加轮数以充分训练小模型）
-    LEARNING_RATE = 0.001            # 初始学习率（提高学习率）
+    LEARNING_RATE = 0.001            # AdamW/Adam基础学习率
+    WEIGHT_DECAY = 1e-5              # AdamW/Adam权重衰减
 
     # 训练批处理
     BATCH_SIZE = 1024                 # GPU每次并行训练的样本数（增加批大小）
     BATCHES_PER_EPOCH = 1            # 每轮训练的批次数（调低以适配时间序采样）
 
-    # 优化器参数
-    USE_ADAMW = True                 # 是否使用AdamW优化器
-    USE_MANO = True                  # 是否使用Mano优化器（与AdamW/Adam互斥，优先级最高）
-    WEIGHT_DECAY = 1e-5              # 权重衰减
+    # 优化器选择（字符串，互斥）
+    # 'adamw':    标准AdamW
+    # 'sam':      AdamW + SAM，寻找平坦极小值，泛化更好
+    # 'lion':     Lion（符号动量），内存省、泛化好
+    # 'lion_sam': Lion + SAM 双重泛化保护
+    # 'mano':     Mano混合优化器
+    OPTIMIZER_TYPE = 'mano'
+
+    # 通用优化器参数
     GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
 
-    # Mano优化器参数（当USE_MANO=True时生效）
+    # AdamW 参数（OPTIMIZER_TYPE='adamw'或'sam'时生效）
+    ADAMW_LR = 0.001                 # AdamW 学习率
+    ADAMW_WEIGHT_DECAY = 1e-5        # AdamW 权重衰减
+
+    # SAM 参数（OPTIMIZER_TYPE含'sam'时生效）
+    SAM_RHO = 0.05                  # SAM扰动半径（越大越倾向平坦区域，但可能欠拟合）
+
+    # Lion 参数（OPTIMIZER_TYPE='lion'或'lion_sam'时生效）
+    LION_LR = 0.0003                # Lion 学习率（AdamW的~1/3，论文推荐1/3~1/10）
+    LION_WEIGHT_DECAY = 0.01        # Lion 权重衰减（比AdamW大约1000倍，论文推荐1e-2量级）
+    LION_BETAS = (0.9, 0.99)        # Lion 动量系数
+
+    # Mano 参数（OPTIMIZER_TYPE='mano'时生效）
+    MANO_LR = 0.001                 # Mano 学习率
+    MANO_WEIGHT_DECAY = 1e-5        # Mano 权重衰减
     MANO_MOMENTUM = 0.95             # Mano动量系数
     MANO_ADAMW_BETAS = (0.9, 0.95)   # 混合优化器中AdamW部分的beta参数
     MANO_NESTEROV = True             # 是否使用Nesterov动量（v2默认True）
@@ -139,6 +159,41 @@ class TrainingConfig:
     COSINE_ETA_MIN = 5e-6            # 余弦退火最小学习率（训练末期的精细微调学习率）
     WARMUP_RATIO = 0.1               # 预热轮数占比（总轮数的10%）
     WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
+
+    @staticmethod
+    def get_base_lr():
+        """返回当前优化器对应的默认学习率"""
+        opt = TrainingConfig.OPTIMIZER_TYPE.lower()
+        if opt.startswith('lion'):
+            return TrainingConfig.LION_LR
+        if opt == 'mano':
+            return TrainingConfig.MANO_LR
+        return TrainingConfig.ADAMW_LR
+
+    @staticmethod
+    def get_base_wd():
+        """返回当前优化器对应的默认权重衰减"""
+        opt = TrainingConfig.OPTIMIZER_TYPE.lower()
+        if opt.startswith('lion'):
+            return TrainingConfig.LION_WEIGHT_DECAY
+        if opt == 'mano':
+            return TrainingConfig.MANO_WEIGHT_DECAY
+        return TrainingConfig.ADAMW_WEIGHT_DECAY
+
+    @staticmethod
+    def validate_optimizer_config():
+        """检查优化器超参数是否合理，打印警告建议"""
+        opt = TrainingConfig.OPTIMIZER_TYPE.lower()
+        warnings = []
+
+        if 'sam' in opt and TrainingConfig.BATCH_SIZE < 256:
+            warnings.append(
+                f"SAM在大batch(≥256)下效果更好，当前batch_size={TrainingConfig.BATCH_SIZE}可能限制SAM有效性"
+            )
+
+        for w in warnings:
+            print(f"  ⚠ {w}")
+        return warnings
 
 # ==================== 损失函数配置 ====================
 class LossConfig:
@@ -362,11 +417,16 @@ def print_config_summary():
     print(f"  输出维度: {ModelConfig.OUTPUT_DIM}")
     print(f"  序列长度: {DataConfig.CONTEXT_LENGTH}")
 
+    optimizer_names = {'adamw': 'AdamW', 'sam': 'AdamW + SAM', 'lion': 'Lion', 'lion_sam': 'Lion + SAM', 'mano': 'Mano'}
+    optimizer_display = optimizer_names.get(TrainingConfig.OPTIMIZER_TYPE.lower(), TrainingConfig.OPTIMIZER_TYPE)
+
     print(f"训练参数:")
     print(f"  训练轮数: {TrainingConfig.EPOCHS}")
-    print(f"  学习率: {TrainingConfig.LEARNING_RATE}")
+    print(f"  学习率: {TrainingConfig.get_base_lr()}")
+    print(f"  权重衰减: {TrainingConfig.get_base_wd()}")
     print(f"  批处理大小: {TrainingConfig.BATCH_SIZE}")
     print(f"  每轮批次数: {TrainingConfig.BATCHES_PER_EPOCH}")
+    print(f"  优化器: {optimizer_display}")
     warmup_epochs = max(1, int(TrainingConfig.EPOCHS * TrainingConfig.WARMUP_RATIO))
     print(f"  预热轮数: {warmup_epochs} (总轮数的{TrainingConfig.WARMUP_RATIO*100:.0f}%)")
     print(f"  预热起始学习率: {TrainingConfig.WARMUP_START_LR}")
@@ -380,4 +440,8 @@ def print_config_summary():
     print(f"  涨停过滤: {'开启' if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP else '关闭'}")
     print(f"评估参数:")
     print(f"  评估批处理大小: {DataConfig.EVAL_BATCH_SIZE}")
+
+    # 优化器超参校验
+    TrainingConfig.validate_optimizer_config()
+
     print("=" * 50)

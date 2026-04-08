@@ -40,12 +40,14 @@ from training_utils import (
     EarlyStopping,
     print_dispersion_sparkline,
     create_optimizer_from_config,
-    create_scheduler_from_config
+    create_scheduler_from_config,
+    SAM,
+    training_step
 )
 
 def train_clone_model(model_a, train_stock_info, test_stock_info,
                       epochs=TrainingConfig.EPOCHS,
-                      learning_rate=TrainingConfig.LEARNING_RATE,
+                      learning_rate=None,
                       device=None,
                       batch_size=TrainingConfig.BATCH_SIZE,
                       batches_per_epoch=TrainingConfig.BATCHES_PER_EPOCH,
@@ -87,6 +89,10 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     if torch.cuda.is_available():
         torch.cuda.manual_seed(DataConfig.RANDOM_SEED)
         torch.cuda.manual_seed_all(DataConfig.RANDOM_SEED)
+
+    # 解析学习率（None时自动使用当前优化器的默认值）
+    if learning_rate is None:
+        learning_rate = TrainingConfig.get_base_lr()
 
     # 创建评估数据集
     eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
@@ -267,24 +273,21 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             batch_returns = epoch_returns_tensor[start_idx:end_idx]
 
             # ========== 训练模型A ==========
-            optimizer_a.zero_grad()
-            output_a = model_a(batch_inputs)
-            if hasattr(criterion, 'update_weights'):
-                criterion.update_weights(batch_targets)
-            if isinstance(criterion, TaskAlignedLoss):
-                loss_a = criterion(output_a.squeeze(-1), batch_targets, batch_returns)
-            else:
-                loss_a = criterion(output_a.squeeze(-1), batch_targets)
-            loss_a.backward()
-            torch.nn.utils.clip_grad_norm_(model_a.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
-            optimizer_a.step()
-            # 累加loss时乘以batch_size，得到该batch的总损失
-            total_loss_a += loss_a.item() * (end_idx - start_idx)
+            def _loss_fn_a():
+                output_a = model_a(batch_inputs)
+                if hasattr(criterion, 'update_weights'):
+                    criterion.update_weights(batch_targets)
+                if isinstance(criterion, TaskAlignedLoss):
+                    loss_a = criterion(output_a.squeeze(-1), batch_targets, batch_returns)
+                else:
+                    loss_a = criterion(output_a.squeeze(-1), batch_targets)
+                return loss_a, output_a
+
+            loss_a_val, _ = training_step(model_a, optimizer_a, _loss_fn_a)
+            total_loss_a += loss_a_val * (end_idx - start_idx)
 
             # ========== 训练模型B（如果存在且启用）==========
             if enable_model_b and model_b is not None and best_model_a_for_pseudo is not None:
-                optimizer_b.zero_grad()
-
                 # 用【最佳模型A】的预测生成伪标签
                 with torch.no_grad():
                     output_a_for_pseudo = best_model_a_for_pseudo(batch_inputs)
@@ -302,19 +305,18 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 total_pseudo_neg += pseudo_stats['pseudo_neg_count']
                 total_unchanged += pseudo_stats['unchanged_count']
 
-                # 训练模型B
-                output_b = model_b(batch_inputs)
-                if hasattr(criterion, 'update_weights'):
-                    criterion.update_weights(pseudo_targets)
-                if isinstance(criterion, TaskAlignedLoss):
-                    loss_b = criterion(output_b.squeeze(-1), pseudo_targets, batch_returns)
-                else:
-                    loss_b = criterion(output_b.squeeze(-1), pseudo_targets)
-                loss_b.backward()
-                torch.nn.utils.clip_grad_norm_(model_b.parameters(), max_norm=TrainingConfig.GRADIENT_CLIP_NORM)
-                optimizer_b.step()
-                # 累加loss时乘以batch_size，得到该batch的总损失
-                total_loss_b += loss_b.item() * (end_idx - start_idx)
+                def _loss_fn_b():
+                    output_b = model_b(batch_inputs)
+                    if hasattr(criterion, 'update_weights'):
+                        criterion.update_weights(pseudo_targets)
+                    if isinstance(criterion, TaskAlignedLoss):
+                        loss_b = criterion(output_b.squeeze(-1), pseudo_targets, batch_returns)
+                    else:
+                        loss_b = criterion(output_b.squeeze(-1), pseudo_targets)
+                    return loss_b, output_b
+
+                loss_b_val, _ = training_step(model_b, optimizer_b, _loss_fn_b)
+                total_loss_b += loss_b_val * (end_idx - start_idx)
 
             # 进度显示
             progress = (step + 1) / actual_batches * 100

@@ -359,7 +359,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         test_loss_a = stats_a['test_loss']
 
         # 打印模型A结果
-        print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
+        print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f} (BCE={stats_a["test_loss_bce"]:.4f}, 利润={stats_a["test_loss_profit_cost"]:.4f}), AUC: {stats_a["auc"]:.4f}')
         print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
         print(f'          Top{DataConfig.TOP_K}%收益: {stats_a["top_return"]*100:+.2f}%')
         
@@ -464,7 +464,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             # 测试损失已在评估中计算
             test_loss_b = stats_b['test_loss']
 
-            print(f'  [模型B] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
+            print(f'  [模型B] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f} (BCE={stats_b["test_loss_bce"]:.4f}, 利润={stats_b["test_loss_profit_cost"]:.4f}), AUC: {stats_b["auc"]:.4f}')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
             print(f'          Top{DataConfig.TOP_K}%收益: {stats_b["top_return"]*100:+.2f}%')
             

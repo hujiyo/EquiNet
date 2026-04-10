@@ -39,7 +39,7 @@ class DataConfig:
     # 采样策略配置
     # 'temporal': 时间顺序采样（指针在训练集上循环滑动）
     # 'random': 随机采样（每次随机选择股票和位置）
-    SAMPLING_STRATEGY = 'temporal'
+    SAMPLING_STRATEGY = 'random'
 
     # 是否过滤上下文最后一天接近涨停的样本
     # True: 过滤最后一天涨停的样本（防止模型过度依赖涨停信号，避免追涨策略）
@@ -121,8 +121,8 @@ class TrainingConfig:
     WEIGHT_DECAY = 1e-5              # AdamW/Adam权重衰减
 
     # 训练批处理
-    BATCH_SIZE = 1024                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 1            # 每轮训练的批次数（调低以适配时间序采样）
+    BATCH_SIZE = 128                 # GPU每次并行训练的样本数（增加批大小）
+    BATCHES_PER_EPOCH = 48            # 每轮训练的批次数（调低以适配时间序采样）
 
     # 优化器选择（字符串，互斥）
     # 'adamw':    标准AdamW
@@ -220,6 +220,15 @@ class LossConfig:
 
     # Top-K聚焦参数
     TOPK_RATIO = 0.10            # 每个batch中关注的Top比例（10%）
+
+    # ========== 评估损失参数 ==========
+    # 利润导向评估损失 = 加权BCE + β × 利润成本
+    # 利润成本衡量"跟着模型做交易会亏多少钱"：
+    #   误选亏损股代价 = 置信度 × |亏损|
+    #   错过上涨股代价 = (1-置信度) × 涨幅
+    # 利润成本量级 ~0.02-0.05，乘以β后与BCE(~0.3-0.7)量级可比
+    EVAL_PROFIT_COST_WEIGHT = 5.0    # 利润成本权重β
+    EVAL_RETURN_CLIP = 0.30          # 利润成本中的收益率裁剪范围（防止极端值）
 
     @staticmethod
     def use_dynamic_bce():

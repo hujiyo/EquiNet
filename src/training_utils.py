@@ -338,6 +338,27 @@ class TaskAlignedLoss(nn.Module):
         return total_loss
 
 
+def _compute_profit_cost(all_preds, all_returns):
+    """
+    利润成本：衡量"跟着模型做交易会亏多少钱"
+
+    对每个样本：
+    - 模型说买（高置信度），股票却跌了 → 代价 = 置信度 × |亏损|
+    - 模型说不买（低置信度），股票却涨了 → 代价 = (1-置信度) × 涨幅
+
+    完美模型 cost=0，随机模型 cost≈mean(|return|)，反向模型 cost≈mean(|return|)
+    """
+    clip = LossConfig.EVAL_RETURN_CLIP
+    returns_clipped = np.clip(all_returns, -clip, clip)
+
+    # 误选亏损股的代价
+    fp_cost = all_preds * np.maximum(0, -returns_clipped)
+    # 错过上涨股的代价
+    fn_cost = (1 - all_preds) * np.maximum(0, returns_clipped)
+
+    return float(np.mean(fp_cost + fn_cost))
+
+
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
                    device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None,
                    criterion=None):
@@ -369,7 +390,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
             'auc': 0.5, 'top_return': 0.0, 'top_count': 0, 'top_threshold': 0.0,
             'high_conf_count': 0, 'low_conf_count': 0, 'pred_mean': 0.0,
             'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None, 'smart_exit_stats': None,
-            'test_loss': None
+            'test_loss': None, 'test_loss_bce': None, 'test_loss_profit_cost': None
         }
 
     all_preds = []
@@ -414,6 +435,18 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     high_conf = all_preds > 0.7
     low_conf = all_preds < 0.2
 
+    # 计算利润成本（始终计算，不依赖criterion）
+    profit_cost = _compute_profit_cost(all_preds, all_returns)
+
+    # BCE损失（仅当criterion提供时）
+    test_loss_bce = total_loss / num_samples if criterion is not None else None
+
+    # 组合评估损失 = BCE + β × 利润成本
+    if test_loss_bce is not None:
+        test_loss = test_loss_bce + LossConfig.EVAL_PROFIT_COST_WEIGHT * profit_cost
+    else:
+        test_loss = profit_cost
+
     stats = {
         'auc': auc,
         'top_return': top_return,
@@ -427,7 +460,9 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         'dispersion_std': float(np.std(all_preds)),
         'dispersion_range': float(np.max(all_preds) - np.min(all_preds)),
         'dispersion_iqr': float(np.percentile(all_preds, 75) - np.percentile(all_preds, 25)),
-        'test_loss': total_loss / num_samples if criterion is not None else None,
+        'test_loss': test_loss,
+        'test_loss_bce': test_loss_bce,
+        'test_loss_profit_cost': profit_cost,
     }
 
     if eval_day_indices is not None:

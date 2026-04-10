@@ -820,21 +820,22 @@ class RandomSampler:
         num_samples_per_round = len(self.valid_stock_indices)
         total_samples_to_generate = num_rounds * num_samples_per_round
         
-        sample_weights = [max_pos - start_pos + 1 
+        sample_weights = [max_pos - start_pos + 1
                          for start_pos, max_pos in self.stock_sample_ranges]
-        
+
         stock_to_range = {
             stock_idx: self.stock_sample_ranges[i]
             for i, stock_idx in enumerate(self.valid_stock_indices)
         }
-        
-        for _ in range(total_samples_to_generate):
-            stock_idx = rng.choices(
-                self.valid_stock_indices,
-                weights=sample_weights,
-                k=1
-            )[0]
-            
+
+        # 批量选择股票（一次调用替代N次循环，避免重复构建累积权重）
+        selected_stocks = rng.choices(
+            self.valid_stock_indices,
+            weights=sample_weights,
+            k=total_samples_to_generate
+        )
+
+        for stock_idx in selected_stocks:
             start_pos, max_pos = stock_to_range[stock_idx]
             start_idx = rng.randint(start_pos, max_pos)
             all_samples.append((stock_idx, start_idx))

@@ -386,7 +386,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
         test_loss = stats['test_loss']
 
-        print(f'  [DFT模型] 训练损失: {avg_loss:.4f}, 测试损失: {test_loss:.4f}, AUC: {stats["auc"]:.4f}')
+        print(f'  [DFT模型] 训练损失: {avg_loss:.4f}, 测试损失: {test_loss:.4f} (BCE={stats["test_loss_bce"]:.4f}, 利润={stats["test_loss_profit_cost"]:.4f}), AUC: {stats["auc"]:.4f}')
         print(f'            预测均值: {stats["pred_mean"]:.3f}, 高置信(>0.7): {stats["high_conf_count"]}, 低置信(<0.2): {stats["low_conf_count"]}')
         print(f'            Top{DataConfig.TOP_K}%收益: {stats["top_return"]*100:+.2f}%')
 

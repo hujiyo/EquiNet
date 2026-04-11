@@ -46,6 +46,18 @@ class DataConfig:
     # False: 保留所有样本（让模型自己学习涨停后的走势规律）
     FILTER_CONTEXT_LAST_DAY_LIMIT_UP = True
 
+    # 正样本距离保护参数
+    # 如果位置i是正样本，则i-LABEL_DISTANCE到i-1的负样本不参与训练（排除）
+    # distance=0时不排除任何样本（等价于原始行为）
+    # 目的：消除正样本左侧特征高度重叠但标签相反的矛盾训练信号
+    LABEL_DISTANCE = 3
+
+    # Day1标签基准选择
+    # True: day1使用开盘到收盘的日内涨幅 (close[T+1]-open[T+1])/open[T+1]，对齐实际买入价
+    #       消除跳空缺口对标签的干扰，标签只反映投资者能赚到的部分
+    # False: day1使用收盘到收盘的涨跌幅 (close[T+1]-close[T])/close[T]，包含隔夜跳空
+    LABEL_DAY1_USE_OPEN = True
+
     # 评估参数
     EVAL_BATCH_SIZE = 256            # 评估批处理大小（分批处理，减少显存占用）
 
@@ -449,6 +461,9 @@ def print_config_summary():
     print(f"  涨停过滤: {'开启' if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP else '关闭'}")
     print(f"评估参数:")
     print(f"  评估批处理大小: {DataConfig.EVAL_BATCH_SIZE}")
+    print(f"标签参数:")
+    print(f"  正样本距离保护: {DataConfig.LABEL_DISTANCE}")
+    print(f"  Day1基准: {'开盘价(日内涨幅)' if DataConfig.LABEL_DAY1_USE_OPEN else '前日收盘(含跳空)'}")
 
     # 优化器超参校验
     TrainingConfig.validate_optimizer_config()

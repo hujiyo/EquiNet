@@ -395,13 +395,6 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
         print(f"│  │  平均实战收益率: {rs['avg_realistic_return']*100:.1f}%")
         print(f"│  │")
     
-    if stats.get('smart_exit_stats') is not None:
-        se = stats['smart_exit_stats']
-        print(f"│  │  【智能止损】")
-        print(f"│  │  收益率: {se['avg_realistic_return']*100:.1f}%")
-        print(f"│  │  Day1止损: {se['stop_loss_day1_count']}次, 累计止损: {se['stop_loss_cum_count']}次, 止盈: {se['take_profit_count']}次")
-        print(f"│  │")
-    
     if stats.get('portfolio_stats') is not None:
         ps = stats['portfolio_stats']
         if ps['total_days'] > 0:

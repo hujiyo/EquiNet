@@ -30,6 +30,7 @@ from data import (
     load_and_preprocess_data,
     create_sampler, sample_with_pools,
     create_fixed_evaluation_dataset,
+    compute_label_distance_exclusions,
     init_index_data
 )
 
@@ -397,10 +398,6 @@ def train_dft_model(model, train_stock_info, test_stock_info,
             print(f'            【实战收益率({mode_str})】每日统计: {{{daily_stats_str}}}')
             print(f'            【实战收益率({mode_str})】平均实战收益率: {rs["avg_realistic_return"]*100:.1f}%')
 
-        if stats.get('smart_exit_stats') is not None:
-            se = stats['smart_exit_stats']
-            print(f'            【智能止损】收益率: {se["avg_realistic_return"]*100:.1f}%, Day1止损: {se["stop_loss_day1_count"]}次, 累计止损: {se["stop_loss_cum_count"]}次, 止盈: {se["take_profit_count"]}次')
-
         epoch_return = {
             'turn': epoch + 1,
             'return': stats['top_return'] * 100,
@@ -568,6 +565,9 @@ if __name__ == "__main__":
 
     print("正在加载和预处理数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
+
+    # 正样本距离保护：排除正样本左侧distance范围内的负样本
+    compute_label_distance_exclusions(train_stock_info)
 
     init_index_data()
 

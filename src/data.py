@@ -641,6 +641,82 @@ def load_and_preprocess_data(data_dir=DataConfig.DATA_DIR, test_days=DataConfig.
     
     return train_stock_info, test_stock_info
 
+def compute_label_distance_exclusions(stock_info_list, distance=None):
+    """
+    计算正样本距离保护区域
+
+    规则：如果位置i是正样本，则i-distance到i-1的负样本不参与训练（被排除）
+    distance=0时不排除任何样本（等价于原始行为）
+    只对训练集生效，不影响评估集
+
+    原理：
+    滑动窗口生成样本时，正样本左侧的样本特征高度重叠（29/30天相同），
+    但因3天预测窗口的硬边界，标签从1翻转为0。
+    排除这些"矛盾负样本"，让模型不被"前一天还不该买、后一天就该买了"的矛盾信号干扰。
+
+    Args:
+        stock_info_list: 训练集股票信息列表
+        distance: 保护距离（默认使用 DataConfig.LABEL_DISTANCE）
+    """
+    if distance is None:
+        distance = DataConfig.LABEL_DISTANCE
+    if distance <= 0:
+        for stock_info in stock_info_list:
+            stock_info['excluded_positions'] = set()
+        return
+
+    total_positive = 0
+    total_excluded = 0
+
+    for stock_info in stock_info_list:
+        data = stock_info['data']
+        train_start = stock_info.get('train_start_idx', 0)
+        train_end = stock_info.get('train_end_idx', len(data))
+        context_length = DataConfig.CONTEXT_LENGTH
+        future_days = DataConfig.FUTURE_DAYS
+
+        # 轻量级标签计算：只用价格数据，不做完整样本验证
+        # 必须与 generate_sample_from_index() 中的标签计算逻辑保持一致
+        labels = {}
+        use_open = DataConfig.LABEL_DAY1_USE_OPEN
+        for pos in range(max(1, train_start + 1), train_end + 1):
+            if pos + context_length + future_days > len(data):
+                continue
+
+            future_start = pos + context_length
+            closes = data[future_start - 1 : future_start + future_days, 3]
+
+            if any(c <= 0 for c in closes):
+                continue
+
+            if use_open:
+                # day1: 开盘到收盘（对齐实际买入价）
+                t1_open = data[future_start, 0]
+                if t1_open <= 0:
+                    continue
+                day1 = (closes[1] - t1_open) / t1_open
+            else:
+                # day1: 收盘到收盘（原始行为）
+                day1 = (closes[1] - closes[0]) / closes[0]
+            day2 = (closes[2] - closes[1]) / closes[1]
+            day3 = (closes[3] - closes[2]) / closes[2]
+            labels[pos] = generate_label(day1, day2, day3)
+
+        # 构建排除集：正样本左侧distance范围内的负样本
+        excluded = set()
+        for pos, label in labels.items():
+            if label == 1:
+                total_positive += 1
+                for d in range(1, distance + 1):
+                    prev_pos = pos - d
+                    if prev_pos in labels and labels[prev_pos] == 0:
+                        excluded.add(prev_pos)
+
+        stock_info['excluded_positions'] = excluded
+        total_excluded += len(excluded)
+
+    print(f"  正样本距离保护(distance={distance}): "
+          f"{total_positive}个正样本, 排除{total_excluded}个负样本")
 
 class TemporalSampler:
     """
@@ -886,6 +962,12 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_no
     返回: (input_seq, target, cumulative_return, daily_returns) 或 None（如果样本无效）
     """
     stock_info = stock_info_list[stock_idx]
+
+    # 正样本距离保护：检查当前位置是否被排除
+    excluded = stock_info.get('excluded_positions', None)
+    if excluded is not None and start_idx in excluded:
+        return None
+
     stock_data = stock_info['data']
     context_length = DataConfig.CONTEXT_LENGTH
     future_days = DataConfig.FUTURE_DAYS
@@ -927,8 +1009,16 @@ def generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_no
         daily_lows.append(day_low)
         daily_closes.append(day_close)
 
-        base_close = prev_close if d == 0 else daily_closes[d - 1]
-        daily_price_changes.append((day_close - base_close) / base_close)
+        if d == 0:
+            if DataConfig.LABEL_DAY1_USE_OPEN:
+                # day1使用开盘到收盘的日内涨幅，对齐实际买入价（消除跳空缺口干扰）
+                daily_price_changes.append((day_close - day_open) / day_open)
+            else:
+                # day1使用收盘到收盘涨跌幅（原始行为，包含隔夜跳空）
+                daily_price_changes.append((day_close - prev_close) / prev_close)
+        else:
+            base_close = daily_closes[d - 1]
+            daily_price_changes.append((day_close - base_close) / base_close)
 
     cumulative_return, daily_returns = calculate_returns(
         t1_open=daily_opens[0],

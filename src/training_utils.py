@@ -379,7 +379,6 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         pred_std：预测标准差
         filtered_count：被过滤的涨停样本数（始终为0，因已在生成阶段过滤）
         realistic_stats：实战收益率统计（如果提供了eval_day_indices）
-        smart_exit_stats：智能止损策略统计（如果提供了eval_daily_returns）
         test_loss：测试集损失（如果提供了criterion）
     """
     model.eval()
@@ -389,7 +388,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         return {
             'auc': 0.5, 'top_return': 0.0, 'top_count': 0, 'top_threshold': 0.0,
             'high_conf_count': 0, 'low_conf_count': 0, 'pred_mean': 0.0,
-            'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None, 'smart_exit_stats': None,
+            'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None,
             'test_loss': None, 'test_loss_bce': None, 'test_loss_profit_cost': None
         }
 
@@ -471,11 +470,6 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
             actual_top_n = None
         stats['realistic_stats'] = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent, actual_top_n)
         
-        if eval_daily_returns is not None and actual_top_n is not None:
-            stats['smart_exit_stats'] = calculate_smart_exit_return(all_preds, eval_daily_returns, eval_day_indices, actual_top_n)
-        else:
-            stats['smart_exit_stats'] = None
-        
         if eval_daily_returns is not None:
             stats['portfolio_stats'] = calculate_portfolio_simulation(
                 all_preds, all_returns, eval_daily_returns, eval_day_indices, percent, actual_top_n)
@@ -483,7 +477,6 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
             stats['portfolio_stats'] = None
     else:
         stats['realistic_stats'] = None
-        stats['smart_exit_stats'] = None
         stats['portfolio_stats'] = None
 
     stats['all_preds'] = all_preds
@@ -822,116 +815,6 @@ def _calculate_max_drawdown(daily_portfolio_values):
             max_dd = dd
     return max_dd
 
-
-def calculate_smart_exit_return(all_preds, all_daily_returns, all_day_indices, top_n_per_day=4,
-                                 stop_loss_day1=-0.05, stop_loss_cum=-0.05, take_profit=0.08,
-                                 sell_at_day2_close=True):
-    """
-    智能止损策略收益率计算（A股T+1规则）
-    """
-    unique_days = np.unique(all_day_indices)
-    unique_days = np.sort(unique_days)
-    future_days = DataConfig.FUTURE_DAYS
-    
-    daily_stats = []
-    daily_returns = []
-    
-    total_trades = 0
-    stop_loss_day1_count = 0
-    stop_loss_cum_count = 0
-    take_profit_count = 0
-    normal_exit_count = 0
-    
-    for day in unique_days:
-        day_mask = all_day_indices == day
-        day_indices = np.where(day_mask)[0]
-        
-        if len(day_indices) == 0:
-            daily_stats.append((0, 0.0, 'none'))
-            continue
-        
-        day_preds = all_preds[day_indices]
-        day_daily_returns = [all_daily_returns[i] for i in day_indices]
-        
-        sorted_local_indices = np.argsort(day_preds)[::-1]
-        select_count = min(top_n_per_day, len(day_indices))
-        top_local_indices = sorted_local_indices[:select_count]
-        
-        day_trade_returns = []
-        day_exit_types = {'stop_day1': 0, 'stop_cum': 0, 'profit': 0, 'normal': 0, 'partial': 0}
-        
-        for idx in top_local_indices:
-            daily_ret = day_daily_returns[idx]
-            if daily_ret is None or len(daily_ret) == 0:
-                continue
-
-            available = len(daily_ret)
-            daily_r = [daily_ret[d] if d < available else 0.0 for d in range(future_days)]
-            has_days = [available > d for d in range(future_days)]
-
-            total_trades += 1
-            
-            if daily_r[0] < stop_loss_day1:
-                if has_days[1]:
-                    final_ret = daily_r[0] + (daily_r[1] if sell_at_day2_close else 0.0)
-                    stop_loss_day1_count += 1
-                    day_exit_types['stop_day1'] += 1
-                else:
-                    final_ret = daily_r[0]
-                    day_exit_types['partial'] += 1
-            elif has_days[1] and (daily_r[0] + daily_r[1]) < stop_loss_cum:
-                final_ret = daily_r[0] + daily_r[1]
-                stop_loss_cum_count += 1
-                day_exit_types['stop_cum'] += 1
-            elif has_days[-1] and sum(daily_r) >= take_profit:
-                final_ret = sum(daily_r)
-                take_profit_count += 1
-                day_exit_types['profit'] += 1
-            elif has_days[-1]:
-                final_ret = sum(daily_r)
-                normal_exit_count += 1
-                day_exit_types['normal'] += 1
-            elif has_days[1]:
-                final_ret = daily_r[0] + daily_r[1]
-                day_exit_types['partial'] += 1
-            else:
-                final_ret = daily_r[0]
-                day_exit_types['partial'] += 1
-            
-            day_trade_returns.append(final_ret)
-        
-        if len(day_trade_returns) == 0:
-            daily_stats.append((0, 0.0, 'none'))
-            continue
-
-        avg_day_return = np.mean(day_trade_returns)
-        daily_returns.append(avg_day_return)
-        
-        exit_type = max(day_exit_types, key=day_exit_types.get)
-        daily_stats.append((len(day_trade_returns), avg_day_return, exit_type))
-    
-    if len(daily_returns) > 0:
-        avg_realistic_return = np.mean(daily_returns)
-        cumulative_return = np.sum(daily_returns)
-    else:
-        avg_realistic_return = 0.0
-        cumulative_return = 0.0
-    
-    return {
-        'daily_stats': daily_stats,
-        'cumulative_return': cumulative_return,
-        'valid_days': len(daily_returns),
-        'avg_realistic_return': avg_realistic_return,
-        'total_trades': total_trades,
-        'stop_loss_day1_count': stop_loss_day1_count,
-        'stop_loss_cum_count': stop_loss_cum_count,
-        'take_profit_count': take_profit_count,
-        'normal_exit_count': normal_exit_count,
-        'stop_loss_day1_ratio': stop_loss_day1_count / total_trades if total_trades > 0 else 0,
-        'stop_loss_cum_ratio': stop_loss_cum_count / total_trades if total_trades > 0 else 0,
-        'take_profit_ratio': take_profit_count / total_trades if total_trades > 0 else 0,
-        'strategy': f'smart_exit(stop_day1={stop_loss_day1*100:.1f}%, stop_cum={stop_loss_cum*100:.1f}%, profit={take_profit*100:.1f}%)'
-    }
 
 
 def generate_pseudo_labels(pred_scores, original_targets,

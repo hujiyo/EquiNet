@@ -13,6 +13,7 @@ EquiNet 模型推理与选股脚本
 
 import os, sys, torch, numpy as np, glob, re
 from datetime import datetime
+import matplotlib.pyplot as plt
 
 from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
@@ -272,6 +273,64 @@ def print_section_end():
     print(f"└" + "─"*62 + "┘")
 
 
+def visualize_classification(preds, targets, title="模型分类能力可视化"):
+    """
+    可视化模型的分类能力
+
+    Args:
+        preds: 模型预测值数组 (0-1)
+        targets: 真实标签数组 (0或1)
+        title: 图表标题
+    """
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    preds = np.array(preds)
+    targets = np.array(targets)
+
+    np.random.seed(42)
+    y_coords = np.random.uniform(0, 1, size=len(preds))
+
+    mask_0 = targets < 0.5
+    mask_1 = targets >= 0.5
+
+    plt.figure(figsize=(10, 8))
+
+    plt.scatter(preds[mask_0], y_coords[mask_0],
+                c='black', alpha=0.6, s=20, label=f'标签=0 ({np.sum(mask_0)}个)', marker='o')
+
+    plt.scatter(preds[mask_1], y_coords[mask_1],
+                c='blue', alpha=0.6, s=20, label=f'标签=1 ({np.sum(mask_1)}个)', marker='o')
+
+    plt.axvline(x=0.5, color='red', linestyle='--', alpha=0.5, label='决策边界(0.5)')
+
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
+    plt.xlabel('模型预测值', fontsize=12)
+    plt.ylabel('随机Y坐标', fontsize=12)
+    plt.title(title, fontsize=14)
+    plt.legend(loc='upper left', fontsize=10)
+    plt.grid(True, alpha=0.3)
+
+    correct_0 = np.sum((preds[mask_0] < 0.5))
+    correct_1 = np.sum((preds[mask_1] >= 0.5))
+    total_correct = correct_0 + correct_1
+    accuracy = total_correct / len(preds) * 100
+
+    info_text = f'准确率: {accuracy:.1f}%\n标签0预测<0.5: {correct_0}/{np.sum(mask_0)}\n标签1预测>=0.5: {correct_1}/{np.sum(mask_1)}'
+    plt.text(0.02, 0.98, info_text, transform=plt.gca().transAxes,
+             fontsize=10, verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    plt.tight_layout()
+
+    save_path = os.path.join('output', 'classification_visualization.png')
+    os.makedirs('output', exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f'  分类可视化已保存: {save_path}')
+    plt.close()
+
+
 def select_model(models):
     """模型选择界面"""
     print_section("可用模型列表")
@@ -427,7 +486,9 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     
     print(f"│  └───────────────────────────────────────────────┘")
     print_section_end()
-    
+
+    stats['eval_targets'] = np.array(eval_targets)
+
     return stats
 
 
@@ -804,6 +865,12 @@ def main():
     # 运行评估
     stats = run_evaluation(model, test_stock_info, device, feature_normalizer)
     threshold = stats['top_threshold']
+
+    visualize_classification(
+        preds=stats['all_preds'],
+        targets=stats['eval_targets'],
+        title=f"模型分类能力可视化 (AUC={stats['auc']:.4f})"
+    )
     
     # 询问是否选股
     print()

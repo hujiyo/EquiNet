@@ -27,7 +27,7 @@ class DataConfig:
     TRAIN_START_YEAR = 2016          # 训练集起始年份（2020年及以前的数据不参与训练）
     
     # 样本生成参数
-    CONTEXT_LENGTH = 30              # 历史数据长度（这是核心参数，其他地方应引用这个值）,TEST_DAYS - CONTEXT_LENGTH = 80
+    CONTEXT_LENGTH = 45              # 历史数据长度（这是核心参数，其他地方应引用这个值）
     FUTURE_DAYS = 3                  # 未来预测天数
     BUFFER_DAY = True                # 额外采集1天安全余量（用于跌停推迟判断）
     REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS + (1 if BUFFER_DAY else 0)
@@ -133,8 +133,8 @@ class TrainingConfig:
     WEIGHT_DECAY = 1e-5              # AdamW/Adam权重衰减
 
     # 训练批处理
-    BATCH_SIZE = 128                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 48            # 每轮训练的批次数（调低以适配时间序采样）
+    BATCH_SIZE = 256                 # GPU每次并行训练的样本数（增加批大小）
+    BATCHES_PER_EPOCH = 24            # 每轮训练的批次数（调低以适配时间序采样）
 
     # 优化器选择（字符串，互斥）
     # 'adamw':    标准AdamW
@@ -305,7 +305,7 @@ def generate_label(day1_change, day2_change, day3_change):
         return 1
 
     # 规则3：稳健上涨（天然安全）
-    if day1_change >= 0.01 and day2_change >= 0.01 and day3_change >= 0.01 and cum_3day >= 0.05:
+    if day1_change >= 0.01 and day2_change >= 0.01 and day3_change >= 0.01 and cum_3day >= 0.06:
         return 1
 
     # 规则4：爆发后延续 + Day1保护

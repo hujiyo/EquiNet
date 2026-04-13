@@ -412,7 +412,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         epoch_returns.append(epoch_return)
 
         # 预测值分布可视化
-        print_dispersion_sparkline(stats.get('all_preds', []), epoch_returns)
+        print_dispersion_sparkline(stats.get('all_preds', []), epoch_returns, all_targets=stats.get('all_targets'))
 
         # 早停检测
         improved, improve_reason = early_stopping.check_improve(

@@ -74,20 +74,10 @@ class WarmupScheduler:
         """判断是否还在预热阶段"""
         return self.current_epoch < self.warmup_epochs
 
-def print_dispersion_sparkline(all_preds, epoch_returns_history=None):
-    """
-    打印预测值在0-1区间上的分布直方图（终端字符可视化）
-    
-    Args:
-        all_preds: 所有样本的预测值数组
-        epoch_returns_history: 历史epoch记录列表（用于显示趋势）
-    """
-    print(f'  【预测值分布直方图】')
-    
-    all_preds = np.array(all_preds)
-    
-    num_bins = 20
-    counts, _ = np.histogram(all_preds, bins=num_bins, range=(0, 1))
+def _draw_sparkline(data, num_bins=20):
+    """绘制单行终端直方图并返回统计信息"""
+    data = np.array(data)
+    counts, _ = np.histogram(data, bins=num_bins, range=(0, 1))
     max_count = max(counts) if max(counts) > 0 else 1
     
     chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
@@ -97,20 +87,65 @@ def print_dispersion_sparkline(all_preds, epoch_returns_history=None):
         idx = int(count / max_count * (len(chars) - 1))
         idx = min(max(idx, 0), len(chars) - 1)
         hist_line += chars[idx]
-    
+
+    mean = float(np.mean(data)) if len(data) > 0 else 0
+    std = float(np.std(data)) if len(data) > 0 else 0
+    min_val = float(np.min(data)) if len(data) > 0 else 0
+    max_val = float(np.max(data)) if len(data) > 0 else 0
+
+    return hist_line, mean, std, min_val, max_val, len(data)
+
+
+def print_dispersion_sparkline(all_preds, epoch_returns_history=None, all_targets=None):
+    """
+    打印预测值在0-1区间上的分布直方图（终端字符可视化）
+
+    Args:
+        all_preds: 所有样本的预测值数组
+        epoch_returns_history: 历史epoch记录列表（用于显示趋势）
+        all_targets: 样本标签数组（0/1），若提供则额外显示正负样本各自的分布
+    """
+    all_preds = np.array(all_preds)
+
+    # ─── 总体分布 ───
+    print(f'  【预测值分布直方图（总体）】')
+    hist_line, mean, std, min_val, max_val, total = _draw_sparkline(all_preds)
     print(f'    0.0  {hist_line}  1.0')
     print(f'         ├────────────────────┤')
-    
-    std = float(np.std(all_preds))
-    mean = float(np.mean(all_preds))
-    min_val = float(np.min(all_preds))
-    max_val = float(np.max(all_preds))
     pos_ratio = float(np.mean(all_preds >= 0.5)) * 100
     high_conf_ratio = float(np.mean(all_preds >= 0.7)) * 100
-    
-    print(f'    均值={mean:.3f}, 标准差={std:.4f}, 范围=[{min_val:.3f}, {max_val:.3f}]')
+    print(f'    均值={mean:.3f}, 标准差={std:.4f}, 范围=[{min_val:.3f}, {max_val:.3f}], N={total}')
     print(f'    >0.5: {pos_ratio:.1f}%, >0.7: {high_conf_ratio:.1f}%')
-    
+
+    # ─── 正负样本各自分布 ───
+    if all_targets is not None:
+        all_targets = np.array(all_targets)
+        pos_mask = all_targets == 1
+        neg_mask = all_targets == 0
+        pos_preds = all_preds[pos_mask]
+        neg_preds = all_preds[neg_mask]
+
+        print()
+        print(f'  【正样本预测值分布】N={len(pos_preds)}')
+        if len(pos_preds) > 0:
+            hist_line, mean, std, min_val, max_val, _ = _draw_sparkline(pos_preds)
+            print(f'    0.0  {hist_line}  1.0')
+            print(f'         ├────────────────────┤')
+            print(f'    均值={mean:.3f}, 标准差={std:.4f}, 范围=[{min_val:.3f}, {max_val:.3f}]')
+        else:
+            print(f'    （无正样本）')
+
+        print()
+        print(f'  【负样本预测值分布】N={len(neg_preds)}')
+        if len(neg_preds) > 0:
+            hist_line, mean, std, min_val, max_val, _ = _draw_sparkline(neg_preds)
+            print(f'    0.0  {hist_line}  1.0')
+            print(f'         ├────────────────────┤')
+            print(f'    均值={mean:.3f}, 标准差={std:.4f}, 范围=[{min_val:.3f}, {max_val:.3f}]')
+        else:
+            print(f'    （无负样本）')
+
+    # ─── 趋势 ───
     if epoch_returns_history and len(epoch_returns_history) >= 2:
         stds = [e.get('dispersion_std', 0) for e in epoch_returns_history]
         returns = [e.get('return', 0) for e in epoch_returns_history]
@@ -480,6 +515,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         stats['portfolio_stats'] = None
 
     stats['all_preds'] = all_preds
+    stats['all_targets'] = all_targets
     return stats
 
 

@@ -390,7 +390,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         }
         epoch_returns.append(epoch_return)
 
-        print_dispersion_sparkline(stats_a.get('all_preds', []), epoch_returns)
+        print_dispersion_sparkline(stats_a.get('all_preds', []), epoch_returns, all_targets=stats_a.get('all_targets'))
 
         # 早停检测（使用测试集loss）
         improved, improve_reason = early_stopping.check_improve(

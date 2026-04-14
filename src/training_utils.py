@@ -107,43 +107,31 @@ def print_dispersion_sparkline(all_preds, epoch_returns_history=None, all_target
     """
     all_preds = np.array(all_preds)
 
-    # ─── 总体分布 ───
-    print(f'  【预测值分布直方图（总体）】')
-    hist_line, mean, std, min_val, max_val, total = _draw_sparkline(all_preds)
-    print(f'    0.0  {hist_line}  1.0')
-    print(f'         ├────────────────────┤')
     pos_ratio = float(np.mean(all_preds >= 0.5)) * 100
     high_conf_ratio = float(np.mean(all_preds >= 0.7)) * 100
-    print(f'    均值={mean:.3f}, 标准差={std:.4f}, 范围=[{min_val:.3f}, {max_val:.3f}], N={total}')
+
+    def _print_block(title, data):
+        hist_line, mean, std, min_val, max_val, total = _draw_sparkline(data)
+        print(f'  【{title}】N={total}')
+        print(f'    0.0  {hist_line}  1.0    均值{mean:.3f}, 标准差{std:.4f}, 范围[{min_val:.3f}, {max_val:.3f}]')
+
+    _print_block('总样本预测值分布', all_preds)
     print(f'    >0.5: {pos_ratio:.1f}%, >0.7: {high_conf_ratio:.1f}%')
 
-    # ─── 正负样本各自分布 ───
     if all_targets is not None:
         all_targets = np.array(all_targets)
-        pos_mask = all_targets == 1
-        neg_mask = all_targets == 0
-        pos_preds = all_preds[pos_mask]
-        neg_preds = all_preds[neg_mask]
+        pos_preds = all_preds[all_targets == 1]
+        neg_preds = all_preds[all_targets == 0]
 
-        print()
-        print(f'  【正样本预测值分布】N={len(pos_preds)}')
         if len(pos_preds) > 0:
-            hist_line, mean, std, min_val, max_val, _ = _draw_sparkline(pos_preds)
-            print(f'    0.0  {hist_line}  1.0')
-            print(f'         ├────────────────────┤')
-            print(f'    均值={mean:.3f}, 标准差={std:.4f}, 范围=[{min_val:.3f}, {max_val:.3f}]')
+            _print_block('正样本预测值分布', pos_preds)
         else:
-            print(f'    （无正样本）')
+            print(f'  【正样本预测值分布】（无正样本）')
 
-        print()
-        print(f'  【负样本预测值分布】N={len(neg_preds)}')
         if len(neg_preds) > 0:
-            hist_line, mean, std, min_val, max_val, _ = _draw_sparkline(neg_preds)
-            print(f'    0.0  {hist_line}  1.0')
-            print(f'         ├────────────────────┤')
-            print(f'    均值={mean:.3f}, 标准差={std:.4f}, 范围=[{min_val:.3f}, {max_val:.3f}]')
+            _print_block('负样本预测值分布', neg_preds)
         else:
-            print(f'    （无负样本）')
+            print(f'  【负样本预测值分布】（无负样本）')
 
     # ─── 趋势 ───
     if epoch_returns_history and len(epoch_returns_history) >= 2:

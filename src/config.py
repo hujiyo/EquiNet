@@ -77,7 +77,7 @@ class DataConfig:
     NORMALIZER_PATH = os.path.join(SRC_DIR, 'normalizer.pkl')
 
     TOP_K = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
-    TOP_N_PER_DAY = 0                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
+    TOP_N_PER_DAY = 4                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
     MAX_SELECT_PER_DAY = 4             # 全局阈值模式下每天最多选股数量（0表示不限制）
 
 # ==================== 模型架构参数 ====================
@@ -95,8 +95,13 @@ class ModelConfig:
     DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合
     ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
 
-    # ========== Embedding 参数初始化配置 ==========
-    # 目标：让Token和Position embedding的输出std统一为0.2，确保训练初期信息势均力敌
+    # ========== FFN-Embedding 参数初始化配置 ==========
+    # 目标：让FFN-Embedding和Position embedding的输出std统一为0.2，确保训练初期信息势均力敌
+    #
+    # FFN-Embedding结构：Linear(8→48) → GELU → Linear(48→48)
+    # - 第一层(8→48): 线性投影，gain=0.37, 输出std≈0.2
+    # - GELU: 有效增益≈0.588, 输出std≈0.118
+    # - 第二层(48→48): 补偿GELU压缩，gain=1.7, 输出std≈0.2 (在model.py中显式设置)
     #
     # Linear层计算公式：输出std = σ_input × gain × sqrt(2×fan_in/(fan_in+fan_out))
     # Embedding层计算公式：输出std = gain × sqrt(2/(vocab_size+embedding_dim))
@@ -104,10 +109,11 @@ class ModelConfig:
     # 假设：输入数据经过归一化后std≈1.0
     #
     # 计算过程：
-    # - Token Embedding (Linear 8→48): gain = 0.2 / sqrt(16/56) ≈ 0.37
+    # - FFN-Embedding第一层 (Linear 8→48): gain = 0.2 / sqrt(16/56) ≈ 0.37
+    # - FFN-Embedding第二层 (Linear 48→48): gain = 1.7 (复用FFN_INIT_GAIN，补偿GELU压缩)
     # - Position Embedding (Embedding 30→48): gain = 0.2 / sqrt(2/78) ≈ 1.25
     # - Query Token (Parameter 48): gain = 0.2 / sqrt(2/96) ≈ 1.39 → 取1.4
-    EMBEDDING_INIT_GAIN = 0.37           # Token Embedding (Linear 8→48)
+    EMBEDDING_INIT_GAIN = 0.37           # FFN-Embedding第一层 (Linear 8→48)
     POSITION_EMBEDDING_INIT_GAIN = 1.25  # Position Embedding (Embedding 30→48)
     QUERY_INIT_GAIN = 1.4                # Query Token (AttentionPooling)
 
@@ -171,6 +177,8 @@ class TrainingConfig:
     COSINE_ETA_MIN = 5e-6            # 余弦退火最小学习率（训练末期的精细微调学习率）
     WARMUP_RATIO = 0.1               # 预热轮数占比（总轮数的10%）
     WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
+
+    OPEN_EARLY_STOPPING = False       # 是否开启早停机制
 
     @staticmethod
     def get_base_lr():

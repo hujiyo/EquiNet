@@ -500,7 +500,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         print("-" * 60)
 
         # 早停检查
-        if early_stopping.should_stop():
+        if early_stopping.should_stop() and TrainingConfig.OPEN_EARLY_STOPPING:
             print(f"\n⚠ 早停触发：连续{patience}轮无改善，停止训练")
             break
 

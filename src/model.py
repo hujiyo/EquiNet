@@ -20,7 +20,7 @@ def init_weights(module):
     当代主流Transformer初始化策略
 
     设计原则：
-    1. Embedding层: 根据层类型和维度计算gain，统一输出std=0.2
+    1. FFN-Embedding层: 第一层gain=0.37(线性投影), 第二层gain=1.7(补偿GELU压缩)
     2. FFN第一层: Xavier初始化，gain=1.7补偿GELU压缩
     3. FFN第二层: Xavier初始化，gain=1.0（无激活函数）
     4. 输出层: 小增益，避免sigmoid饱和
@@ -31,8 +31,9 @@ def init_weights(module):
     - Embedding层: 输出std = gain × sqrt(2/(vocab_size+embedding_dim))
 
     各层gain计算结果：
-    - Token Embedding (Linear 8→48): gain=0.37
-
+    - FFN-Embedding第一层 (Linear 8→48): gain=0.37, 输出std≈0.2
+    - FFN-Embedding GELU: 有效增益≈0.588, 输出std≈0.118
+    - FFN-Embedding第二层 (Linear 48→48): gain=1.7, 输出std≈0.2 (由StockTransformer.__init__显式设置)
     - Position Embedding (Embedding 30→48): gain=1.25
     - Query Token (Parameter 48): gain=1.4
     """
@@ -201,23 +202,26 @@ class AttentionPooling(nn.Module):
 
 class StockTransformer(nn.Module):
     """
-    Transformer 模型（Pre-Norm 架构 + Linear-Embedding）
+    Transformer 模型（Pre-Norm 架构 + FFN-Embedding）
 
-    核心设计：回归主流 Transformer 架构
-    - 8 个输入特征 (OHLC + Volume + Exchange + 大盘涨跌幅 + 大盘量能涨跌幅) -> 单一线性层映射到 d_model 维
-    - 遵循 BERT/GPT/LLaMA 等主流模型的设计：embedding = nn.Linear(input_dim, d_model)
-    - 简化结构，减少不必要的非线性变换，让模型更容易训练
-
-    架构统一性：
-    - Embedding 层：线性投影（无激活函数）
-    - Transformer 层：标准 Attention + FFN 结构
+    核心设计：
+    - FFN-Embedding: Linear(8→48) → GELU → Linear(48→48)
+      相比纯线性映射，GELU在中间层提供非线性特征组合能力
+      让第一层Transformer就能访问到特征间的非线性交互（如上影线、实体大小等）
+    - Transformer 层：标准 Attention + FFN 结构，专注于跨时间模式识别
     """
     def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, seq_len):
         super(StockTransformer, self).__init__()
 
-        # Linear-Embedding：单一线性层，主流 Transformer 标准做法
-        # 输入特征直接线性映射到 d_model 维，无中间层和激活函数
-        self.embedding = nn.Linear(input_dim, d_model)
+        # FFN-Embedding：线性映射 + GELU非线性 + 线性混合
+        # 第一层: 8→48, 各特征线性组合
+        # GELU: 引入非线性，使embedding输出包含特征间的非线性交互
+        # 第二层: 48→48, 混合非线性变换后的特征
+        self.embedding = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model)
+        )
 
         # 使用标准位置编码
         self.pos_encoding = PositionalEncoding(d_model, seq_len)
@@ -249,10 +253,17 @@ class StockTransformer(nn.Module):
         # 应用初始化
         self.apply(init_weights)
 
+        # FFN-Embedding第二层显式初始化：补偿GELU压缩
+        # init_weights无法区分此层(48→48)与MHA输出投影(48→48)，需显式覆盖
+        # GELU有效增益≈0.588，第二层用gain=1.7补偿，维持输出std≈0.2
+        nn.init.xavier_uniform_(self.embedding[2].weight, gain=ModelConfig.FFN_INIT_GAIN)
+        nn.init.zeros_(self.embedding[2].bias)
+
     def forward(self, x):
         # x: [batch_size, seq_len, 8] (OHLC + volume + exchange + 大盘涨跌幅 + 大盘量能涨跌幅)
 
-        # 1. 统一Embedding：8个特征一起映射到d_model维
+        # 1. FFN-Embedding：线性映射 + GELU非线性 + 线性混合
+        #    输出包含特征间的非线性交互（如影线、实体、量价关系等）
         x = self.embedding(x)  # [batch_size, seq_len, d_model]
 
         # 2. 位置编码

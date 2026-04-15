@@ -122,7 +122,7 @@ ep29 - 第29轮
 
 1. **克隆项目**
    ```bash
-   git clone https://gitee.com/hujiyo/EquiNet.git
+   git clone https://github.com/hujiyo/EquiNet-v2.git
    ```
 2. **创建虚拟环境**
    ```bash

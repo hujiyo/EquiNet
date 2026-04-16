@@ -59,7 +59,7 @@ class DataConfig:
     LABEL_DAY1_USE_OPEN = True
 
     # 评估参数
-    EVAL_BATCH_SIZE = 256            # 评估批处理大小（分批处理，减少显存占用）
+    EVAL_BATCH_SIZE = 512            # 评估批处理大小（分批处理，减少显存占用）
 
     INDEX_FILE = '000000.csv'
     INDEX_CODE = 'sh.000001'
@@ -85,7 +85,7 @@ class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
     INPUT_DIM = 8                    # 输入特征维度数（OHLC + volume + exchange + 大盘涨跌幅 + 大盘量能涨跌幅）
-    D_MODEL = 48                     # 模型维度（Transformer 内部维度）
+    D_MODEL = 128                    # 模型维度（Transformer 内部维度）
     FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数
     NUM_LAYERS = 6                   # Transformer 层数
@@ -98,10 +98,10 @@ class ModelConfig:
     # ========== FFN-Embedding 参数初始化配置 ==========
     # 目标：让FFN-Embedding和Position embedding的输出std统一为0.2，确保训练初期信息势均力敌
     #
-    # FFN-Embedding结构：Linear(8→48) → GELU → Linear(48→48)
-    # - 第一层(8→48): 线性投影，gain=0.37, 输出std≈0.2
+    # FFN-Embedding结构：Linear(8→128) → GELU → Linear(128→128)
+    # - 第一层(8→128): 线性投影，gain=0.58, 输出std≈0.2
     # - GELU: 有效增益≈0.588, 输出std≈0.118
-    # - 第二层(48→48): 补偿GELU压缩，gain=1.7, 输出std≈0.2 (在model.py中显式设置)
+    # - 第二层(128→128): 补偿GELU压缩，gain=1.7, 输出std≈0.2 (在model.py中显式设置)
     #
     # Linear层计算公式：输出std = σ_input × gain × sqrt(2×fan_in/(fan_in+fan_out))
     # Embedding层计算公式：输出std = gain × sqrt(2/(vocab_size+embedding_dim))
@@ -109,18 +109,18 @@ class ModelConfig:
     # 假设：输入数据经过归一化后std≈1.0
     #
     # 计算过程：
-    # - FFN-Embedding第一层 (Linear 8→48): gain = 0.2 / sqrt(16/56) ≈ 0.37
-    # - FFN-Embedding第二层 (Linear 48→48): gain = 1.7 (复用FFN_INIT_GAIN，补偿GELU压缩)
-    # - Position Embedding (Embedding 30→48): gain = 0.2 / sqrt(2/78) ≈ 1.25
-    # - Query Token (Parameter 48): gain = 0.2 / sqrt(2/96) ≈ 1.39 → 取1.4
-    EMBEDDING_INIT_GAIN = 0.37           # FFN-Embedding第一层 (Linear 8→48)
-    POSITION_EMBEDDING_INIT_GAIN = 1.25  # Position Embedding (Embedding 30→48)
-    QUERY_INIT_GAIN = 1.4                # Query Token (AttentionPooling)
+    # - FFN-Embedding第一层 (Linear 8→128): gain = 0.2 / sqrt(16/136) ≈ 0.58
+    # - FFN-Embedding第二层 (Linear 128→128): gain = 1.7 (复用FFN_INIT_GAIN，补偿GELU压缩)
+    # - Position Embedding (Embedding 30→128): gain = 0.2 / sqrt(2/158) ≈ 1.78
+    # - Query Token (Parameter 128): gain = 0.2 / sqrt(2/256) ≈ 2.26
+    EMBEDDING_INIT_GAIN = 0.58           # FFN-Embedding第一层 (Linear 8→128)
+    POSITION_EMBEDDING_INIT_GAIN = 1.78  # Position Embedding (Embedding 30→128)
+    QUERY_INIT_GAIN = 2.26               # Query Token (AttentionPooling)
 
     # FFN层初始化配置
     # - GELU在x~N(0,1)附近的有效增益约为0.588，需要补偿：gain ≈ 1/0.588 ≈ 1.7
-    # - 48→192: gain=1.7 → 范围±0.27, std≈0.155
-    # - 192→48: gain=1.0 → 范围±0.158, std≈0.091 (第二层无激活函数)
+    # - 128→512: gain=1.7 → 范围±0.27, std≈0.155
+    # - 512→128: gain=1.0 → 范围±0.158, std≈0.091 (第二层无激活函数)
     FFN_INIT_GAIN = 1.7              # FFN第一层初始化增益（补偿GELU压缩）
 
     # 输出层参数（当代最佳实践：避免sigmoid饱和）
@@ -139,8 +139,8 @@ class TrainingConfig:
     WEIGHT_DECAY = 1e-5              # AdamW/Adam权重衰减
 
     # 训练批处理
-    BATCH_SIZE = 256                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 24            # 每轮训练的批次数（调低以适配时间序采样）
+    BATCH_SIZE = 512                 # GPU每次并行训练的样本数（增加批大小）
+    BATCHES_PER_EPOCH = 48            # 每轮训练的批次数（调低以适配时间序采样）
 
     # 优化器选择（字符串，互斥）
     # 'adamw':    标准AdamW

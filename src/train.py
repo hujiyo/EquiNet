@@ -362,7 +362,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         # 打印模型A结果
         print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f} (BCE={stats_a["test_loss_bce"]:.4f}, 利润={stats_a["test_loss_profit_cost"]:.4f}), AUC: {stats_a["auc"]:.4f}')
         print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
-        print(f'          Top{DataConfig.TOP_K}%收益: {stats_a["top_return"]*100:+.2f}%')
+        daily_str_a = f', 日Top{DataConfig.TOP_K}%收益: {stats_a["daily_top_return"]*100:+.2f}%' if stats_a.get("daily_top_return") is not None else ''
+        print(f'          Top{DataConfig.TOP_K}%收益: {stats_a["top_return"]*100:+.2f}%{daily_str_a}')
         
         if stats_a['realistic_stats'] is not None:
             rs = stats_a['realistic_stats']
@@ -463,7 +464,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
 
             print(f'  [模型B] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f} (BCE={stats_b["test_loss_bce"]:.4f}, 利润={stats_b["test_loss_profit_cost"]:.4f}), AUC: {stats_b["auc"]:.4f}')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
-            print(f'          Top{DataConfig.TOP_K}%收益: {stats_b["top_return"]*100:+.2f}%')
+            daily_str_b = f', 日Top{DataConfig.TOP_K}%收益: {stats_b["daily_top_return"]*100:+.2f}%' if stats_b.get("daily_top_return") is not None else ''
+            print(f'          Top{DataConfig.TOP_K}%收益: {stats_b["top_return"]*100:+.2f}%{daily_str_b}')
             
             if stats_b['realistic_stats'] is not None:
                 rs = stats_b['realistic_stats']

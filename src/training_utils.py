@@ -112,11 +112,9 @@ def print_dispersion_sparkline(all_preds, epoch_returns_history=None, all_target
 
     def _print_block(title, data):
         hist_line, mean, std, min_val, max_val, total = _draw_sparkline(data)
-        print(f'  【{title}】N={total}')
-        print(f'    0.0  {hist_line}  1.0    均值{mean:.3f}, 标准差{std:.4f}, 范围[{min_val:.3f}, {max_val:.3f}]')
+        print(f' 【{title}】  0.0  {hist_line}  1.0   均值{mean:.3f},标准差{std:.4f},范围[{min_val:.3f},{max_val:.3f}],N={total}')
 
     _print_block('总样本预测值分布', all_preds)
-    print(f'    >0.5: {pos_ratio:.1f}%, >0.7: {high_conf_ratio:.1f}%')
 
     if all_targets is not None:
         all_targets = np.array(all_targets)
@@ -126,12 +124,12 @@ def print_dispersion_sparkline(all_preds, epoch_returns_history=None, all_target
         if len(pos_preds) > 0:
             _print_block('正样本预测值分布', pos_preds)
         else:
-            print(f'  【正样本预测值分布】（无正样本）')
+            print(f' 【正样本预测值分布】（无正样本）')
 
         if len(neg_preds) > 0:
             _print_block('负样本预测值分布', neg_preds)
         else:
-            print(f'  【负样本预测值分布】（无负样本）')
+            print(f' 【负样本预测值分布】（无负样本）')
 
     # ─── 趋势 ───
     if epoch_returns_history and len(epoch_returns_history) >= 2:
@@ -409,7 +407,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     num_samples = len(eval_inputs)
     if num_samples == 0:
         return {
-            'auc': 0.5, 'top_return': 0.0, 'top_count': 0, 'top_threshold': 0.0,
+            'auc': 0.5, 'top_return': 0.0, 'daily_top_return': None, 'top_count': 0, 'top_threshold': 0.0,
             'high_conf_count': 0, 'low_conf_count': 0, 'pred_mean': 0.0,
             'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None,
             'test_loss': None, 'test_loss_bce': None, 'test_loss_profit_cost': None
@@ -469,9 +467,27 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     else:
         test_loss = profit_cost
 
+    daily_top_return = None
+    if eval_day_indices is not None:
+        all_day_idx = np.array(eval_day_indices)
+        unique_days = np.unique(all_day_idx)
+        daily_top_indices_list = []
+        for day in unique_days:
+            day_mask = all_day_idx == day
+            day_preds = all_preds[day_mask]
+            day_local_k = max(1, int(len(day_preds) * percent / 100))
+            day_sorted = np.argsort(day_preds)[::-1]
+            day_top_local = day_sorted[:day_local_k]
+            day_global_indices = np.where(day_mask)[0][day_top_local]
+            daily_top_indices_list.append(day_global_indices)
+        if daily_top_indices_list:
+            all_daily_top_indices = np.concatenate(daily_top_indices_list)
+            daily_top_return = float(np.mean(all_returns[all_daily_top_indices]))
+
     stats = {
         'auc': auc,
         'top_return': top_return,
+        'daily_top_return': daily_top_return,
         'top_count': top_k,
         'top_threshold': top_threshold,
         'high_conf_count': np.sum(high_conf),

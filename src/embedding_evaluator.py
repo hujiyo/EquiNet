@@ -204,7 +204,7 @@ class EmbeddingModuleAnalyzer:
                 x_tensor = torch.tensor(x, dtype=torch.float32, device=self.device)
                 base_output = self.embedding_module(x_tensor)
             
-            jacobian = np.zeros((8, 48))
+            jacobian = np.zeros((8, ModelConfig.D_MODEL))
 
             for j in range(8):
                 x_plus = x.copy()
@@ -665,7 +665,7 @@ class EmbeddingModuleAnalyzer:
             test_inputs = sample_inputs[:n_pca_samples]
             test_inputs_tensor = torch.tensor(test_inputs, dtype=torch.float32, device=self.device)
             outputs = self.embedding_module(test_inputs_tensor)
-            outputs_flat = outputs.reshape(-1, 48).cpu().numpy()
+            outputs_flat = outputs.reshape(-1, ModelConfig.D_MODEL).cpu().numpy()
 
             from sklearn.decomposition import PCA
             pca = PCA(n_components=2)

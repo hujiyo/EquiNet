@@ -174,7 +174,8 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         eval_day_indices=eval_day_indices,
         eval_daily_returns=eval_daily_returns
     )
-    print(f"初始模型评估: AUC={stats_init['auc']:.4f}, Top{DataConfig.TOP_K}%收益={stats_init['top_return']*100:+.2f}%")
+    daily_init_str = f", 日Top{DataConfig.TOP_K}%收益={stats_init['daily_top_return']*100:+.2f}%" if stats_init.get('daily_top_return') is not None else ''
+    print(f"初始模型评估: AUC={stats_init['auc']:.4f}, Top{DataConfig.TOP_K}%收益={stats_init['top_return']*100:+.2f}%{daily_init_str}")
     if stats_init['realistic_stats'] is not None:
         rs = stats_init['realistic_stats']
         print(f"              【实战收益率】平均: {rs['avg_realistic_return']*100:.1f}%")
@@ -389,7 +390,8 @@ def train_dft_model(model, train_stock_info, test_stock_info,
 
         print(f'  [DFT模型] 训练损失: {avg_loss:.4f}, 测试损失: {test_loss:.4f} (BCE={stats["test_loss_bce"]:.4f}, 利润={stats["test_loss_profit_cost"]:.4f}), AUC: {stats["auc"]:.4f}')
         print(f'            预测均值: {stats["pred_mean"]:.3f}, 高置信(>0.7): {stats["high_conf_count"]}, 低置信(<0.2): {stats["low_conf_count"]}')
-        print(f'            Top{DataConfig.TOP_K}%收益: {stats["top_return"]*100:+.2f}%')
+        daily_str = f', 日Top{DataConfig.TOP_K}%收益: {stats["daily_top_return"]*100:+.2f}%' if stats.get("daily_top_return") is not None else ''
+        print(f'            Top{DataConfig.TOP_K}%收益: {stats["top_return"]*100:+.2f}%{daily_str}')
 
         if stats['realistic_stats'] is not None:
             rs = stats['realistic_stats']

@@ -31,11 +31,11 @@ def init_weights(module):
     - Embedding层: 输出std = gain × sqrt(2/(vocab_size+embedding_dim))
 
     各层gain计算结果：
-    - FFN-Embedding第一层 (Linear 8→48): gain=0.37, 输出std≈0.2
+    - FFN-Embedding第一层 (Linear 8→128): gain=0.58, 输出std≈0.2
     - FFN-Embedding GELU: 有效增益≈0.588, 输出std≈0.118
-    - FFN-Embedding第二层 (Linear 48→48): gain=1.7, 输出std≈0.2 (由StockTransformer.__init__显式设置)
-    - Position Embedding (Embedding 30→48): gain=1.25
-    - Query Token (Parameter 48): gain=1.4
+    - FFN-Embedding第二层 (Linear 128→128): gain=1.7, 输出std≈0.2 (由StockTransformer.__init__显式设置)
+    - Position Embedding (Embedding 30→128): gain=1.78
+    - Query Token (Parameter 128): gain=2.26
     """
     ffn_hidden_dim = ModelConfig.D_MODEL * ModelConfig.FFN_EXPAND_RATIO
 
@@ -205,7 +205,7 @@ class StockTransformer(nn.Module):
     Transformer 模型（Pre-Norm 架构 + FFN-Embedding）
 
     核心设计：
-    - FFN-Embedding: Linear(8→48) → GELU → Linear(48→48)
+    - FFN-Embedding: Linear(8→128) → GELU → Linear(128→128)
       相比纯线性映射，GELU在中间层提供非线性特征组合能力
       让第一层Transformer就能访问到特征间的非线性交互（如上影线、实体大小等）
     - Transformer 层：标准 Attention + FFN 结构，专注于跨时间模式识别
@@ -214,9 +214,9 @@ class StockTransformer(nn.Module):
         super(StockTransformer, self).__init__()
 
         # FFN-Embedding：线性映射 + GELU非线性 + 线性混合
-        # 第一层: 8→48, 各特征线性组合
+        # 第一层: 8→128, 各特征线性组合
         # GELU: 引入非线性，使embedding输出包含特征间的非线性交互
-        # 第二层: 48→48, 混合非线性变换后的特征
+        # 第二层: 128→128, 混合非线性变换后的特征
         self.embedding = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.GELU(),
@@ -254,7 +254,7 @@ class StockTransformer(nn.Module):
         self.apply(init_weights)
 
         # FFN-Embedding第二层显式初始化：补偿GELU压缩
-        # init_weights无法区分此层(48→48)与MHA输出投影(48→48)，需显式覆盖
+        # init_weights无法区分此层(128→128)与MHA输出投影(128→128)，需显式覆盖
         # GELU有效增益≈0.588，第二层用gain=1.7补偿，维持输出std≈0.2
         nn.init.xavier_uniform_(self.embedding[2].weight, gain=ModelConfig.FFN_INIT_GAIN)
         nn.init.zeros_(self.embedding[2].bias)

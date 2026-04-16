@@ -438,6 +438,8 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     print(f"│  │  低置信(<0.2):      {stats['low_conf_count']} 个")
     print(f"│  │  Top{DataConfig.TOP_K}%样本数:        {stats['top_count']} 个")
     print(f"│  │  Top{DataConfig.TOP_K}%平均收益:      {stats['top_return']*100:+.2f}%")
+    if stats.get('daily_top_return') is not None:
+        print(f"│  │  日Top{DataConfig.TOP_K}%平均收益:    {stats['daily_top_return']*100:+.2f}%")
     print(f"│  │")
     print(f"│  │  ★ Top{DataConfig.TOP_K}%阈值:        {stats['top_threshold']:.10f}")
     print(f"│  │")

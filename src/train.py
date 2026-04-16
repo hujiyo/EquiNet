@@ -43,7 +43,8 @@ from training_utils import (
     create_optimizer_from_config,
     create_scheduler_from_config,
     SAM,
-    training_step
+    training_step,
+    _get_amp_context
 )
 
 def train_clone_model(model_a, train_stock_info, test_stock_info,
@@ -290,9 +291,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             # ========== 训练模型B（如果存在且启用）==========
             if enable_model_b and model_b is not None and best_model_a_for_pseudo is not None:
                 # 用【最佳模型A】的预测生成伪标签
-                with torch.no_grad():
+                with torch.no_grad(), _get_amp_context(device):
                     output_a_for_pseudo = best_model_a_for_pseudo(batch_inputs)
-                    pred_a_for_pseudo = torch.sigmoid(output_a_for_pseudo).squeeze()
+                    pred_a_for_pseudo = torch.sigmoid(output_a_for_pseudo.float()).squeeze()
 
                 # 使用统一的伪标签生成函数
                 pseudo_targets_numpy, pseudo_stats = generate_pseudo_labels(
@@ -638,7 +639,8 @@ if __name__ == "__main__":
     print(f" 测试集: {len(test_stock_info)} 只股票")
 
     # 创建模型A
-    print("\n正在创建模型A (FP32精度)...")
+    amp_str = "BF16混合精度" if TrainingConfig.USE_AMP else "FP32精度"
+    print(f"\n正在创建模型A ({amp_str})...")
     model_a = create_model().to(device)
 
     total_params = sum(p.numel() for p in model_a.parameters())

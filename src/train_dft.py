@@ -335,7 +335,7 @@ def train_dft_model(model, train_stock_info, test_stock_info,
                 output = model(batch_inputs)
                 # 每次前向后重新计算DFT自引导权重（SAM第二步时参数已扰动，权重需更新）
                 with torch.no_grad():
-                    dft_w = compute_dft_weights(torch.sigmoid(output), w_min=dft_w_min, w_max=dft_w_max)
+                    dft_w = compute_dft_weights(torch.sigmoid(output.float()), w_min=dft_w_min, w_max=dft_w_max)
             # 根据损失函数类型选择计算方式
                 if use_task_aligned:
                 # 刷新正负样本动态权重（task_loss_fn内部BCE + 独立的dft_train_bce同步更新）

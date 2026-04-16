@@ -20,7 +20,7 @@ from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
                   create_recent_days_dataset, normalize_and_validate_context_window,
                   init_index_data)
-from training_utils import evaluate_model, DynamicWeightedBCE
+from training_utils import evaluate_model, DynamicWeightedBCE, _get_amp_context
 
 
 # ==================== 工具函数 ====================
@@ -233,16 +233,19 @@ def score_all_stocks(model, stock_list, device, feature_normalizer=None):
     batch_size = DataConfig.EVAL_BATCH_SIZE
     all_inputs_np = np.array(all_inputs)
     all_scores = []
-    
+    amp_ctx = _get_amp_context(device)
+
     num_batches = (len(all_inputs_np) + batch_size - 1) // batch_size
     with torch.no_grad():
         for i in range(num_batches):
             start = i * batch_size
             end = min((i + 1) * batch_size, len(all_inputs_np))
             batch = torch.tensor(all_inputs_np[start:end], dtype=torch.float32, device=device)
-            preds = torch.sigmoid(model(batch)).cpu().numpy().flatten()
+            with amp_ctx:
+                logits = model(batch)
+            preds = torch.sigmoid(logits.float()).cpu().numpy().flatten()
             all_scores.extend(preds)
-            del batch
+            del batch, logits
     
     # 组合结果
     for i in range(len(all_codes)):
@@ -723,13 +726,17 @@ def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4,
     
     model.eval()
     all_preds = []
-    
+    amp_ctx = _get_amp_context(device)
+
     with torch.no_grad():
         batch_size = DataConfig.EVAL_BATCH_SIZE
         for i in range(0, len(recent_inputs), batch_size):
             batch = torch.tensor(recent_inputs[i:i+batch_size], dtype=torch.float32, device=device)
-            preds = torch.sigmoid(model(batch)).cpu().numpy().flatten()
+            with amp_ctx:
+                logits = model(batch)
+            preds = torch.sigmoid(logits.float()).cpu().numpy().flatten()
             all_preds.extend(preds)
+            del batch, logits
     
     all_preds = np.array(all_preds)
     all_returns = np.array(recent_returns)

@@ -16,6 +16,7 @@
 '''
 
 import os,torch,torch.nn as nn,numpy as np
+import contextlib
 from datetime import datetime
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
@@ -416,6 +417,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     all_preds = []
     total_loss = 0.0
     num_batches = (num_samples + batch_size - 1) // batch_size
+    amp_ctx = _get_amp_context(device)
 
     with torch.no_grad():
         for i in range(num_batches):
@@ -423,8 +425,10 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
             end_idx = min((i + 1) * batch_size, num_samples)
 
             batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], dtype=torch.float32, device=device)
-            logits = model(batch_inputs)
-            all_preds.append(torch.sigmoid(logits).cpu().numpy().flatten())
+            with amp_ctx:
+                logits = model(batch_inputs)
+            scores = torch.sigmoid(logits.float())
+            all_preds.append(scores.cpu().numpy().flatten())
 
             if criterion is not None:
                 batch_targets = torch.tensor(eval_targets[start_idx:end_idx], dtype=torch.float32, device=device)
@@ -1310,14 +1314,21 @@ class SAM(torch.optim.Optimizer):
         self.base_optimizer.load_state_dict(state_dict)
 
 
+def _get_amp_context(device):
+    """获取AMP自动混合精度上下文管理器（BF16）"""
+    if TrainingConfig.USE_AMP and device.type == 'cuda':
+        return torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
 def training_step(model, optimizer, loss_fn):
     """
-    通用训练步，自动处理SAM两步优化和梯度裁剪。
+    通用训练步，自动处理SAM两步优化、梯度裁剪和AMP混合精度。
 
     统一封装前向-反向-更新流程：
-    - 非SAM: zero_grad → loss_fn → backward → clip → step
-    - SAM:   zero_grad → loss_fn → backward → first_step
-             → loss_fn → backward → clip → second_step
+    - 非SAM: zero_grad → loss_fn(AMP) → backward → clip → step
+    - SAM:   zero_grad → loss_fn(AMP) → backward → first_step
+             → loss_fn(AMP) → backward → clip → second_step
 
     梯度裁剪仅在真正更新参数前执行，不在SAM first_step前裁剪，
     以保证SAM扰动方向基于原始梯度（参见SAM论文Appendix A）。
@@ -1332,10 +1343,13 @@ def training_step(model, optimizer, loss_fn):
         tuple: (loss_value, output) — loss_value为Python float，output为首次前向输出
     """
     is_sam = isinstance(optimizer, SAM)
+    device = next(model.parameters()).device
+    amp_ctx = _get_amp_context(device)
 
-    # 第一次前向-反向
+    # 第一次前向-反向（AMP仅包裹前向+损失计算）
     optimizer.zero_grad()
-    loss, output = loss_fn()
+    with amp_ctx:
+        loss, output = loss_fn()
     loss.backward()
 
     if is_sam:
@@ -1344,7 +1358,8 @@ def training_step(model, optimizer, loss_fn):
         optimizer.first_step(zero_grad=True)
 
         # 在扰动后的参数处重新计算loss和梯度
-        loss_2, _ = loss_fn()
+        with amp_ctx:
+            loss_2, _ = loss_fn()
         loss_2.backward()
 
         # 仅在真正更新前裁剪

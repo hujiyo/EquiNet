@@ -59,7 +59,7 @@ class DataConfig:
     LABEL_DAY1_USE_OPEN = True
 
     # 评估参数
-    EVAL_BATCH_SIZE = 512            # 评估批处理大小（分批处理，减少显存占用）
+    EVAL_BATCH_SIZE = 2560            # 评估批处理大小（分批处理，减少显存占用）
 
     INDEX_FILE = '000000.csv'
     INDEX_CODE = 'sh.000001'
@@ -149,6 +149,10 @@ class TrainingConfig:
     # 'lion_sam': Lion + SAM 双重泛化保护
     # 'mano':     Mano混合优化器
     OPTIMIZER_TYPE = 'mano'
+
+    # 自动混合精度（AMP）
+    USE_AMP = True                   # 启用BF16自动混合精度（矩阵乘法用BF16，归一化/激活/损失保持FP32）
+    # 训练和推理均受此开关控制，sigmoid始终在FP32下执行，不影响选股排名精度
 
     # 通用优化器参数
     GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
@@ -456,6 +460,7 @@ def print_config_summary():
     print(f"  批处理大小: {TrainingConfig.BATCH_SIZE}")
     print(f"  每轮批次数: {TrainingConfig.BATCHES_PER_EPOCH}")
     print(f"  优化器: {optimizer_display}")
+    print(f"  混合精度(AMP): {'BF16' if TrainingConfig.USE_AMP else '关闭(FP32)'}")
     warmup_epochs = max(1, int(TrainingConfig.EPOCHS * TrainingConfig.WARMUP_RATIO))
     print(f"  预热轮数: {warmup_epochs} (总轮数的{TrainingConfig.WARMUP_RATIO*100:.0f}%)")
     print(f"  预热起始学习率: {TrainingConfig.WARMUP_START_LR}")

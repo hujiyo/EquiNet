@@ -40,7 +40,7 @@ class EmbeddingModule(nn.Module):
     
     将细处理和 Embedding 层封装为一个整体：
     - 细处理：FeatureNormalizer（训练时学到的变换）
-    - Embedding 层：nn.Linear（训练时学到的映射）
+    - Embedding 层：可以是 nn.Linear 或 nn.Sequential (FFN-embedding)
     
     注意：粗处理（OHLE变换）在数据加载阶段完成，
     本模块接收粗处理后的数据作为输入。
@@ -51,26 +51,39 @@ class EmbeddingModule(nn.Module):
         self.embedding_layer = embedding_layer
         self.feature_normalizer = feature_normalizer
     
+    def _get_device(self):
+        """获取embedding层所在的设备，兼容nn.Linear和nn.Sequential"""
+        if isinstance(self.embedding_layer, nn.Sequential):
+            # FFN-embedding: 取第一个有weight的层
+            for module in self.embedding_layer:
+                if hasattr(module, 'weight'):
+                    return module.weight.device
+        elif hasattr(self.embedding_layer, 'weight'):
+            # 传统Linear层
+            return self.embedding_layer.weight.device
+        return torch.device('cpu')
+    
     def forward(self, x):
         """
         Args:
-            x: 粗处理后的数据 [batch, seq_len, 6]
-               范围：OHLE [-0.1, 0.1], Volume [0, 1], Exchange [0, 1]
+            x: 粗处理后的数据 [batch, seq_len, 8]
+               范围：OHLE [-0.1, 0.1], Volume [0, 1], Exchange [0, 1], Index/IdxVol
         
         Returns:
             embedded: [batch, seq_len, d_model]
         """
         if self.feature_normalizer is not None:
             x_np = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else x
+            device = self._get_device()
             if x_np.ndim == 3:
                 batch_size, seq_len, n_features = x_np.shape
                 x_normalized = np.empty_like(x_np, dtype=np.float32)
                 for b in range(batch_size):
                     x_normalized[b] = self.feature_normalizer.transform(x_np[b])
-                x = torch.tensor(x_normalized, dtype=torch.float32, device=self.embedding_layer.weight.device)
+                x = torch.tensor(x_normalized, dtype=torch.float32, device=device)
             else:
                 x_normalized = self.feature_normalizer.transform(x_np)
-                x = torch.tensor(x_normalized, dtype=torch.float32, device=self.embedding_layer.weight.device)
+                x = torch.tensor(x_normalized, dtype=torch.float32, device=device)
         
         return self.embedding_layer(x)
     

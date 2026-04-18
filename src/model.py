@@ -213,12 +213,12 @@ class StockTransformer(nn.Module):
     def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, seq_len):
         super(StockTransformer, self).__init__()
 
-        # FFN-Embedding：线性映射 + GELU非线性 + 线性混合
-        # 第一层: 8→128, 各特征线性组合
-        # GELU: 引入非线性，使embedding输出包含特征间的非线性交互
-        # 第二层: 128→128, 混合非线性变换后的特征
-        self.embedding = nn.Sequential(
-            nn.Linear(input_dim, d_model),
+        # FFN-Embedding：线性投影 + 残差MLP（非线性特征交互）
+        # Linear(8→128): 基础线性映射，保底传递原始特征信息
+        # GELU + Linear(128→128): 残差分支，专注学习非线性交互（K线形态翻转等）
+        # 残差连接: 线性映射永远保底，MLP只负责"加增量"
+        self.embed_proj = nn.Linear(input_dim, d_model)
+        self.embed_mlp = nn.Sequential(
             nn.GELU(),
             nn.Linear(d_model, d_model)
         )
@@ -240,25 +240,26 @@ class StockTransformer(nn.Module):
         # 相比单向量点积，每个注意力头可以学到不同的时间聚合模式
         self.attention_pooling = AttentionPooling(d_model, nhead)
 
-        # 单层线性分类头（主流）,让backbone承担特征学习，避免MLP head过早过拟合
+        # Pooling输出归一化：与backbone的Pre-Norm风格一致，稳定分类头输入
+        self.head_norm = nn.LayerNorm(d_model)
+
+        # 单层线性分类头（主流做法），让backbone承担特征学习
         self.output_projection = nn.Linear(d_model, output_dim)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
         # 应用初始化
         self.apply(init_weights)
 
-        # FFN-Embedding第二层显式初始化：补偿GELU压缩
-        # init_weights无法区分此层(128→128)与MHA输出投影(128→128)，需显式覆盖
-        # GELU有效增益≈0.588，第二层用gain=1.7补偿，维持输出std≈0.2
-        nn.init.xavier_uniform_(self.embedding[2].weight, gain=ModelConfig.FFN_INIT_GAIN)
-        nn.init.zeros_(self.embedding[2].bias)
+        # FFN-Embedding残差MLP第二层显式初始化：补偿GELU压缩
+        nn.init.xavier_uniform_(self.embed_mlp[1].weight, gain=ModelConfig.FFN_INIT_GAIN)
+        nn.init.zeros_(self.embed_mlp[1].bias)
 
     def forward(self, x):
         # x: [batch_size, seq_len, 8] (OHLC + volume + exchange + 大盘涨跌幅 + 大盘量能涨跌幅)
 
-        # 1. FFN-Embedding：线性映射 + GELU非线性 + 线性混合
-        #    输出包含特征间的非线性交互（如影线、实体、量价关系等）
-        x = self.embedding(x)  # [batch_size, seq_len, d_model]
+        # 1. FFN-Embedding：线性投影 + 残差MLP
+        x = self.embed_proj(x)          # 线性映射保底
+        x = x + self.embed_mlp(x)       # MLP学非线性交互，残差保护线性映射
 
         # 2. 位置编码
         x = self.pos_encoding(x)
@@ -275,6 +276,8 @@ class StockTransformer(nn.Module):
         # 5. 多头注意力聚合
         aggregated = self.attention_pooling(x)  # [batch_size, d_model]
 
+        # 6. Pooling归一化 + 分类头
+        aggregated = self.head_norm(aggregated)
         output = self.output_projection(aggregated)  # [batch_size, output_dim]
         return output
 

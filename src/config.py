@@ -59,7 +59,7 @@ class DataConfig:
     LABEL_DAY1_USE_OPEN = True
 
     # 评估参数
-    EVAL_BATCH_SIZE = 2560            # 评估批处理大小（分批处理，减少显存占用）
+    EVAL_BATCH_SIZE = 4096            # 评估批处理大小（分批处理，减少显存占用）
 
     INDEX_FILE = '000000.csv'
     INDEX_CODE = 'sh.000001'

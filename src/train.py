@@ -37,7 +37,6 @@ from training_utils import (
     generate_pseudo_labels,
     save_model_with_metadata,
     DynamicWeightedBCE,
-    TaskAlignedLoss,
     EarlyStopping,
     print_dispersion_sparkline,
     create_optimizer_from_config,
@@ -114,24 +113,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     )
 
     # 损失函数选择
-    if LossConfig.use_task_aligned():
-        print("损失函数: TaskAlignedLoss (BCE + 排序损失 + 收益加权 + Top-K聚焦)")
-        print(f"  权重: rank={LossConfig.RANK_LOSS_WEIGHT}, return={LossConfig.RETURN_LOSS_WEIGHT}, topk={LossConfig.TOPK_LOSS_WEIGHT}")
-        criterion = TaskAlignedLoss(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
-        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
-        
-        test_targets = np.array(eval_targets)
-        test_pos_count = np.sum(test_targets >= 0.5)
-        test_neg_count = np.sum(test_targets < 0.5)
-        if test_pos_count > 0 and test_neg_count > 0:
-            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
-        elif test_pos_count == 0:
-            test_neg_weight = float(LossConfig.POS_WEIGHT)
-        else:
-            test_neg_weight = 0.1
-        eval_criterion.weight_0_0.fill_(test_neg_weight)
-        print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
-    elif LossConfig.use_dynamic_bce():
+    if LossConfig.use_dynamic_bce():
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
@@ -361,7 +343,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         test_loss_a = stats_a['test_loss']
 
         # 打印模型A结果
-        print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f} (BCE={stats_a["test_loss_bce"]:.4f}, 利润={stats_a["test_loss_profit_cost"]:.4f}), AUC: {stats_a["auc"]:.4f}')
+        print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
         print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
         daily_str_a = f', 日Top{DataConfig.TOP_K}%收益: {stats_a["daily_top_return"]*100:+.2f}%' if stats_a.get("daily_top_return") is not None else ''
         print(f'          Top{DataConfig.TOP_K}%收益: {stats_a["top_return"]*100:+.2f}%{daily_str_a}')
@@ -463,7 +445,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             # 测试损失已在评估中计算
             test_loss_b = stats_b['test_loss']
 
-            print(f'  [模型B] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f} (BCE={stats_b["test_loss_bce"]:.4f}, 利润={stats_b["test_loss_profit_cost"]:.4f}), AUC: {stats_b["auc"]:.4f}')
+            print(f'  [模型B] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
             daily_str_b = f', 日Top{DataConfig.TOP_K}%收益: {stats_b["daily_top_return"]*100:+.2f}%' if stats_b.get("daily_top_return") is not None else ''
             print(f'          Top{DataConfig.TOP_K}%收益: {stats_b["top_return"]*100:+.2f}%{daily_str_b}')

@@ -5,7 +5,6 @@
 - WarmupScheduler: 学习率预热调度器
 - GradientMonitor: 梯度监控器
 - DynamicWeightedBCE: 动态加权BCE损失函数
-- TaskAlignedLoss: 任务对齐损失函数
 - EarlyStopping: 早停机制
 - evaluate_model: 模型评估函数
 - generate_pseudo_labels: 伪标签生成
@@ -215,171 +214,6 @@ class DynamicWeightedBCE(nn.Module):
             return loss
 
 
-class TaskAlignedLoss(nn.Module):
-    """
-    任务对齐损失函数：专为Top-K选股任务设计的多目标组合损失
-    
-    总损失 = L_bce + λ1·L_rank + λ2·L_return + λ3·L_topk
-    
-    四个组件各司其职：
-    1. L_bce:    基础分类能力（DynamicWeightedBCE，保持正负样本均衡）
-    2. L_rank:   排序损失（高收益样本的预测分数应高于低收益样本）
-    3. L_return: 收益加权损失（收益越高/亏损越大的样本，分类错误代价越高）
-    4. L_topk:   头部聚焦损失（只关注模型预测分数最高的那批样本的质量）
-    """
-    def __init__(self, pos_weight=4.0, reduction='mean'):
-        super(TaskAlignedLoss, self).__init__()
-        self.reduction = reduction
-        
-        self.bce = DynamicWeightedBCE(pos_weight=pos_weight, reduction=reduction)
-        
-        self.rank_weight = LossConfig.RANK_LOSS_WEIGHT
-        self.return_weight = LossConfig.RETURN_LOSS_WEIGHT
-        self.topk_weight = LossConfig.TOPK_LOSS_WEIGHT
-        
-        self.rank_margin = LossConfig.RANK_MARGIN
-        self.rank_num_pairs = LossConfig.RANK_NUM_PAIRS
-        
-        self.return_alpha = LossConfig.RETURN_ALPHA
-        self.return_beta = LossConfig.RETURN_BETA
-        self.return_clip = LossConfig.RETURN_CLIP
-        
-        self.topk_ratio = LossConfig.TOPK_RATIO
-    
-    def update_weights(self, targets):
-        """动态更新BCE组件的正负样本权重"""
-        self.bce.update_weights(targets)
-    
-    def _ranking_loss(self, logits, returns):
-        """
-        排序损失：确保高收益样本的预测分数高于低收益样本
-        """
-        batch_size = logits.size(0)
-        if batch_size < 2:
-            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-        
-        sorted_indices = torch.argsort(returns, descending=True)
-        
-        half = batch_size // 2
-        high_indices = sorted_indices[:half]
-        low_indices = sorted_indices[half:]
-        
-        num_pairs = min(self.rank_num_pairs, half * len(low_indices))
-        if num_pairs == 0:
-            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-        
-        high_sample = high_indices[torch.randint(0, len(high_indices), (num_pairs,), device=logits.device)]
-        low_sample = low_indices[torch.randint(0, len(low_indices), (num_pairs,), device=logits.device)]
-        
-        score_diff = logits[high_sample] - logits[low_sample]
-        loss = F.relu(self.rank_margin - score_diff)
-        
-        return loss.mean()
-    
-    def _return_weighted_loss(self, logits, targets, returns):
-        """
-        收益加权损失：用收益率大小调制BCE的梯度
-        """
-        clipped_returns = torch.clamp(returns, -self.return_clip, self.return_clip)
-        
-        bce_per_sample = F.binary_cross_entropy_with_logits(
-            logits.float(), targets.float(), reduction='none'
-        )
-        
-        pos_mask = targets >= 0.5
-        neg_loss_mask = (targets < 0.5) & (returns < 0)
-        
-        weights = torch.ones_like(returns)
-        weights[pos_mask] = 1.0 + self.return_alpha * clipped_returns[pos_mask].abs()
-        weights[neg_loss_mask] = 1.0 + self.return_beta * clipped_returns[neg_loss_mask].abs()
-        
-        weights = weights / (weights.mean() + 1e-8)
-        
-        loss = (bce_per_sample * weights).mean()
-        return loss
-    
-    def _topk_focus_loss(self, logits, targets, returns):
-        """
-        Top-K聚焦损失：只关注模型预测分数最高的那些样本
-        """
-        batch_size = logits.size(0)
-        k = max(1, int(batch_size * self.topk_ratio))
-        
-        _, topk_indices = torch.topk(logits.detach(), k)
-        
-        topk_logits = logits[topk_indices]
-        topk_targets = targets[topk_indices]
-        topk_returns = returns[topk_indices]
-        
-        topk_bce = F.binary_cross_entropy_with_logits(
-            topk_logits.float(), topk_targets.float(), reduction='none'
-        )
-        
-        clipped_returns = torch.clamp(topk_returns, -self.return_clip, self.return_clip)
-        penalty = torch.where(
-            topk_returns < 0,
-            1.0 + self.return_beta * clipped_returns.abs(),
-            torch.ones_like(topk_returns)
-        )
-        
-        loss = (topk_bce * penalty).mean()
-        return loss
-    
-    def forward(self, logits, targets, returns=None):
-        """
-        前向计算：组合所有子损失
-        
-        Args:
-            logits: [batch_size] 或 [batch_size, 1] 模型原始输出
-            targets: [batch_size] 真实标签 (0/1)
-            returns: [batch_size] 真实累计收益率（可选，不提供则退化为纯BCE）
-        """
-        if logits.dim() == 2 and logits.size(1) == 1:
-            logits = logits.squeeze(-1)
-        
-        loss_bce = self.bce(logits, targets)
-        
-        if returns is None:
-            return loss_bce
-        
-        if returns.dim() == 2:
-            returns = returns.squeeze(-1)
-        returns = returns.to(dtype=logits.dtype, device=logits.device)
-        
-        loss_rank = self._ranking_loss(logits, returns)
-        
-        loss_return = self._return_weighted_loss(logits, targets, returns)
-        
-        loss_topk = self._topk_focus_loss(logits, targets, returns)
-        
-        total_loss = loss_bce + \
-                     self.rank_weight * loss_rank + \
-                     self.return_weight * loss_return + \
-                     self.topk_weight * loss_topk
-        
-        return total_loss
-
-
-def _compute_profit_cost(all_preds, all_returns):
-    """
-    利润成本：衡量"跟着模型做交易会亏多少钱"
-
-    对每个样本：
-    - 模型说买（高置信度），股票却跌了 → 代价 = 置信度 × |亏损|
-    - 模型说不买（低置信度），股票却涨了 → 代价 = (1-置信度) × 涨幅
-
-    完美模型 cost=0，随机模型 cost≈mean(|return|)，反向模型 cost≈mean(|return|)
-    """
-    clip = LossConfig.EVAL_RETURN_CLIP
-    returns_clipped = np.clip(all_returns, -clip, clip)
-
-    # 误选亏损股的代价
-    fp_cost = all_preds * np.maximum(0, -returns_clipped)
-    # 错过上涨股的代价
-    fn_cost = (1 - all_preds) * np.maximum(0, returns_clipped)
-
-    return float(np.mean(fp_cost + fn_cost))
-
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
                    device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None,
@@ -411,7 +245,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
             'auc': 0.5, 'top_return': 0.0, 'daily_top_return': None, 'top_count': 0, 'top_threshold': 0.0,
             'high_conf_count': 0, 'low_conf_count': 0, 'pred_mean': 0.0,
             'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None,
-            'test_loss': None, 'test_loss_bce': None, 'test_loss_profit_cost': None
+            'test_loss': None
         }
 
     all_preds = []
@@ -459,17 +293,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     high_conf = all_preds > 0.7
     low_conf = all_preds < 0.2
 
-    # 计算利润成本（始终计算，不依赖criterion）
-    profit_cost = _compute_profit_cost(all_preds, all_returns)
-
-    # BCE损失（仅当criterion提供时）
-    test_loss_bce = total_loss / num_samples if criterion is not None else None
-
-    # 组合评估损失 = BCE + β × 利润成本
-    if test_loss_bce is not None:
-        test_loss = test_loss_bce + LossConfig.EVAL_PROFIT_COST_WEIGHT * profit_cost
-    else:
-        test_loss = profit_cost
+    test_loss = total_loss / num_samples if criterion is not None else None
 
     daily_top_return = None
     if eval_day_indices is not None:
@@ -503,8 +327,6 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         'dispersion_range': float(np.max(all_preds) - np.min(all_preds)),
         'dispersion_iqr': float(np.percentile(all_preds, 75) - np.percentile(all_preds, 25)),
         'test_loss': test_loss,
-        'test_loss_bce': test_loss_bce,
-        'test_loss_profit_cost': profit_cost,
     }
 
     if eval_day_indices is not None:

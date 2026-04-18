@@ -39,7 +39,6 @@ from training_utils import (
     evaluate_model,
     save_model_with_metadata,
     DynamicWeightedBCE,
-    TaskAlignedLoss,
     EarlyStopping,
     print_dispersion_sparkline,
     create_optimizer_from_config,
@@ -81,47 +80,6 @@ def weighted_bce_with_dft(logits, targets, dft_weights, bce_criterion):
     return (per_sample_loss * dft_w).mean()
 
 
-def weighted_task_aligned_loss(logits, targets, returns, dft_weights, task_loss_fn, dft_bce_none):
-    """
-    DFT加权版TaskAlignedLoss：
-    - BCE分量：通过独立的DynamicWeightedBCE(reduction='none')实例获取
-      含正负样本动态权重的per-sample损失，再叠加DFT自引导权重
-    - 排序/收益/TopK分量：直接复用TaskAlignedLoss的子组件，保持原有逻辑
-    
-    Args:
-        dft_bce_none: 独立的DynamicWeightedBCE(reduction='none')实例，
-                      与 task_loss_fn 内部的BCE共享相同的权重更新逻辑，
-                      但返回 per-sample 损失而非标量
-    """
-    if logits.dim() == 2 and logits.size(1) == 1:
-        logits = logits.squeeze(-1)
-
-    # BCE分量：通过独立的 reduction='none' 实例获取per-sample损失
-    bce_per_sample = dft_bce_none(logits, targets)  # [batch_size], 已含正负样本动态权重
-    
-    # 叠加DFT自引导权重
-    dft_w = dft_weights.to(dtype=bce_per_sample.dtype)
-    weighted_bce = (bce_per_sample * dft_w).mean()
-
-    if returns is None:
-        return weighted_bce
-
-    if returns.dim() == 2:
-        returns = returns.squeeze(-1)
-    returns = returns.to(dtype=logits.dtype, device=logits.device)
-
-    # 排序损失、收益加权损失、Top-K聚焦损失直接复用TaskAlignedLoss的子组件
-    loss_rank = task_loss_fn._ranking_loss(logits, returns)
-    loss_return = task_loss_fn._return_weighted_loss(logits, targets, returns)
-    loss_topk = task_loss_fn._topk_focus_loss(logits, targets, returns)
-
-    total_loss = weighted_bce + \
-                 task_loss_fn.rank_weight * loss_rank + \
-                 task_loss_fn.return_weight * loss_return + \
-                 task_loss_fn.topk_weight * loss_topk
-
-    return total_loss
-
 
 # ==================== DFT训练主函数 ====================
 
@@ -142,7 +100,6 @@ def train_dft_model(model, train_stock_info, test_stock_info,
     - 加载已有模型，使用自引导DFT继续微调
     - 样本权重基于模型自身的预测排名分位数：中间排名高权值，头尾低权值
     - w = w_min + (w_max - w_min) * 4 * rank * (1 - rank)
-    - 支持TaskAlignedLoss：DFT权重调制基础BCE分量，排序/收益/TopK子损失照常计算
     """
     print("\n" + "="*60)
     print("DFT自引导微调训练")
@@ -197,31 +154,8 @@ def train_dft_model(model, train_stock_info, test_stock_info,
     )
 
     # 损失函数选择
-    use_task_aligned = LossConfig.use_task_aligned()
-
-    if use_task_aligned:
-        print("损失函数: DFT加权TaskAlignedLoss (DFT权重调制BCE + 排序损失 + 收益加权 + Top-K聚焦)")
-        print(f"  权重: rank={LossConfig.RANK_LOSS_WEIGHT}, return={LossConfig.RETURN_LOSS_WEIGHT}, topk={LossConfig.TOPK_LOSS_WEIGHT}")
-        task_loss_fn = TaskAlignedLoss(pos_weight=LossConfig.POS_WEIGHT, reduction='mean').to(device)
-        # 独立的 reduction='none' BCE 实例，用于 DFT 加权时获取 per-sample 损失
-        # 与 task_loss_fn.bce 共享相同的 pos_weight，但不修改 task_loss_fn 内部状态
-        dft_train_bce = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='none').to(device)
-        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
-
-        test_targets = np.array(eval_targets)
-        test_pos_count = np.sum(test_targets >= 0.5)
-        test_neg_count = np.sum(test_targets < 0.5)
-        if test_pos_count > 0 and test_neg_count > 0:
-            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
-        elif test_pos_count == 0:
-            test_neg_weight = float(LossConfig.POS_WEIGHT)
-        else:
-            test_neg_weight = 0.1
-        eval_criterion.weight_0_0.fill_(test_neg_weight)
-        print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
-    elif LossConfig.use_dynamic_bce():
+    if LossConfig.use_dynamic_bce():
         print("损失函数: DFT加权DynamicWeightedBCE (正负样本动态权重 × DFT自引导权重)")
-        task_loss_fn = None
         # 训练用：reduction='none' 以获取per-sample损失，再叠加DFT权重
         dft_train_bce = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='none').to(device)
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
@@ -239,7 +173,6 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
     else:
         print("损失函数: DFT加权BCE (标准BCE × DFT自引导权重)")
-        task_loss_fn = None
         dft_train_bce = None  # 标准BCE路径不需要DynamicWeightedBCE
         eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
@@ -336,20 +269,12 @@ def train_dft_model(model, train_stock_info, test_stock_info,
                 # 每次前向后重新计算DFT自引导权重（SAM第二步时参数已扰动，权重需更新）
                 with torch.no_grad():
                     dft_w = compute_dft_weights(torch.sigmoid(output.float()), w_min=dft_w_min, w_max=dft_w_max)
-            # 根据损失函数类型选择计算方式
-                if use_task_aligned:
-                # 刷新正负样本动态权重（task_loss_fn内部BCE + 独立的dft_train_bce同步更新）
-                    task_loss_fn.update_weights(batch_targets)
-                    dft_train_bce.update_weights(batch_targets)
-                    loss = weighted_task_aligned_loss(
-                        output, batch_targets, batch_returns, dft_w, task_loss_fn, dft_train_bce
-                    )
-                elif dft_train_bce is not None:
-                # DynamicWeightedBCE路径：刷新正负样本动态权重，再叠加DFT权重
+                if dft_train_bce is not None:
+                    # DynamicWeightedBCE路径：刷新正负样本动态权重，再叠加DFT权重
                     dft_train_bce.update_weights(batch_targets)
                     loss = weighted_bce_with_dft(output, batch_targets, dft_w, dft_train_bce)
                 else:
-                # 标准BCE路径：裸BCE × DFT权重
+                    # 标准BCE路径：裸BCE × DFT权重
                     logits = output.squeeze(-1)
                     bce_per_sample = F.binary_cross_entropy_with_logits(
                         logits.float(), batch_targets.float(), reduction='none'

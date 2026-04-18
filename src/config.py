@@ -223,46 +223,14 @@ class TrainingConfig:
 class LossConfig:
     """损失函数相关配置"""
 
-    LOSS_TYPE = 'task_aligned'  #'task_aligned':任务对齐损失 | 'dynamic_bce':批权重动态平衡 | 'standard_bce':标准二元交叉熵
-    
-    POS_WEIGHT = 4.0  # DynamicWeightedBCE 的正样本权重（同时用于 TaskAlignedLoss 的基础BCE组件）
+    LOSS_TYPE = 'dynamic_bce'  # 'dynamic_bce':批权重动态平衡 | 'standard_bce':标准二元交叉熵
 
-    # ========== TaskAlignedLoss 参数 ==========
-    # 各子损失的权重
-    RANK_LOSS_WEIGHT = 0.3       # 排序损失权重（确保高收益样本排在前面）
-    RETURN_LOSS_WEIGHT = 0.2     # 收益加权损失权重（收益越高/亏损越大，梯度越强）
-    TOPK_LOSS_WEIGHT = 0.1       # Top-K聚焦损失权重（只关注模型预测最高的那部分）
-
-    # 排序损失参数
-    RANK_MARGIN = 0.1            # 排序损失的margin（要求正负样本对的分数差距至少这么大）
-    RANK_NUM_PAIRS = 64          # 每个batch采样的正负样本对数量
-
-    # 收益加权参数
-    RETURN_ALPHA = 5.0           # 正样本收益率放大系数（收益越高权重越大）
-    RETURN_BETA = 3.0            # 负样本亏损放大系数（亏损越多权重越大）
-    RETURN_CLIP = 0.30           # 收益率裁剪范围（防止极端值主导梯度）
-
-    # Top-K聚焦参数
-    TOPK_RATIO = 0.10            # 每个batch中关注的Top比例（10%）
-
-    # ========== 评估损失参数 ==========
-    # 利润导向评估损失 = 加权BCE + β × 利润成本
-    # 利润成本衡量"跟着模型做交易会亏多少钱"：
-    #   误选亏损股代价 = 置信度 × |亏损|
-    #   错过上涨股代价 = (1-置信度) × 涨幅
-    # 利润成本量级 ~0.02-0.05，乘以β后与BCE(~0.3-0.7)量级可比
-    EVAL_PROFIT_COST_WEIGHT = 5.0    # 利润成本权重β
-    EVAL_RETURN_CLIP = 0.30          # 利润成本中的收益率裁剪范围（防止极端值）
+    POS_WEIGHT = 4.0  # DynamicWeightedBCE 的正样本权重
 
     @staticmethod
     def use_dynamic_bce():
         return LossConfig.LOSS_TYPE.lower() == 'dynamic_bce'
 
-    @staticmethod
-    def use_task_aligned():
-        return LossConfig.LOSS_TYPE.lower() == 'task_aligned'
-
-        
 # ==================== 用户自定义标签生成函数 ====================
 def generate_label(day1_change, day2_change, day3_change):
     """

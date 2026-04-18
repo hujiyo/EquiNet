@@ -240,14 +240,8 @@ class StockTransformer(nn.Module):
         # 相比单向量点积，每个注意力头可以学到不同的时间聚合模式
         self.attention_pooling = AttentionPooling(d_model, nhead)
 
-        # 简化输出层，减少过拟合
-        self.output_projection = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),  # 降维
-            nn.GELU(),
-            nn.Dropout(ModelConfig.DROPOUT_RATE),
-            nn.Linear(d_model // 2, output_dim)  # 最终输出
-        )
-
+        # 单层线性分类头（主流）,让backbone承担特征学习，避免MLP head过早过拟合
+        self.output_projection = nn.Linear(d_model, output_dim)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
         # 应用初始化

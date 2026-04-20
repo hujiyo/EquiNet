@@ -13,6 +13,7 @@ EquiNet 模型定义文件
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from config import ModelConfig, DataConfig
 
 def init_weights(module):
@@ -20,9 +21,9 @@ def init_weights(module):
     当代主流Transformer初始化策略
 
     设计原则：
-    1. FFN-Embedding层: 第一层gain=0.37(线性投影), 第二层gain=1.7(补偿GELU压缩)
-    2. FFN第一层: Xavier初始化，gain=1.7补偿GELU压缩
-    3. FFN第二层: Xavier初始化，gain=1.0（无激活函数）
+    1. FFN-Embedding层: 第一层gain=0.58(线性投影), 第二层gain=1.7(补偿GELU压缩)
+    2. SwiGLU w1/w3层: Xavier初始化，gain=1.7
+    3. SwiGLU w2层: Xavier初始化，gain=1.0（无激活函数）
     4. 输出层: 小增益，避免sigmoid饱和
     5. LayerNorm: weight=1, bias=0
 
@@ -114,35 +115,33 @@ class MultiHeadAttention(nn.Module):
 
 class TransformerLayer(nn.Module):
     """
-    标准 Transformer 层（Pre-Norm架构，主流大厂风格）
-    统一管理归一化和残差连接，数据流清晰易懂
-    Pre-Norm相比Post-Norm有更好的训练稳定性
+    标准 Transformer 层（Pre-Norm架构，SwiGLU前馈网络）
+    SwiGLU: w2(SiLU(w1(x)) * w3(x))，门控机制提供选择性信息流动
+    参考: Shazeer, "GLU Variants Improve Transformer" (2020)
     """
     def __init__(self, d_model, nhead):
         super(TransformerLayer, self).__init__()
-        
+
         # 注意力子层
         self.attn = MultiHeadAttention(d_model, nhead)
         self.attn_norm = nn.LayerNorm(d_model)
-        
-        # 前馈网络子层
+
+        # SwiGLU前馈网络: w2(SiLU(w1(x)) * w3(x))
         ffn_hidden_dim = int(d_model * ModelConfig.FFN_EXPAND_RATIO)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, ffn_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(ModelConfig.DROPOUT_RATE),
-            nn.Linear(ffn_hidden_dim, d_model),
-        )
+        self.ffn_w1 = nn.Linear(d_model, ffn_hidden_dim)
+        self.ffn_w3 = nn.Linear(d_model, ffn_hidden_dim)
+        self.ffn_w2 = nn.Linear(ffn_hidden_dim, d_model)
         self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn_dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
     def forward(self, x):
         # 注意力子层: x = x + Dropout(Attention(LayerNorm(x)))
         x = x + self.attn(self.attn_norm(x), attn_mask=None)
-        
-        # 前馈网络子层: x = x + Dropout(FFN(LayerNorm(x)))
-        x = x + self.ffn_dropout(self.ffn(self.ffn_norm(x)))
-        
+
+        # SwiGLU前馈网络: x = x + Dropout(w2(SiLU(w1(h)) * w3(h)))
+        h = self.ffn_norm(x)
+        x = x + self.ffn_dropout(self.ffn_w2(F.silu(self.ffn_w1(h)) * self.ffn_w3(h)))
+
         return x
 
 

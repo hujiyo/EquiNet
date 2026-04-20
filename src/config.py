@@ -117,11 +117,12 @@ class ModelConfig:
     POSITION_EMBEDDING_INIT_GAIN = 1.78  # Position Embedding (Embedding 30→128)
     QUERY_INIT_GAIN = 2.26               # Query Token (AttentionPooling)
 
-    # FFN层初始化配置
-    # - GELU在x~N(0,1)附近的有效增益约为0.588，需要补偿：gain ≈ 1/0.588 ≈ 1.7
-    # - 128→512: gain=1.7 → 范围±0.27, std≈0.155
-    # - 512→128: gain=1.0 → 范围±0.158, std≈0.091 (第二层无激活函数)
-    FFN_INIT_GAIN = 1.7              # FFN第一层初始化增益（补偿GELU压缩）
+    # SwiGLU FFN层初始化配置
+    # SwiGLU结构: W2(SiLU(W1(x)) ⊙ W3(x))
+    # - SiLU在x~N(0,1)附近的有效增益≈1.1，但门控乘法(sigmoid压缩)会衰减信号
+    # - W1/W3(128→512): gain=1.7 补偿门控机制的信息压缩
+    # - W2(512→128): gain=1.0（无激活函数）
+    FFN_INIT_GAIN = 1.7              # SwiGLU W1/W3 初始化增益（补偿门控信息压缩）
 
     # 输出层参数（当代最佳实践：避免sigmoid饱和）
     # - 输出层使用sigmoid，如果logits范围太大会导致饱和、梯度消失

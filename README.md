@@ -1,5 +1,7 @@
 # EquiNet
 
+> 2026.4.20谷雨:EquiNet v2归档，v3 start ~，v3将转为私有仓库继续开发。方向：应用因子规模化、参数规模化、架构重构，核心聚焦风险与稳定性。
+
 ## 项目简介
 
  - EquiNet基于历史数据进行统计建模，对未来3天是否具有短期上涨趋势进行打分
@@ -48,14 +50,14 @@ data_select.py ──筛选──> data/     (训练数据)
 data_update.py --mode train ──增量更新──> data/
 ```
 
-### 1. 更新全量股票池（慢，偶尔做）
+### 1. 更新全量股票池
 
 ```bash
 python data_update.py                 # 增量更新已有股票的最新数据（默认）
 python data_update.py --mode full     # 全量更新：拉取所有A股完整历史（首次/添加新股）
 ```
 
-### 2. 筛选训练数据（慢，偶尔做）
+### 2. 筛选训练数据
 
 ```bash
 python data_select.py                 # 使用默认配置筛选（市值<MARKET_CAP_MAX and > MARKET_CAP_MIN）
@@ -65,13 +67,13 @@ python data_select.py --market-cap 200e8  # 自定义市值上限
 
 筛选条件：主板股票 → 排除ST → 排除退市/停牌 → 市值 < MARKET_CAP_MAX and > MARKET_CAP_MIN
 
-### 3. 更新训练数据（快，训练前做）
+### 3. 更新训练数据
 
 ```bash
 python data_update.py --mode train    # 增量更新 data/ 中的股票（快，推荐频繁使用）
 ```
 
-### 4. 检查数据质量（按需）
+### 4. 检查数据质量
 
 ```bash
 python data_check.py                  # 检查全量股票池最近100天数据
@@ -85,7 +87,7 @@ python data_check.py --days 50        # 指定检查天数
 python data_update.py --mode full     # 1. 拉取全量数据（首次需要数小时）
 python data_select.py                 # 2. 筛选训练股票（约数小时）
 
-# 日常训练（快速）
+# 日常训练
 python data_update.py --mode train    # 3. 刷新训练数据（几小时）
 python src/train.py                   # 4. 开始训练
 python src/run.py                     # 5. 选股推理

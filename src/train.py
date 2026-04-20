@@ -261,10 +261,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 output_a = model_a(batch_inputs)
                 if hasattr(criterion, 'update_weights'):
                     criterion.update_weights(batch_targets)
-                if isinstance(criterion, TaskAlignedLoss):
-                    loss_a = criterion(output_a.squeeze(-1), batch_targets, batch_returns)
-                else:
-                    loss_a = criterion(output_a.squeeze(-1), batch_targets)
+                loss_a = criterion(output_a.squeeze(-1), batch_targets)
                 return loss_a, output_a
 
             loss_a_val, _ = training_step(model_a, optimizer_a, _loss_fn_a)
@@ -293,10 +290,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                     output_b = model_b(batch_inputs)
                     if hasattr(criterion, 'update_weights'):
                         criterion.update_weights(pseudo_targets)
-                    if isinstance(criterion, TaskAlignedLoss):
-                        loss_b = criterion(output_b.squeeze(-1), pseudo_targets, batch_returns)
-                    else:
-                        loss_b = criterion(output_b.squeeze(-1), pseudo_targets)
+                    loss_b = criterion(output_b.squeeze(-1), pseudo_targets)
                     return loss_b, output_b
 
                 loss_b_val, _ = training_step(model_b, optimizer_b, _loss_fn_b)

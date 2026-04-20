@@ -134,13 +134,13 @@ class ModelConfig:
 class TrainingConfig:
     """训练相关参数"""
     # 基础训练参数（优化训练策略）
-    EPOCHS = 400                     # 训练轮数（增加轮数以充分训练小模型）
+    EPOCHS = 80                     # 训练轮数（增加轮数以充分训练小模型）
     LEARNING_RATE = 0.001            # AdamW/Adam基础学习率
     WEIGHT_DECAY = 1e-5              # AdamW/Adam权重衰减
 
     # 训练批处理
     BATCH_SIZE = 512                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 48            # 每轮训练的批次数（调低以适配时间序采样）
+    BATCHES_PER_EPOCH = 240            # 每轮训练的批次数（调低以适配时间序采样）
 
     # 优化器选择（字符串，互斥）
     # 'adamw':    标准AdamW
@@ -178,8 +178,9 @@ class TrainingConfig:
     MANO_DUAL_DIM_PROJECTION = True  # 是否使用双维度投影（v2新功能，默认True）
 
     # 余弦退火调度器参数,学习率预热参数
-    COSINE_ETA_MIN = 5e-6            # 余弦退火最小学习率（训练末期的精细微调学习率）
-    WARMUP_RATIO = 0.1               # 预热轮数占比（总轮数的10%）
+    COSINE_ETA_MIN = 1e-4          # 余弦退火最小学习率 / 固定阶段学习率
+    COSINE_FREEZE_RATIO = 0.2     # 余弦退火占总训练的比例（之后学习率固定在ETA_MIN），设为1.0为全程退火
+    WARMUP_RATIO = 0.1               # 预热轮数占总轮数比
     WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
 
     OPEN_EARLY_STOPPING = False       # 是否开启早停机制

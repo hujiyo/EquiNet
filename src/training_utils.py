@@ -14,7 +14,7 @@
 - create_scheduler_from_config: 根据配置创建学习率调度器
 '''
 
-import os,torch,torch.nn as nn,numpy as np
+import os,torch,torch.nn as nn,numpy as np,math
 import contextlib
 from datetime import datetime
 import torch.nn.functional as F
@@ -73,6 +73,50 @@ class WarmupScheduler:
     def is_warmup_phase(self):
         """判断是否还在预热阶段"""
         return self.current_epoch < self.warmup_epochs
+
+
+class CosineAnnealFreezeLR:
+    """
+    余弦退火 + 固定学习率调度器
+
+    学习率变化：warmup → 余弦退火 → 固定在 eta_min
+    余弦退火仅持续 freeze_ratio 比例的训练轮数，之后学习率固定不再下降。
+    用于观察 epoch-wise 双下降现象：模型在恒定学习率下持续被推动，
+    有机会逃离过拟合解，展现"先降→中间反弹→再降"的曲线。
+    """
+    def __init__(self, optimizer, total_main_epochs, eta_min, freeze_ratio):
+        """
+        Args:
+            optimizer: PyTorch优化器
+            total_main_epochs: 预热后的总训练轮数
+            eta_min: 余弦退火终止学习率（也是固定阶段的学习率）
+            freeze_ratio: 余弦退火占总训练的比例 (0,1]
+                          0.5 = 前50%余弦退火，后50%固定
+                          1.0 = 退火到训练结束（等同原始行为）
+        """
+        self.optimizer = optimizer
+        self.total_main_epochs = total_main_epochs
+        self.eta_min = eta_min
+        self.freeze_ratio = min(freeze_ratio, 1.0)
+        self.anneal_epochs = max(1, int(total_main_epochs * self.freeze_ratio))
+        self.current_step = 0
+
+        # 记录初始学习率（余弦退火的起点）
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+
+    def step(self):
+        """更新学习率：退火阶段内按余弦衰减，之后固定不变"""
+        self.current_step += 1
+        if self.current_step <= self.anneal_epochs:
+            for param_group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+                cosine_factor = 0.5 * (1 + math.cos(math.pi * self.current_step / self.anneal_epochs))
+                param_group['lr'] = self.eta_min + (base_lr - self.eta_min) * cosine_factor
+        # 超过退火轮数后不更新，学习率固定在 eta_min
+
+    def get_last_lr(self):
+        """获取当前学习率"""
+        return [group['lr'] for group in self.optimizer.param_groups]
+
 
 def _draw_sparkline(data, num_bins=20):
     """绘制单行终端直方图并返回统计信息"""
@@ -1272,10 +1316,20 @@ def create_scheduler_from_config(optimizer, epochs, lr=None, eta_min=None, warmu
 
     # 确保余弦退火的 T_max 至少为1，防止 epochs 过小时崩溃
     total_main_epochs = max(1, epochs - warmup_epochs)
-    main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_main_epochs,
-        eta_min=actual_eta_min
-    )
+
+    freeze_ratio = getattr(TrainingConfig, 'COSINE_FREEZE_RATIO', 1.0)
+    if freeze_ratio < 1.0:
+        main_scheduler = CosineAnnealFreezeLR(
+            optimizer,
+            total_main_epochs=total_main_epochs,
+            eta_min=actual_eta_min,
+            freeze_ratio=freeze_ratio
+        )
+    else:
+        main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_main_epochs,
+            eta_min=actual_eta_min
+        )
 
     return warmup_scheduler, main_scheduler, warmup_epochs

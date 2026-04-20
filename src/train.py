@@ -144,7 +144,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     best_return_epoch_b = None if not enable_model_b else 0
 
     # 按loss保存的最佳模型（需要满足条件才参与评估）
-    # 条件：epoch >= 100, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%
+    # 条件：预热结束后, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%
     best_loss_a = float('inf')
     best_loss_epoch_a = 0
     best_model_a_by_loss = None
@@ -153,7 +153,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     best_threshold_a_at_best_loss = 0.0
     best_realistic_return_a_at_best_loss = 0.0
 
-    # 按实战收益率保存的最佳模型A（第100轮后）
+    # 按实战收益率保存的最佳模型A（预热结束后）
     best_realistic_return_a = -float('inf')
     best_realistic_return_epoch_a = 0
     best_model_a_by_realistic_return = None
@@ -396,9 +396,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             best_model_a_for_pseudo.eval()
             print(f'          ✓ 新最佳模型A（收益率）！Top1%收益: {best_return_a*100:+.2f}% (第{best_return_epoch_a}轮)')
 
-        # 按loss评估最佳模型A（条件：epoch >= 100, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
+        # 按loss评估最佳模型A（条件：预热结束后, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
         realistic_return_a = stats_a['realistic_stats']['avg_realistic_return'] if stats_a.get('realistic_stats') else 0.0
-        if (epoch + 1) >= 100 and realistic_return_a >= 0.014 and stats_a['top_return'] > 0.008 and stats_a['auc'] > 0.65:
+        if (epoch + 1) > warmup_epochs and realistic_return_a >= 0.014 and stats_a['top_return'] > 0.008 and stats_a['auc'] > 0.65:
             if test_loss_a < best_loss_a:
                 best_loss_a = test_loss_a
                 best_loss_epoch_a = epoch + 1
@@ -409,8 +409,8 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 best_realistic_return_a_at_best_loss = realistic_return_a
                 print(f'          ✓ 新最佳模型A（loss）！Loss: {best_loss_a:.4f}, 实战收益率: {best_realistic_return_a_at_best_loss*100:.1f}% (第{best_loss_epoch_a}轮)')
 
-        # 按实战收益率评估最佳模型A（第100轮后）
-        if (epoch + 1) >= 100:
+        # 按实战收益率评估最佳模型A（预热结束后）
+        if (epoch + 1) > warmup_epochs:
             if realistic_return_a > best_realistic_return_a:
                 best_realistic_return_a = realistic_return_a
                 best_realistic_return_epoch_a = epoch + 1
@@ -459,9 +459,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 best_return_epoch_b = epoch + 1
                 print(f'          ✓ 新最佳模型B（收益率）！Top1%收益: {best_return_b*100:+.2f}% (第{best_return_epoch_b}轮)')
 
-            # 按loss评估最佳模型B（条件：epoch >= 100, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
+            # 按loss评估最佳模型B（条件：预热结束后, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
             realistic_return_b = stats_b['realistic_stats']['avg_realistic_return'] if stats_b.get('realistic_stats') else 0.0
-            if (epoch + 1) >= 100 and realistic_return_b >= 0.014 and stats_b['top_return'] > 0.008 and stats_b['auc'] > 0.65:
+            if (epoch + 1) > warmup_epochs and realistic_return_b >= 0.014 and stats_b['top_return'] > 0.008 and stats_b['auc'] > 0.65:
                 if test_loss_b < best_loss_b:
                     best_loss_b = test_loss_b
                     best_loss_epoch_b = epoch + 1

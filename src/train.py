@@ -352,14 +352,19 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         epoch_return = {
             'turn': epoch + 1,
             'return': stats_a['top_return'] * 100,
+            'daily_return': stats_a.get('daily_top_return'),
             'return_a': stats_a['top_return'] * 100,
+            'daily_return_a': stats_a.get('daily_top_return'),
             'return_b': None,
+            'daily_return_b': None,
             'train_loss': avg_loss_a,
             'train_loss_a': avg_loss_a,
             'train_loss_b': None,
             'test_loss': test_loss_a,
             'test_loss_a': test_loss_a,
             'test_loss_b': None,
+            'auc': stats_a['auc'],
+            'avg_realistic_return': stats_a['realistic_stats']['avg_realistic_return'] if stats_a.get('realistic_stats') else None,
             'dispersion_std': stats_a.get('dispersion_std', 0),
             'dispersion_range': stats_a.get('dispersion_range', 0),
             'dispersion_iqr': stats_a.get('dispersion_iqr', 0),
@@ -473,8 +478,11 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                     print(f'          ✓ 新最佳模型B（loss）！Loss: {best_loss_b:.4f}, 实战收益率: {best_realistic_return_b_at_best_loss*100:.1f}% (第{best_loss_epoch_b}轮)')
 
             epoch_return['return_b'] = stats_b['top_return'] * 100
+            epoch_return['daily_return_b'] = stats_b.get('daily_top_return')
             epoch_return['train_loss_b'] = avg_loss_b
             epoch_return['test_loss_b'] = test_loss_b
+            epoch_return['auc_B'] = stats_b['auc']
+            epoch_return['avg_realistic_return_B'] = stats_b['realistic_stats']['avg_realistic_return'] if stats_b.get('realistic_stats') else None
 
         print("-" * 60)
 
@@ -539,9 +547,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     
     # 根据 enable_model_b 动态决定 CSV 字段
     if enable_model_b:
-        fieldnames = ['turn', 'A', 'B', 'train_loss_A', 'test_loss_A', 'train_loss_B', 'test_loss_B']
+        fieldnames = ['turn', 'A', 'daily_return_A', 'B', 'daily_return_B', 'train_loss_A', 'test_loss_A', 'train_loss_B', 'test_loss_B', 'auc_A', 'avg_realistic_return_A', 'auc_B', 'avg_realistic_return_B']
     else:
-        fieldnames = ['turn', 'A', 'train_loss_A', 'test_loss_A']
+        fieldnames = ['turn', 'A', 'daily_return_A', 'train_loss_A', 'test_loss_A', 'auc_A', 'avg_realistic_return_A']
     
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -551,15 +559,20 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             row = {
                 'turn': epoch_return['turn'],
                 'A': f"{epoch_return['return_a']:.2f}" if epoch_return['return_a'] is not None else "",
+                'daily_return_A': f"{epoch_return['daily_return_a']*100:.2f}" if epoch_return.get('daily_return_a') is not None else "",
                 'train_loss_A': f"{epoch_return['train_loss_a']:.4f}" if epoch_return.get('train_loss_a') is not None else "",
-                'test_loss_A': f"{epoch_return['test_loss_a']:.4f}" if epoch_return.get('test_loss_a') is not None else ""
+                'test_loss_A': f"{epoch_return['test_loss_a']:.4f}" if epoch_return.get('test_loss_a') is not None else "",
+                'auc_A': f"{epoch_return['auc']:.4f}" if epoch_return.get('auc') is not None else "",
+                'avg_realistic_return_A': f"{epoch_return['avg_realistic_return']*100:.1f}" if epoch_return.get('avg_realistic_return') is not None else "",
             }
-            
+
             if enable_model_b:
                 row.update({
                     'B': f"{epoch_return['return_b']:.2f}" if epoch_return['return_b'] is not None else "",
-                    'train_loss_B': f"{epoch_return['train_loss_b']:.4f}" if epoch_return.get('train_loss_b') is not None else "",
-                    'test_loss_B': f"{epoch_return['test_loss_b']:.4f}" if epoch_return.get('test_loss_b') is not None else ""
+                    'daily_return_B': f"{epoch_return['daily_return_b']*100:.2f}" if epoch_return.get('daily_return_b') is not None else "",
+                    'test_loss_B': f"{epoch_return['test_loss_b']:.4f}" if epoch_return.get('test_loss_b') is not None else "",
+                    'auc_B': f"{epoch_return['auc_B']:.4f}" if epoch_return.get('auc_B') is not None else "",
+                    'avg_realistic_return_B': f"{epoch_return['avg_realistic_return_B']*100:.1f}" if epoch_return.get('avg_realistic_return_B') is not None else "",
                 })
             
             writer.writerow(row)

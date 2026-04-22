@@ -135,7 +135,14 @@ class ModelConfig:
 class TrainingConfig:
     """训练相关参数"""
     # 基础训练参数（优化训练策略）
-    EPOCHS = 80                     # 训练轮数（增加轮数以充分训练小模型）
+    EPOCHS = 80                     # 训练轮数
+    WARMUP_EPOCHS = 8               # 预热轮数
+    COSINE_ANNEAL_EPOCHS = 14       # 余弦退火轮数（之后学习率固定在ETA_MIN）
+
+    # 余弦退火调度器参数,学习率预热参数
+    COSINE_ETA_MIN = 1e-4          # 余弦退火最小学习率 / 固定阶段学习率
+    WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
+
     LEARNING_RATE = 0.001            # AdamW/Adam基础学习率
     WEIGHT_DECAY = 1e-5              # AdamW/Adam权重衰减
 
@@ -177,12 +184,6 @@ class TrainingConfig:
     MANO_ADAMW_BETAS = (0.9, 0.95)   # 混合优化器中AdamW部分的beta参数
     MANO_NESTEROV = True             # 是否使用Nesterov动量（v2默认True）
     MANO_DUAL_DIM_PROJECTION = True  # 是否使用双维度投影（v2新功能，默认True）
-
-    # 余弦退火调度器参数,学习率预热参数
-    COSINE_ETA_MIN = 1e-4          # 余弦退火最小学习率 / 固定阶段学习率
-    COSINE_FREEZE_RATIO = 0.2     # 余弦退火占总训练的比例（之后学习率固定在ETA_MIN），设为1.0为全程退火
-    WARMUP_RATIO = 0.1               # 预热轮数占总轮数比
-    WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
 
     OPEN_EARLY_STOPPING = False       # 是否开启早停机制
 
@@ -431,9 +432,10 @@ def print_config_summary():
     print(f"  每轮批次数: {TrainingConfig.BATCHES_PER_EPOCH}")
     print(f"  优化器: {optimizer_display}")
     print(f"  混合精度(AMP): {'BF16' if TrainingConfig.USE_AMP else '关闭(FP32)'}")
-    warmup_epochs = max(1, int(TrainingConfig.EPOCHS * TrainingConfig.WARMUP_RATIO))
-    print(f"  预热轮数: {warmup_epochs} (总轮数的{TrainingConfig.WARMUP_RATIO*100:.0f}%)")
+    print(f"  预热轮数: {TrainingConfig.WARMUP_EPOCHS}")
     print(f"  预热起始学习率: {TrainingConfig.WARMUP_START_LR}")
+    main_epochs = TrainingConfig.EPOCHS - TrainingConfig.WARMUP_EPOCHS
+    print(f"  余弦退火轮数: {TrainingConfig.COSINE_ANNEAL_EPOCHS} (后{main_epochs - TrainingConfig.COSINE_ANNEAL_EPOCHS}轮固定在ETA_MIN)")
 
     print(f"数据参数:")
     print(f"  数据目录: {DataConfig.DATA_DIR}")
@@ -442,7 +444,6 @@ def print_config_summary():
     print(f"  测试集天数: {DataConfig.TEST_DAYS}天")
     print(f"  上下文长度: {DataConfig.CONTEXT_LENGTH}")
     print(f"  涨停过滤: {'开启' if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP else '关闭'}")
-    print(f"评估参数:")
     print(f"  评估批处理大小: {DataConfig.EVAL_BATCH_SIZE}")
     print(f"标签参数:")
     print(f"  正样本距离保护: {DataConfig.LABEL_DISTANCE}")

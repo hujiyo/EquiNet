@@ -326,8 +326,11 @@ def train_dft_model(model, train_stock_info, test_stock_info,
         epoch_return = {
             'turn': epoch + 1,
             'return': stats['top_return'] * 100,
+            'daily_return': stats.get('daily_top_return'),
             'train_loss': avg_loss,
             'test_loss': test_loss,
+            'auc': stats['auc'],
+            'avg_realistic_return': stats['realistic_stats']['avg_realistic_return'] if stats.get('realistic_stats') else None,
             'dispersion_std': stats.get('dispersion_std', 0),
             'dispersion_range': stats.get('dispersion_range', 0),
             'dispersion_iqr': stats.get('dispersion_iqr', 0),
@@ -407,15 +410,18 @@ def train_dft_model(model, train_stock_info, test_stock_info,
     timestamp_csv = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"dft_epoch_returns_{timestamp_csv}.csv")
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'train_loss', 'test_loss'])
+        writer = csv.DictWriter(f, fieldnames=['turn', 'return', 'daily_return', 'train_loss', 'test_loss', 'auc', 'avg_realistic_return'])
         writer.writeheader()
 
         for er in epoch_returns:
             row = {
                 'turn': er['turn'],
                 'return': f"{er['return']:.2f}",
+                'daily_return': f"{er['daily_return']*100:.2f}" if er.get('daily_return') is not None else "",
                 'train_loss': f"{er['train_loss']:.4f}",
-                'test_loss': f"{er['test_loss']:.4f}"
+                'test_loss': f"{er['test_loss']:.4f}",
+                'auc': f"{er['auc']:.4f}" if er.get('auc') is not None else "",
+                'avg_realistic_return': f"{er['avg_realistic_return']*100:.1f}" if er.get('avg_realistic_return') is not None else "",
             }
             writer.writerow(row)
 

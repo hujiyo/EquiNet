@@ -80,25 +80,20 @@ class CosineAnnealFreezeLR:
     余弦退火 + 固定学习率调度器
 
     学习率变化：warmup → 余弦退火 → 固定在 eta_min
-    余弦退火仅持续 freeze_ratio 比例的训练轮数，之后学习率固定不再下降。
+    余弦退火仅持续 anneal_epochs 轮，之后学习率固定不再下降。
     用于观察 epoch-wise 双下降现象：模型在恒定学习率下持续被推动，
     有机会逃离过拟合解，展现"先降→中间反弹→再降"的曲线。
     """
-    def __init__(self, optimizer, total_main_epochs, eta_min, freeze_ratio):
+    def __init__(self, optimizer, anneal_epochs, eta_min):
         """
         Args:
             optimizer: PyTorch优化器
-            total_main_epochs: 预热后的总训练轮数
+            anneal_epochs: 余弦退火的轮数（绝对值）
             eta_min: 余弦退火终止学习率（也是固定阶段的学习率）
-            freeze_ratio: 余弦退火占总训练的比例 (0,1]
-                          0.5 = 前50%余弦退火，后50%固定
-                          1.0 = 退火到训练结束（等同原始行为）
         """
         self.optimizer = optimizer
-        self.total_main_epochs = total_main_epochs
         self.eta_min = eta_min
-        self.freeze_ratio = min(freeze_ratio, 1.0)
-        self.anneal_epochs = max(1, int(total_main_epochs * self.freeze_ratio))
+        self.anneal_epochs = max(1, anneal_epochs)
         self.current_step = 0
 
         # 记录初始学习率（余弦退火的起点）
@@ -1305,7 +1300,7 @@ def create_scheduler_from_config(optimizer, epochs, lr=None, eta_min=None, warmu
     actual_eta_min = eta_min if eta_min is not None else TrainingConfig.COSINE_ETA_MIN
     actual_warmup_start_lr = warmup_start_lr if warmup_start_lr is not None else TrainingConfig.WARMUP_START_LR
 
-    warmup_epochs = max(1, int(epochs * TrainingConfig.WARMUP_RATIO))
+    warmup_epochs = TrainingConfig.WARMUP_EPOCHS
 
     warmup_scheduler = WarmupScheduler(
         optimizer,
@@ -1314,16 +1309,14 @@ def create_scheduler_from_config(optimizer, epochs, lr=None, eta_min=None, warmu
         start_lr=actual_warmup_start_lr
     )
 
-    # 确保余弦退火的 T_max 至少为1，防止 epochs 过小时崩溃
     total_main_epochs = max(1, epochs - warmup_epochs)
+    anneal_epochs = TrainingConfig.COSINE_ANNEAL_EPOCHS
 
-    freeze_ratio = getattr(TrainingConfig, 'COSINE_FREEZE_RATIO', 1.0)
-    if freeze_ratio < 1.0:
+    if anneal_epochs < total_main_epochs:
         main_scheduler = CosineAnnealFreezeLR(
             optimizer,
-            total_main_epochs=total_main_epochs,
-            eta_min=actual_eta_min,
-            freeze_ratio=freeze_ratio
+            anneal_epochs=anneal_epochs,
+            eta_min=actual_eta_min
         )
     else:
         main_scheduler = optim.lr_scheduler.CosineAnnealingLR(

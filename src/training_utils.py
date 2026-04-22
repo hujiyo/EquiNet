@@ -256,7 +256,7 @@ class DynamicWeightedBCE(nn.Module):
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
                    device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None,
-                   criterion=None):
+                   criterion=None, enable_portfolio_simulation=False):
     """
     模型评估函数
     涨停样本已在generate_sample_from_index中过滤，无需再次过滤
@@ -374,7 +374,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
             actual_top_n = None
         stats['realistic_stats'] = calculate_realistic_return(all_preds, all_returns, eval_day_indices, percent, actual_top_n)
         
-        if eval_daily_returns is not None:
+        if enable_portfolio_simulation and eval_daily_returns is not None:
             stats['portfolio_stats'] = calculate_portfolio_simulation(
                 all_preds, all_returns, eval_daily_returns, eval_day_indices, percent, actual_top_n)
         else:

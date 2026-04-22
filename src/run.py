@@ -426,7 +426,8 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
         device, model_name="选中模型",
         eval_day_indices=eval_day_indices,
         eval_daily_returns=eval_daily_returns,
-        criterion=eval_criterion
+        criterion=eval_criterion,
+        enable_portfolio_simulation=True
     )
     test_loss = stats['test_loss']
     

@@ -21,7 +21,6 @@ EquiNet/
 │   ├── train.py              # 主训练脚本
 │   ├── run.py                # 推理/选股脚本
 │   ├── training_utils.py     # 训练工具模块
-│   ├── train_dft.py          # DFT微调训练脚本
 │   ├── config.py        	    # 统一配置文件
 │   └── ...              	    # 其他可能的脚本/目录
 ├── LICENSE                   # Apache-2.0许可证

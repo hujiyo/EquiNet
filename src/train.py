@@ -25,10 +25,13 @@ from model import create_model
 
 from data import (
     load_and_preprocess_data,
-    create_sampler, sample_with_pools,
     create_fixed_evaluation_dataset,FeatureNormalizer,
     compute_label_distance_exclusions,
-    init_index_data
+    init_index_data,
+    precompute_training_pool,
+    sample_from_pool,
+    sample_temporal_from_pool,
+    TemporalSampler
 )
 
 from training_utils import (
@@ -41,7 +44,6 @@ from training_utils import (
     print_dispersion_sparkline,
     create_optimizer_from_config,
     create_scheduler_from_config,
-    SAM,
     training_step,
     _get_amp_context
 )
@@ -174,9 +176,17 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     patience = int(epochs * 0.25)
     early_stopping = EarlyStopping(patience=patience)
 
-    # 创建采样器（根据配置选择策略）
-    sampler = create_sampler(train_stock_info)
+    # 预计算所有训练样本（验证+归一化+标签+收益率只做一次，后续epoch只做数组索引）
     train_rng = random.Random(DataConfig.RANDOM_SEED)
+    pool_inputs, pool_targets, pool_returns, pos_indices, neg_indices, sample_key_map = precompute_training_pool(
+        train_stock_info, feature_normalizer
+    )
+
+    # 根据采样策略初始化采样器
+    use_temporal = DataConfig.SAMPLING_STRATEGY == 'temporal'
+    if use_temporal:
+        temporal_sampler = TemporalSampler(train_stock_info)
+        print("  使用时间顺序采样策略（预计算池化版）")
 
     # 记录每轮收益率
     epoch_returns = []  # 格式: [{'turn': 1, 'return_a': 1.62, 'return_b': None}, ...]
@@ -220,15 +230,18 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 print(f"\n  >>> 第{clone_epoch}轮：模型B训练已禁用，跳过克隆 <<<")
                 print()
 
-        # 使用时间顺序采样器生成训练数据（与主训练流程统一）
-        epoch_inputs, epoch_targets, epoch_cum_returns = sample_with_pools(
-            sampler, train_stock_info, batch_size, batches_per_epoch, train_rng,
-            feature_normalizer
-        )
-
-        # 打印循环统计
-        looped_count, total_loops = sampler.get_loop_stats()
-        print(f"  [循环统计] 已循环股票: {looped_count}/{len(train_stock_info)}, 总循环次数: {total_loops}")
+        # 从预计算池中采样（numpy数组索引，无需重复归一化）
+        if use_temporal:
+            epoch_inputs, epoch_targets, epoch_cum_returns = sample_temporal_from_pool(
+                temporal_sampler, train_stock_info,
+                pool_inputs, pool_targets, pool_returns, sample_key_map,
+                batch_size, batches_per_epoch
+            )
+        else:
+            epoch_inputs, epoch_targets, epoch_cum_returns = sample_from_pool(
+                pool_inputs, pool_targets, pool_returns, pos_indices, neg_indices,
+                batch_size, batches_per_epoch, train_rng
+            )
 
         # 打印标签分布
         count_positive = np.sum(epoch_targets >= 0.9)
@@ -577,10 +590,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             
             writer.writerow(row)
 
-    print(f"✓ 每轮收益率已保存: {os.path.basename(returns_csv_path)}")
-    print(f"  共记录 {len(epoch_returns)} 轮训练数据")
-    print("=" * 60)
-
+    print(f"✓ 训练日志已保存: {os.path.basename(returns_csv_path)}")
     return best_return_a, best_return_b
 
 
@@ -589,7 +599,7 @@ if __name__ == "__main__":
     print_config_summary()
 
     # 获取设备
-    device = DeviceConfig.print_device_info()
+    device = DeviceConfig.get_device()
 
     # 创建输出目录
     os.makedirs(DataConfig.OUTPUT_DIR, exist_ok=True)

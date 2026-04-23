@@ -927,28 +927,6 @@ class RandomSampler:
         return 0, 0
 
 
-def create_sampler(stock_info_list, strategy=None):
-    """
-    根据配置创建采样器
-    
-    参数:
-        stock_info_list: 股票信息列表
-        strategy: 采样策略，可选 'temporal' 或 'random'，默认使用 DataConfig.SAMPLING_STRATEGY
-    
-    返回:
-        sampler: TemporalSampler 或 RandomSampler 实例
-    """
-    if strategy is None:
-        strategy = DataConfig.SAMPLING_STRATEGY
-    
-    if strategy == 'random':
-        print("使用随机采样策略")
-        return RandomSampler(stock_info_list)
-    else:
-        print("使用时间顺序采样策略")
-        return TemporalSampler(stock_info_list)
-
-
 def generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_normalizer=None):
     """
     根据预生成的索引生成单个样本（向量化优化版）
@@ -1120,136 +1098,6 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx, fe
     )
 
     return (input_seq, cumulative_return, daily_returns, available_days)
-
-
-def sample_with_pools(sampler, stock_info_list, batch_size, batches_per_epoch, rng, feature_normalizer=None):
-    """
-    使用样本池机制采样（流式处理版）：
-    1. 按时间顺序遍历样本索引
-    2. 实时填充正负样本池
-    3. 一旦正样本达到配额且负样本足够，立即生成Batch并清空负样本池
-    4. 确保Batch之间的时间有序性，严格防止未来数据泄露到过去的Batch中
-    5. 支持循环采样：数据到达末尾后自动循环回起点
-    6. 动态生成索引：按需生成，直到batch数量满足要求
-
-    Args:
-        sampler: 采样器实例
-        stock_info_list: 股票信息列表
-        batch_size: 批次大小
-        batches_per_epoch: 每个epoch的batch数量
-        rng: 随机数生成器
-        feature_normalizer: 可选的特征归一化器实例
-    """
-    positive_ratio = 0.25
-    pos_quota = max(1, int(batch_size * positive_ratio))
-    neg_quota = batch_size - pos_quota
-
-    pos_pool_inputs = []
-    pos_pool_targets = []
-    pos_pool_returns = []
-    neg_pool_inputs = []
-    neg_pool_targets = []
-    neg_pool_returns = []
-
-    all_batch_inputs = []
-    all_batch_targets = []
-    all_batch_returns = []
-
-    batches_generated = 0
-    
-    initial_rounds = 50
-    total_rounds_generated = 0
-    total_indices_generated = 0
-    
-    print(f"    动态采样策略：按需生成索引，直到满足{batches_per_epoch}个batch...")
-    
-    while batches_generated < batches_per_epoch:
-        if isinstance(sampler, RandomSampler):
-            sample_indices = sampler.sample_batch_rounds(initial_rounds, rng)
-        else:
-            sample_indices = sampler.sample_batch_rounds(initial_rounds)
-        
-        if len(sample_indices) == 0:
-            print(f"\n    ⚠ 警告：采样头已到达所有股票终点且无法循环，停止采样")
-            break
-        
-        total_rounds_generated += initial_rounds
-        total_indices_generated += len(sample_indices)
-        
-        for stock_idx, start_idx in sample_indices:
-            if batches_generated >= batches_per_epoch:
-                break
-
-            # 不传归一化器，只做粗处理（后续批量细处理）
-            sample = generate_sample_from_index(stock_info_list, stock_idx, start_idx, None)
-            if sample is None:
-                continue
-
-            input_seq, target, cumulative_return, _ = sample
-
-            if target >= 0.5:
-                pos_pool_inputs.append(input_seq)
-                pos_pool_targets.append(target)
-                pos_pool_returns.append(cumulative_return)
-            else:
-                neg_pool_inputs.append(input_seq)
-                neg_pool_targets.append(target)
-                neg_pool_returns.append(cumulative_return)
-            
-            if len(pos_pool_inputs) >= pos_quota and len(neg_pool_inputs) >= neg_quota:
-                batch_pos_inputs = pos_pool_inputs[:pos_quota]
-                batch_pos_targets = pos_pool_targets[:pos_quota]
-                batch_pos_returns = pos_pool_returns[:pos_quota]
-                
-                neg_indices = rng.sample(range(len(neg_pool_inputs)), neg_quota)
-                batch_neg_inputs = [neg_pool_inputs[i] for i in neg_indices]
-                batch_neg_targets = [neg_pool_targets[i] for i in neg_indices]
-                batch_neg_returns = [neg_pool_returns[i] for i in neg_indices]
-                
-                batch_inputs = batch_pos_inputs + batch_neg_inputs
-                batch_targets = batch_pos_targets + batch_neg_targets
-                batch_returns = batch_pos_returns + batch_neg_returns
-                
-                combined = list(zip(batch_inputs, batch_targets, batch_returns))
-                rng.shuffle(combined)
-                b_inputs, b_targets, b_returns = zip(*combined)
-                
-                all_batch_inputs.extend(b_inputs)
-                all_batch_targets.extend(b_targets)
-                all_batch_returns.extend(b_returns)
-                
-                batches_generated += 1
-                
-                pos_pool_inputs = pos_pool_inputs[pos_quota:]
-                pos_pool_targets = pos_pool_targets[pos_quota:]
-                pos_pool_returns = pos_pool_returns[pos_quota:]
-                neg_pool_inputs = []
-                neg_pool_targets = []
-                neg_pool_returns = []
-        
-        print(f"    已生成 {batches_generated}/{batches_per_epoch} 个Batch (已采样{total_rounds_generated}轮)", end='\r', flush=True)
-        
-        if batches_generated < batches_per_epoch:
-            remaining_batches = batches_per_epoch - batches_generated
-            if batches_generated > 0:
-                estimated_rounds = max(20, int(remaining_batches / batches_generated * total_rounds_generated * 1.2))
-                initial_rounds = min(estimated_rounds, 100)
-            else:
-                initial_rounds = 100
-
-    print(f"\n    已生成 {batches_generated}/{batches_per_epoch} 个batch (总共采样{total_rounds_generated}轮, {total_indices_generated}个索引)")
-    
-    if batches_generated < batches_per_epoch:
-        print(f"    ⚠ 警告：样本不足，仅生成 {batches_generated} 个Batch (目标: {batches_per_epoch})")
-        if batches_generated == 0:
-             raise ValueError(f"样本严重不足：无法生成任何Batch")
-
-    # 批量细处理：将所有粗处理后的样本一次性归一化
-    all_batch_inputs = np.asarray(all_batch_inputs)
-    if feature_normalizer is not None:
-        all_batch_inputs = feature_normalizer.transform_batch(all_batch_inputs)
-
-    return all_batch_inputs, np.asarray(all_batch_targets), np.asarray(all_batch_returns)
 
 
 def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
@@ -1586,6 +1434,244 @@ def fit_feature_normalizer(output_path=None, output_distribution='normal', n_qua
     normalizer.save(output_path)
 
     return normalizer
+
+
+def precompute_training_pool(train_stock_info, feature_normalizer=None):
+    """
+    预计算所有合法训练样本，一次性完成验证+粗归一化+标签+收益率+细归一化
+
+    训练数据在整个训练过程中不变，此函数将 sample_with_pools 中每个 epoch
+    重复执行的 Python 循环（验证、归一化、大盘特征查找、标签计算）合并为
+    一次预计算。后续 epoch 只需从预计算结果中索引采样。
+
+    Returns:
+        all_inputs: [N, context_length, 8] float32 归一化后的输入
+        all_targets: [N] float32 标签 (0/1)
+        all_returns: [N] float32 累计收益率
+        pos_indices: [M] int 正样本在 all_inputs 中的索引
+        neg_indices: [K] int 负样本在 all_inputs 中的索引
+        sample_key_to_pool_idx: dict  (stock_idx, start_idx) -> pool_index 映射
+    """
+    import time
+    t0 = time.time()
+
+    all_inputs = []
+    all_targets = []
+    all_returns = []
+    sample_key_to_pool_idx = {}
+
+    for stock_idx, stock_info in enumerate(train_stock_info):
+        train_start = max(1, stock_info.get('train_start_idx', 0) + 1)
+        train_end = stock_info.get('train_end_idx', len(stock_info['data']))
+        excluded = stock_info.get('excluded_positions', set())
+
+        for start_idx in range(train_start, train_end + 1):
+            if start_idx in excluded:
+                continue
+            sample = generate_sample_from_index(train_stock_info, stock_idx, start_idx, None)
+            if sample is None:
+                continue
+            input_seq, target, cumulative_return, _ = sample
+            pool_idx = len(all_inputs)
+            sample_key_to_pool_idx[(stock_idx, start_idx)] = pool_idx
+            all_inputs.append(input_seq)
+            all_targets.append(target)
+            all_returns.append(cumulative_return)
+
+    if len(all_inputs) == 0:
+        raise ValueError("预计算结果为空：没有有效的训练样本")
+
+    all_inputs = np.asarray(all_inputs)
+    if feature_normalizer is not None:
+        chunk_size = 100_000
+        for start in range(0, len(all_inputs), chunk_size):
+            end = min(start + chunk_size, len(all_inputs))
+            all_inputs[start:end] = feature_normalizer.transform_batch(all_inputs[start:end])
+    all_targets = np.asarray(all_targets)
+    all_returns = np.asarray(all_returns)
+
+    pos_indices = np.where(all_targets >= 0.5)[0]
+    neg_indices = np.where(all_targets < 0.5)[0]
+
+    elapsed = time.time() - t0
+    mem_mb = all_inputs.nbytes / 1024 / 1024
+    print(f"  预计算完成: {len(all_inputs)} 个有效样本 "
+          f"(正样本 {len(pos_indices)}, 负样本 {len(neg_indices)})，"
+          f"耗时 {elapsed:.1f}s，占用 {mem_mb:.0f}MB")
+
+    return all_inputs, all_targets, all_returns, pos_indices, neg_indices, sample_key_to_pool_idx
+
+
+def sample_temporal_from_pool(sampler, train_stock_info,
+                              all_inputs, all_targets, all_returns,
+                              sample_key_to_pool_idx,
+                              batch_size, batches_per_epoch):
+    """
+    时间顺序采样（预计算池化版）：用 TemporalSampler 的有状态指针推进生成索引，
+    通过 sample_key_to_pool_idx 映射从预计算池中取数据，避免重复调用
+    generate_sample_from_index。
+
+    正负池动态攒取逻辑与旧 sample_with_pools 完全一致：
+    - 按时间顺序逐个获取样本，分入正/负池
+    - 正样本达到 quota 且负样本足够时，立即出 batch
+    - 正样本按顺序取用，负样本从池中随机抽取后清空负池
+    - 采样头到达末尾后循环回起点（由 TemporalSampler 内部处理）
+
+    Args:
+        sampler: TemporalSampler 实例（跨 epoch 保持指针状态）
+        train_stock_info: 股票信息列表（用于 get_loop_stats）
+        all_inputs/all_targets/all_returns: precompute_training_pool 返回的完整样本
+        sample_key_to_pool_idx: dict  (stock_idx, start_idx) -> pool_index 映射
+        batch_size: 批次大小
+        batches_per_epoch: 每 epoch 批次数
+
+    Returns:
+        epoch_inputs: [batches_per_epoch * batch_size, context_length, 8]
+        epoch_targets: [batches_per_epoch * batch_size]
+        epoch_returns: [batches_per_epoch * batch_size]
+    """
+    positive_ratio = 0.25
+    pos_quota = max(1, int(batch_size * positive_ratio))
+    neg_quota = batch_size - pos_quota
+
+    pos_pool_indices = []
+    pos_pool_targets = []
+    neg_pool_indices = []
+    neg_pool_targets = []
+
+    all_batch_indices = []
+    all_batch_targets = []
+    batches_generated = 0
+
+    initial_rounds = 50
+    total_rounds_generated = 0
+
+    while batches_generated < batches_per_epoch:
+        sample_keys = sampler.sample_batch_rounds(initial_rounds)
+
+        if len(sample_keys) == 0:
+            print(f"\n    ⚠ 警告：采样头已到达所有股票终点且无法循环，停止采样")
+            break
+
+        total_rounds_generated += initial_rounds
+
+        for stock_idx, start_idx in sample_keys:
+            if batches_generated >= batches_per_epoch:
+                break
+
+            pool_idx = sample_key_to_pool_idx.get((stock_idx, start_idx))
+            if pool_idx is None:
+                continue
+
+            target = all_targets[pool_idx]
+
+            if target >= 0.5:
+                pos_pool_indices.append(pool_idx)
+                pos_pool_targets.append(target)
+            else:
+                neg_pool_indices.append(pool_idx)
+                neg_pool_targets.append(target)
+
+            if len(pos_pool_indices) >= pos_quota and len(neg_pool_indices) >= neg_quota:
+                batch_pos = pos_pool_indices[:pos_quota]
+                neg_sel = random.sample(range(len(neg_pool_indices)), neg_quota)
+                batch_neg = [neg_pool_indices[i] for i in neg_sel]
+
+                batch_indices = batch_pos + batch_neg
+                batch_targets = pos_pool_targets[:pos_quota] + [neg_pool_targets[i] for i in neg_sel]
+
+                combined = list(zip(batch_indices, batch_targets))
+                random.shuffle(combined)
+                bi, bt = zip(*combined)
+
+                all_batch_indices.extend(bi)
+                all_batch_targets.extend(bt)
+                batches_generated += 1
+
+                pos_pool_indices = pos_pool_indices[pos_quota:]
+                pos_pool_targets = pos_pool_targets[pos_quota:]
+                neg_pool_indices = []
+                neg_pool_targets = []
+
+        if batches_generated < batches_per_epoch:
+            remaining = batches_per_epoch - batches_generated
+            if batches_generated > 0:
+                estimated = max(20, int(remaining / batches_generated * total_rounds_generated * 1.2))
+                initial_rounds = min(estimated, 100)
+            else:
+                initial_rounds = 100
+
+    if batches_generated < batches_per_epoch:
+        print(f"    ⚠ 警告：样本不足，仅生成 {batches_generated} 个Batch (目标: {batches_per_epoch})")
+        if batches_generated == 0:
+            raise ValueError("样本严重不足：无法生成任何Batch")
+
+    looped_count, total_loops = sampler.get_loop_stats()
+    print(f"  [循环统计] 已循环股票: {looped_count}/{len(train_stock_info)}, 总循环次数: {total_loops}")
+
+    batch_idx = np.array(all_batch_indices)
+    return all_inputs[batch_idx], np.asarray(all_batch_targets), all_returns[batch_idx]
+
+
+def sample_from_pool(all_inputs, all_targets, all_returns,
+                     pos_indices, neg_indices,
+                     batch_size, batches_per_epoch, rng):
+    """
+    从预计算样本池中按 25% 正样本比例采样一个 epoch 的数据
+
+    等价于旧 sample_with_pools 的无放回随机采样：先打乱正/负样本索引，
+    再按 quota 顺序取用，保证每个 epoch 内同一样本最多出现一次。
+
+    Args:
+        all_inputs/all_targets/all_returns: precompute_training_pool 返回的完整样本
+        pos_indices/neg_indices: 正/负样本索引
+        batch_size: 批次大小
+        batches_per_epoch: 每 epoch 批次数
+        rng: random.Random 实例
+
+    Returns:
+        epoch_inputs: [batches_per_epoch * batch_size, context_length, 8]
+        epoch_targets: [batches_per_epoch * batch_size]
+        epoch_returns: [batches_per_epoch * batch_size]
+    """
+    pos_quota = max(1, int(batch_size * 0.25))
+    neg_quota = batch_size - pos_quota
+    total_pos_needed = pos_quota * batches_per_epoch
+    total_neg_needed = neg_quota * batches_per_epoch
+
+    pos_list = list(pos_indices)
+    neg_list = list(neg_indices)
+
+    # 不足时循环补充（等价于旧流程中采样器循环回起点）
+    if len(pos_list) < total_pos_needed:
+        reps = (total_pos_needed + len(pos_list) - 1) // len(pos_list)
+        pos_list = pos_list * reps
+    if len(neg_list) < total_neg_needed:
+        reps = (total_neg_needed + len(neg_list) - 1) // len(neg_list)
+        neg_list = neg_list * reps
+
+    rng.shuffle(pos_list)
+    rng.shuffle(neg_list)
+
+    total_samples = batches_per_epoch * batch_size
+    epoch_inputs = np.empty((total_samples, *all_inputs.shape[1:]), dtype=all_inputs.dtype)
+    epoch_targets = np.empty(total_samples, dtype=all_targets.dtype)
+    epoch_returns = np.empty(total_samples, dtype=all_returns.dtype)
+
+    for i in range(batches_per_epoch):
+        offset = i * batch_size
+        p_start = i * pos_quota
+        n_start = i * neg_quota
+        p_idx = np.array(pos_list[p_start:p_start + pos_quota])
+        n_idx = np.array(neg_list[n_start:n_start + neg_quota])
+        batch_idx = np.concatenate([p_idx, n_idx])
+        rng.shuffle(batch_idx)
+
+        epoch_inputs[offset:offset + batch_size] = all_inputs[batch_idx]
+        epoch_targets[offset:offset + batch_size] = all_targets[batch_idx]
+        epoch_returns[offset:offset + batch_size] = all_returns[batch_idx]
+
+    return epoch_inputs, epoch_targets, epoch_returns
 
 
 def main():

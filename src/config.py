@@ -152,9 +152,7 @@ class TrainingConfig:
 
     # 优化器选择（字符串，互斥）
     # 'adamw':    标准AdamW
-    # 'sam':      AdamW + SAM，寻找平坦极小值，泛化更好
     # 'lion':     Lion（符号动量），内存省、泛化好
-    # 'lion_sam': Lion + SAM 双重泛化保护
     # 'mano':     Mano混合优化器
     OPTIMIZER_TYPE = 'mano'
 
@@ -165,14 +163,11 @@ class TrainingConfig:
     # 通用优化器参数
     GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
 
-    # AdamW 参数（OPTIMIZER_TYPE='adamw'或'sam'时生效）
+    # AdamW 参数（OPTIMIZER_TYPE='adamw'时生效）
     ADAMW_LR = 0.001                 # AdamW 学习率
     ADAMW_WEIGHT_DECAY = 1e-5        # AdamW 权重衰减
 
-    # SAM 参数（OPTIMIZER_TYPE含'sam'时生效）
-    SAM_RHO = 0.05                  # SAM扰动半径（越大越倾向平坦区域，但可能欠拟合）
-
-    # Lion 参数（OPTIMIZER_TYPE='lion'或'lion_sam'时生效）
+    # Lion 参数（OPTIMIZER_TYPE='lion'时生效）
     LION_LR = 0.0003                # Lion 学习率（AdamW的~1/3，论文推荐1/3~1/10）
     LION_WEIGHT_DECAY = 0.01        # Lion 权重衰减（比AdamW大约1000倍，论文推荐1e-2量级）
     LION_BETAS = (0.9, 0.99)        # Lion 动量系数
@@ -210,17 +205,7 @@ class TrainingConfig:
     @staticmethod
     def validate_optimizer_config():
         """检查优化器超参数是否合理，打印警告建议"""
-        opt = TrainingConfig.OPTIMIZER_TYPE.lower()
-        warnings = []
-
-        if 'sam' in opt and TrainingConfig.BATCH_SIZE < 256:
-            warnings.append(
-                f"SAM在大batch(≥256)下效果更好，当前batch_size={TrainingConfig.BATCH_SIZE}可能限制SAM有效性"
-            )
-
-        for w in warnings:
-            print(f"  ⚠ {w}")
-        return warnings
+        return []
 
 # ==================== 损失函数配置 ====================
 class LossConfig:
@@ -421,7 +406,7 @@ def print_config_summary():
     print(f"  输出维度: {ModelConfig.OUTPUT_DIM}")
     print(f"  序列长度: {DataConfig.CONTEXT_LENGTH}")
 
-    optimizer_names = {'adamw': 'AdamW', 'sam': 'AdamW + SAM', 'lion': 'Lion', 'lion_sam': 'Lion + SAM', 'mano': 'Mano'}
+    optimizer_names = {'adamw': 'AdamW', 'lion': 'Lion', 'mano': 'Mano'}
     optimizer_display = optimizer_names.get(TrainingConfig.OPTIMIZER_TYPE.lower(), TrainingConfig.OPTIMIZER_TYPE)
 
     print(f"训练参数:")

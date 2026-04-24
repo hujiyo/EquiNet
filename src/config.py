@@ -61,8 +61,6 @@ class DataConfig:
     # 评估参数
     EVAL_BATCH_SIZE = 4096            # 评估批处理大小（分批处理，减少显存占用）
 
-    INDEX_FILE = '000000.csv'
-    INDEX_CODE = 'sh.000001'
     # ========== 特征归一化配置 ==========
     # 使用 QuantileTransformer + StandardScaler 进行高级特征归一化
     # 优点：
@@ -84,7 +82,7 @@ class DataConfig:
 class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
-    INPUT_DIM = 8                    # 输入特征维度数（OHLC + volume + exchange + 大盘涨跌幅 + 大盘量能涨跌幅）
+    INPUT_DIM = 6                    # 输入特征维度数（OHLC + volume + exchange）
     D_MODEL = 128                    # 模型维度（Transformer 内部维度）
     FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数
@@ -98,8 +96,8 @@ class ModelConfig:
     # ========== FFN-Embedding 参数初始化配置 ==========
     # 目标：让FFN-Embedding和Position embedding的输出std统一为0.2，确保训练初期信息势均力敌
     #
-    # FFN-Embedding结构：Linear(8→128) → GELU → Linear(128→128)
-    # - 第一层(8→128): 线性投影，gain=0.58, 输出std≈0.2
+    # FFN-Embedding结构：Linear(6→128) → GELU → Linear(128→128)
+    # - 第一层(6→128): 线性投影，gain=0.58, 输出std≈0.2
     # - GELU: 有效增益≈0.588, 输出std≈0.118
     # - 第二层(128→128): 补偿GELU压缩，gain=1.7, 输出std≈0.2 (在model.py中显式设置)
     #
@@ -109,11 +107,11 @@ class ModelConfig:
     # 假设：输入数据经过归一化后std≈1.0
     #
     # 计算过程：
-    # - FFN-Embedding第一层 (Linear 8→128): gain = 0.2 / sqrt(16/136) ≈ 0.58
+    # - FFN-Embedding第一层 (Linear 6→128): gain = 0.2 / sqrt(12/134) ≈ 0.58
     # - FFN-Embedding第二层 (Linear 128→128): gain = 1.7 (复用FFN_INIT_GAIN，补偿GELU压缩)
     # - Position Embedding (Embedding 30→128): gain = 0.2 / sqrt(2/158) ≈ 1.78
     # - Query Token (Parameter 128): gain = 0.2 / sqrt(2/256) ≈ 2.26
-    EMBEDDING_INIT_GAIN = 0.58           # FFN-Embedding第一层 (Linear 8→128)
+    EMBEDDING_INIT_GAIN = 0.58           # FFN-Embedding第一层 (Linear 6→128)
     POSITION_EMBEDDING_INIT_GAIN = 1.78  # Position Embedding (Embedding 30→128)
     QUERY_INIT_GAIN = 2.26               # Query Token (AttentionPooling)
 

@@ -54,15 +54,13 @@ class DataSelector:
         self.market_cap_min = market_cap_min if market_cap_min is not None else DataConfig.MARKET_CAP_MIN
         self.market_cap_max = market_cap_max if market_cap_max is not None else DataConfig.MARKET_CAP_MAX
         self.valid_prefixes = valid_prefixes or DataConfig.VALID_STOCK_PREFIXES
-        self.index_file = "000000.csv"
 
     def _get_all_stock_codes(self) -> List[str]:
-        """获取 data_all/ 中所有股票代码（排除指数文件）"""
+        """获取 data_all/ 中所有股票代码"""
         codes = []
         for csv_file in sorted(self.data_all_dir.glob("*.csv")):
             code = csv_file.stem
-            if code != self.index_file.replace('.csv', ''):
-                codes.append(code)
+            codes.append(code)
         return codes
 
     def _filter_by_code(self, stock_codes: List[str]) -> List[str]:
@@ -248,12 +246,6 @@ class DataSelector:
                 csv_file.unlink()
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-        index_src = self.data_all_dir / self.index_file
-        if index_src.exists():
-            shutil.copy2(index_src, self.data_dir / self.index_file)
-        else:
-            print(f"⚠ 指数文件不存在：{index_src}")
-
         copied = 0
         for code in selected_codes:
             src = self.data_all_dir / f"{code}.csv"
@@ -261,7 +253,7 @@ class DataSelector:
                 shutil.copy2(src, self.data_dir / f"{code}.csv")
                 copied += 1
 
-        print(f"\n✓ 已复制 {copied} 只股票 + 1 个指数文件到 {self.data_dir}")
+        print(f"\n✓ 已复制 {copied} 只股票到 {self.data_dir}")
         return copied
 
 

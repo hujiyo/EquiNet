@@ -18,8 +18,7 @@ import matplotlib.pyplot as plt
 from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
-                  create_recent_days_dataset, normalize_and_validate_context_window,
-                  init_index_data)
+                  create_recent_days_dataset, normalize_and_validate_context_window)
 from training_utils import evaluate_model, DynamicWeightedBCE, _get_amp_context
 
 
@@ -114,7 +113,7 @@ def load_model(model_path, device):
     return model, metadata
 
 
-def generate_latest_input(stock_data, file_name, feature_normalizer=None, times=None):
+def generate_latest_input(stock_data, file_name, feature_normalizer=None):
     """
     为单只股票生成最新一天的模型输入（不需要未来数据）用于预测
     
@@ -125,28 +124,23 @@ def generate_latest_input(stock_data, file_name, feature_normalizer=None, times=
         stock_data: 股票原始数据
         file_name: 文件名
         feature_normalizer: 可选的特征归一化器实例
-        times: 股票时间戳数组（用于大盘数据日期对齐）
     返回: (input_seq, stock_code) 或 None
     """
     context_length = DataConfig.CONTEXT_LENGTH
     data_length = len(stock_data)
     
-    # 需要 context_length + 1 天数据（第一天需要前一天做参照）
     if data_length < context_length + 1:
         return None
     
-    # 取最后 context_length 天作为输入窗口
     start_idx = data_length - context_length
     
-    # 使用 data.py 的统一归一化和验证函数
     input_seq = normalize_and_validate_context_window(
         stock_data,
         start_idx,
         context_length,
         check_limit_up=True,
-        required_length=context_length,  # 只检查上下文窗口（无未来数据）
-        feature_normalizer=feature_normalizer,
-        times=times
+        required_length=context_length,
+        feature_normalizer=feature_normalizer
     )
     
     if input_seq is None:
@@ -165,7 +159,7 @@ def load_all_stock_data(data_dir=DataConfig.DATA_DIR):
     """
     import pandas as pd
     
-    all_files = sorted([f for f in os.listdir(data_dir) if f.endswith('.csv') and f != DataConfig.INDEX_FILE])
+    all_files = sorted([f for f in os.listdir(data_dir) if f.endswith('.csv')])
     stock_list = []
     
     for fname in all_files:
@@ -207,7 +201,7 @@ def score_all_stocks(model, stock_list, device, feature_normalizer=None):
     
     for item in stock_list:
         fname, data, latest_date, times = item
-        result = generate_latest_input(data, fname, feature_normalizer, times)
+        result = generate_latest_input(data, fname, feature_normalizer)
         if result is None:
             skipped += 1
             continue
@@ -868,9 +862,6 @@ def main():
         raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
 
     train_stock_info, test_stock_info = load_and_preprocess_data()
-
-    # 初始化大盘数据
-    init_index_data()
 
     # 运行评估
     stats = run_evaluation(model, test_stock_info, device, feature_normalizer)

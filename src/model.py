@@ -254,7 +254,7 @@ class StockTransformer(nn.Module):
         nn.init.zeros_(self.embed_mlp[1].bias)
 
     def forward(self, x):
-        # x: [batch_size, seq_len, 8] (OHLC + volume + exchange + 大盘涨跌幅 + 大盘量能涨跌幅)
+        # x: [batch_size, seq_len, 6] (OHLC + volume + exchange)
 
         # 1. FFN-Embedding：线性投影 + 残差MLP
         x = self.embed_proj(x)          # 线性映射保底

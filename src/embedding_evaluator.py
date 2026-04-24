@@ -1,7 +1,7 @@
 """
 Embedding模块评估脚本
 
-核心思路：评估Embedding层是否成功编码了8个输入维度之间的交互关系
+核心思路：评估Embedding层是否成功编码了6个输入维度之间的交互关系
 
 评估对象：粗处理后的数据 → 细处理(FeatureNormalizer) → Embedding层 → d_model维输出
 
@@ -86,8 +86,8 @@ class EmbeddingModule(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: 粗处理后的数据 [batch, seq_len, 8]
-               范围：OHLE [-0.1, 0.1], Volume [0, 1], Exchange [0, 1], Index/IdxVol
+            x: 粗处理后的数据 [batch, seq_len, 6]
+               范围：OHLE [-0.1, 0.1], Volume [0, 1], Exchange [0, 1]
 
         Returns:
             embedded: [batch, seq_len, d_model]
@@ -127,58 +127,55 @@ class EmbeddingModule(nn.Module):
 class EmbeddingModuleAnalyzer:
     """Embedding模块分析器 - 评估维度间交互编码质量"""
 
-    FEATURE_NAMES = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'Index', 'IdxVol']
+    FEATURE_NAMES = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange']
 
-    # 特征遮盖的"零值"（coarse-normalized空间中的语义中性值）
-    NEUTRAL_VALUES = [0.0, 0.0, 0.0, 0.0, 0.5, 0.01, 0.0, 0.0]
+    NEUTRAL_VALUES = [0.0, 0.0, 0.0, 0.0, 0.5, 0.01]
 
-    # 每个维度的扰动步长（coarse-normalized空间）
-    DELTA_MAP = {0: 0.03, 1: 0.03, 2: 0.03, 3: 0.03, 4: 0.10, 5: 0.05, 6: 0.03, 7: 0.03}
+    DELTA_MAP = {0: 0.03, 1: 0.03, 2: 0.03, 3: 0.03, 4: 0.10, 5: 0.05}
 
-    # 重点关注的维度对
-    KEY_PAIRS = [(0, 3), (1, 2), (3, 4), (3, 5), (3, 6)]
-    KEY_PAIR_NAMES = ['Open-Close', 'High-Low', 'Close-Volume', 'Close-Exchange', 'Close-Index']
+    KEY_PAIRS = [(0, 3), (1, 2), (3, 4), (3, 5)]
+    KEY_PAIR_NAMES = ['Open-Close', 'High-Low', 'Close-Volume', 'Close-Exchange']
 
     # 原型交易日模式（coarse-normalized空间）
     SEMANTIC_PATTERNS = {
         'bullish_large': {
-            'values': [0.01, 0.05, -0.01, 0.04, 0.70, 0.05, 0.02, 0.03],
+            'values': [0.01, 0.05, -0.01, 0.04, 0.70, 0.05],
             'desc': '大阳线'
         },
         'bearish_large': {
-            'values': [-0.01, 0.01, -0.05, -0.04, 0.70, 0.05, -0.02, 0.03],
+            'values': [-0.01, 0.01, -0.05, -0.04, 0.70, 0.05],
             'desc': '大阴线'
         },
         'doji': {
-            'values': [0.0, 0.01, -0.01, 0.001, 0.50, 0.02, 0.0, 0.0],
+            'values': [0.0, 0.01, -0.01, 0.001, 0.50, 0.02],
             'desc': '十字星'
         },
         'high_vol_bull': {
-            'values': [0.01, 0.04, -0.005, 0.03, 0.85, 0.08, 0.02, 0.05],
+            'values': [0.01, 0.04, -0.005, 0.03, 0.85, 0.08],
             'desc': '放量上涨'
         },
         'low_vol_bull': {
-            'values': [0.01, 0.04, -0.005, 0.03, 0.35, 0.01, 0.02, 0.01],
+            'values': [0.01, 0.04, -0.005, 0.03, 0.35, 0.01],
             'desc': '缩量上涨'
         },
         'divergence_bull': {
-            'values': [0.005, 0.03, -0.005, 0.02, 0.60, 0.04, -0.03, -0.02],
+            'values': [0.005, 0.03, -0.005, 0.02, 0.60, 0.04],
             'desc': '逆势上涨'
         },
         'following_bull': {
-            'values': [0.01, 0.02, -0.005, 0.015, 0.50, 0.03, 0.015, 0.01],
+            'values': [0.01, 0.02, -0.005, 0.015, 0.50, 0.03],
             'desc': '跟风上涨'
         },
         'upper_shadow': {
-            'values': [0.0, 0.06, -0.005, 0.005, 0.60, 0.04, 0.0, 0.0],
+            'values': [0.0, 0.06, -0.005, 0.005, 0.60, 0.04],
             'desc': '长上影线'
         },
         'lower_shadow': {
-            'values': [0.0, 0.005, -0.06, 0.005, 0.60, 0.04, 0.0, 0.0],
+            'values': [0.0, 0.005, -0.06, 0.005, 0.60, 0.04],
             'desc': '长下影线'
         },
         'high_ex_limit': {
-            'values': [0.02, 0.10, 0.01, 0.10, 0.90, 0.15, 0.01, 0.03],
+            'values': [0.02, 0.10, 0.01, 0.10, 0.90, 0.15],
             'desc': '高换手涨停'
         }
     }
@@ -292,11 +289,11 @@ class EmbeddingModuleAnalyzer:
         print("  核心问题: 维度间是否存在非线性交互效应？")
 
         sample_inputs = np.array(sample_inputs[:n_samples])
-        n_dims = 8
+        n_dims = 6
         interaction_sum = np.zeros((n_dims, n_dims))
 
         for sample_idx in range(len(sample_inputs)):
-            x = sample_inputs[sample_idx:sample_idx+1]  # [1, seq_len, 8]
+            x = sample_inputs[sample_idx:sample_idx+1]  # [1, seq_len, 6]
 
             f_base = self._embed_batch(x).flatten()
 
@@ -368,7 +365,7 @@ class EmbeddingModuleAnalyzer:
         print("  核心问题: 符号翻转是否比同向平移产生更大的embedding变化？")
 
         sample_inputs = np.array(sample_inputs[:n_samples])
-        n_dims = 8
+        n_dims = 6
         flip_mag = np.zeros(n_dims)
         shift_mag = np.zeros(n_dims)
 
@@ -436,7 +433,7 @@ class EmbeddingModuleAnalyzer:
         # 构造单时间步输入并获取embedding
         embeddings = {}
         for name, pattern in self.SEMANTIC_PATTERNS.items():
-            x = np.array(pattern['values'], dtype=np.float32).reshape(1, 1, 8)
+            x = np.array(pattern['values'], dtype=np.float32).reshape(1, 1, 6)
             emb = self._embed_batch(x).flatten()
             embeddings[name] = emb
 
@@ -501,7 +498,7 @@ class EmbeddingModuleAnalyzer:
         print("\n[高维连续性分析]")
         print("  核心问题: embedding是否全局平滑但在决策边界处有高曲率？")
 
-        base_sample = sample_inputs[0:1]  # [1, seq_len, 8]
+        base_sample = sample_inputs[0:1]  # [1, seq_len, 6]
 
         sweep_configs = {
             'Close': (3, np.linspace(-0.05, 0.05, n_steps)),
@@ -585,10 +582,10 @@ class EmbeddingModuleAnalyzer:
         X_emb = embeddings[:, -1, :]  # [n, d_model]
 
         # 目标：细处理后的输入（embedding层的直接输入）
-        y_features = self.embedding_module.transform_numpy(sample_inputs)[:, -1, :]  # [n, 8]
+        y_features = self.embedding_module.transform_numpy(sample_inputs)[:, -1, :]  # [n, 6]
 
-        r2_values = np.zeros(8)
-        for j in range(8):
+        r2_values = np.zeros(6)
+        for j in range(6):
             ridge = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0])
             scores = cross_val_score(ridge, X_emb, y_features[:, j], cv=5, scoring='r2')
             r2_values[j] = float(np.mean(scores))
@@ -696,14 +693,13 @@ class EmbeddingModuleAnalyzer:
         if 'cross_interaction' in results:
             matrix = results['cross_interaction']['interaction_matrix']
             im = ax.imshow(matrix, cmap='YlOrRd', aspect='auto')
-            ax.set_xticks(range(8))
-            ax.set_yticks(range(8))
+            ax.set_xticks(range(6))
+            ax.set_yticks(range(6))
             ax.set_xticklabels(self.FEATURE_NAMES, rotation=45, ha='right')
             ax.set_yticklabels(self.FEATURE_NAMES)
             ax.set_title('跨维度交互强度')
-            # 标注数值
-            for i in range(8):
-                for j in range(8):
+            for i in range(6):
+                for j in range(6):
                     if i != j:
                         ax.text(j, i, f'{matrix[i,j]:.3f}', ha='center', va='center',
                                 fontsize=7, color='black' if matrix[i,j] < matrix.max()*0.7 else 'white')
@@ -1024,20 +1020,15 @@ def main():
     print("[步骤1] 加载数据...")
     train_stock_info, test_stock_info = load_and_preprocess_data()
 
-    from data import init_index_data
-    init_index_data()
-
     print("\n[步骤2] 准备测试样本...")
     from data import coarse_normalize_context_window
     all_inputs = []
     for stock in test_stock_info[:50]:
         data = stock['data']
         test_split = stock['test_split_point']
-        times = stock['times']
         for i in range(test_split, min(test_split + 10, len(data) - 33)):
             input_seq = coarse_normalize_context_window(
-                data, i, 30, check_limit_up=False, required_length=33,
-                times=times
+                data, i, 30, check_limit_up=False, required_length=33
             )
             if input_seq is not None:
                 all_inputs.append(input_seq)

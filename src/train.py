@@ -27,7 +27,6 @@ from data import (
     load_and_preprocess_data,
     create_fixed_evaluation_dataset,FeatureNormalizer,
     compute_label_distance_exclusions,
-    init_index_data,
     precompute_training_pool,
     sample_from_pool,
     sample_temporal_from_pool,
@@ -621,9 +620,6 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
 
     print("="*60)
-
-    # 初始化大盘数据
-    init_index_data()
 
     # 加载数据
     train_stock_info, test_stock_info = load_and_preprocess_data()

@@ -56,8 +56,6 @@ class DataChecker:
         self.enable_backup = backup
         self.check_days = check_days
         self.login_success = False
-        self.index_code = "sh.000001"
-        self.index_file = "000000.csv"
         self.stats = {
             'total': 0,
             'pass': 0,
@@ -103,8 +101,8 @@ class DataChecker:
             print(f"✗ 备份失败：{e}")
     
     def get_all_csv_files(self) -> List[Path]:
-        """获取所有 CSV 文件（排除大盘指数文件）"""
-        return sorted([f for f in self.data_dir.glob("*.csv") if f.name != self.index_file])
+        """获取所有 CSV 文件"""
+        return sorted(self.data_dir.glob("*.csv"))
     
     def get_last_date_in_file(self, file_path: Path) -> Optional[str]:
         """获取文件中最新日期"""
@@ -212,174 +210,6 @@ class DataChecker:
         except Exception as e:
             print(f"获取 Baostock 数据失败：{e}")
             return None
-
-    def fetch_index_baostock_data(self, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
-        """
-        从 Baostock 获取上证指数指定日期范围的数据
-
-        Args:
-            start_date: 开始日期 (YYYY-MM-DD)
-            end_date: 结束日期 (YYYY-MM-DD)
-        Returns:
-            DataFrame 或 None
-        """
-        try:
-            rs = bs.query_history_k_data_plus(
-                self.index_code,
-                "date,open,high,low,close,volume,amount,turn",
-                start_date=start_date,
-                end_date=end_date,
-                frequency="d",
-                adjustflag="3"
-            )
-
-            if rs.error_code != '0':
-                return None
-
-            data_list = []
-            while rs.error_code == '0' and rs.next():
-                row = rs.get_row_data()
-                data_list.append(row)
-
-            if not data_list:
-                return None
-
-            df = pd.DataFrame(data_list, columns=rs.fields)
-
-            df['date'] = df['date'].str.replace('-', '')
-            df = df[df['date'] != '']
-
-            if len(df) == 0:
-                return None
-
-            df['date'] = df['date'].astype(str)
-            df['open'] = pd.to_numeric(df['open'], errors='coerce')
-            df['high'] = pd.to_numeric(df['high'], errors='coerce')
-            df['low'] = pd.to_numeric(df['low'], errors='coerce')
-            df['close'] = pd.to_numeric(df['close'], errors='coerce')
-
-            if 'amount' in df.columns:
-                df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-                df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
-            else:
-                df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
-
-            df['turn'] = pd.to_numeric(df['turn'], errors='coerce')
-
-            df = df.dropna(subset=['open', 'high', 'low', 'close'])
-
-            return df[['date', 'open', 'high', 'low', 'close', 'volume', 'turn']]
-
-        except Exception as e:
-            print(f"获取上证指数 Baostock 数据失败：{e}")
-            return None
-
-    def check_index_data(self, verbose: bool = False) -> CheckResult:
-        """
-        检查上证指数数据的完整性
-
-        Args:
-            verbose: 是否详细输出
-        Returns:
-            CheckResult
-        """
-        file_path = self.data_dir / self.index_file
-
-        if not file_path.exists():
-            return CheckResult(
-                stock_code=self.index_file,
-                status=CheckStatus.FAIL,
-                message="大盘数据文件不存在"
-            )
-
-        local_latest = self.get_last_date_in_file(file_path)
-
-        if not local_latest:
-            return CheckResult(
-                stock_code=self.index_file,
-                status=CheckStatus.FAIL,
-                message="无法读取大盘数据"
-            )
-
-        today = datetime.datetime.now()
-        local_date_obj = datetime.datetime.strptime(local_latest, "%Y%m%d")
-        days_diff = (today - local_date_obj).days
-
-        if days_diff > 10:
-            return CheckResult(
-                stock_code=self.index_file,
-                status=CheckStatus.WARNING,
-                message=f"数据滞后 {days_diff} 天 (最新：{local_latest})",
-                details={'latest_date': local_latest, 'days_behind': days_diff}
-            )
-
-        check_start_date = self._get_previous_date(local_latest, self.check_days)
-        local_recent = self.get_recent_local_data(file_path, self.check_days)
-
-        if local_recent is None or len(local_recent) == 0:
-            return CheckResult(
-                stock_code=self.index_file,
-                status=CheckStatus.FAIL,
-                message="本地数据为空"
-            )
-
-        baostock_start = self._date_to_baostock_format(check_start_date)
-        baostock_end = self._date_to_baostock_format(local_latest)
-
-        bs_data = self.fetch_index_baostock_data(baostock_start, baostock_end)
-
-        if bs_data is None or len(bs_data) == 0:
-            return CheckResult(
-                stock_code=self.index_file,
-                status=CheckStatus.SKIP,
-                message="无法获取 Baostock 数据",
-                details={'latest_date': local_latest}
-            )
-
-        local_dates = set(local_recent['date'])
-        bs_dates = set(bs_data['date'])
-
-        missing_dates = bs_dates - local_dates
-
-        if missing_dates:
-            return CheckResult(
-                stock_code=self.index_file,
-                status=CheckStatus.FAIL,
-                message=f"缺失 {len(missing_dates)} 个交易日",
-                details={'missing_dates': sorted(list(missing_dates))}
-            )
-
-        for _, bs_row in bs_data.iterrows():
-            bs_time = bs_row['date']
-            local_row = local_recent[local_recent['date'] == bs_time]
-
-            if len(local_row) == 0:
-                continue
-
-            local_row = local_row.iloc[0]
-
-            if abs(local_row['open'] - bs_row['open']) > 0.01:
-                return CheckResult(
-                    stock_code=self.index_file,
-                    status=CheckStatus.FAIL,
-                    message=f"开盘价不匹配 ({bs_time}): 本地={local_row['open']}, Baostock={bs_row['open']}",
-                    details={'date': bs_time, 'field': 'open'}
-                )
-
-            if abs(local_row['close'] - bs_row['close']) > 0.01:
-                return CheckResult(
-                    stock_code=self.index_file,
-                    status=CheckStatus.FAIL,
-                    message=f"收盘价不匹配 ({bs_time}): 本地={local_row['close']}, Baostock={bs_row['close']}",
-                    details={'date': bs_time, 'field': 'close'}
-                )
-
-        return CheckResult(
-            stock_code=self.index_file,
-            status=CheckStatus.PASS,
-            message=f"数据完整且准确 (最新：{local_latest}, 检查 {len(bs_data)} 个交易日)",
-            details={'latest_date': local_latest, 'checked_days': len(bs_data)}
-        )
 
     def _date_to_baostock_format(self, date_str: str) -> str:
         """转换日期格式从 YYYYMMDD 到 YYYY-MM-DD"""
@@ -755,127 +585,6 @@ class DataChecker:
         print(f"  ⚠ 无对应修复策略：{msg}")
         return False
 
-    def repair_index_data(self, file_path: Path, result: CheckResult) -> bool:
-        """
-        尝试修复上证指数数据错误
-
-        Args:
-            file_path: 本地文件路径
-            result: 对应的 CheckResult
-        Returns:
-            修复是否成功
-        """
-        msg = result.message
-
-        if "缺失" in msg and result.details and 'missing_dates' in result.details:
-            missing_dates = result.details['missing_dates']
-            print(f"  → 修复：补拉 {len(missing_dates)} 个缺失交易日")
-            start_bs = f"{missing_dates[0][:4]}-{missing_dates[0][4:6]}-{missing_dates[0][6:]}"
-            end_bs = f"{missing_dates[-1][:4]}-{missing_dates[-1][4:6]}-{missing_dates[-1][6:]}"
-            patch_df = self.fetch_index_baostock_data(start_bs, end_bs)
-            if patch_df is None or len(patch_df) == 0:
-                print(f"  ✗ 无法获取补丁数据，跳过")
-                return False
-            try:
-                old_df = pd.read_csv(file_path)
-                old_df['date'] = old_df['date'].astype(str)
-                patch_df['date'] = patch_df['date'].astype(str)
-                existing = set(old_df['date'])
-                patch_df = patch_df[~patch_df['date'].isin(existing)]
-                if len(patch_df) == 0:
-                    print(f"  ⚠ 补丁数据已存在，无需写入")
-                    return True
-                combined = pd.concat([old_df, patch_df], ignore_index=True)
-                combined = combined.sort_values('date', ascending=False).reset_index(drop=True)
-                combined.to_csv(file_path, index=False)
-                print(f"  ✓ 补入 {len(patch_df)} 条，总计 {len(combined)} 条")
-                return True
-            except Exception as e:
-                print(f"  ✗ 写入失败：{e}")
-                return False
-
-        if any(k in msg for k in ["不匹配", "OHLC", "超出范围", "无法读取", "最高价", "最低价"]):
-            print(f"  → 修复：重新全量拉取上证指数")
-            rs = bs.query_history_k_data_plus(
-                self.index_code,
-                "date,open,high,low,close,volume,amount,turn,tradestatus,pctChg,peTTM,"
-                "pbMRQ,psTTM,pcfNcfTTM,isST",
-                start_date="2010-01-01",
-                end_date=datetime.datetime.now().strftime("%Y-%m-%d"),
-                frequency="d",
-                adjustflag="3"
-            )
-            if rs.error_code != '0':
-                print(f"  ✗ 全量拉取失败：{rs.error_msg}")
-                return False
-            data_list = []
-            while rs.error_code == '0' and rs.next():
-                data_list.append(rs.get_row_data())
-            if not data_list:
-                print(f"  ✗ 未获取到数据")
-                return False
-            try:
-                df = pd.DataFrame(data_list, columns=rs.fields)
-                df['date'] = df['date'].str.replace('-', '')
-                df = df[df['date'] != '']
-                df['date'] = df['date'].astype(int)
-                for col in ['open', 'high', 'low', 'close']:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                df = df.dropna(subset=['open', 'high', 'low', 'close'])
-                if 'amount' in df.columns:
-                    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-                    df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
-                else:
-                    df['volume'] = 0.0
-                if 'turnover' in df.columns:
-                    df['exchange'] = pd.to_numeric(df['turnover'], errors='coerce').fillna(0.0)
-                elif 'turn' in df.columns:
-                    df['exchange'] = pd.to_numeric(df['turn'], errors='coerce').fillna(0.0)
-                else:
-                    df['exchange'] = 0.0
-                df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']]
-                df = df.iloc[::-1].reset_index(drop=True)
-                df.to_csv(file_path, index=False)
-                print(f"  ✓ 全量写入 {len(df)} 条")
-                return True
-            except Exception as e:
-                print(f"  ✗ 写入失败：{e}")
-                return False
-
-        if "滞后" in msg and result.details and 'latest_date' in result.details:
-            latest = result.details['latest_date']
-            start_date = f"{latest[:4]}-{latest[4:6]}-{latest[6:]}"
-            next_day = (datetime.datetime.strptime(start_date, "%Y-%m-%d")
-                        + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-            print(f"  → 修复：增量补更上证指数（从 {next_day} 起）")
-            patch_df = self.fetch_index_baostock_data(
-                next_day, datetime.datetime.now().strftime("%Y-%m-%d")
-            )
-            if patch_df is None or len(patch_df) == 0:
-                print(f"  ⚠ 无新数据可补（可能已是最新）")
-                return True
-            try:
-                old_df = pd.read_csv(file_path)
-                old_df['date'] = old_df['date'].astype(str)
-                patch_df['date'] = patch_df['date'].astype(str)
-                existing = set(old_df['date'])
-                patch_df = patch_df[~patch_df['date'].isin(existing)]
-                if len(patch_df) == 0:
-                    print(f"  ⚠ 补丁数据已存在，无需写入")
-                    return True
-                combined = pd.concat([patch_df, old_df], ignore_index=True)
-                combined = combined.sort_values('date', ascending=False).reset_index(drop=True)
-                combined.to_csv(file_path, index=False)
-                new_latest = str(int(combined.iloc[0]['date']))
-                print(f"  ✓ 补入 {len(patch_df)} 条，最新：{new_latest}")
-                return True
-            except Exception as e:
-                print(f"  ✗ 写入失败：{e}")
-                return False
-
-        print(f"  ⚠ 无对应修复策略：{msg}")
-        return False
-
     def run_full_check(self, stock_codes: Optional[List[str]] = None,
                       verbose: bool = False, check_ohlc: bool = True) -> List[CheckResult]:
         """
@@ -896,26 +605,6 @@ class DataChecker:
             return []
         
         try:
-            print(f"\n检查上证指数数据...")
-            index_result = self.check_index_data(verbose)
-            results = [index_result]
-            self._update_stats(index_result.status)
-
-            if index_result.status == CheckStatus.PASS:
-                print(f"✓ 上证指数 - {index_result.message}")
-            elif index_result.status == CheckStatus.WARNING:
-                print(f"⚠ 上证指数 - {index_result.message}")
-            else:
-                print(f"✗ 上证指数 - {index_result.message}")
-
-            if index_result.status in (CheckStatus.FAIL, CheckStatus.WARNING):
-                index_file_path = self.data_dir / self.index_file
-                ok = self.repair_index_data(index_file_path, index_result)
-                if ok:
-                    print(f"  ✓ 上证指数数据已修复")
-                else:
-                    print(f"  ✗ 上证指数数据修复失败")
-
             if stock_codes:
                 files_to_check = [self.data_dir / f"{code}.csv" for code in stock_codes]
                 files_to_check = [f for f in files_to_check if f.exists()]

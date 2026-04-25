@@ -105,7 +105,7 @@ class FeatureNormalizer:
         exchange_data = []
 
         context_length = DataConfig.CONTEXT_LENGTH
-        max_windows = 10000
+        max_windows = 100000
         total_windows = 0
 
         for stock in train_stock_info:
@@ -1066,7 +1066,10 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     执行完整的数据验证和归一化流程，与 generate_sample_from_index 保持一致。
 
     数据处理分两阶段：
-        - 粗处理：CSV → OHLE 格式（涨跌幅 -0.1~0.1，Volume 0~1，Exchange 0~1）
+        - 粗处理：CSV → OHLE 格式
+            - OHLC: 日环比变化率，clip [-0.1, 0.1]
+            - Volume: (volume_i - MA_N) / MA_N，MA_N 为过去 N 日均量，无 clip
+            - Exchange: (exchange_i - MA_N) / MA_N，MA_N 为过去 N 日均换手率，无 clip
         - 细处理：OHLE → 标准化数据（均值≈0，方差≈1）
 
     Args:
@@ -1080,7 +1083,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
 
     Returns:
         input_seq: [context_length, 6] 归一化后的输入序列，或 None（如果验证失败）
-            - 粗处理后：OHLE: -0.1~0.1, Volume: 0~1, Exchange: 0~1
+            - 粗处理后：OHLC: [-0.1, 0.1], Volume: 相对N日均值变化率, Exchange: 相对N日均值变化率
             - 细处理后：均值≈0，方差≈1
 
     验证项：
@@ -1148,16 +1151,40 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     if context_length > 1:
         input_seq[1:, :4] = (input_seq_raw[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
 
-    input_seq[0, 4] = (volumes[0] - prev_volume) / prev_volume
-    if context_length > 1:
-        input_seq[1:, 4] = (volumes[1:] - volumes[:-1]) / volumes[:-1]
-
-    input_seq[:, 5] = input_seq_raw[:, 5] / 100.0
+    N = DataConfig.MA_WINDOW
+    exchanges = input_seq_raw[:, 5]
 
     np.clip(input_seq[:, :4], -0.1, 0.1, out=input_seq[:, :4])
-    np.clip(input_seq[:, 4], -5.0, 5.0, out=input_seq[:, 4])
-    input_seq[:, 4] = input_seq[:, 4] / 10.0 + 0.5
-    np.clip(input_seq[:, 5], 0.0, 1.0, out=input_seq[:, 5])
+
+    abs_indices = start_idx + np.arange(context_length)
+
+    if start_idx >= N:
+        for col, raw_vals in [(4, volumes), (5, exchanges)]:
+            full_col = stock_data[:, col]
+            cumsum = np.empty(len(full_col) + 1, dtype=np.float64)
+            cumsum[0] = 0
+            np.cumsum(full_col, out=cumsum[1:])
+            ma_values = (cumsum[abs_indices] - cumsum[abs_indices - N]) / N
+            if np.any(~np.isfinite(ma_values)) or np.any(ma_values <= 0):
+                return None
+            input_seq[:, col] = (raw_vals - ma_values) / ma_values
+    else:
+        left_starts = np.maximum(0, abs_indices - N)
+        deficits = N - (abs_indices - left_starts)
+        for col, raw_vals in [(4, volumes), (5, exchanges)]:
+            full_col = stock_data[:, col]
+            ma_values = np.empty(context_length, dtype=np.float32)
+            for k in range(context_length):
+                if deficits[k] > 0:
+                    ma_values[k] = np.mean(np.concatenate([
+                        full_col[left_starts[k]:abs_indices[k]],
+                        full_col[abs_indices[k] + 1:abs_indices[k] + 1 + deficits[k]]
+                    ]))
+                else:
+                    ma_values[k] = np.mean(full_col[left_starts[k]:abs_indices[k]])
+            if np.any(~np.isfinite(ma_values)) or np.any(ma_values <= 0):
+                return None
+            input_seq[:, col] = (raw_vals - ma_values) / ma_values
 
     # ========== 细处理阶段（可选）==========
     # 应用高级特征归一化，将粗处理结果转换为均值≈0、方差≈1的标准化数据
@@ -1177,9 +1204,9 @@ def coarse_normalize_context_window(stock_data, start_idx, context_length,
 
     只执行粗处理阶段，不应用细处理（特征归一化器）。
     输出数据范围：
-        - OHLE: -0.1 ~ 0.1（涨跌幅）
-        - Volume: 0 ~ 1（成交量变化率）
-        - Exchange: 0 ~ 1（换手率）
+        - OHLC: -0.1 ~ 0.1（日环比变化率）
+        - Volume: 相对N日均值变化率（无固定范围，由 QuantileTransformer 统一）
+        - Exchange: 相对N日均值变化率（无固定范围，由 QuantileTransformer 统一）
 
     Args:
         stock_data: 股票原始数据 [N, 6]

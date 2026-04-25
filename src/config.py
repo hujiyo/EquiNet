@@ -32,6 +32,9 @@ class DataConfig:
     BUFFER_DAY = True                # 额外采集1天安全余量（用于跌停推迟判断）
     REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS + (1 if BUFFER_DAY else 0)
 
+    # 量能/换手率归一化配置
+    MA_WINDOW = 10                   # 量能与换手率相对均值的滑动窗口大小（N日均值基准）
+
     # 涨跌停配置
     LIMIT_THRESHOLD = 0.095          # 涨跌停判断阈值（9.5%，覆盖普通板±10%）
     LIMIT_CHECK_MODE = 'ohlc'        # 'simple': 仅看涨跌幅 | 'ohlc': 通过OHLC判断是否开板

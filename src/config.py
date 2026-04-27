@@ -203,22 +203,13 @@ class TrainingConfig:
             return TrainingConfig.MANO_WEIGHT_DECAY
         return TrainingConfig.ADAMW_WEIGHT_DECAY
 
-    @staticmethod
-    def validate_optimizer_config():
-        """检查优化器超参数是否合理，打印警告建议"""
-        return []
-
 # ==================== 损失函数配置 ====================
 class LossConfig:
     """损失函数相关配置"""
-
-    LOSS_TYPE = 'dynamic_bce'  # 'dynamic_bce':批权重动态平衡 | 'standard_bce':标准二元交叉熵
+    # 'dynamic_bce':批权重动态平衡 | 'standard_bce':标准二元交叉熵
+    LOSS_TYPE = 'dynamic_bce'
 
     POS_WEIGHT = 4.0  # DynamicWeightedBCE 的正样本权重
-
-    @staticmethod
-    def use_dynamic_bce():
-        return LossConfig.LOSS_TYPE.lower() == 'dynamic_bce'
 
 # ==================== 用户自定义标签生成函数 ====================
 def generate_label(day1_change, day2_change, day3_change):
@@ -383,17 +374,12 @@ def calculate_returns(t1_open, t1_close, t2_open=None, t2_close=None, t3_close=N
 class DeviceConfig:
     @staticmethod
     def get_device():
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    @staticmethod
-    def print_device_info():
-        device = DeviceConfig.get_device()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if device.type == "cuda":
-            print(f"使用{torch.cuda.get_device_name()}进行训练")
+            return device
         else:
             print("ERROR:CUDA 不可用，程序退出")
             sys.exit(1)
-        return device
 
 # ==================== 配置打印函数 ====================
 def print_config_summary():
@@ -434,8 +420,5 @@ def print_config_summary():
     print(f"标签参数:")
     print(f"  正样本距离保护: {DataConfig.LABEL_DISTANCE}")
     print(f"  Day1基准: {'开盘价(日内涨幅)' if DataConfig.LABEL_DAY1_USE_OPEN else '前日收盘(含跳空)'}")
-
-    # 优化器超参校验
-    TrainingConfig.validate_optimizer_config()
 
     print("=" * 50)

@@ -396,7 +396,7 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     print(f"│  正在评估模型...")
 
     # 创建评估损失函数（与 train.py 一致）
-    if LossConfig.use_dynamic_bce():
+    if LossConfig.LOSS_TYPE.lower() == 'dynamic_bce':
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
 
         # 测试集权重

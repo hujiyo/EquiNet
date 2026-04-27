@@ -114,7 +114,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     )
 
     # 损失函数选择
-    if LossConfig.use_dynamic_bce():
+    if LossConfig.LOSS_TYPE.lower() == 'dynamic_bce':
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')

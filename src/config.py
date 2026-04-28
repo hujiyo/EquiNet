@@ -78,7 +78,7 @@ class DataConfig:
     NORMALIZER_PATH = os.path.join(SRC_DIR, 'normalizer.pkl')
 
     TOP_K = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
-    TOP_N_PER_DAY = 4                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
+    TOP_N_PER_DAY = 0                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
     MAX_SELECT_PER_DAY = 4             # 全局阈值模式下每天最多选股数量（0表示不限制）
 
 # ==================== 模型架构参数 ====================
@@ -153,7 +153,8 @@ class TrainingConfig:
 
     # 优化器选择（字符串，互斥）
     # 'adamw':    标准AdamW
-    # 'lion':     Lion（符号动量），内存省、泛化好
+    # 'lion':     Lion（符号动量），内存省、泛化好（lion-pytorch库）
+    # 'muon':     Muon（Newton-Schulz正交化），收敛快（KellerJordan/Muon库）
     # 'mano':     Mano混合优化器
     OPTIMIZER_TYPE = 'mano'
 
@@ -181,6 +182,17 @@ class TrainingConfig:
     MANO_NESTEROV = True             # 是否使用Nesterov动量（v2默认True）
     MANO_DUAL_DIM_PROJECTION = True  # 是否使用双维度投影（v2新功能，默认True）
 
+    # Muon 参数（OPTIMIZER_TYPE='muon'时生效）
+    # Muon通过Newton-Schulz迭代对2D权重矩阵的梯度动量进行正交化，加速收敛
+    # 2D权重(Linear/Conv)走Muon，1D参数(bias/LayerNorm)走AdamW
+    # 使用KellerJordan/Muon官方库的SingleDeviceMuonWithAuxAdam
+    # 参考: https://github.com/KellerJordan/Muon
+    MUON_LR = 0.02                  # Muon 学习率（官方默认0.02，示例用0.05）
+    MUON_WEIGHT_DECAY = 0           # Muon 权重衰减（官方默认0，正交化本身已提供正则化）
+    MUON_MOMENTUM = 0.95            # Muon动量系数（官方默认0.95）
+    MUON_ADAMW_LR_RATIO = 0.8       # AdamW部分学习率 = MUON_LR × 此比例（官方示例: scalar lr=0.04 / muon lr=0.05）
+    MUON_ADAMW_BETAS = (0.8, 0.95)  # AdamW部分的beta参数（官方示例: 0.8, 0.95）
+
     OPEN_EARLY_STOPPING = False       # 是否开启早停机制
 
     @staticmethod
@@ -191,6 +203,8 @@ class TrainingConfig:
             return TrainingConfig.LION_LR
         if opt == 'mano':
             return TrainingConfig.MANO_LR
+        if opt == 'muon':
+            return TrainingConfig.MUON_LR
         return TrainingConfig.ADAMW_LR
 
     @staticmethod
@@ -201,6 +215,8 @@ class TrainingConfig:
             return TrainingConfig.LION_WEIGHT_DECAY
         if opt == 'mano':
             return TrainingConfig.MANO_WEIGHT_DECAY
+        if opt == 'muon':
+            return TrainingConfig.MUON_WEIGHT_DECAY
         return TrainingConfig.ADAMW_WEIGHT_DECAY
 
 # ==================== 损失函数配置 ====================

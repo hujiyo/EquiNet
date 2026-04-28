@@ -21,6 +21,8 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from config import DataConfig,LossConfig,TrainingConfig
 import torch.optim as optim
+from lion_pytorch import Lion
+from muon import SingleDeviceMuonWithAuxAdam as MuonWithAuxAdam
 
 class WarmupScheduler:
     """
@@ -29,49 +31,43 @@ class WarmupScheduler:
     这有助于模型在训练初期更稳定地收敛
     """
     def __init__(self, optimizer, warmup_epochs, target_lr, start_lr=None):
-        """
-        Args:
-            optimizer: PyTorch优化器
-            warmup_epochs: 预热轮数
-            target_lr: 目标学习率（预热结束后的学习率）
-            start_lr: 预热起始学习率，如果为None则使用target_lr的1/100
-        """
         self.optimizer = optimizer
         self.warmup_epochs = warmup_epochs
         self.target_lr = target_lr
         self.start_lr = start_lr if start_lr is not None else target_lr / 100
         self.current_epoch = 0
-        
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = self.start_lr
+
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+        target_ratio = target_lr / self.base_lrs[0] if self.base_lrs[0] != 0 else 1.0
+        start_ratio = self.start_lr / target_lr if target_lr != 0 else 1.0
+
+        for group, base_lr in zip(optimizer.param_groups, self.base_lrs):
+            group['lr'] = base_lr * target_ratio * start_ratio
     
     def step(self, epoch=None):
-        """
-        更新学习率
-        Args:
-            epoch: 当前轮数，如果为None则使用内部计数器
-        """
         if epoch is not None:
             self.current_epoch = epoch
         else:
             self.current_epoch += 1
         
         if self.current_epoch < self.warmup_epochs:
-            lr = self.start_lr + (self.target_lr - self.start_lr) * ((self.current_epoch + 1) / self.warmup_epochs)
+            progress = (self.current_epoch + 1) / self.warmup_epochs
         else:
-            lr = self.target_lr
+            progress = 1.0
+
+        target_ratio = self.target_lr / self.base_lrs[0] if self.base_lrs[0] != 0 else 1.0
+        start_ratio = self.start_lr / self.target_lr if self.target_lr != 0 else 1.0
+
+        for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            scale = start_ratio + (1.0 - start_ratio) * progress
+            group['lr'] = base_lr * target_ratio * scale
         
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-        
-        return lr
+        return self.optimizer.param_groups[0]['lr']
     
     def get_last_lr(self):
-        """获取当前学习率（兼容PyTorch调度器接口）"""
-        return [param_group['lr'] for param_group in self.optimizer.param_groups]
+        return [group['lr'] for group in self.optimizer.param_groups]
     
     def is_warmup_phase(self):
-        """判断是否还在预热阶段"""
         return self.current_epoch < self.warmup_epochs
 
 
@@ -81,35 +77,38 @@ class CosineAnnealFreezeLR:
 
     学习率变化：warmup → 余弦退火 → 固定在 eta_min
     余弦退火仅持续 anneal_epochs 轮，之后学习率固定不再下降。
-    用于观察 epoch-wise 双下降现象：模型在恒定学习率下持续被推动，
-    有机会逃离过拟合解，展现"先降→中间反弹→再降"的曲线。
+
+    支持多 param_group 不同学习率：按各自 base_lr 的比例独立退火。
+    eta_min 为第一个 group 的最低学习率，其余 group 按比例计算。
+    base_lrs 在第一次 step() 时才记录，确保拿到预热结束后的真实目标 lr。
     """
     def __init__(self, optimizer, anneal_epochs, eta_min):
-        """
-        Args:
-            optimizer: PyTorch优化器
-            anneal_epochs: 余弦退火的轮数（绝对值）
-            eta_min: 余弦退火终止学习率（也是固定阶段的学习率）
-        """
         self.optimizer = optimizer
         self.eta_min = eta_min
         self.anneal_epochs = max(1, anneal_epochs)
         self.current_step = 0
+        self.base_lrs = None
+        self.eta_mins = None
 
-        # 记录初始学习率（余弦退火的起点）
-        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+    def _ensure_base_lrs(self):
+        if self.base_lrs is None:
+            self.base_lrs = [group['lr'] for group in self.optimizer.param_groups]
+            self.eta_mins = []
+            if self.base_lrs and self.base_lrs[0] != 0:
+                for base_lr in self.base_lrs:
+                    self.eta_mins.append(self.eta_min * base_lr / self.base_lrs[0])
+            else:
+                self.eta_mins = [self.eta_min] * len(self.base_lrs)
 
     def step(self):
-        """更新学习率：退火阶段内按余弦衰减，之后固定不变"""
+        self._ensure_base_lrs()
         self.current_step += 1
         if self.current_step <= self.anneal_epochs:
-            for param_group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            for param_group, base_lr, em in zip(self.optimizer.param_groups, self.base_lrs, self.eta_mins):
                 cosine_factor = 0.5 * (1 + math.cos(math.pi * self.current_step / self.anneal_epochs))
-                param_group['lr'] = self.eta_min + (base_lr - self.eta_min) * cosine_factor
-        # 超过退火轮数后不更新，学习率固定在 eta_min
+                param_group['lr'] = em + (base_lr - em) * cosine_factor
 
     def get_last_lr(self):
-        """获取当前学习率"""
         return [group['lr'] for group in self.optimizer.param_groups]
 
 
@@ -1031,63 +1030,6 @@ class GradientMonitor:
         return exploding, vanishing, abnormal
 
 
-class Lion(torch.optim.Optimizer):
-    """
-    Lion (EvoLved Sign Momentum) 优化器
-
-    Google Research 2023 通过程序搜索发现的优化器。
-    核心特点：使用梯度符号（sign）而非幅度更新参数，内存效率高，泛化好。
-    相比Adam：只维护一个动量buffer（Adam需要两个），内存减半。
-
-    论文: "Symbolic Discovery of Optimization Algorithms" (Chen et al., 2023)
-    """
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
-        """
-        Args:
-            params: 模型参数
-            lr: 学习率（Lion通常需要比Adam小3-10倍的学习率）
-            betas: (beta1, beta2) 动量系数
-            weight_decay: 权重衰减（Lion推荐1e-2量级，比Adam的1e-4大）
-        """
-        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-
-                grad = p.grad
-                state = self.state[p]
-
-                # 初始化状态
-                if len(state) == 0:
-                    state['exp_avg'] = torch.zeros_like(p)
-
-                exp_avg = state['exp_avg']
-                beta1, beta2 = group['betas']
-
-                # 权重衰减（解耦方式，与AdamW一致）
-                if group['weight_decay'] > 0:
-                    p.data.mul_(1 - group['lr'] * group['weight_decay'])
-
-                # Lion核心：sign(c * momentum + (1-c) * gradient)
-                update = exp_avg * beta1 + grad * (1 - beta1)
-                p.add_(torch.sign(update), alpha=-group['lr'])
-
-                # 更新动量（用当前梯度的EMA）
-                exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
-
-        return loss
-
-
 def _get_amp_context(device):
     """获取AMP自动混合精度上下文管理器（BF16）"""
     if TrainingConfig.USE_AMP and device.type == 'cuda':
@@ -1156,6 +1098,25 @@ def create_optimizer_from_config(model, lr=None):
     elif optimizer_type == 'lion':
         optimizer = Lion(model.parameters(), lr=actual_lr, betas=TrainingConfig.LION_BETAS, weight_decay=wd)
         print(f"优化器: Lion (lr={actual_lr}, wd={wd}, betas={TrainingConfig.LION_BETAS})")
+    elif optimizer_type == 'muon':
+        muon_lr = actual_lr
+        muon_wd = TrainingConfig.MUON_WEIGHT_DECAY
+        muon_momentum = TrainingConfig.MUON_MOMENTUM
+        adamw_lr = TrainingConfig.MUON_ADAMW_LR_RATIO * muon_lr
+
+        hidden_weights = [p for p in model.parameters() if p.ndim >= 2]
+        other_params = [p for p in model.parameters() if p.ndim < 2]
+
+        param_groups = [
+            dict(params=hidden_weights, use_muon=True,
+                 lr=muon_lr, momentum=muon_momentum, weight_decay=muon_wd),
+            dict(params=other_params, use_muon=False,
+                 lr=adamw_lr, betas=TrainingConfig.MUON_ADAMW_BETAS, weight_decay=muon_wd),
+        ]
+        optimizer = MuonWithAuxAdam(param_groups)
+        print(f"优化器: MuonWithAuxAdam (Muon lr={muon_lr}, AdamW lr={adamw_lr:.6f}, wd={muon_wd})")
+        print(f"  2D权重(Muon): {len(hidden_weights)} 个参数")
+        print(f"  1D参数(AdamW): {len(other_params)} 个参数")
     else:  # 'adamw' 或其他
         optimizer = optim.AdamW(model.parameters(), lr=actual_lr, weight_decay=wd)
         print(f"优化器: AdamW (lr={actual_lr}, wd={wd})")

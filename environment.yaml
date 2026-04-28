@@ -46,6 +46,7 @@ dependencies:
     - Jinja2==3.1.4
     - jsonlines==4.0.0
     - kiwisolver==1.4.9
+    - lion-pytorch==0.2.4
     - llama_cpp_python==0.3.16
     - loguru==0.7.3
     - lxml==6.0.2
@@ -101,6 +102,7 @@ dependencies:
     - wheel==0.45.1
     - win32_setctime==1.2.0
     - wrapt==1.17.3
+    - muon-optimizer==0.1.0
     - xlsxwriter==3.2.9
     - yt-dlp==2026.3.3
     - zhipuai==2.1.5.20250825

@@ -61,6 +61,7 @@ class FeatureNormalizer:
         self.ohl_pipeline = self._create_pipeline()
         self.volume_pipeline = self._create_pipeline()
         self.exchange_pipeline = self._create_pipeline()
+        self.ma_pipeline = self._create_pipeline()
 
         self.is_fitted = False
 
@@ -84,7 +85,7 @@ class FeatureNormalizer:
             ('scaler', StandardScaler())
         ])
 
-    def _collect_training_features(self, train_stock_info: List[Dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _collect_training_features(self, train_stock_info: List[Dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         从训练集收集所有特征值（避免数据泄漏）
 
@@ -97,12 +98,14 @@ class FeatureNormalizer:
             ohl_data: OHLC 特征 [N_values]
             volume_data: Volume 特征 [N_values]
             exchange_data: Exchange 特征 [N_values]
+            ma_data: MA偏离度特征 [N_values]
         """
         from data import coarse_normalize_context_window, DataConfig
 
         ohl_data = []
         volume_data = []
         exchange_data = []
+        ma_data = []
 
         context_length = DataConfig.CONTEXT_LENGTH
         max_windows = 100000
@@ -138,18 +141,21 @@ class FeatureNormalizer:
                 ohl_data.append(input_seq[:, :4].flatten())
                 volume_data.append(input_seq[:, 4].flatten())
                 exchange_data.append(input_seq[:, 5].flatten())
+                ma_data.append(input_seq[:, 6:9].flatten())
                 total_windows += 1
 
         ohl_data = np.concatenate(ohl_data) if ohl_data else np.array([])
         volume_data = np.concatenate(volume_data) if volume_data else np.array([])
         exchange_data = np.concatenate(exchange_data) if exchange_data else np.array([])
+        ma_data = np.concatenate(ma_data) if ma_data else np.array([])
 
         print(f"[FeatureNormalizer] 收集到的训练数据 ({total_windows} 个窗口):")
         print(f"  OHLC: {len(ohl_data)} 个值")
         print(f"  Volume: {len(volume_data)} 个值")
         print(f"  Exchange: {len(exchange_data)} 个值")
+        print(f"  MA: {len(ma_data)} 个值")
 
-        return ohl_data, volume_data, exchange_data
+        return ohl_data, volume_data, exchange_data, ma_data
 
     def fit(self, train_stock_info: List[Dict]):
         """
@@ -166,7 +172,7 @@ class FeatureNormalizer:
         print(f"  分位数数量: {self.n_quantiles}")
 
         # 收集训练数据
-        ohl_data, volume_data, exchange_data = self._collect_training_features(
+        ohl_data, volume_data, exchange_data, ma_data = self._collect_training_features(
             train_stock_info
         )
 
@@ -180,13 +186,16 @@ class FeatureNormalizer:
         print("[FeatureNormalizer] 拟合 Exchange 特征...")
         self.exchange_pipeline.fit(exchange_data.reshape(-1, 1))
 
+        print("[FeatureNormalizer] 拟合 MA 特征...")
+        self.ma_pipeline.fit(ma_data.reshape(-1, 1))
+
         self.is_fitted = True
 
-        self._print_transform_stats(ohl_data, volume_data, exchange_data)
+        self._print_transform_stats(ohl_data, volume_data, exchange_data, ma_data)
 
         print("\n[FeatureNormalizer] ✓ 拟合完成！")
 
-    def _print_transform_stats(self, ohl_data, volume_data, exchange_data):
+    def _print_transform_stats(self, ohl_data, volume_data, exchange_data, ma_data):
         """
         打印变换后的统计信息，验证归一化效果
         """
@@ -212,18 +221,22 @@ class FeatureNormalizer:
         print(f"    均值: {exchange_transformed.mean():.6f}")
         print(f"    标准差: {exchange_transformed.std():.6f}")
         print(f"    范围: [{exchange_transformed.min():.6f}, {exchange_transformed.max():.6f}]")
+
+        # MA
+        ma_transformed = self.ma_pipeline.transform(ma_data.reshape(-1, 1)).flatten()
+        print(f"  MA:")
+        print(f"    均值: {ma_transformed.mean():.6f}")
+        print(f"    标准差: {ma_transformed.std():.6f}")
+        print(f"    范围: [{ma_transformed.min():.6f}, {ma_transformed.max():.6f}]")
     def transform(self, input_seq: np.ndarray) -> np.ndarray:
         """
         对单个样本应用归一化
 
-        ⚠️ 重要：此函数可以在训练集、验证集、测试集上调用
-        因为它只使用 fit() 时学到的参数，不会产生数据泄漏
-
         Args:
-            input_seq: [context_length, 6] 原始输入序列
+            input_seq: [context_length, 9] 原始输入序列
 
         Returns:
-            normalized_seq: [context_length, 6] 归一化后的序列
+            normalized_seq: [context_length, 9] 归一化后的序列
         """
         if not self.is_fitted:
             raise RuntimeError("归一化器未拟合！请先调用 fit() 方法")
@@ -233,6 +246,7 @@ class FeatureNormalizer:
         ohl_flat = input_seq[:, :4].flatten()
         volume_flat = input_seq[:, 4].flatten()
         exchange_flat = input_seq[:, 5].flatten()
+        ma_flat = input_seq[:, 6:9].flatten()
 
         normalized_ohl = self.ohl_pipeline.transform(
             ohl_flat.reshape(-1, 1)
@@ -243,10 +257,14 @@ class FeatureNormalizer:
         normalized_exchange = self.exchange_pipeline.transform(
             exchange_flat.reshape(-1, 1)
         ).flatten()
+        normalized_ma = self.ma_pipeline.transform(
+            ma_flat.reshape(-1, 1)
+        ).flatten()
 
         normalized[:, :4] = normalized_ohl.reshape(input_seq[:, :4].shape)
         normalized[:, 4] = normalized_volume
         normalized[:, 5] = normalized_exchange
+        normalized[:, 6:9] = normalized_ma.reshape(input_seq[:, 6:9].shape)
 
         return normalized
 
@@ -258,10 +276,10 @@ class FeatureNormalizer:
         避免了逐样本调用时的重复开销（输入验证、维度检查等）。
 
         Args:
-            input_seqs: [batch_size, context_length, 6] 原始输入序列
+            input_seqs: [batch_size, context_length, 9] 原始输入序列
 
         Returns:
-            [batch_size, context_length, 6] 归一化后的序列
+            [batch_size, context_length, 9] 归一化后的序列
         """
         if not self.is_fitted:
             raise RuntimeError("归一化器未拟合！请先调用 fit() 方法")
@@ -280,6 +298,10 @@ class FeatureNormalizer:
         normalized[:, :, 5] = self.exchange_pipeline.transform(
             input_seqs[:, :, 5].reshape(-1, 1)
         ).reshape(batch_size, context_length)
+
+        normalized[:, :, 6:9] = self.ma_pipeline.transform(
+            input_seqs[:, :, 6:9].reshape(-1, 1)
+        ).reshape(batch_size, context_length, 3)
 
         return normalized
 
@@ -311,6 +333,7 @@ class FeatureNormalizer:
                 'ohl_pipeline': self.ohl_pipeline,
                 'volume_pipeline': self.volume_pipeline,
                 'exchange_pipeline': self.exchange_pipeline,
+                'ma_pipeline': self.ma_pipeline,
                 'is_fitted': self.is_fitted,
                 'output_distribution': self.output_distribution,
                 'n_quantiles': self.n_quantiles,
@@ -347,6 +370,7 @@ class FeatureNormalizer:
         normalizer.ohl_pipeline = data['ohl_pipeline']
         normalizer.volume_pipeline = data['volume_pipeline']
         normalizer.exchange_pipeline = data['exchange_pipeline']
+        normalizer.ma_pipeline = data.get('ma_pipeline', normalizer.ma_pipeline)
         normalizer.is_fitted = data['is_fitted']
 
         print(f" ✓ 归一化器已从 {path} 加载")
@@ -389,7 +413,7 @@ def process_single_file(args):
         df = pd.read_csv(file_path)
         df = df.iloc[::-1].reset_index(drop=True)
                 
-        data = df[['open', 'high', 'low', 'close', 'volume', 'exchange']].values
+        data = df[['open', 'high', 'low', 'close', 'volume', 'exchange', 'm5', 'm10', 'm20']].values
         times = df['date'].values
         
         data_length = len(data)
@@ -1073,7 +1097,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         - 细处理：OHLE → 标准化数据（均值≈0，方差≈1）
 
     Args:
-        stock_data: 股票原始数据 [N, 6]
+        stock_data: 股票原始数据 [N, 9]
         start_idx: 上下文窗口起始索引（需要 >= 1，因为需要前一天作为基准）
         context_length: 上下文窗口长度
         check_limit_up: 是否检查涨停（默认 True）
@@ -1082,7 +1106,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         apply_fine_normalization: 是否应用细处理（默认 True）。设为 False 时只执行粗处理。
 
     Returns:
-        input_seq: [context_length, 6] 归一化后的输入序列，或 None（如果验证失败）
+        input_seq: [context_length, 9] 归一化后的输入序列，或 None（如果验证失败）
             - 粗处理后：OHLC: [-0.1, 0.1], Volume: 相对N日均值变化率, Exchange: 相对N日均值变化率
             - 细处理后：均值≈0，方差≈1
 
@@ -1145,7 +1169,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         if last_day_return >= DataConfig.LIMIT_THRESHOLD:
             return None
 
-    input_seq = np.empty((context_length, 6), dtype=np.float32)
+    input_seq = np.empty((context_length, 9), dtype=np.float32)
 
     input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
     if context_length > 1:
@@ -1186,6 +1210,9 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
                 return None
             input_seq[:, col] = (raw_vals - ma_values) / ma_values
 
+    # MA偏离度特征（已在CSV中预计算为 (close-MA)/MA 比值）
+    input_seq[:, 6:9] = input_seq_raw[:, 6:9]
+
     # ========== 细处理阶段（可选）==========
     # 应用高级特征归一化，将粗处理结果转换为均值≈0、方差≈1的标准化数据
     if apply_fine_normalization and feature_normalizer is not None:
@@ -1209,14 +1236,14 @@ def coarse_normalize_context_window(stock_data, start_idx, context_length,
         - Exchange: 相对N日均值变化率（无固定范围，由 QuantileTransformer 统一）
 
     Args:
-        stock_data: 股票原始数据 [N, 6]
+        stock_data: 股票原始数据 [N, 9]
         start_idx: 上下文窗口起始索引（需要 >= 1，因为需要前一天作为基准）
         context_length: 上下文窗口长度
         check_limit_up: 是否检查涨停（默认 True）
         required_length: 完整采样窗口长度（用于涨停过滤），如果为 None 则只检查上下文窗口
 
     Returns:
-        input_seq: [context_length, 6] 粗处理后的输入序列，或 None（如果验证失败）
+        input_seq: [context_length, 9] 粗处理后的输入序列，或 None（如果验证失败）
     """
     return normalize_and_validate_context_window(
         stock_data, start_idx, context_length,
@@ -1237,7 +1264,7 @@ def fine_normalize_batch(input_seq, feature_normalizer):
     Args:
         input_seq: 粗处理后的数据
             - 单个样本: [seq_len, 6]
-            - 批量样本: [batch_size, seq_len, 6]
+            - 批量样本: [batch_size, seq_len, 9]
         feature_normalizer: 特征归一化器实例
 
     Returns:

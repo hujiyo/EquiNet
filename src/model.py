@@ -32,7 +32,7 @@ def init_weights(module):
     - Embedding层: 输出std = gain × sqrt(2/(vocab_size+embedding_dim))
 
     各层gain计算结果：
-    - FFN-Embedding第一层 (Linear 8→128): gain=0.58, 输出std≈0.2
+    - FFN-Embedding第一层 (Linear 9→128): gain=0.58, 输出std≈0.2
     - FFN-Embedding GELU: 有效增益≈0.588, 输出std≈0.118
     - FFN-Embedding第二层 (Linear 128→128): gain=1.7, 输出std≈0.2 (由StockTransformer.__init__显式设置)
     - Position Embedding (Embedding 30→128): gain=1.78
@@ -204,7 +204,7 @@ class StockTransformer(nn.Module):
     Transformer 模型（Pre-Norm 架构 + FFN-Embedding）
 
     核心设计：
-    - FFN-Embedding: Linear(8→128) → GELU → Linear(128→128)
+    - FFN-Embedding: Linear(9→128) → GELU → Linear(128→128)
       相比纯线性映射，GELU在中间层提供非线性特征组合能力
       让第一层Transformer就能访问到特征间的非线性交互（如上影线、实体大小等）
     - Transformer 层：标准 Attention + FFN 结构，专注于跨时间模式识别
@@ -213,7 +213,7 @@ class StockTransformer(nn.Module):
         super(StockTransformer, self).__init__()
 
         # FFN-Embedding：线性投影 + 残差MLP（非线性特征交互）
-        # Linear(8→128): 基础线性映射，保底传递原始特征信息
+        # Linear(9→128): 基础线性映射，保底传递原始特征信息
         # GELU + Linear(128→128): 残差分支，专注学习非线性交互（K线形态翻转等）
         # 残差连接: 线性映射永远保底，MLP只负责"加增量"
         self.embed_proj = nn.Linear(input_dim, d_model)
@@ -254,7 +254,7 @@ class StockTransformer(nn.Module):
         nn.init.zeros_(self.embed_mlp[1].bias)
 
     def forward(self, x):
-        # x: [batch_size, seq_len, 6] (OHLC + volume + exchange)
+        # x: [batch_size, seq_len, 9] (OHLC + volume + exchange + m5 + m10 + m20)
 
         # 1. FFN-Embedding：线性投影 + 残差MLP
         x = self.embed_proj(x)          # 线性映射保底

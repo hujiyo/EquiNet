@@ -349,7 +349,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         test_loss_a = stats_a['test_loss']
 
         # 打印模型A结果
-        print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}')
+        print(f'  [模型A] 训练损失: {avg_loss_a:.4f}, 测试损失: {test_loss_a:.4f}, AUC: {stats_a["auc"]:.4f}, Prec@10%: {stats_a["precision_top10"]:.3f}, Prec@5%: {stats_a["precision_top5"]:.3f}, Prec@3%: {stats_a["precision_top3"]:.3f} (基线: {stats_a["base_positive_rate"]:.3f})')
         print(f'          预测均值: {stats_a["pred_mean"]:.3f}, 高置信(>0.7): {stats_a["high_conf_count"]}, 低置信(<0.2): {stats_a["low_conf_count"]}')
         daily_str_a = f', 日Top{DataConfig.TOP_K}%收益: {stats_a["daily_top_return"]*100:+.2f}%' if stats_a.get("daily_top_return") is not None else ''
         print(f'          Top{DataConfig.TOP_K}%收益: {stats_a["top_return"]*100:+.2f}%{daily_str_a}')
@@ -376,6 +376,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             'test_loss_a': test_loss_a,
             'test_loss_b': None,
             'auc': stats_a['auc'],
+            'precision_top10': stats_a['precision_top10'],
+            'precision_top5': stats_a['precision_top5'],
+            'precision_top3': stats_a['precision_top3'],
             'avg_realistic_return': stats_a['realistic_stats']['avg_realistic_return'] if stats_a.get('realistic_stats') else None,
             'dispersion_std': stats_a.get('dispersion_std', 0),
             'dispersion_range': stats_a.get('dispersion_range', 0),
@@ -456,7 +459,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             # 测试损失已在评估中计算
             test_loss_b = stats_b['test_loss']
 
-            print(f'  [模型B] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}')
+            print(f'  [模型B] 训练损失: {avg_loss_b:.4f}, 测试损失: {test_loss_b:.4f}, AUC: {stats_b["auc"]:.4f}, Prec@10%: {stats_b["precision_top10"]:.3f}, Prec@5%: {stats_b["precision_top5"]:.3f}, Prec@3%: {stats_b["precision_top3"]:.3f} (基线: {stats_b["base_positive_rate"]:.3f})')
             print(f'          预测均值: {stats_b["pred_mean"]:.3f}, 高置信(>0.7): {stats_b["high_conf_count"]}, 低置信(<0.2): {stats_b["low_conf_count"]}')
             daily_str_b = f', 日Top{DataConfig.TOP_K}%收益: {stats_b["daily_top_return"]*100:+.2f}%' if stats_b.get("daily_top_return") is not None else ''
             print(f'          Top{DataConfig.TOP_K}%收益: {stats_b["top_return"]*100:+.2f}%{daily_str_b}')
@@ -494,6 +497,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             epoch_return['train_loss_b'] = avg_loss_b
             epoch_return['test_loss_b'] = test_loss_b
             epoch_return['auc_B'] = stats_b['auc']
+            epoch_return['precision_top10_B'] = stats_b['precision_top10']
+            epoch_return['precision_top5_B'] = stats_b['precision_top5']
+            epoch_return['precision_top3_B'] = stats_b['precision_top3']
             epoch_return['avg_realistic_return_B'] = stats_b['realistic_stats']['avg_realistic_return'] if stats_b.get('realistic_stats') else None
 
         print("-" * 60)
@@ -559,9 +565,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     
     # 根据 enable_model_b 动态决定 CSV 字段
     if enable_model_b:
-        fieldnames = ['turn', 'A', 'daily_return_A', 'B', 'daily_return_B', 'train_loss_A', 'test_loss_A', 'train_loss_B', 'test_loss_B', 'auc_A', 'avg_realistic_return_A', 'auc_B', 'avg_realistic_return_B']
+        fieldnames = ['turn', 'A', 'daily_return_A', 'B', 'daily_return_B', 'train_loss_A', 'test_loss_A', 'train_loss_B', 'test_loss_B', 'auc_A', 'prec_top10_A', 'prec_top5_A', 'prec_top3_A', 'avg_realistic_return_A', 'auc_B', 'prec_top10_B', 'prec_top5_B', 'prec_top3_B', 'avg_realistic_return_B']
     else:
-        fieldnames = ['turn', 'A', 'daily_return_A', 'train_loss_A', 'test_loss_A', 'auc_A', 'avg_realistic_return_A']
+        fieldnames = ['turn', 'A', 'daily_return_A', 'train_loss_A', 'test_loss_A', 'auc_A', 'prec_top10_A', 'prec_top5_A', 'prec_top3_A', 'avg_realistic_return_A']
     
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -575,6 +581,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 'train_loss_A': f"{epoch_return['train_loss_a']:.4f}" if epoch_return.get('train_loss_a') is not None else "",
                 'test_loss_A': f"{epoch_return['test_loss_a']:.4f}" if epoch_return.get('test_loss_a') is not None else "",
                 'auc_A': f"{epoch_return['auc']:.4f}" if epoch_return.get('auc') is not None else "",
+                'prec_top10_A': f"{epoch_return['precision_top10']:.4f}" if epoch_return.get('precision_top10') is not None else "",
+                'prec_top5_A': f"{epoch_return['precision_top5']:.4f}" if epoch_return.get('precision_top5') is not None else "",
+                'prec_top3_A': f"{epoch_return['precision_top3']:.4f}" if epoch_return.get('precision_top3') is not None else "",
                 'avg_realistic_return_A': f"{epoch_return['avg_realistic_return']*100:.1f}" if epoch_return.get('avg_realistic_return') is not None else "",
             }
 
@@ -584,6 +593,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                     'daily_return_B': f"{epoch_return['daily_return_b']*100:.2f}" if epoch_return.get('daily_return_b') is not None else "",
                     'test_loss_B': f"{epoch_return['test_loss_b']:.4f}" if epoch_return.get('test_loss_b') is not None else "",
                     'auc_B': f"{epoch_return['auc_B']:.4f}" if epoch_return.get('auc_B') is not None else "",
+                    'prec_top10_B': f"{epoch_return['precision_top10_B']:.4f}" if epoch_return.get('precision_top10_B') is not None else "",
+                    'prec_top5_B': f"{epoch_return['precision_top5_B']:.4f}" if epoch_return.get('precision_top5_B') is not None else "",
+                    'prec_top3_B': f"{epoch_return['precision_top3_B']:.4f}" if epoch_return.get('precision_top3_B') is not None else "",
                     'avg_realistic_return_B': f"{epoch_return['avg_realistic_return_B']*100:.1f}" if epoch_return.get('avg_realistic_return_B') is not None else "",
                 })
             

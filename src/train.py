@@ -39,6 +39,7 @@ from training_utils import (
     generate_pseudo_labels,
     save_model_with_metadata,
     DynamicWeightedBCE,
+    PairwiseWeightedBCE,
     EarlyStopping,
     print_dispersion_sparkline,
     create_optimizer_from_config,
@@ -114,11 +115,32 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     )
 
     # 损失函数选择
-    if LossConfig.LOSS_TYPE.lower() == 'dynamic_bce':
+    if LossConfig.LOSS_TYPE.lower() == 'pairwise_bce':
+        print(f"损失函数: PairwiseWeightedBCE (BCE权重{LossConfig.POS_WEIGHT}, Pairwise权重{LossConfig.PAIRWISE_WEIGHT}, Top{LossConfig.PAIRWISE_TOP_K*100:.0f}%)")
+        print(f"  Pairwise: Top{LossConfig.PAIRWISE_TOP_K*100:.0f}%区域, {LossConfig.PAIRWISE_NUM_NEG}个负样本/正样本, warmup {LossConfig.PAIRWISE_WARMUP_EPOCHS}轮")
+        criterion = PairwiseWeightedBCE(
+            pos_weight=LossConfig.POS_WEIGHT,
+            reduction='mean',
+            pairwise_weight=LossConfig.PAIRWISE_WEIGHT,
+            pairwise_top_k=LossConfig.PAIRWISE_TOP_K,
+            pairwise_pos_weight=LossConfig.PAIRWISE_POS_WEIGHT,
+            warmup_epochs=LossConfig.PAIRWISE_WARMUP_EPOCHS,
+            sigma=LossConfig.PAIRWISE_SIGMA,
+            num_neg=LossConfig.PAIRWISE_NUM_NEG
+        )
+        # 评估损失始终使用纯BCE（Pairwise仅用于训练）
+        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+    elif LossConfig.LOSS_TYPE.lower() == 'dynamic_bce':
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
-        
+    else:
+        print("损失函数: 简单BCE (BCEWithLogitsLoss)")
+        criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
+
+    # 设置评估损失权重（BCE类损失共享此逻辑）
+    if isinstance(eval_criterion, DynamicWeightedBCE):
         test_targets = np.array(eval_targets)
         test_pos_count = np.sum(test_targets >= 0.5)
         test_neg_count = np.sum(test_targets < 0.5)
@@ -130,10 +152,6 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             test_neg_weight = 0.1
         eval_criterion.weight_0_0.fill_(test_neg_weight)
         print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
-    else:
-        print("损失函数: 简单BCE (BCEWithLogitsLoss)")
-        criterion = nn.BCEWithLogitsLoss(reduction='mean')
-        eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
     # 最佳模型A缓存（按Top1%收益率判断，用于生成伪标签）
     best_return_a = -float('inf')
@@ -194,6 +212,14 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
         model_a.train()
         if model_b is not None:
             model_b.train()
+
+        # 更新损失函数的epoch信息（控制Pairwise warmup）
+        if hasattr(criterion, 'set_epoch'):
+            was_active = criterion.pairwise_active
+            criterion.set_epoch(epoch)
+            if not was_active and criterion.pairwise_active:
+                print(f'  ⚙ Pairwise排序损失已激活 (第{epoch+1}轮)')
+                print()
 
         total_loss_a = 0
         total_loss_b = 0

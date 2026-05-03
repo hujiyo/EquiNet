@@ -222,10 +222,18 @@ class TrainingConfig:
 # ==================== 损失函数配置 ====================
 class LossConfig:
     """损失函数相关配置"""
-    # 'dynamic_bce':批权重动态平衡 | 'standard_bce':标准二元交叉熵
-    LOSS_TYPE = 'dynamic_bce'
+    # 'dynamic_bce':批权重动态平衡 | 'pairwise_bce':BCE+Pairwise排序 | 'standard_bce':标准二元交叉熵
+    LOSS_TYPE = 'pairwise_bce'
 
     POS_WEIGHT = 4.0  # DynamicWeightedBCE 的正样本权重
+
+    # --- Pairwise排序损失（LOSS_TYPE='pairwise_bce'时生效）---
+    PAIRWISE_WEIGHT = 0.5           # Pairwise损失权重系数（总损失 = BCE + PAIRWISE_WEIGHT * Pairwise）
+    PAIRWISE_TOP_K = 0.10           # Top K%预测区域（构建pair的样本范围）
+    PAIRWISE_POS_WEIGHT = 2.0       # 正负对的额外权重（放大排序梯度）
+    PAIRWISE_WARMUP_EPOCHS = 8      # 前N轮纯BCE训练，之后引入Pairwise
+    PAIRWISE_SIGMA = 1.0            # RankNet温度参数（控制排序信号的锐度）
+    PAIRWISE_NUM_NEG = 2            # 每个正样本配对的负样本数
 
 # ==================== 用户自定义标签生成函数 ====================
 def generate_label(day1_change, day2_change, day3_change):

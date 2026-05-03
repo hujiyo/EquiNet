@@ -253,6 +253,109 @@ class DynamicWeightedBCE(nn.Module):
 
 
 
+class PairwiseWeightedBCE(DynamicWeightedBCE):
+    """
+    动态加权BCE + Top-K%区域Pairwise排序损失
+
+    继承DynamicWeightedBCE的动态加权机制，额外在模型预测的Top K%区域内
+    构建正负对，使用RankNet风格的排序损失锐化排序边界。
+
+    训练前warmup_epochs轮仅使用BCE，之后渐进引入Pairwise分量。
+    接口与DynamicWeightedBCE完全一致（update_weights/forward），
+    仅新增set_epoch用于控制warmup。
+    """
+
+    def __init__(self, pos_weight=4.0, reduction='mean',
+                 pairwise_weight=0.5, pairwise_top_k=0.10,
+                 pairwise_pos_weight=2.0, warmup_epochs=8,
+                 sigma=1.0, num_neg=2):
+        super().__init__(pos_weight=pos_weight, reduction=reduction)
+
+        # Pairwise参数
+        self.pairwise_weight = pairwise_weight
+        self.pairwise_top_k = pairwise_top_k
+        self.pairwise_pos_weight = pairwise_pos_weight
+        self.sigma = sigma
+        self.num_neg = num_neg
+        self.warmup_epochs = warmup_epochs
+        self._current_epoch = 0
+
+    def set_epoch(self, epoch):
+        """设置当前epoch，用于控制Pairwise的渐进引入"""
+        self._current_epoch = epoch
+
+    @property
+    def pairwise_active(self):
+        """Pairwise分量是否已激活"""
+        return self._current_epoch >= self.warmup_epochs
+
+    def _compute_pairwise(self, logits, targets):
+        """
+        Top-K%区域Pairwise排序损失（RankNet风格）
+
+        在模型预测的Top K%样本中，选取正样本与负样本构建pair，
+        优化目标：正样本的分数应高于负样本。
+
+        Args:
+            logits: [B] 模型原始输出（未经sigmoid）
+            targets: [B] 真实标签（0.0/1.0）
+
+        Returns:
+            scalar loss，或None（无有效pair时）
+        """
+        with torch.no_grad():
+            probs = torch.sigmoid(logits)
+            k = max(2, int(len(probs) * self.pairwise_top_k))
+            _, top_indices = torch.topk(probs, k)
+
+        top_logits = logits[top_indices]
+        top_targets = targets[top_indices]
+
+        pos_mask = top_targets >= 0.5
+        neg_mask = ~pos_mask
+
+        n_pos = pos_mask.sum().item()
+        n_neg = neg_mask.sum().item()
+        if n_pos == 0 or n_neg == 0:
+            return None
+
+        pos_logits = top_logits[pos_mask]
+        neg_logits = top_logits[neg_mask]
+
+        # 每个正样本随机配对num_neg个负样本（控制计算量 + 引入随机性）
+        n_sample = min(self.num_neg, n_neg)
+        perm = torch.randperm(n_neg, device=logits.device)[:n_sample]
+        neg_sampled = neg_logits[perm]
+
+        # RankNet: L = -log(σ(σ * (s_pos - s_neg)))
+        # 广播: [n_pos, 1] - [1, n_sample]
+        diff = self.sigma * (pos_logits.unsqueeze(1) - neg_sampled.unsqueeze(0))
+        loss = -torch.log(torch.sigmoid(diff) + 1e-8)
+
+        return loss.mean() * self.pairwise_pos_weight
+
+    def forward(self, inputs, targets):
+        """
+        inputs: [batch_size] 或 [batch_size, 1] 模型输出的logits
+        targets: [batch_size] 真实标签 (1.0/0.0)
+        """
+        # BCE部分（父类计算）
+        bce_loss = super().forward(inputs, targets)
+
+        if not self.pairwise_active:
+            return bce_loss
+
+        # 准备pairwise输入（与父类相同的squeeze处理）
+        if inputs.dim() == 2 and inputs.size(1) == 1:
+            inputs = inputs.squeeze(-1)
+
+        pw_loss = self._compute_pairwise(inputs.float(), targets.float())
+        if pw_loss is None:
+            return bce_loss
+
+        return bce_loss + self.pairwise_weight * pw_loss
+
+
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
                    device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None,
                    criterion=None, enable_portfolio_simulation=False):

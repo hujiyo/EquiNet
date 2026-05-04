@@ -196,16 +196,17 @@ class DataChecker:
             
             if 'amount' in df.columns:
                 df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-                df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
+                df['amount'] = (df['amount'] / 1000.0).fillna(0.0)
             else:
-                print(f"⚠ {stock_code} 警告：Baostock 未返回 amount 字段，使用原始 volume 字段")
-                df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
+                print(f"⚠ {stock_code} 警告：Baostock 未返回 amount 字段，amount 将设为 0")
+                df['amount'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
+                df['amount'] = df['amount'] / 1000.0
             
             df['turn'] = pd.to_numeric(df['turn'], errors='coerce')
             
             df = df.dropna(subset=['open', 'high', 'low', 'close'])
 
-            return df[['date', 'open', 'high', 'low', 'close', 'volume', 'turn']]
+            return df[['date', 'open', 'high', 'low', 'close', 'amount', 'turn']]
 
         except Exception as e:
             print(f"获取 Baostock 数据失败：{e}")
@@ -324,12 +325,12 @@ class DataChecker:
                     details={'date': bs_time, 'field': 'close'}
                 )
             
-            if abs(local_row['volume'] - bs_row['volume']) / max(bs_row['volume'], 1) > 0.05:
+            if abs(local_row['amount'] - bs_row['amount']) / max(bs_row['amount'], 1) > 0.05:
                 return CheckResult(
                     stock_code=stock_code,
                     status=CheckStatus.WARNING,
-                    message=f"成交量差异较大 ({bs_time}): 本地={local_row['volume']}, Baostock={bs_row['volume']}",
-                    details={'date': bs_time, 'field': 'volume'}
+                    message=f"成交额差异较大 ({bs_time}): 本地={local_row['amount']}, Baostock={bs_row['amount']}",
+                    details={'date': bs_time, 'field': 'amount'}
                 )
         
         return CheckResult(
@@ -482,7 +483,7 @@ class DataChecker:
                 old_df['date'] = old_df['date'].astype(str)
                 patch_df['date'] = patch_df['date'].astype(str)
                 patch_df = patch_df.rename(columns={'turn': 'exchange'})
-                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']]
+                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'exchange']]
                 existing = set(old_df['date'])
                 patch_df = patch_df[~patch_df['date'].isin(existing)]
                 if len(patch_df) == 0:
@@ -528,16 +529,16 @@ class DataChecker:
                 df = df.dropna(subset=['open', 'high', 'low', 'close'])
                 if 'amount' in df.columns:
                     df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-                    df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
+                    df['amount'] = (df['amount'] / 1000.0).fillna(0.0)
                 else:
-                    df['volume'] = 0.0
+                    df['amount'] = 0.0
                 if 'turnover' in df.columns:
                     df['exchange'] = pd.to_numeric(df['turnover'], errors='coerce').fillna(0.0)
                 elif 'turn' in df.columns:
                     df['exchange'] = pd.to_numeric(df['turn'], errors='coerce').fillna(0.0)
                 else:
                     df['exchange'] = 0.0
-                df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']]
+                df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'exchange']]
                 df = df.iloc[::-1].reset_index(drop=True)
                 df.to_csv(file_path, index=False)
                 print(f"  ✓ 全量写入 {len(df)} 条")
@@ -566,7 +567,7 @@ class DataChecker:
                 old_df['date'] = old_df['date'].astype(str)
                 patch_df['date'] = patch_df['date'].astype(str)
                 patch_df = patch_df.rename(columns={'turn': 'exchange'})
-                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']]
+                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'exchange']]
                 existing = set(old_df['date'])
                 patch_df = patch_df[~patch_df['date'].isin(existing)]
                 if len(patch_df) == 0:

@@ -87,7 +87,7 @@ class EmbeddingModule(nn.Module):
         """
         Args:
             x: 粗处理后的数据 [batch, seq_len, 9]
-               范围：OHLE [-0.1, 0.1], Volume [0, 1], Exchange [0, 1]
+               范围：OHLE [-0.1, 0.1], Amount [0, 1], Exchange [0, 1]
 
         Returns:
             embedded: [batch, seq_len, d_model]
@@ -127,14 +127,14 @@ class EmbeddingModule(nn.Module):
 class EmbeddingModuleAnalyzer:
     """Embedding模块分析器 - 评估维度间交互编码质量"""
 
-    FEATURE_NAMES = ['Open', 'High', 'Low', 'Close', 'Volume', 'Exchange', 'MA5', 'MA10', 'MA20']
+    FEATURE_NAMES = ['Open', 'High', 'Low', 'Close', 'Amount', 'Exchange', 'MA5', 'MA10', 'MA20']
 
     NEUTRAL_VALUES = [0.0, 0.0, 0.0, 0.0, 0.5, 0.01, 0.0, 0.0, 0.0]
 
     DELTA_MAP = {0: 0.03, 1: 0.03, 2: 0.03, 3: 0.03, 4: 0.10, 5: 0.05, 6: 0.02, 7: 0.015, 8: 0.01}
 
     KEY_PAIRS = [(0, 3), (1, 2), (3, 4), (3, 5)]
-    KEY_PAIR_NAMES = ['Open-Close', 'High-Low', 'Close-Volume', 'Close-Exchange']
+    KEY_PAIR_NAMES = ['Open-Close', 'High-Low', 'Close-Amount', 'Close-Exchange']
 
     # 原型交易日模式（coarse-normalized空间, 9维: OHLC + Vol + Ex + MA5 + MA10 + MA20）
     SEMANTIC_PATTERNS = {
@@ -388,7 +388,7 @@ class EmbeddingModuleAnalyzer:
 
                 # 符号翻转
                 x_flip = x.copy()
-                if j in (4, 5):  # Volume/Exchange: [0,1]范围，翻转=1-x
+                if j in (4, 5):  # Amount/Exchange: [0,1]范围，翻转=1-x
                     x_flip[:, :, j] = 1.0 - x_flip[:, :, j]
                 else:
                     x_flip[:, :, j] = -x_flip[:, :, j]
@@ -489,7 +489,7 @@ class EmbeddingModuleAnalyzer:
         """
         高维连续性分析
 
-        沿关键维度（Close, Volume）扫值，检测：
+        沿关键维度（Close, Amount）扫值，检测：
         1. embedding是否平滑（速度连续，无突变）
         2. 在关键边界处（如Close=0）是否有曲率尖峰
 
@@ -502,7 +502,7 @@ class EmbeddingModuleAnalyzer:
 
         sweep_configs = {
             'Close': (3, np.linspace(-0.05, 0.05, n_steps)),
-            'Volume': (4, np.linspace(0.3, 0.7, n_steps)),
+            'Volume': (4, np.linspace(0.3, 0.7, n_steps)),  # Amount dimension
         }
 
         profiles = {}
@@ -792,7 +792,7 @@ class EmbeddingModuleAnalyzer:
         pca = PCA(n_components=2)
         pca_2d = pca.fit_transform(pca_outputs)
 
-        # 用最后时间步的Close和Volume着色
+        # 用最后时间步的Close和Amount着色
         close_vals = pca_inputs[:, -1, 3]
         vol_vals = pca_inputs[:, -1, 4]
         categories = []
@@ -853,12 +853,12 @@ class EmbeddingModuleAnalyzer:
             if status == "WEAK":
                 issues.append("维度间几乎无非线性交互，embedding接近线性映射")
                 recommendations.append("增加embedding层的非线性能力（更深/更宽的MLP，或使用更强的激活函数）")
-            # 检查Close-Volume是否在top 5
+            # 检查Close-Amount是否在top 5
             top5 = ci['strongest_interactions'][:5]
             top5_pairs = {(s[0], s[1]) for s in top5}
             if (3, 4) not in top5_pairs:
-                issues.append("Close-Volume交互不在Top5，量价关系未被重点编码")
-                recommendations.append("考虑显式构造Close×Volume交互特征")
+                issues.append("Close-Amount交互不在Top5，量价关系未被重点编码")
+                recommendations.append("考虑显式构造Close×Amount交互特征")
 
         # 2. 方向对比
         if 'directional_contrast' in results:

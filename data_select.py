@@ -140,7 +140,7 @@ class DataSelector:
         流通市值 = 成交额 × 100 / 换手率
         
         本地数据字段说明：
-        - volume: 成交额（千元）
+        - amount: 成交额（千元）
         - exchange: 换手率（%，流通换手率）
         """
         file_path = self.data_all_dir / f"{stock_code}.csv"
@@ -153,7 +153,7 @@ class DataSelector:
                 return None
             
             latest = df.iloc[0]
-            amount_k = latest['volume']  # 成交额（千元）
+            amount_k = latest['amount']  # 成交额（千元）
             turnover_pct = latest['exchange']  # 换手率（%）
             
             if pd.isna(amount_k) or pd.isna(turnover_pct) or turnover_pct <= 0:

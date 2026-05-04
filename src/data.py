@@ -59,7 +59,7 @@ class FeatureNormalizer:
 
         # 为每个特征组创建独立的 pipeline
         self.ohl_pipeline = self._create_pipeline()
-        self.volume_pipeline = self._create_pipeline()
+        self.amount_pipeline = self._create_pipeline()
         self.exchange_pipeline = self._create_pipeline()
         self.ma_pipeline = self._create_pipeline()
 
@@ -96,7 +96,7 @@ class FeatureNormalizer:
 
         Returns:
             ohl_data: OHLC 特征 [N_values]
-            volume_data: Volume 特征 [N_values]
+            volume_data: Amount 特征 [N_values]
             exchange_data: Exchange 特征 [N_values]
             ma_data: MA偏离度特征 [N_values]
         """
@@ -151,7 +151,7 @@ class FeatureNormalizer:
 
         print(f"[FeatureNormalizer] 收集到的训练数据 ({total_windows} 个窗口):")
         print(f"  OHLC: {len(ohl_data)} 个值")
-        print(f"  Volume: {len(volume_data)} 个值")
+        print(f"  Amount: {len(volume_data)} 个值")
         print(f"  Exchange: {len(exchange_data)} 个值")
         print(f"  MA: {len(ma_data)} 个值")
 
@@ -180,8 +180,8 @@ class FeatureNormalizer:
         print("\n[FeatureNormalizer] 拟合 OHLC 特征...")
         self.ohl_pipeline.fit(ohl_data.reshape(-1, 1))
 
-        print("[FeatureNormalizer] 拟合 Volume 特征...")
-        self.volume_pipeline.fit(volume_data.reshape(-1, 1))
+        print("[FeatureNormalizer] 拟合 Amount 特征...")
+        self.amount_pipeline.fit(volume_data.reshape(-1, 1))
 
         print("[FeatureNormalizer] 拟合 Exchange 特征...")
         self.exchange_pipeline.fit(exchange_data.reshape(-1, 1))
@@ -208,9 +208,9 @@ class FeatureNormalizer:
         print(f"    标准差: {ohl_transformed.std():.6f}")
         print(f"    范围: [{ohl_transformed.min():.6f}, {ohl_transformed.max():.6f}]")
 
-        # Volume
-        volume_transformed = self.volume_pipeline.transform(volume_data.reshape(-1, 1)).flatten()
-        print(f"  Volume:")
+        # Amount
+        volume_transformed = self.amount_pipeline.transform(volume_data.reshape(-1, 1)).flatten()
+        print(f"  Amount:")
         print(f"    均值: {volume_transformed.mean():.6f}")
         print(f"    标准差: {volume_transformed.std():.6f}")
         print(f"    范围: [{volume_transformed.min():.6f}, {volume_transformed.max():.6f}]")
@@ -251,7 +251,7 @@ class FeatureNormalizer:
         normalized_ohl = self.ohl_pipeline.transform(
             ohl_flat.reshape(-1, 1)
         ).flatten()
-        normalized_volume = self.volume_pipeline.transform(
+        normalized_volume = self.amount_pipeline.transform(
             volume_flat.reshape(-1, 1)
         ).flatten()
         normalized_exchange = self.exchange_pipeline.transform(
@@ -291,7 +291,7 @@ class FeatureNormalizer:
             input_seqs[:, :, :4].reshape(-1, 1)
         ).reshape(batch_size, context_length, 4)
 
-        normalized[:, :, 4] = self.volume_pipeline.transform(
+        normalized[:, :, 4] = self.amount_pipeline.transform(
             input_seqs[:, :, 4].reshape(-1, 1)
         ).reshape(batch_size, context_length)
 
@@ -331,7 +331,7 @@ class FeatureNormalizer:
         with open(path, 'wb') as f:
             pickle.dump({
                 'ohl_pipeline': self.ohl_pipeline,
-                'volume_pipeline': self.volume_pipeline,
+                'amount_pipeline': self.amount_pipeline,
                 'exchange_pipeline': self.exchange_pipeline,
                 'ma_pipeline': self.ma_pipeline,
                 'is_fitted': self.is_fitted,
@@ -368,7 +368,7 @@ class FeatureNormalizer:
 
         # 恢复状态
         normalizer.ohl_pipeline = data['ohl_pipeline']
-        normalizer.volume_pipeline = data['volume_pipeline']
+        normalizer.amount_pipeline = data['amount_pipeline']
         normalizer.exchange_pipeline = data['exchange_pipeline']
         normalizer.ma_pipeline = data.get('ma_pipeline', normalizer.ma_pipeline)
         normalizer.is_fitted = data['is_fitted']
@@ -385,7 +385,7 @@ def process_single_file(args):
     
     数据处理流程：
     1. 读取CSV并反转时间顺序
-    2. 提取OHLCV数据：['open', 'high', 'low', 'close', 'volume', 'exchange']
+    2. 提取OHLCV数据：['open', 'high', 'low', 'close', 'amount', 'exchange']
     3. 验证数据长度是否满足最低要求
     
     数据分割策略（确保训练集和测试集严格分离）：
@@ -413,7 +413,7 @@ def process_single_file(args):
         df = pd.read_csv(file_path)
         df = df.iloc[::-1].reset_index(drop=True)
                 
-        data = df[['open', 'high', 'low', 'close', 'volume', 'exchange', 'm5', 'm10', 'm20']].values
+        data = df[['open', 'high', 'low', 'close', 'amount', 'exchange', 'm5', 'm10', 'm20']].values
         times = df['date'].values
         
         data_length = len(data)
@@ -1092,7 +1092,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     数据处理分两阶段：
         - 粗处理：CSV → OHLE 格式
             - OHLC: 日环比变化率，clip [-0.1, 0.1]
-            - Volume: (volume_i - MA_N) / MA_N，MA_N 为过去 N 日均量，无 clip
+            - Volume: (amount_i - MA_N) / MA_N，MA_N 为过去 N 日均量，无 clip
             - Exchange: (exchange_i - MA_N) / MA_N，MA_N 为过去 N 日均换手率，无 clip
         - 细处理：OHLE → 标准化数据（均值≈0，方差≈1）
 
@@ -1107,12 +1107,12 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
 
     Returns:
         input_seq: [context_length, 9] 归一化后的输入序列，或 None（如果验证失败）
-            - 粗处理后：OHLC: [-0.1, 0.1], Volume: 相对N日均值变化率, Exchange: 相对N日均值变化率
+            - 粗处理后：OHLC: [-0.1, 0.1], Amount: 相对N日均值变化率, Exchange: 相对N日均值变化率
             - 细处理后：均值≈0，方差≈1
 
     验证项：
-        1. 基准日（start_idx-1）的 OHLC 和 volume 非零
-        2. 上下文窗口的 close 和 volume 非零
+        1. 基准日（start_idx-1）的 OHLC 和 amount 非零
+        2. 上下文窗口的 close 和 amount 非零
         3. 最新价格过滤：上下文最后一天收盘价不超过40元
         4. 涨停过滤：窗口内任何一天涨跌幅不超过 11%
         5. 上下文最后一天涨停过滤（可选，通过 DataConfig 控制）
@@ -1128,13 +1128,13 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     prev_day_data = stock_data[start_idx - 1]
 
     prev_close = prev_day_data[3]
-    prev_volume = prev_day_data[4]
-    if prev_close == 0 or prev_volume == 0 or np.any(prev_day_data[:4] == 0):
+    prev_amount = prev_day_data[4]
+    if prev_close == 0 or prev_amount == 0 or np.any(prev_day_data[:4] == 0):
         return None
     
     closes = input_seq_raw[:, 3]
-    volumes = input_seq_raw[:, 4]
-    if np.any(closes == 0) or np.any(volumes == 0):
+    amounts = input_seq_raw[:, 4]
+    if np.any(closes == 0) or np.any(amounts == 0):
         return None
 
     if closes[-1] > 40:
@@ -1183,7 +1183,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     abs_indices = start_idx + np.arange(context_length)
 
     if start_idx >= N:
-        for col, raw_vals in [(4, volumes), (5, exchanges)]:
+        for col, raw_vals in [(4, amounts), (5, exchanges)]:
             full_col = stock_data[:, col]
             cumsum = np.empty(len(full_col) + 1, dtype=np.float64)
             cumsum[0] = 0
@@ -1195,7 +1195,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     else:
         left_starts = np.maximum(0, abs_indices - N)
         deficits = N - (abs_indices - left_starts)
-        for col, raw_vals in [(4, volumes), (5, exchanges)]:
+        for col, raw_vals in [(4, amounts), (5, exchanges)]:
             full_col = stock_data[:, col]
             ma_values = np.empty(context_length, dtype=np.float32)
             for k in range(context_length):
@@ -1232,7 +1232,7 @@ def coarse_normalize_context_window(stock_data, start_idx, context_length,
     只执行粗处理阶段，不应用细处理（特征归一化器）。
     输出数据范围：
         - OHLC: -0.1 ~ 0.1（日环比变化率）
-        - Volume: 相对N日均值变化率（无固定范围，由 QuantileTransformer 统一）
+        - Amount: 相对N日均值变化率（无固定范围，由 QuantileTransformer 统一）
         - Exchange: 相对N日均值变化率（无固定范围，由 QuantileTransformer 统一）
 
     Args:

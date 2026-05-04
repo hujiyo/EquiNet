@@ -152,7 +152,7 @@ class StockDataUpdater:
         Returns:
             DataFrame 或 None
         """
-        columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']
+        columns = ['date', 'open', 'high', 'low', 'close', 'amount', 'exchange']
 
         try:
             code_with_prefix = self._format_stock_code(stock_code)
@@ -203,10 +203,10 @@ class StockDataUpdater:
             
             if 'amount' in df.columns:
                 df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-                df['volume'] = (df['amount'] / 1000.0).fillna(0.0)
+                df['amount'] = (df['amount'] / 1000.0).fillna(0.0)
             else:
-                print(f"⚠ {stock_code} 警告：Baostock 未返回 amount 字段，volume 将设为 0")
-                df['volume'] = pd.Series([0.0] * len(df), dtype=float)
+                print(f"⚠ {stock_code} 警告：Baostock 未返回 amount 字段，amount 将设为 0")
+                df['amount'] = pd.Series([0.0] * len(df), dtype=float)
             
             df = df.dropna(subset=['open', 'high', 'low', 'close'])
             
@@ -219,7 +219,7 @@ class StockDataUpdater:
             else:
                 df['exchange'] = 0.0
             
-            df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'exchange']]
+            df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'exchange']]
             df = df.iloc[::-1].reset_index(drop=True)
             return df
             

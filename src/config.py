@@ -68,8 +68,8 @@ class DataConfig:
     # 使用 QuantileTransformer + StandardScaler 进行高级特征归一化
     # 优点：
     #   1. 统一所有特征到均值0、标准差1的分布
-    #   2. 自动处理特征范围不同（Volume/Exchange vs OHLC）
-    #   3. 自动处理特征集中度不同（Volume 99%集中在小范围）
+    #   2. 自动处理特征范围不同（Amount/Exchange vs OHLC）
+    #   3. 自动处理特征集中度不同（Amount 99%集中在小范围）
     #   4. 自动处理异常值和偏态分布
 
     # 归一化器配置
@@ -85,7 +85,7 @@ class DataConfig:
 class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
-    INPUT_DIM = 9                    # 输入特征维度数（OHLC + volume + exchange + m5 + m10 + m20）
+    INPUT_DIM = 9                    # 输入特征维度数（OHLC + amount + exchange + m5 + m10 + m20）
     D_MODEL = 128                    # 模型维度（Transformer 内部维度）
     FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数

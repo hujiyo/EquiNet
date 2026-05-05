@@ -168,7 +168,10 @@ def load_all_stock_data(data_dir=DataConfig.DATA_DIR):
             df = pd.read_csv(fpath)
             # 原始数据按时间倒序，翻转为正序（早→晚）
             df = df.iloc[::-1].reset_index(drop=True)
-            data = df[['open', 'high', 'low', 'close', 'amount', 'exchange']].values
+            cols = ['open', 'high', 'low', 'close', 'vwap', 'amount', 'exchange']
+            if 'm5' in df.columns:
+                cols += ['m5', 'm10', 'm20']
+            data = df[cols].values
             latest_date = str(df['date'].iloc[-1])  # 最新交易日期
             times = df['date'].values  # 时间戳数组
             stock_list.append((fname, data, latest_date, times))

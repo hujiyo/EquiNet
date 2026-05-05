@@ -16,6 +16,7 @@ python data_check.py --verbose # 详细输出模式
 """
 
 import time
+import sys
 import datetime
 import pandas as pd
 import baostock as bs
@@ -195,18 +196,16 @@ class DataChecker:
             df['close'] = pd.to_numeric(df['close'], errors='coerce')
             
             if 'amount' in df.columns:
-                df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-                df['amount'] = (df['amount'] / 1000.0).fillna(0.0)
+                df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0.0)
             else:
-                print(f"⚠ {stock_code} 警告：Baostock 未返回 amount 字段，amount 将设为 0")
-                df['amount'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
-                df['amount'] = df['amount'] / 1000.0
-            
+                df['amount'] = 0.0
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
+
             df['turn'] = pd.to_numeric(df['turn'], errors='coerce')
             
             df = df.dropna(subset=['open', 'high', 'low', 'close'])
 
-            return df[['date', 'open', 'high', 'low', 'close', 'amount', 'turn']]
+            return df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'turn']]
 
         except Exception as e:
             print(f"获取 Baostock 数据失败：{e}")
@@ -483,7 +482,9 @@ class DataChecker:
                 old_df['date'] = old_df['date'].astype(str)
                 patch_df['date'] = patch_df['date'].astype(str)
                 patch_df = patch_df.rename(columns={'turn': 'exchange'})
-                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'exchange']]
+                patch_df['vwap'] = patch_df['amount'] / patch_df['volume'].replace(0, float('nan'))
+                patch_df['vwap'] = patch_df['vwap'].fillna(patch_df['close'])
+                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
                 existing = set(old_df['date'])
                 patch_df = patch_df[~patch_df['date'].isin(existing)]
                 if len(patch_df) == 0:
@@ -528,17 +529,22 @@ class DataChecker:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
                 df = df.dropna(subset=['open', 'high', 'low', 'close'])
                 if 'amount' in df.columns:
-                    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-                    df['amount'] = (df['amount'] / 1000.0).fillna(0.0)
+                    df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0.0)
                 else:
                     df['amount'] = 0.0
+                if 'volume' in df.columns:
+                    df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
+                else:
+                    df['volume'] = 0.0
+                df['vwap'] = df['amount'] / df['volume'].replace(0, float('nan'))
+                df['vwap'] = df['vwap'].fillna(df['close'])
                 if 'turnover' in df.columns:
                     df['exchange'] = pd.to_numeric(df['turnover'], errors='coerce').fillna(0.0)
                 elif 'turn' in df.columns:
                     df['exchange'] = pd.to_numeric(df['turn'], errors='coerce').fillna(0.0)
                 else:
                     df['exchange'] = 0.0
-                df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'exchange']]
+                df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
                 df = df.iloc[::-1].reset_index(drop=True)
                 df.to_csv(file_path, index=False)
                 print(f"  ✓ 全量写入 {len(df)} 条")
@@ -567,7 +573,9 @@ class DataChecker:
                 old_df['date'] = old_df['date'].astype(str)
                 patch_df['date'] = patch_df['date'].astype(str)
                 patch_df = patch_df.rename(columns={'turn': 'exchange'})
-                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'exchange']]
+                patch_df['vwap'] = patch_df['amount'] / patch_df['volume'].replace(0, float('nan'))
+                patch_df['vwap'] = patch_df['vwap'].fillna(patch_df['close'])
+                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
                 existing = set(old_df['date'])
                 patch_df = patch_df[~patch_df['date'].isin(existing)]
                 if len(patch_df) == 0:
@@ -725,6 +733,178 @@ class DataChecker:
         if repair_success + repair_fail > 0:
             print(f"\n修复统计：成功 {repair_success}，失败 {repair_fail}")
 
+
+class AKShareDataChecker(DataChecker):
+    """基于 AKShare 的数据检查器"""
+
+    def __init__(self, data_dir: str, check_days: int = 100, backup: bool = True):
+        super().__init__(data_dir, check_days, backup)
+        import akshare as ak
+        self.ak = ak
+
+    def login_baostock(self) -> bool:
+        return True
+
+    def logout_baostock(self):
+        pass
+
+    def fetch_baostock_data(self, stock_code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        try:
+            start_fmt = start_date.replace('-', '')
+            end_fmt = end_date.replace('-', '')
+
+            df = self.ak.stock_zh_a_hist(
+                symbol=stock_code,
+                period="daily",
+                start_date=start_fmt,
+                end_date=end_fmt,
+                adjust=""
+            )
+
+            if df is None or len(df) == 0:
+                return None
+
+            df = df.rename(columns={
+                '日期': 'date', '开盘': 'open', '最高': 'high',
+                '最低': 'low', '收盘': 'close',
+                '成交量': 'volume', '成交额': 'amount', '换手率': 'turn'
+            })
+
+            df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'turn']]
+
+            df['date'] = df['date'].astype(str).str.replace('-', '')
+
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0.0)
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0) * 100  # 手→股
+            df['turn'] = pd.to_numeric(df['turn'], errors='coerce')
+
+            df = df.dropna(subset=['open', 'high', 'low', 'close'])
+
+            return df
+
+        except Exception as e:
+            print(f"AKShare 获取数据失败：{e}")
+            return None
+
+    def _format_stock_code(self, stock_code: str):
+        return stock_code  # AKShare 不需要前缀
+
+    def repair_stock_data(self, stock_code: str, file_path: Path, result: CheckResult) -> bool:
+        """覆写修复：使用 AKShare 重拉数据"""
+        msg = result.message
+
+        # 情况1：缺失交易日
+        if "缺失" in msg and result.details and 'missing_dates' in result.details:
+            missing_dates = result.details['missing_dates']
+            print(f"  → 修复：补拉 {len(missing_dates)} 个缺失交易日")
+            start_bs = f"{missing_dates[0][:4]}-{missing_dates[0][4:6]}-{missing_dates[0][6:]}"
+            end_bs = f"{missing_dates[-1][:4]}-{missing_dates[-1][4:6]}-{missing_dates[-1][6:]}"
+            patch_df = self.fetch_baostock_data(stock_code, start_bs, end_bs)
+            if patch_df is None or len(patch_df) == 0:
+                print(f"  ✗ 无法获取补丁数据，跳过")
+                return False
+            try:
+                old_df = pd.read_csv(file_path)
+                old_df['date'] = old_df['date'].astype(str)
+                patch_df['date'] = patch_df['date'].astype(str)
+                patch_df = patch_df.rename(columns={'turn': 'exchange'})
+                patch_df['vwap'] = patch_df['amount'] / patch_df['volume'].replace(0, float('nan'))
+                patch_df['vwap'] = patch_df['vwap'].fillna(patch_df['close'])
+                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
+                existing = set(old_df['date'])
+                patch_df = patch_df[~patch_df['date'].isin(existing)]
+                if len(patch_df) == 0:
+                    print(f"  ⚠ 补丁数据已存在，无需写入")
+                    return True
+                combined = pd.concat([old_df, patch_df], ignore_index=True)
+                combined = combined.sort_values('date', ascending=False).reset_index(drop=True)
+                combined.to_csv(file_path, index=False)
+                print(f"  ✓ 补入 {len(patch_df)} 条，总计 {len(combined)} 条")
+                return True
+            except Exception as e:
+                print(f"  ✗ 写入失败：{e}")
+                return False
+
+        # 情况2/3：全量重拉或增量补更
+        if any(k in msg for k in ["不匹配", "OHLC", "超出范围", "无法读取", "最高价", "滞后"]):
+            if "滞后" in msg and result.details and 'latest_date' in result.details:
+                latest = result.details['latest_date']
+                start_date = f"{latest[:4]}-{latest[4:6]}-{latest[6:]}"
+                next_day = (datetime.datetime.strptime(start_date, "%Y-%m-%d")
+                            + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                print(f"  → 修复：增量补更 {stock_code}（从 {next_day} 起）")
+                patch_df = self.fetch_baostock_data(
+                    stock_code, next_day,
+                    datetime.datetime.now().strftime("%Y-%m-%d")
+                )
+                if patch_df is None or len(patch_df) == 0:
+                    print(f"  ⚠ 无新数据可补（可能已是最新）")
+                    return True
+                try:
+                    old_df = pd.read_csv(file_path)
+                    old_df['date'] = old_df['date'].astype(str)
+                    patch_df['date'] = patch_df['date'].astype(str)
+                    patch_df = patch_df.rename(columns={'turn': 'exchange'})
+                    patch_df['vwap'] = patch_df['amount'] / patch_df['volume'].replace(0, float('nan'))
+                    patch_df['vwap'] = patch_df['vwap'].fillna(patch_df['close'])
+                    patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
+                    existing = set(old_df['date'])
+                    patch_df = patch_df[~patch_df['date'].isin(existing)]
+                    if len(patch_df) == 0:
+                        print(f"  ⚠ 补丁数据已存在，无需写入")
+                        return True
+                    combined = pd.concat([patch_df, old_df], ignore_index=True)
+                    combined = combined.sort_values('date', ascending=False).reset_index(drop=True)
+                    combined.to_csv(file_path, index=False)
+                    new_latest = str(int(combined.iloc[0]['date']))
+                    print(f"  ✓ 补入 {len(patch_df)} 条，最新：{new_latest}")
+                    return True
+                except Exception as e:
+                    print(f"  ✗ 写入失败：{e}")
+                    return False
+            else:
+                # 全量重拉
+                print(f"  → 修复：重新全量拉取 {stock_code}")
+                try:
+                    df = self.ak.stock_zh_a_hist(
+                        symbol=stock_code, period="daily",
+                        start_date="20100101",
+                        end_date=datetime.datetime.now().strftime("%Y%m%d"),
+                        adjust=""
+                    )
+                    if df is None or len(df) == 0:
+                        print(f"  ✗ 未获取到数据")
+                        return False
+                    df = df.rename(columns={
+                        '日期': 'date', '开盘': 'open', '最高': 'high',
+                        '最低': 'low', '收盘': 'close',
+                        '成交量': 'volume', '成交额': 'amount', '换手率': 'exchange'
+                    })
+                    df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange']]
+                    df['date'] = df['date'].astype(str).str.replace('-', '').astype(int)
+                    for col in ['open', 'high', 'low', 'close']:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    df = df.dropna(subset=['open', 'high', 'low', 'close'])
+                    df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0.0)
+                    df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0) * 100
+                    df['exchange'] = pd.to_numeric(df['exchange'], errors='coerce').fillna(0.0)
+                    df['vwap'] = df['amount'] / df['volume'].replace(0, float('nan'))
+                    df['vwap'] = df['vwap'].fillna(df['close'])
+                    df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
+                    df = df.iloc[::-1].reset_index(drop=True)
+                    df.to_csv(file_path, index=False)
+                    print(f"  ✓ 全量写入 {len(df)} 条")
+                    return True
+                except Exception as e:
+                    print(f"  ✗ 写入失败：{e}")
+                    return False
+
+        print(f"  ⚠ 无对应修复策略：{msg}")
+        return False
+
 def main():
     parser = argparse.ArgumentParser(description='股票数据质量检查工具')
     parser.add_argument('--data-dir', type=str, default='data_all',help='数据存储目录 (默认：data_all)')
@@ -739,8 +919,17 @@ def main():
     if not data_dir.is_absolute():
         script_dir = Path(__file__).parent
         data_dir = script_dir / data_dir
-    
-    checker = DataChecker(str(data_dir), check_days=args.days, backup=not args.no_backup)
+
+    # 根据配置选择数据源
+    script_dir = Path(__file__).parent
+    sys.path.insert(0, str(script_dir / 'src'))
+    from config import DataConfig
+    data_source = DataConfig.DATA_SOURCE
+
+    if data_source == 'akshare':
+        checker = AKShareDataChecker(str(data_dir), check_days=args.days, backup=not args.no_backup)
+    else:
+        checker = DataChecker(str(data_dir), check_days=args.days, backup=not args.no_backup)
     
     checker.run_full_check(
         stock_codes=args.stocks,

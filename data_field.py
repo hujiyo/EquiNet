@@ -6,7 +6,7 @@ data_field.py - 为CSV文件添加均线偏离度特征
 - m10: (close - MA10) / MA10  — 价格偏离10日均线
 - m20: (close - MA20) / MA20  — 价格偏离20日均线
 
-边缘处理：借鉴 data.py 中 amount/exchange 的方法，
+边缘处理：借鉴 data.py 中 exchange 的方法，
 当左侧数据不足时从右侧借用，保持完整的滑动窗口大小。
 
 用法:

@@ -26,6 +26,7 @@ python data_update.py --no-backup                  # 禁用备份
 """
 
 import time
+import sys
 import datetime
 import pandas as pd
 import baostock as bs
@@ -152,7 +153,7 @@ class StockDataUpdater:
         Returns:
             DataFrame 或 None
         """
-        columns = ['date', 'open', 'high', 'low', 'close', 'amount', 'exchange']
+        columns = ['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']
 
         try:
             code_with_prefix = self._format_stock_code(stock_code)
@@ -200,14 +201,12 @@ class StockDataUpdater:
             df['high'] = pd.to_numeric(df['high'], errors='coerce')
             df['low'] = pd.to_numeric(df['low'], errors='coerce')
             df['close'] = pd.to_numeric(df['close'], errors='coerce')
-            
-            if 'amount' in df.columns:
-                df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-                df['amount'] = (df['amount'] / 1000.0).fillna(0.0)
-            else:
-                print(f"⚠ {stock_code} 警告：Baostock 未返回 amount 字段，amount 将设为 0")
-                df['amount'] = pd.Series([0.0] * len(df), dtype=float)
-            
+
+            df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0.0)
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
+            df['vwap'] = df['amount'] / df['volume'].replace(0, float('nan'))
+            df['vwap'] = df['vwap'].fillna(df['close'])
+
             df = df.dropna(subset=['open', 'high', 'low', 'close'])
             
             if len(df) == 0:
@@ -218,8 +217,8 @@ class StockDataUpdater:
                 df['exchange'] = df['turn'].fillna(0.0).astype(float)
             else:
                 df['exchange'] = 0.0
-            
-            df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'exchange']]
+
+            df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
             df = df.iloc[::-1].reset_index(drop=True)
             return df
             
@@ -431,6 +430,138 @@ class StockDataUpdater:
             self.logout_baostock()
 
 
+class AKShareDataUpdater(StockDataUpdater):
+    """基于 AKShare 的数据更新器"""
+
+    def __init__(self, data_dir: str, backup: bool = True):
+        super().__init__(data_dir, backup)
+        import akshare as ak
+        self.ak = ak
+
+    def login_baostock(self) -> bool:
+        return True  # AKShare 无需登录
+
+    def logout_baostock(self):
+        pass  # AKShare 无需登出
+
+    def get_all_a_shares(self) -> List[Tuple[str, str]]:
+        """通过 AKShare 获取所有 A 股列表"""
+        try:
+            df = self.ak.stock_zh_a_spot_em()
+            stock_list = []
+            for _, row in df.iterrows():
+                code = str(row['代码'])
+                name = str(row['名称'])
+                if code.startswith(('6', '0', '3')):
+                    stock_list.append((code, name))
+            return stock_list
+        except Exception as e:
+            print(f"✗ AKShare 获取股票列表失败：{e}")
+            return []
+
+    def fetch_stock_data(self, stock_code: str, start_date: Optional[str] = None) -> Optional[pd.DataFrame]:
+        """
+        通过 AKShare 获取 K 线数据（不复权）
+        """
+        try:
+            end_date = datetime.datetime.now().strftime("%Y%m%d")
+
+            if start_date:
+                query_start = start_date.replace('-', '')
+            else:
+                query_start = "20100101"
+
+            df = self.ak.stock_zh_a_hist(
+                symbol=stock_code,
+                period="daily",
+                start_date=query_start,
+                end_date=end_date,
+                adjust=""
+            )
+
+            if df is None or len(df) == 0:
+                return None
+
+            # 重命名列
+            df = df.rename(columns={
+                '日期': 'date', '开盘': 'open', '最高': 'high',
+                '最低': 'low', '收盘': 'close',
+                '成交量': 'volume', '成交额': 'amount', '换手率': 'exchange'
+            })
+
+            df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange']]
+            df['date'] = df['date'].astype(str).str.replace('-', '').astype(int)
+
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0.0)
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0) * 100  # 手→股
+            df['exchange'] = pd.to_numeric(df['exchange'], errors='coerce').fillna(0.0)
+
+            df['vwap'] = df['amount'] / df['volume'].replace(0, float('nan'))
+            df['vwap'] = df['vwap'].fillna(df['close'])
+
+            df = df.dropna(subset=['open', 'high', 'low', 'close'])
+            if len(df) == 0:
+                return None
+
+            df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
+            df = df.iloc[::-1].reset_index(drop=True)  # AKShare 返回正序，反转为倒序（最新在前）
+            return df
+
+        except Exception as e:
+            print(f"✗ {stock_code} AKShare 获取失败：{e}")
+            return None
+
+    def update_all_stocks(self, incremental: bool = True, stock_codes: Optional[List[str]] = None):
+        """覆写以增加 AKShare 的请求间隔"""
+        if stock_codes:
+            codes_to_update = stock_codes
+            print(f"\n更新指定股票：{len(stock_codes)} 只")
+        else:
+            if incremental:
+                existing_stocks = self.get_existing_stocks()
+                codes_to_update = list(existing_stocks)
+                print(f"\n增量更新模式：更新 {len(codes_to_update)} 只已有股票")
+            else:
+                print("\n全量更新模式：获取所有 A 股数据")
+                all_stocks = self.get_all_a_shares()
+                codes_to_update = [code for code, _ in all_stocks]
+                print(f"获取到 {len(codes_to_update)} 只股票")
+
+        if self.enable_backup:
+            self.backup_data()
+
+        success_count = 0
+        failed_stocks = []
+
+        for i, stock_code in enumerate(codes_to_update, 1):
+            print(f"[{i}/{len(codes_to_update)}] 更新 {stock_code}...", end=" ")
+
+            try:
+                if self.update_single_stock(stock_code, incremental):
+                    success_count += 1
+                else:
+                    failed_stocks.append(stock_code)
+            except Exception as e:
+                print(f"✗ 异常：{e}")
+                failed_stocks.append(stock_code)
+
+            if i % 5 == 0:
+                time.sleep(1)
+
+        print("*"*32 + "更新完成统计" + "*"*32)
+        print(f"成功：{success_count}/{len(codes_to_update)}")
+        print(f"失败：{len(failed_stocks)}")
+
+        if failed_stocks:
+            failed_str = ', '.join(failed_stocks[:20])
+            if len(failed_stocks) > 20:
+                failed_str += '...'
+            print(f"\n失败的股票：{failed_str}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='EquiNet股票数据更新工具')
     parser.add_argument('--data-dir', type=str, default=None,
@@ -456,7 +587,16 @@ def main():
     print(f"数据目录：{data_dir}")
     print(f"更新模式：{args.mode}")
 
-    updater = StockDataUpdater(str(data_dir), backup=not args.no_backup)
+    # 根据配置选择数据源
+    sys.path.insert(0, str(script_dir / 'src'))
+    from config import DataConfig
+    data_source = DataConfig.DATA_SOURCE
+    print(f"数据源：{data_source}")
+
+    if data_source == 'akshare':
+        updater = AKShareDataUpdater(str(data_dir), backup=not args.no_backup)
+    else:
+        updater = StockDataUpdater(str(data_dir), backup=not args.no_backup)
 
     incremental = (args.mode != 'full')
     updater.update_all_stocks(incremental=incremental, stock_codes=args.stocks)

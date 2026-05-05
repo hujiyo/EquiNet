@@ -168,7 +168,7 @@ def load_all_stock_data(data_dir=DataConfig.DATA_DIR):
             df = pd.read_csv(fpath)
             # 原始数据按时间倒序，翻转为正序（早→晚）
             df = df.iloc[::-1].reset_index(drop=True)
-            cols = ['open', 'high', 'low', 'close', 'vwap', 'amount', 'exchange']
+            cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange']
             if 'm5' in df.columns:
                 cols += ['m5', 'm10', 'm20']
             data = df[cols].values

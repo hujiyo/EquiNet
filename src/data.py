@@ -412,7 +412,7 @@ def process_single_file(args):
     
     数据处理流程：
     1. 读取CSV并反转时间顺序
-    2. 提取OHLCV数据：['open', 'high', 'low', 'close', 'vwap', 'amount', 'exchange']
+    2. 提取OHLCV数据：['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange']
     3. 验证数据长度是否满足最低要求
     
     数据分割策略（确保训练集和测试集严格分离）：
@@ -440,7 +440,7 @@ def process_single_file(args):
         df = pd.read_csv(file_path)
         df = df.iloc[::-1].reset_index(drop=True)
                 
-        data = df[['open', 'high', 'low', 'close', 'vwap', 'amount', 'exchange', 'm5', 'm10', 'm20']].values
+        data = df[['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange', 'm5', 'm10', 'm20']].values
         times = df['date'].values
         
         data_length = len(data)
@@ -1135,12 +1135,12 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
 
     Returns:
         input_seq: [context_length, 10] 归一化后的输入序列，或 None（如果验证失败）
-            - 粗处理后：OHLC/VWAP: [-0.1, 0.1], Amount: 相对N日均值变化率, Exchange: 相对N日均值变化率
+            - 粗处理后：OHLC/VWAP: [-0.1, 0.1], Volume: 相对N日均值变化率, Exchange: 相对N日均值变化率
             - 细处理后：均值≈0，方差≈1
 
     验证项：
-        1. 基准日（start_idx-1）的 OHLC、VWAP 和 amount 非零
-        2. 上下文窗口的 close 和 amount 非零
+        1. 基准日（start_idx-1）的 OHLC、VWAP 和 volume 非零
+        2. 上下文窗口的 close 和 volume 非零
         3. 最新价格过滤：上下文最后一天收盘价不超过40元
         4. 涨停过滤：窗口内任何一天涨跌幅不超过 11%
         5. 上下文最后一天涨停过滤（可选，通过 DataConfig 控制）

@@ -88,7 +88,7 @@ class DataConfig:
 class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
-    INPUT_DIM = 10                   # 输入特征维度数（OHLC + vwap + amount + exchange + m5 + m10 + m20）
+    INPUT_DIM = 10                   # 输入特征维度数（OHLC + vwap + volume + exchange + m5 + m10 + m20）
     D_MODEL = 128                    # 模型维度（Transformer 内部维度）
     FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数

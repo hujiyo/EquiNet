@@ -14,12 +14,12 @@
 这样模型B学习的是A"确信"的模式，同时过滤掉A不确定的噪声样本
 '''
 
-import os, torch, torch.nn as nn, torch.optim as optim, numpy as np
+import os, sys, torch, torch.nn as nn, torch.optim as optim, numpy as np
 import copy
 import random
 import csv
 from datetime import datetime
-from config import (TrainingConfig,DataConfig,DeviceConfig,print_config_summary,LossConfig)
+from config import (TrainingConfig,DataConfig,DeviceConfig,ModelConfig,print_config_summary,LossConfig,EmbeddingConfig)
 
 from model import create_model
 
@@ -42,7 +42,7 @@ from training_utils import (
     PairwiseWeightedBCE,
     EarlyStopping,
     print_dispersion_sparkline,
-    create_optimizer_from_config,
+    create_optimizer_from_config_for_params,
     create_scheduler_from_config,
     training_step,
     _get_amp_context
@@ -104,8 +104,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
     model_b = None
     optimizer_b = None
 
-    # 创建优化器（模型A）
-    optimizer_a = create_optimizer_from_config(model_a, lr=learning_rate)
+    # 创建优化器（模型A）—— embedding 已冻结，只传可训练参数
+    trainable_params = [p for p in model_a.parameters() if p.requires_grad]
+    optimizer_a = create_optimizer_from_config_for_params(trainable_params, lr=learning_rate)
 
     # 创建学习率调度器（模型A）
     warmup_scheduler_a, main_scheduler_a, warmup_epochs = create_scheduler_from_config(
@@ -247,8 +248,9 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
                 model_b = copy.deepcopy(model_a)
                 model_b = model_b.to(device)
 
-                # 模型B使用半学习率，更保守的更新
-                optimizer_b = create_optimizer_from_config(model_b, lr=learning_rate * 0.5)
+                # 模型B使用半学习率，更保守的更新（embedding 同样冻结）
+                trainable_params_b = [p for p in model_b.parameters() if p.requires_grad]
+                optimizer_b = create_optimizer_from_config_for_params(trainable_params_b, lr=learning_rate * 0.5)
                 print(f"  模型B已创建，参数数: {sum(p.numel() for p in model_b.parameters()):,}")
                 print()
             else:
@@ -551,7 +553,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             best_return_a_at_best_loss, best_threshold_a_at_best_loss, best_auc_a_at_best_loss,
             best_loss_epoch_a,
             model_prefix="modelA_loss",
-            output_dir=DataConfig.OUTPUT_DIR
+            output_dir=DataConfig.OUTPUT_DIR,
         )
         print(f"✓ 模型A(loss)已保存: {os.path.basename(save_path_a)}")
         print(f"  Top1%阈值: {best_threshold_a_at_best_loss:.4f}")
@@ -564,7 +566,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             best_return_a_at_best_realistic, best_threshold_a_at_best_realistic, best_auc_a_at_best_realistic,
             best_realistic_return_epoch_a,
             model_prefix="modelA_realistic",
-            output_dir=DataConfig.OUTPUT_DIR
+            output_dir=DataConfig.OUTPUT_DIR,
         )
         print(f"✓ 模型A(realistic)已保存: {os.path.basename(save_path_a_realistic)}")
         print(f"  Top1%阈值: {best_threshold_a_at_best_realistic:.4f}")
@@ -577,7 +579,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             best_return_b_at_best_loss, best_threshold_b_at_best_loss, best_auc_b_at_best_loss,
             best_loss_epoch_b,
             model_prefix="modelB",
-            output_dir=DataConfig.OUTPUT_DIR
+            output_dir=DataConfig.OUTPUT_DIR,
         )
         print(f"✓ 模型B已保存: {os.path.basename(save_path_b)}")
         print(f"  Top1%阈值: {best_threshold_b_at_best_loss:.4f}")
@@ -675,6 +677,17 @@ if __name__ == "__main__":
     amp_str = "BF16混合精度" if TrainingConfig.USE_AMP else "FP32精度"
     print(f"\n正在创建模型A ({amp_str})...")
     model_a = create_model().to(device)
+
+    # 加载预训练 Embedding（必须步骤，类似 normalizer.pkl）
+    embedding_path = EmbeddingConfig.BEST_EMBEDDING_PATH
+    if os.path.exists(embedding_path):
+        print(f"加载预训练 Embedding: {embedding_path}")
+        model_a.load_pretrained_embedding(embedding_path)
+        model_a.freeze_embedding(True)
+    else:
+        print(f"错误: 预训练 Embedding 不存在: {embedding_path}")
+        print("请先运行: python src/pretrain_embedding.py")
+        sys.exit(1)
 
     total_params = sum(p.numel() for p in model_a.parameters())
     print(f" 模型A参数数: {total_params:,}")

@@ -1259,6 +1259,210 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
 
     return input_seq
 
+def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days,
+                              required_length, ma_window, limit_threshold,
+                              filter_last_day_limit_up, label_day1_use_open,
+                              label_fn, returns_fn):
+    """
+    向量化处理单只股票的所有合法窗口（替代逐样本 generate_sample_from_index 循环）
+
+    将原本 N 次 Python 函数调用合并为一次 numpy 批处理，
+    消除 Python 循环调度开销，预期加速 10-20 倍。
+
+    Args:
+        stock_info: 单只股票信息字典
+        stock_idx: 股票索引（用于 sample_key）
+        context_length: 上下文窗口长度
+        future_days: 未来天数
+        required_length: 完整采样窗口长度
+        ma_window: MA均线窗口
+        limit_threshold: 涨停阈值
+        filter_last_day_limit_up: 是否过滤上下文最后一天涨停
+        label_day1_use_open: Day1是否使用开盘价
+        label_fn: generate_label 函数引用
+        returns_fn: calculate_returns 函数引用
+
+    Returns:
+        (inputs, targets, returns_list, keys) 或 (None, None, None, None)
+    """
+    stock_data = stock_info['data']
+    T = len(stock_data)
+
+    train_start = max(1, stock_info.get('train_start_idx', 0) + 1)
+    train_end = stock_info.get('train_end_idx', T)
+    excluded = stock_info.get('excluded_positions', set())
+
+    max_valid_start = T - required_length
+    if max_valid_start < train_start:
+        return None, None, None, None
+
+    all_starts = np.arange(train_start, min(train_end, max_valid_start) + 1)
+
+    if excluded:
+        excl_arr = np.array(sorted(excluded), dtype=np.intp)
+        mask = ~np.isin(all_starts, excl_arr)
+        all_starts = all_starts[mask]
+
+    N = len(all_starts)
+    if N == 0:
+        return None, None, None, None
+
+    C = context_length
+    offsets = np.arange(C, dtype=np.intp)
+    window_idx = all_starts[:, None] + offsets[None, :]
+    raw_windows = stock_data[window_idx]
+    prev_days = stock_data[all_starts - 1]
+
+    valid = np.ones(N, dtype=bool)
+
+    valid &= prev_days[:, 3] != 0
+    valid &= prev_days[:, 5] != 0
+    valid &= np.all(prev_days[:, :4] != 0, axis=1)
+    valid &= np.all(raw_windows[:, :, 3] != 0, axis=1)
+    valid &= np.all(raw_windows[:, :, 5] != 0, axis=1)
+    valid &= raw_windows[:, -1, 3] <= 40
+
+    sample_offsets = np.arange(required_length + 1, dtype=np.intp)
+    sample_idx = (all_starts[:, None] - 1) + sample_offsets[None, :]
+    sample_idx = np.clip(sample_idx, 0, T - 1)
+
+    sample_closes = stock_data[sample_idx][:, :, 3]
+    prev_c = sample_closes[:, :-1]
+    curr_c = sample_closes[:, 1:]
+    valid &= np.all(prev_c != 0, axis=1)
+    safe_prev_c = np.where(prev_c != 0, prev_c, 1.0)
+    daily_rets_sample = (curr_c - prev_c) / safe_prev_c
+
+    in_bounds = sample_idx < T
+    in_bounds &= sample_idx >= 0
+    in_bounds_inner = in_bounds[:, 1:]
+    daily_rets_sample = np.where(in_bounds_inner, daily_rets_sample, 0.0)
+    valid &= np.all(np.abs(daily_rets_sample) <= 0.11, axis=1)
+
+    if filter_last_day_limit_up:
+        last_close = raw_windows[:, -1, 3]
+        prev_last_close = raw_windows[:, -2, 3]
+        safe_plc = np.where(prev_last_close != 0, prev_last_close, 1.0)
+        last_ret = (last_close - prev_last_close) / safe_plc
+        valid &= last_ret < limit_threshold
+
+    if not np.any(valid):
+        return None, None, None, None
+
+    vs = all_starts[valid]
+    raw_w = raw_windows[valid]
+    prev_d = prev_days[valid]
+    Nv = len(vs)
+
+    input_seqs = np.empty((Nv, C, 10), dtype=np.float32)
+
+    closes_w = raw_w[:, :, 3]
+    prev_close = prev_d[:, 3:4]
+    safe_prev_close = np.where(prev_close != 0, prev_close, 1.0)
+    input_seqs[:, 0, :4] = (raw_w[:, 0, :4] - prev_close) / safe_prev_close
+
+    if C > 1:
+        closes_prev = closes_w[:, :-1]
+        safe_cp = np.where(closes_prev != 0, closes_prev, 1.0)[:, :, np.newaxis]
+        input_seqs[:, 1:, :4] = (raw_w[:, 1:, :4] - closes_prev[:, :, np.newaxis]) / safe_cp
+
+    vwaps_w = raw_w[:, :, 4]
+    safe_closes_w = np.where(closes_w != 0, closes_w, 1.0)
+    input_seqs[:, :, 4] = (vwaps_w - closes_w) / safe_closes_w
+
+    np.clip(input_seqs[:, :, :5], -0.1, 0.1, out=input_seqs[:, :, :5])
+
+    abs_idx = vs[:, None] + offsets[None, :]
+
+    for col in [5, 6]:
+        full_col = stock_data[:, col].astype(np.float64)
+        cs = np.empty(T + 1, dtype=np.float64)
+        cs[0] = 0
+        np.cumsum(full_col, out=cs[1:])
+
+        left = np.maximum(abs_idx - ma_window, 0)
+        actual_count = abs_idx - left
+        actual_count = np.maximum(actual_count, 1)
+
+        ma_vals = (cs[abs_idx] - cs[left]) / actual_count
+
+        raw_vals = raw_w[:, :, col]
+        safe_ma = np.where(ma_vals > 0, ma_vals, 1.0)
+        input_seqs[:, :, col] = ((raw_vals - ma_vals) / safe_ma).astype(np.float32)
+
+        invalid_ma = ~np.isfinite(ma_vals) | (ma_vals <= 0)
+        row_bad = np.any(invalid_ma, axis=1)
+        input_seqs[row_bad] = np.nan
+
+    input_seqs[:, :, 7:10] = raw_w[:, :, 7:10]
+
+    nan_rows = np.any(~np.isfinite(input_seqs), axis=(1, 2))
+    good = ~nan_rows
+    if not np.any(good):
+        return None, None, None, None
+
+    input_seqs = input_seqs[good]
+    vs = vs[good]
+    Nv = len(vs)
+
+    future_offsets = np.arange(future_days, dtype=np.intp)
+    future_idx = (vs[:, None] + C) + future_offsets[None, :]
+    future_idx = np.clip(future_idx, 0, T - 1)
+    future_data = stock_data[future_idx]
+
+    future_valid = ((vs[:, None] + C) + future_offsets[None, :]) < T
+    future_valid &= future_data[:, :, 0] != 0
+    future_valid &= future_data[:, :, 3] != 0
+    fv_rows = np.all(future_valid, axis=1)
+    if not np.all(fv_rows):
+        input_seqs = input_seqs[fv_rows]
+        vs = vs[fv_rows]
+        future_data = future_data[fv_rows]
+        Nv = len(vs)
+
+    if Nv == 0:
+        return None, None, None, None
+
+    f_closes = future_data[:, :, 3]
+    context_last_close = stock_data[vs + C - 1, 3]
+
+    day1_change = np.where(
+        label_day1_use_open,
+        (f_closes[:, 0] - future_data[:, 0, 0]) / np.where(future_data[:, 0, 0] != 0, future_data[:, 0, 0], 1.0),
+        (f_closes[:, 0] - context_last_close) / np.where(context_last_close != 0, context_last_close, 1.0)
+    )
+    day2_change = (f_closes[:, 1] - f_closes[:, 0]) / np.where(f_closes[:, 0] != 0, f_closes[:, 0], 1.0)
+    day3_change = (f_closes[:, 2] - f_closes[:, 1]) / np.where(f_closes[:, 1] != 0, f_closes[:, 1], 1.0)
+
+    targets = np.zeros(Nv, dtype=np.float32)
+    for i in range(Nv):
+        targets[i] = float(label_fn(
+            day1_change=day1_change[i],
+            day2_change=day2_change[i],
+            day3_change=day3_change[i]
+        ))
+
+    returns_arr = np.zeros(Nv, dtype=np.float32)
+    for i in range(Nv):
+        t1_open = future_data[i, 0, 0]
+        t1_close = f_closes[i, 0]
+        t2_open = future_data[i, 1, 0] if future_days >= 2 else None
+        t2_close = f_closes[i, 1] if future_days >= 2 else None
+        t3_close = f_closes[i, 2] if future_days >= 3 else None
+        cum_ret, _ = returns_fn(
+            t1_open=t1_open, t1_close=t1_close,
+            t2_open=t2_open, t2_close=t2_close,
+            t3_close=t3_close,
+            day1_change=day1_change[i],
+            day2_change=day2_change[i] if future_days >= 2 else None,
+            day3_change=day3_change[i] if future_days >= 3 else None,
+        )
+        returns_arr[i] = cum_ret
+
+    keys = [(stock_idx, int(s)) for s in vs]
+
+    return input_seqs, targets, returns_arr, keys
+
 
 def coarse_normalize_context_window(stock_data, start_idx, context_length,
                                      check_limit_up=True, required_length=None):
@@ -1356,12 +1560,10 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None):
     """
     预计算所有合法训练样本，一次性完成验证+粗归一化+标签+收益率+细归一化
 
-    训练数据在整个训练过程中不变，此函数将 sample_with_pools 中每个 epoch
-    重复执行的 Python 循环（验证、归一化、标签计算）合并为
-    一次预计算。后续 epoch 只需从预计算结果中索引采样。
+    使用向量化批处理替代逐样本 Python 循环，每只股票的所有窗口一次性处理。
 
     Returns:
-        all_inputs: [N, context_length, 8] float32 归一化后的输入
+        all_inputs: [N, context_length, 10] float32 归一化后的输入
         all_targets: [N] float32 标签 (0/1)
         all_returns: [N] float32 累计收益率
         pos_indices: [M] int 正样本在 all_inputs 中的索引
@@ -1375,36 +1577,49 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None):
     all_targets = []
     all_returns = []
     sample_key_to_pool_idx = {}
+    total_samples = 0
+
+    context_length = DataConfig.CONTEXT_LENGTH
+    future_days = DataConfig.FUTURE_DAYS
+    required_length = DataConfig.REQUIRED_LENGTH
+    ma_window = DataConfig.MA_WINDOW
+    limit_threshold = DataConfig.LIMIT_THRESHOLD
+    filter_last_day = DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP
+    label_day1_use_open = DataConfig.LABEL_DAY1_USE_OPEN
 
     for stock_idx, stock_info in enumerate(train_stock_info):
-        train_start = max(1, stock_info.get('train_start_idx', 0) + 1)
-        train_end = stock_info.get('train_end_idx', len(stock_info['data']))
-        excluded = stock_info.get('excluded_positions', set())
+        result = _vectorized_process_stock(
+            stock_info, stock_idx,
+            context_length, future_days, required_length,
+            ma_window, limit_threshold, filter_last_day,
+            label_day1_use_open,
+            generate_label, calculate_returns
+        )
+        inputs, targets, returns_arr, keys = result
 
-        for start_idx in range(train_start, train_end + 1):
-            if start_idx in excluded:
-                continue
-            sample = generate_sample_from_index(train_stock_info, stock_idx, start_idx, None)
-            if sample is None:
-                continue
-            input_seq, target, cumulative_return, _ = sample
-            pool_idx = len(all_inputs)
-            sample_key_to_pool_idx[(stock_idx, start_idx)] = pool_idx
-            all_inputs.append(input_seq)
-            all_targets.append(target)
-            all_returns.append(cumulative_return)
+        if inputs is None:
+            continue
+
+        base_idx = total_samples
+        total_samples += len(inputs)
+        all_inputs.append(inputs)
+        all_targets.append(targets)
+        all_returns.append(returns_arr)
+        for i, key in enumerate(keys):
+            sample_key_to_pool_idx[key] = base_idx + i
 
     if len(all_inputs) == 0:
         raise ValueError("预计算结果为空：没有有效的训练样本")
 
-    all_inputs = np.asarray(all_inputs)
+    all_inputs = np.concatenate(all_inputs, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+    all_returns = np.concatenate(all_returns, axis=0)
+
     if feature_normalizer is not None:
         chunk_size = 100_000
         for start in range(0, len(all_inputs), chunk_size):
             end = min(start + chunk_size, len(all_inputs))
             all_inputs[start:end] = feature_normalizer.transform_batch(all_inputs[start:end])
-    all_targets = np.asarray(all_targets)
-    all_returns = np.asarray(all_returns)
 
     pos_indices = np.where(all_targets >= 0.5)[0]
     neg_indices = np.where(all_targets < 0.5)[0]

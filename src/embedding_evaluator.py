@@ -86,8 +86,8 @@ class EmbeddingModule(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: 粗处理后的数据 [batch, seq_len, 9]
-               范围：OHLE [-0.1, 0.1], VWAP [-0.1, 0.1], Amount [0, 1], Exchange [0, 1]
+            x: 粗处理后的数据 [batch, seq_len, 10]
+               范围：OHLC [-0.1, 0.1], VWAP [-0.1, 0.1], Amount 相对MA变化率, Exchange 相对MA变化率
 
         Returns:
             embedded: [batch, seq_len, d_model]
@@ -131,51 +131,51 @@ class EmbeddingModuleAnalyzer:
 
     NEUTRAL_VALUES = [0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.01, 0.0, 0.0, 0.0]
 
-    DELTA_MAP = {0: 0.03, 1: 0.03, 2: 0.03, 3: 0.03, 4: 0.10, 5: 0.05, 6: 0.02, 7: 0.015, 8: 0.01}
+    DELTA_MAP = {0: 0.03, 1: 0.03, 2: 0.03, 3: 0.03, 4: 0.03, 5: 0.05, 6: 0.02, 7: 0.015, 8: 0.01, 9: 0.01}
 
     KEY_PAIRS = [(0, 3), (1, 2), (3, 4), (3, 5)]
     KEY_PAIR_NAMES = ['Open-Close', 'High-Low', 'Close-VWAP', 'Close-Amount']
 
-    # 原型交易日模式（coarse-normalized空间, 9维: OHLC + Vol + Ex + MA5 + MA10 + MA20）
+    # 原型交易日模式（coarse-normalized空间, 10维: OHLC + VWAP + Amount + Exchange + MA5 + MA10 + MA20）
     SEMANTIC_PATTERNS = {
         'bullish_large': {
-            'values': [0.01, 0.05, -0.01, 0.04, 0.70, 0.05, 0.02, 0.015, 0.01],
+            'values': [0.01, 0.05, -0.01, 0.04, -0.01, 0.70, 0.05, 0.02, 0.015, 0.01],
             'desc': '大阳线'
         },
         'bearish_large': {
-            'values': [-0.01, 0.01, -0.05, -0.04, 0.70, 0.05, -0.02, -0.015, -0.01],
+            'values': [-0.01, 0.01, -0.05, -0.04, 0.01, 0.70, 0.05, -0.02, -0.015, -0.01],
             'desc': '大阴线'
         },
         'doji': {
-            'values': [0.0, 0.01, -0.01, 0.001, 0.50, 0.02, 0.0, 0.0, 0.0],
+            'values': [0.0, 0.01, -0.01, 0.001, 0.0, 0.50, 0.02, 0.0, 0.0, 0.0],
             'desc': '十字星'
         },
         'high_vol_bull': {
-            'values': [0.01, 0.04, -0.005, 0.03, 0.85, 0.08, 0.02, 0.015, 0.01],
+            'values': [0.01, 0.04, -0.005, 0.03, -0.01, 0.85, 0.08, 0.02, 0.015, 0.01],
             'desc': '放量上涨'
         },
         'low_vol_bull': {
-            'values': [0.01, 0.04, -0.005, 0.03, 0.35, 0.01, 0.015, 0.01, 0.005],
+            'values': [0.01, 0.04, -0.005, 0.03, -0.005, 0.35, 0.01, 0.015, 0.01, 0.005],
             'desc': '缩量上涨'
         },
         'divergence_bull': {
-            'values': [0.005, 0.03, -0.005, 0.02, 0.60, 0.04, 0.01, 0.005, 0.0],
+            'values': [0.005, 0.03, -0.005, 0.02, -0.005, 0.60, 0.04, 0.01, 0.005, 0.0],
             'desc': '逆势上涨'
         },
         'following_bull': {
-            'values': [0.01, 0.02, -0.005, 0.015, 0.50, 0.03, 0.01, 0.005, 0.0],
+            'values': [0.01, 0.02, -0.005, 0.015, 0.0, 0.50, 0.03, 0.01, 0.005, 0.0],
             'desc': '跟风上涨'
         },
         'upper_shadow': {
-            'values': [0.0, 0.06, -0.005, 0.005, 0.60, 0.04, 0.005, 0.0, 0.0],
+            'values': [0.0, 0.06, -0.005, 0.005, 0.01, 0.60, 0.04, 0.005, 0.0, 0.0],
             'desc': '长上影线'
         },
         'lower_shadow': {
-            'values': [0.0, 0.005, -0.06, 0.005, 0.60, 0.04, -0.005, 0.0, 0.0],
+            'values': [0.0, 0.005, -0.06, 0.005, -0.01, 0.60, 0.04, -0.005, 0.0, 0.0],
             'desc': '长下影线'
         },
         'high_ex_limit': {
-            'values': [0.02, 0.10, 0.01, 0.10, 0.90, 0.15, 0.04, 0.03, 0.02],
+            'values': [0.02, 0.10, 0.01, 0.10, -0.02, 0.90, 0.15, 0.04, 0.03, 0.02],
             'desc': '高换手涨停'
         }
     }
@@ -230,6 +230,28 @@ class EmbeddingModuleAnalyzer:
                 current_state.update(matched_state)
                 self.model.load_state_dict(current_state)
                 print(f"加载训练好的模型: {self.model_path}")
+            elif isinstance(checkpoint, dict) and 'embed_proj_weight' in checkpoint:
+                # 预训练 Embedding 格式（来自 pretrain_embedding.py）
+                self.model = create_model().to(self.device)
+
+                key_map = {
+                    'embed_proj_weight': 'embed_proj.weight',
+                    'embed_proj_bias': 'embed_proj.bias',
+                    'embed_mlp_1_weight': 'embed_mlp.1.weight',
+                    'embed_mlp_1_bias': 'embed_mlp.1.bias',
+                }
+
+                current_state = self.model.state_dict()
+                matched_state = {}
+                for src_key, dst_key in key_map.items():
+                    if src_key in checkpoint and dst_key in current_state:
+                        if checkpoint[src_key].shape == current_state[dst_key].shape:
+                            matched_state[dst_key] = checkpoint[src_key]
+
+                current_state.update(matched_state)
+                self.model.load_state_dict(current_state)
+                print(f"加载预训练Embedding: {self.model_path}")
+                print(f"  匹配权重: {len(matched_state)} 组")
             else:
                 self.model = create_model().to(self.device)
                 current_state = self.model.state_dict()
@@ -972,10 +994,16 @@ def main():
 
     out_dir = DataConfig.OUTPUT_DIR
     model_files = []
-    if os.path.exists(out_dir):
-        for f in os.listdir(out_dir):
-            if f.endswith('.pth'):
-                model_files.append(os.path.join(out_dir, f))
+    # 搜索 out/ 和 out/embedding_pretrain/ 下的模型文件
+    search_dirs = [out_dir]
+    from config import EmbeddingConfig
+    if hasattr(EmbeddingConfig, 'OUTPUT_DIR'):
+        search_dirs.append(EmbeddingConfig.OUTPUT_DIR)
+    for search_dir in search_dirs:
+        if os.path.exists(search_dir):
+            for f in os.listdir(search_dir):
+                if f.endswith('.pth'):
+                    model_files.append(os.path.join(search_dir, f))
 
     if args.list_models:
         print("\n可用的模型文件:")
@@ -1024,13 +1052,15 @@ def main():
 
     print("\n[步骤2] 准备测试样本...")
     from data import coarse_normalize_context_window
+    eval_ctx = DataConfig.CONTEXT_LENGTH
+    eval_req = DataConfig.REQUIRED_LENGTH
     all_inputs = []
     for stock in test_stock_info[:50]:
         data = stock['data']
         test_split = stock['test_split_point']
-        for i in range(test_split, min(test_split + 10, len(data) - 33)):
+        for i in range(test_split, min(test_split + 10, len(data) - eval_req)):
             input_seq = coarse_normalize_context_window(
-                data, i, 30, check_limit_up=False, required_length=33
+                data, i, eval_ctx, check_limit_up=False, required_length=eval_req
             )
             if input_seq is not None:
                 all_inputs.append(input_seq)

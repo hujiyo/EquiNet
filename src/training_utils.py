@@ -1237,6 +1237,70 @@ def create_optimizer_from_config(model, lr=None):
     return optimizer
 
 
+def create_optimizer_from_config_for_params(params, lr=None):
+    """
+    根据配置创建优化器（接受参数列表而非模型，用于冻结embedding等场景）
+
+    Args:
+        params: 可迭代的参数列表（通常来自 [p for p in model.parameters() if p.requires_grad]）
+        lr: 学习率
+
+    Returns:
+        optimizer: 创建的优化器实例
+    """
+    actual_lr = lr if lr is not None else TrainingConfig.get_base_lr()
+    wd = TrainingConfig.get_base_wd()
+    optimizer_type = TrainingConfig.OPTIMIZER_TYPE.lower()
+
+    if optimizer_type == 'mano':
+        from optimizers import create_optimizer
+
+        class _ParamContainer:
+            """包装参数列表，让 create_optimizer 能像 model 一样使用"""
+            def __init__(self, params):
+                self._params = list(params)
+            def parameters(self):
+                return iter(self._params)
+            def named_parameters(self):
+                return ((f"param_{i}", p) for i, p in enumerate(self._params))
+
+        optimizer = create_optimizer(
+            _ParamContainer(params),
+            optimizer_type='mano',
+            lr=actual_lr,
+            momentum=TrainingConfig.MANO_MOMENTUM,
+            weight_decay=wd,
+            betas=TrainingConfig.MANO_ADAMW_BETAS,
+            nesterov=TrainingConfig.MANO_NESTEROV,
+            dual_dim_projection=TrainingConfig.MANO_DUAL_DIM_PROJECTION
+        )
+    elif optimizer_type == 'lion':
+        optimizer = Lion(params, lr=actual_lr, betas=TrainingConfig.LION_BETAS, weight_decay=wd)
+        print(f"优化器(部分参数): Lion (lr={actual_lr}, wd={wd}, betas={TrainingConfig.LION_BETAS})")
+    elif optimizer_type == 'muon':
+        params_list = list(params)
+        hidden_weights = [p for p in params_list if p.ndim >= 2]
+        other_params = [p for p in params_list if p.ndim < 2]
+        muon_lr = actual_lr
+        muon_wd = TrainingConfig.MUON_WEIGHT_DECAY
+        muon_momentum = TrainingConfig.MUON_MOMENTUM
+        adamw_lr = TrainingConfig.MUON_ADAMW_LR_RATIO * muon_lr
+
+        param_groups = [
+            dict(params=hidden_weights, use_muon=True,
+                 lr=muon_lr, momentum=muon_momentum, weight_decay=muon_wd),
+            dict(params=other_params, use_muon=False,
+                 lr=adamw_lr, betas=TrainingConfig.MUON_ADAMW_BETAS, weight_decay=muon_wd),
+        ]
+        optimizer = MuonWithAuxAdam(param_groups)
+        print(f"优化器(部分参数): MuonWithAuxAdam (Muon lr={muon_lr}, AdamW lr={adamw_lr:.6f})")
+    else:
+        optimizer = optim.AdamW(params, lr=actual_lr, weight_decay=wd)
+        print(f"优化器(部分参数): AdamW (lr={actual_lr}, wd={wd})")
+
+    return optimizer
+
+
 def create_scheduler_from_config(optimizer, epochs, lr=None, eta_min=None, warmup_start_lr=None):
     """
     根据配置创建学习率调度器（预热 + 余弦退火）

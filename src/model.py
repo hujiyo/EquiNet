@@ -80,7 +80,7 @@ class PositionalEncoding(nn.Module):
     让模型自己学习最优的位置表示，而非使用固定的正弦公式
     """
     def __init__(self, d_model, seq_len=DataConfig.CONTEXT_LENGTH):
-        super(PositionalEncoding, self).__init__()        
+        super(PositionalEncoding, self).__init__()
         self.pe = nn.Embedding(seq_len, d_model)
 
     def forward(self, x):
@@ -260,7 +260,7 @@ class StockTransformer(nn.Module):
         x = self.embed_proj(x)          # 线性映射保底
         x = x + self.embed_mlp(x)       # MLP学非线性交互，残差保护线性映射
 
-        # 2. 位置编码
+        # 位置编码
         x = self.pos_encoding(x)
         x = self.dropout(x)
 
@@ -280,10 +280,44 @@ class StockTransformer(nn.Module):
         output = self.output_projection(aggregated)  # [batch_size, output_dim]
         return output
 
+    def load_pretrained_embedding(self, path):
+        """
+        加载预训练 embedding 权重（来自 pretrain_embedding.py）
+
+        Args:
+            path: 预训练权重 .pth 文件路径
+        """
+        checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+
+        self.embed_proj.weight.data.copy_(checkpoint['embed_proj_weight'])
+        self.embed_proj.bias.data.copy_(checkpoint['embed_proj_bias'])
+        # embed_mlp 结构为 Sequential(GELU, Linear)，通过类型定位 Linear 层
+        linear_layer = next(m for m in self.embed_mlp if isinstance(m, nn.Linear))
+        linear_layer.weight.data.copy_(checkpoint['embed_mlp_1_weight'])
+        linear_layer.bias.data.copy_(checkpoint['embed_mlp_1_bias'])
+
+        print(f"  已加载预训练 Embedding: {path}")
+
+    def freeze_embedding(self, freeze=True):
+        """
+        冻结或解冻 FFN-Embedding 参数
+
+        Args:
+            freeze: True=冻结，False=解冻
+        """
+        for param in self.embed_proj.parameters():
+            param.requires_grad = not freeze
+        for param in self.embed_mlp.parameters():
+            param.requires_grad = not freeze
+
+        n_frozen = (sum(p.numel() for p in self.embed_proj.parameters()) +
+                    sum(p.numel() for p in self.embed_mlp.parameters()))
+        status = "冻结" if freeze else "解冻"
+        print(f"  Embedding {status}: {n_frozen:,} 参数")
 
 # ==================== 工厂函数 ====================
 
-def create_model(input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL, 
+def create_model(input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL,
                  nhead=ModelConfig.NHEAD, num_layers=ModelConfig.NUM_LAYERS,
                  output_dim=ModelConfig.OUTPUT_DIM, seq_len=DataConfig.CONTEXT_LENGTH,
                  model_arch=None):
@@ -311,10 +345,10 @@ def create_model(input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL,
         nhead=nhead,
         num_layers=num_layers,
         output_dim=output_dim,
-        seq_len=seq_len
+        seq_len=seq_len,
     )
 
-        # 打印模型信息
+    # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 

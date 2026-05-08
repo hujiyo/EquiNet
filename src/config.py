@@ -143,7 +143,7 @@ class EmbeddingConfig:
     D_MODEL = ModelConfig.D_MODEL         # 128
 
     # 训练超参数
-    EPOCHS = 50                          # 预训练轮数
+    EPOCHS = 80                          # 预训练轮数
     BATCH_SIZE = 2560                     # 大batch，对比学习需要充足负样本
     LEARNING_RATE = 3e-3                  # 预训练学习率
     WEIGHT_DECAY = 1e-4                   # 权重衰减
@@ -184,6 +184,39 @@ class EmbeddingConfig:
     # 输出
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out', 'embedding_pretrain')
     BEST_EMBEDDING_PATH = os.path.join(OUTPUT_DIR, 'best_embedding.pth')
+
+# ==================== 自监督预训练参数 ====================
+class PretrainConfig:
+    """自监督预训练参数（src/pretrain.py 使用）"""
+    SEQ_LEN = 90                          # 预训练序列长度
+    PREDICT_DIMS = [0, 3, 5]              # 预测目标特征索引: Open, Close, Amount
+    LOSS_WEIGHTS = [0.60, 0.25, 0.15]     # 各维度损失权重: Open 60%, Close 25%, Amount 15%
+
+    # 训练超参数
+    EPOCHS = 50                           # 预训练轮数
+    BATCH_SIZE = 512                      # 批大小
+    BATCHES_PER_EPOCH = 240               # 每轮批次数
+    LEARNING_RATE = 0.001                 # 基础学习率
+    WEIGHT_DECAY = 1e-5                   # 权重衰减
+    OPTIMIZER_TYPE = 'mano'               # 优化器类型
+    USE_AMP = True                        # BF16混合精度
+    GRADIENT_CLIP_NORM = 1.0              # 梯度裁剪
+
+    # 学习率调度
+    WARMUP_EPOCHS = 5                     # 预热轮数
+    COSINE_ANNEAL_EPOCHS = 30             # 余弦退火轮数
+    COSINE_ETA_MIN = 1e-4                 # 余弦退火最小学习率
+    WARMUP_START_LR = 1e-4                # 预热起始学习率
+
+    # 微调冻结策略
+    FINETUNE_UNFREEZE_LAYERS = 2          # 微调时解冻最后N层Transformer
+
+    # 验证集
+    VAL_RATIO = 0.05                      # 验证集比例（每只股票最后5%）
+
+    # 输出
+    OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out', 'pretrain')
+    BEST_PRETRAIN_PATH = os.path.join(OUTPUT_DIR, 'best_pretrain.pth')
 
 # ==================== 训练参数 ====================
 class TrainingConfig:

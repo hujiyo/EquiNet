@@ -14,7 +14,12 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from config import ModelConfig, DataConfig
+from config import ModelConfig, DataConfig, PretrainConfig
+
+
+def generate_causal_mask(seq_len, device):
+    """生成因果注意力掩码（上三角矩阵），位置t只能看到<=t的位置"""
+    return torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=device), diagonal=1)
 
 def init_weights(module):
     """
@@ -66,8 +71,7 @@ def init_weights(module):
         nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
         # Position Embedding初始化
-        # vocab_size = CONTEXT_LENGTH = 30
-        if module.weight.shape[0] == DataConfig.CONTEXT_LENGTH:
+        if module.weight.shape[0] in (DataConfig.CONTEXT_LENGTH, PretrainConfig.SEQ_LEN):
             nn.init.xavier_uniform_(module.weight, gain=ModelConfig.POSITION_EMBEDDING_INIT_GAIN)
         else:
             nn.init.xavier_uniform_(module.weight, gain=1.0)
@@ -134,9 +138,9 @@ class TransformerLayer(nn.Module):
         self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn_dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
-    def forward(self, x):
+    def forward(self, x, attn_mask=None):
         # 注意力子层: x = x + Dropout(Attention(LayerNorm(x)))
-        x = x + self.attn(self.attn_norm(x), attn_mask=None)
+        x = x + self.attn(self.attn_norm(x), attn_mask=attn_mask)
 
         # SwiGLU前馈网络: x = x + Dropout(w2(SiLU(w1(h)) * w3(h)))
         h = self.ffn_norm(x)
@@ -203,19 +207,17 @@ class StockTransformer(nn.Module):
     """
     Transformer 模型（Pre-Norm 架构 + FFN-Embedding）
 
-    核心设计：
-    - FFN-Embedding: Linear(9→128) → GELU → Linear(128→128)
-      相比纯线性映射，GELU在中间层提供非线性特征组合能力
-      让第一层Transformer就能访问到特征间的非线性交互（如上影线、实体大小等）
-    - Transformer 层：标准 Attention + FFN 结构，专注于跨时间模式识别
+    支持两种模式：
+    - pretrain: 自回归预训练，输出 [batch, seq_len, predict_dims] 用于下一K线预测
+    - finetune: 分类微调，输出 [batch, 1] 用于二分类
     """
-    def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, seq_len):
+    def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, seq_len, mode='finetune'):
         super(StockTransformer, self).__init__()
 
+        self.mode = mode
+        self.num_layers = num_layers
+
         # FFN-Embedding：线性投影 + 残差MLP（非线性特征交互）
-        # Linear(9→128): 基础线性映射，保底传递原始特征信息
-        # GELU + Linear(128→128): 残差分支，专注学习非线性交互（K线形态翻转等）
-        # 残差连接: 线性映射永远保底，MLP只负责"加增量"
         self.embed_proj = nn.Linear(input_dim, d_model)
         self.embed_mlp = nn.Sequential(
             nn.GELU(),
@@ -232,19 +234,20 @@ class StockTransformer(nn.Module):
         ])
 
         # Pre-Norm架构：在最后添加一个LayerNorm
-        # 因为Pre-Norm的最后一层没有归一化输出
         self.final_norm = nn.LayerNorm(d_model)
 
-        # 多头注意力聚合：通过 cross-attention 聚合序列信息
-        # 相比单向量点积，每个注意力头可以学到不同的时间聚合模式
-        self.attention_pooling = AttentionPooling(d_model, nhead)
-
-        # Pooling输出归一化：与backbone的Pre-Norm风格一致，稳定分类头输入
-        self.head_norm = nn.LayerNorm(d_model)
-
-        # 单层线性分类头（主流做法），让backbone承担特征学习
-        self.output_projection = nn.Linear(d_model, output_dim)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
+
+        if mode == 'pretrain':
+            # 自回归预测头：预测下一根K线的 Open, Close, Amount
+            self.pretrain_head = nn.Linear(d_model, len(PretrainConfig.PREDICT_DIMS))
+        else:
+            # 多头注意力聚合：通过 cross-attention 聚合序列信息
+            self.attention_pooling = AttentionPooling(d_model, nhead)
+            # Pooling输出归一化
+            self.head_norm = nn.LayerNorm(d_model)
+            # 单层线性分类头
+            self.output_projection = nn.Linear(d_model, output_dim)
 
         # 应用初始化
         self.apply(init_weights)
@@ -253,32 +256,33 @@ class StockTransformer(nn.Module):
         nn.init.xavier_uniform_(self.embed_mlp[1].weight, gain=ModelConfig.FFN_INIT_GAIN)
         nn.init.zeros_(self.embed_mlp[1].bias)
 
-    def forward(self, x):
-        # x: [batch_size, seq_len, 10] (OHLC + vwap + volume + exchange + m5 + m10 + m20)
+    def forward(self, x, causal_mask=None):
+        # x: [batch_size, seq_len, 10]
 
         # 1. FFN-Embedding：线性投影 + 残差MLP
-        x = self.embed_proj(x)          # 线性映射保底
-        x = x + self.embed_mlp(x)       # MLP学非线性交互，残差保护线性映射
+        x = self.embed_proj(x)
+        x = x + self.embed_mlp(x)
 
-        # 位置编码
+        # 2. 位置编码
         x = self.pos_encoding(x)
         x = self.dropout(x)
 
         # 3. Transformer层（Pre-Norm架构）
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, attn_mask=causal_mask)
 
         # 4. Pre-Norm架构需要在最后进行归一化
-        #    因为每层的输出没有经过归一化
         x = self.final_norm(x)
 
-        # 5. 多头注意力聚合
-        aggregated = self.attention_pooling(x)  # [batch_size, d_model]
-
-        # 6. Pooling归一化 + 分类头
-        aggregated = self.head_norm(aggregated)
-        output = self.output_projection(aggregated)  # [batch_size, output_dim]
-        return output
+        if self.mode == 'pretrain':
+            # [batch_size, seq_len, predict_dims]
+            return self.pretrain_head(x)
+        else:
+            # 5. 多头注意力聚合
+            aggregated = self.attention_pooling(x)
+            # 6. Pooling归一化 + 分类头
+            aggregated = self.head_norm(aggregated)
+            return self.output_projection(aggregated)
 
     def load_pretrained_embedding(self, path):
         """
@@ -315,15 +319,97 @@ class StockTransformer(nn.Module):
         status = "冻结" if freeze else "解冻"
         print(f"  Embedding {status}: {n_frozen:,} 参数")
 
+    def load_pretrained_backbone(self, path):
+        """
+        加载预训练 backbone 权重（来自 pretrain.py）
+
+        只加载两种模型共有的层（embedding, pos_encoding, transformer layers, final_norm），
+        跳过任务特定的头（pretrain_head / attention_pooling / classification head）。
+
+        Args:
+            path: 预训练模型 .pth 文件路径
+        """
+        checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+
+        # 提取 state_dict
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            src_state = checkpoint['state_dict']
+        else:
+            src_state = checkpoint
+
+        dst_state = self.state_dict()
+        loaded_keys = []
+        skipped_keys = []
+
+        for key, value in src_state.items():
+            # 跳过任务特定的头
+            if any(key.startswith(prefix) for prefix in [
+                'pretrain_head', 'attention_pooling', 'head_norm', 'output_projection'
+            ]):
+                skipped_keys.append(key)
+                continue
+
+            if key in dst_state and dst_state[key].shape == value.shape:
+                dst_state[key] = value
+                loaded_keys.append(key)
+            else:
+                skipped_keys.append(key)
+
+        self.load_state_dict(dst_state)
+        print(f"  已加载预训练 Backbone: {len(loaded_keys)} 层")
+        if skipped_keys:
+            print(f"  跳过 {len(skipped_keys)} 层: {skipped_keys[:5]}{'...' if len(skipped_keys) > 5 else ''}")
+
+    def freeze_backbone(self, unfreeze_last_n=0):
+        """
+        冻结 backbone 参数，可选解冻最后 N 层 Transformer
+
+        冻结: embed_proj, embed_mlp, pos_encoding, final_norm
+        冻结前 (num_layers - unfreeze_last_n) 层 Transformer
+        解冻最后 unfreeze_last_n 层 Transformer
+
+        Args:
+            unfreeze_last_n: 解冻最后 N 层 Transformer（0=全部冻结）
+        """
+        # 冻结 embedding
+        for param in self.embed_proj.parameters():
+            param.requires_grad = False
+        for param in self.embed_mlp.parameters():
+            param.requires_grad = False
+
+        # 冻结位置编码
+        for param in self.pos_encoding.parameters():
+            param.requires_grad = False
+
+        # 冻结 final_norm
+        for param in self.final_norm.parameters():
+            param.requires_grad = False
+
+        # 冻结/解冻 Transformer 层
+        frozen_layers = self.num_layers - unfreeze_last_n
+        for i, layer in enumerate(self.layers):
+            freeze = i < frozen_layers
+            for param in layer.parameters():
+                param.requires_grad = not freeze
+
+        # 统计
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen = total - trainable
+        print(f"  Backbone 冻结: {frozen:,} 参数, 可训练: {trainable:,} 参数")
+        if unfreeze_last_n > 0:
+            print(f"  解冻最后 {unfreeze_last_n}/{self.num_layers} 层 Transformer")
+
 # ==================== 工厂函数 ====================
 
 def create_model(input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL,
                  nhead=ModelConfig.NHEAD, num_layers=ModelConfig.NUM_LAYERS,
-                 output_dim=ModelConfig.OUTPUT_DIM, seq_len=DataConfig.CONTEXT_LENGTH,
-                 model_arch=None):
+                 output_dim=ModelConfig.OUTPUT_DIM, seq_len=PretrainConfig.SEQ_LEN,
+                 mode='finetune', model_arch=None):
     """
     Args:
         参数均为可选，如果不提供则使用 ModelConfig 中的默认值
+        mode: 'pretrain' 或 'finetune'
         model_arch: 可选的元数据字典（来自 .pth 内的 'model_arch' 键），
                     若提供则优先使用其中的参数覆盖默认值，
                     用于 run.py 自动重建与训练时架构一致的模型
@@ -338,6 +424,7 @@ def create_model(input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL,
         num_layers = model_arch.get('num_layers', num_layers)
         output_dim = model_arch.get('output_dim', output_dim)
         seq_len    = model_arch.get('context_length', seq_len)
+        mode       = model_arch.get('mode', mode)
 
     model = StockTransformer(
         input_dim=input_dim,
@@ -346,14 +433,16 @@ def create_model(input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL,
         num_layers=num_layers,
         output_dim=output_dim,
         seq_len=seq_len,
+        mode=mode,
     )
 
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+    mode_str = "预训练(GPT)" if mode == 'pretrain' else "微调(BERT)"
     print(f"\n{'='*50}")
-    print(f"模型架构 (StockTransformer)")
+    print(f"模型架构 (StockTransformer) [{mode_str}]")
     print(f"{'='*50}")
     print(f"输入维度: {input_dim}")
     print(f"序列长度: {seq_len}")

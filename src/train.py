@@ -19,7 +19,7 @@ import copy
 import random
 import csv
 from datetime import datetime
-from config import (TrainingConfig,DataConfig,DeviceConfig,ModelConfig,print_config_summary,LossConfig,EmbeddingConfig)
+from config import (TrainingConfig,DataConfig,DeviceConfig,ModelConfig,print_config_summary,LossConfig,EmbeddingConfig,PretrainConfig)
 
 from model import create_model
 
@@ -440,7 +440,7 @@ def train_clone_model(model_a, train_stock_info, test_stock_info,
             if best_model_a_for_pseudo is None:
                 best_model_a_for_pseudo = copy.deepcopy(model_a)
             else:
-                best_model_a_for_pseudo.load_state_dict(copy.deepcopy(model_a.state_dict()))
+                best_model_a_for_pseudo.load_state_dict(model_a.state_dict())
             best_model_a_for_pseudo.eval()
             print(f'          ✓ 新最佳模型A（收益率）！Top1%收益: {best_return_a*100:+.2f}% (第{best_return_epoch_a}轮)')
 
@@ -673,10 +673,10 @@ if __name__ == "__main__":
     print(f" 训练集: {len(train_stock_info)} 只股票")
     print(f" 测试集: {len(test_stock_info)} 只股票")
 
-    # 创建模型A
+    # 创建模型A（微调模式）
     amp_str = "BF16混合精度" if TrainingConfig.USE_AMP else "FP32精度"
     print(f"\n正在创建模型A ({amp_str})...")
-    model_a = create_model().to(device)
+    model_a = create_model(mode='finetune', seq_len=PretrainConfig.SEQ_LEN).to(device)
 
     # 加载预训练 Embedding（必须步骤，类似 normalizer.pkl）
     embedding_path = EmbeddingConfig.BEST_EMBEDDING_PATH
@@ -689,8 +689,19 @@ if __name__ == "__main__":
         print("请先运行: python src/pretrain_embedding.py")
         sys.exit(1)
 
+    # 加载预训练 Backbone（冻结，解冻最后N层Transformer）
+    pretrain_path = PretrainConfig.BEST_PRETRAIN_PATH
+    if os.path.exists(pretrain_path):
+        print(f"加载预训练 Backbone: {pretrain_path}")
+        model_a.load_pretrained_backbone(pretrain_path)
+        model_a.freeze_backbone(unfreeze_last_n=PretrainConfig.FINETUNE_UNFREEZE_LAYERS)
+    else:
+        print(f"⚠ 预训练 Backbone 不存在: {pretrain_path}")
+        print("将从头训练（无预训练权重）")
+
     total_params = sum(p.numel() for p in model_a.parameters())
-    print(f" 模型A参数数: {total_params:,}")
+    trainable_params = sum(p.numel() for p in model_a.parameters() if p.requires_grad)
+    print(f" 模型A参数数: {total_params:,}, 可训练: {trainable_params:,}")
 
     # 开始训练
     print("\n开始克隆模型训练...")

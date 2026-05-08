@@ -1829,3 +1829,203 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ==================== 自监督预训练数据管道 ====================
+
+def coarse_normalize_series(stock_data, start_idx, end_idx):
+    """
+    对股票整段训练序列进行粗处理（无窗口限制）
+
+    与 coarse_normalize_context_window() 相同的归一化逻辑，
+    但应用于任意长度的连续序列，不执行验证/过滤。
+
+    Args:
+        stock_data: 股票原始数据 [N, 10]
+        start_idx: 起始索引（需要 >= 1，因为需要前一天作为基准）
+        end_idx: 结束索引（不含）
+
+    Returns:
+        normalized: [end_idx - start_idx, 10] 粗处理后的序列，或 None
+    """
+    if start_idx < 1:
+        return None
+
+    raw = stock_data[start_idx:end_idx]
+    length = end_idx - start_idx
+    if length <= 0:
+        return None
+
+    prev_close = stock_data[start_idx - 1, 3]
+    if prev_close == 0:
+        return None
+
+    closes = raw[:, 3]
+    vwaps = raw[:, 4]
+    amounts = raw[:, 5]
+    exchanges = raw[:, 6]
+
+    if np.any(closes == 0) or np.any(amounts == 0):
+        return None
+
+    result = np.empty((length, 10), dtype=np.float32)
+
+    # OHLC: 日环比变化率
+    result[0, :4] = (raw[0, :4] - prev_close) / prev_close
+    if length > 1:
+        result[1:, :4] = (raw[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
+
+    # VWAP: 相对当日收盘价偏离
+    result[:, 4] = (vwaps - closes) / closes
+
+    np.clip(result[:, :5], -0.1, 0.1, out=result[:, :5])
+
+    # Amount 和 Exchange: 相对N日均值变化率
+    N = DataConfig.MA_WINDOW
+    abs_indices = start_idx + np.arange(length)
+
+    for col, raw_vals in [(5, amounts), (6, exchanges)]:
+        full_col = stock_data[:, col]
+        cumsum = np.empty(len(full_col) + 1, dtype=np.float64)
+        cumsum[0] = 0
+        np.cumsum(full_col, out=cumsum[1:])
+
+        valid_start = np.maximum(abs_indices - N, 0)
+        actual_N = abs_indices - valid_start
+
+        ma_values = np.empty(length, dtype=np.float32)
+        for k in range(length):
+            if actual_N[k] > 0:
+                ma_values[k] = (cumsum[abs_indices[k]] - cumsum[valid_start[k]]) / actual_N[k]
+            else:
+                ma_values[k] = raw_vals[k]
+
+        valid = np.isfinite(ma_values) & (ma_values > 0)
+        if not np.all(valid):
+            result[:, col] = 0.0
+            result[valid, col] = (raw_vals[valid] - ma_values[valid]) / ma_values[valid]
+        else:
+            result[:, col] = (raw_vals - ma_values) / ma_values
+
+    # MA偏离度特征
+    result[:, 7:10] = raw[:, 7:10]
+
+    if np.any(~np.isfinite(result)):
+        return None
+
+    return result
+
+
+def precompute_pretrain_pool(train_stock_info, feature_normalizer, val_ratio=0.05):
+    """
+    预计算预训练数据池
+
+    对每只股票的训练序列进行粗处理 + 细处理，
+    返回可用于自回归训练的标准化序列列表。
+
+    Args:
+        train_stock_info: 训练集股票信息列表
+        feature_normalizer: 已拟合的特征归一化器
+        val_ratio: 验证集比例（每只股票最后 val_ratio 的数据）
+
+    Returns:
+        train_pool: 训练池 [{'series': ndarray, 'length': int}, ...]
+        val_pool: 验证池（同格式）
+    """
+    train_pool = []
+    val_pool = []
+
+    for stock_idx, stock in enumerate(train_stock_info):
+        data = stock['data']
+        start_idx = stock['train_start_idx']
+        end_idx = stock['train_end_idx']
+
+        if end_idx - start_idx < 2:
+            continue
+
+        # 粗处理（从 start_idx 到 end_idx，start_idx-1 作为基准日）
+        coarse = coarse_normalize_series(data, start_idx, end_idx)
+        if coarse is None:
+            continue
+
+        # 细处理
+        normalized = feature_normalizer.transform(coarse)
+        if np.any(~np.isfinite(normalized)):
+            continue
+
+        # 分割训练/验证
+        length = len(normalized)
+        val_length = max(1, int(length * val_ratio))
+        train_length = length - val_length
+
+        if train_length > 0:
+            train_pool.append({
+                'series': np.ascontiguousarray(normalized[:train_length]),
+                'length': train_length,
+                'stock_idx': stock_idx,
+            })
+        if val_length > 0:
+            val_pool.append({
+                'series': np.ascontiguousarray(normalized[train_length:]),
+                'length': val_length,
+                'stock_idx': stock_idx,
+            })
+
+    print(f"  预训练数据池: {len(train_pool)} 只股票(训练), {len(val_pool)} 只股票(验证)")
+    total_train = sum(s['length'] for s in train_pool)
+    total_val = sum(s['length'] for s in val_pool)
+    print(f"  总时间步: 训练={total_train:,}, 验证={total_val:,}")
+
+    return train_pool, val_pool
+
+
+def sample_pretrain_batch(pool, seq_len, predict_dims, batch_size, rng=None):
+    """
+    从预训练数据池中采样一个batch
+
+    每个样本包含 seq_len+1 个时间步：
+    - 输入: window[:seq_len] (seq_len 步)
+    - 目标: window[1:seq_len+1, predict_dims] (seq_len 步，shifted by 1)
+
+    Args:
+        pool: precompute_pretrain_pool() 返回的数据池
+        seq_len: 序列长度（不含 shift 的目标步）
+        predict_dims: 预测目标的特征索引列表
+        batch_size: 批大小
+        rng: numpy 随机数生成器
+
+    Returns:
+        inputs: [batch_size, seq_len, 10]
+        targets: [batch_size, seq_len, len(predict_dims)]
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+
+    # 预计算权重（按序列长度加权，长序列被选中概率更高）
+    lengths = np.array([s['length'] for s in pool], dtype=np.float64)
+    weights = lengths / lengths.sum()
+
+    inputs = np.empty((batch_size, seq_len, 10), dtype=np.float32)
+    targets = np.empty((batch_size, seq_len, len(predict_dims)), dtype=np.float32)
+
+    for i in range(batch_size):
+        # 按长度加权随机选股
+        pool_idx = rng.choice(len(pool), p=weights)
+        entry = pool[pool_idx]
+        series = entry['series']
+
+        # 随机起始位置（需要 seq_len + 1 个时间步）
+        max_start = entry['length'] - seq_len - 1
+        if max_start <= 0:
+            # 序列不够长，用零填充
+            window = np.zeros((seq_len + 1, 10), dtype=np.float32)
+            avail = min(entry['length'], seq_len + 1)
+            window[:avail] = series[:avail]
+        else:
+            start = rng.randint(0, max_start + 1)
+            window = series[start:start + seq_len + 1]
+
+        inputs[i] = window[:seq_len]
+        targets[i] = window[1:seq_len + 1, predict_dims]
+
+    return inputs, targets

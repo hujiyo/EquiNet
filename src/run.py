@@ -876,7 +876,7 @@ def main():
         print(f"  请先运行: python data.py")
         raise FileNotFoundError(f"归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
 
-    train_stock_info, test_stock_info = load_and_preprocess_data()
+    train_stock_info, val_stock_info, test_stock_info = load_and_preprocess_data()
 
     # 运行评估
     stats = run_evaluation(model, test_stock_info, device, feature_normalizer)

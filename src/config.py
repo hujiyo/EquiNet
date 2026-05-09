@@ -25,11 +25,12 @@ class DataConfig:
     VALID_STOCK_PREFIXES = ['600', '601', '603', '605', '000', '001', '002', '003']  # 主板股票代码前缀
 
     # 数据分割参数（按时间划分）
-    TEST_DAYS = 110                   # 测试集天数（每只股票的最近N天作为测试集）
+    TRAIN_START_DATE = 20160101      # 训练集起始日期（含）
+    TRAIN_END_DATE = 20241231        # 训练集截止日期（含）
+    VAL_START_DATE = 20250101        # 验证集起始日期（含），用于训练时模型选择
+    VAL_END_DATE = 20251231          # 验证集截止日期（含）
+    TEST_START_DATE = 20260101       # 测试集起始日期（含），截止日期为数据库最新日期，训练结束后仅评估一次
     RANDOM_SEED = 42                 # 随机种子
-    
-    # 训练集时间范围限制
-    TRAIN_START_YEAR = 2016          # 训练集起始年份（2020年及以前的数据不参与训练）
     
     # 样本生成参数
     CONTEXT_LENGTH = 45              # 历史数据长度（这是核心参数，其他地方应引用这个值）
@@ -524,8 +525,9 @@ def print_config_summary():
     print(f"数据参数:")
     print(f"  数据库: {DataConfig.DB_PATH}")
     print(f"  采样策略: {DataConfig.SAMPLING_STRATEGY} ({'时间顺序采样' if DataConfig.SAMPLING_STRATEGY == 'temporal' else '随机采样'})")
-    print(f"  训练集起始年份: {DataConfig.TRAIN_START_YEAR}年（过滤{DataConfig.TRAIN_START_YEAR-1}年及以前的数据）")
-    print(f"  测试集天数: {DataConfig.TEST_DAYS}天")
+    print(f"  训练集范围: {DataConfig.TRAIN_START_DATE} ~ {DataConfig.TRAIN_END_DATE}")
+    print(f"  验证集范围: {DataConfig.VAL_START_DATE} ~ {DataConfig.VAL_END_DATE}")
+    print(f"  测试集起始: {DataConfig.TEST_START_DATE} ~ 最新")
     print(f"  上下文长度: {DataConfig.CONTEXT_LENGTH}")
     print(f"  涨停过滤: {'开启' if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP else '关闭'}")
     print(f"  评估批处理大小: {DataConfig.EVAL_BATCH_SIZE}")

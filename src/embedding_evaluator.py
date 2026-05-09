@@ -1048,7 +1048,7 @@ def main():
 
     print("\n" + "=" * 60)
     print("[步骤1] 加载数据...")
-    train_stock_info, test_stock_info = load_and_preprocess_data()
+    train_stock_info, val_stock_info, test_stock_info = load_and_preprocess_data()
 
     print("\n[步骤2] 准备测试样本...")
     from data import coarse_normalize_context_window

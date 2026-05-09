@@ -4,7 +4,8 @@ EquiNet 模型训练脚本
 训练策略：
 - 使用 DynamicWeightedBCE / PairwiseWeightedBCE 损失函数
 - 两阶段学习率调度：Warmup + Cosine Annealing
-- 按测试集 loss 和实战收益率分别保存最佳模型
+- 训练时在验证集上评估，按验证集 loss 和实战收益率选择最佳模型
+- 训练结束后用最佳模型在测试集上做最终评估
 '''
 
 import os, sys, torch, torch.nn as nn, numpy as np
@@ -39,7 +40,7 @@ from training_utils import (
     training_step
 )
 
-def train(model, train_stock_info, test_stock_info,
+def train(model, train_stock_info, val_stock_info, test_stock_info,
           epochs=TrainingConfig.EPOCHS,
           learning_rate=None,
           device=None,
@@ -52,7 +53,8 @@ def train(model, train_stock_info, test_stock_info,
     Args:
         model: 待训练的模型实例
         train_stock_info: 训练集股票信息
-        test_stock_info: 测试集股票信息
+        val_stock_info: 验证集股票信息（训练时用于模型选择）
+        test_stock_info: 测试集股票信息（训练结束后仅评估一次）
         epochs: 训练轮数
         learning_rate: 学习率（None时自动使用当前优化器默认值）
         device: 训练设备
@@ -75,8 +77,25 @@ def train(model, train_stock_info, test_stock_info,
     if learning_rate is None:
         learning_rate = TrainingConfig.get_base_lr()
 
-    # 创建评估数据集
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
+    # 创建验证集评估数据集（训练时用于模型选择）
+    has_val = len(val_stock_info) > 0
+    if has_val:
+        print("创建验证集评估数据集...")
+        eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(
+            val_stock_info, feature_normalizer,
+            start_key='val_split_point', end_key='test_split_point'
+        )
+        print(f"  验证集样本数: {len(eval_inputs)}")
+    else:
+        print("⚠ 无验证集数据，使用测试集进行模型选择（不推荐）")
+        eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(
+            test_stock_info, feature_normalizer
+        )
+
+    # 创建测试集评估数据集（训练结束后仅评估一次）
+    test_eval_inputs, test_eval_targets, test_eval_cumulative_returns, test_eval_day_indices, test_eval_daily_returns = create_fixed_evaluation_dataset(
+        test_stock_info, feature_normalizer
+    )
 
     # 创建优化器（embedding 已冻结，只传可训练参数）
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -114,19 +133,20 @@ def train(model, train_stock_info, test_stock_info,
         criterion = nn.BCEWithLogitsLoss(reduction='mean')
         eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
-    # 设置评估损失权重（BCE类损失共享此逻辑）
+    # 设置验证集评估损失权重（BCE类损失共享此逻辑）
     if isinstance(eval_criterion, DynamicWeightedBCE):
-        test_targets = np.array(eval_targets)
-        test_pos_count = np.sum(test_targets >= 0.5)
-        test_neg_count = np.sum(test_targets < 0.5)
-        if test_pos_count > 0 and test_neg_count > 0:
-            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
-        elif test_pos_count == 0:
-            test_neg_weight = float(LossConfig.POS_WEIGHT)
+        val_targets = np.array(eval_targets)
+        val_pos_count = np.sum(val_targets >= 0.5)
+        val_neg_count = np.sum(val_targets < 0.5)
+        if val_pos_count > 0 and val_neg_count > 0:
+            val_neg_weight = LossConfig.POS_WEIGHT * (val_pos_count / val_neg_count)
+        elif val_pos_count == 0:
+            val_neg_weight = float(LossConfig.POS_WEIGHT)
         else:
-            test_neg_weight = 0.1
-        eval_criterion.weight_0_0.fill_(test_neg_weight)
-        print(f"测试集权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={test_neg_weight:.4f} (正负比例={test_pos_count}:{test_neg_count})")
+            val_neg_weight = 0.1
+        eval_criterion.weight_0_0.fill_(val_neg_weight)
+        eval_set_name = "验证集" if has_val else "测试集"
+        print(f"{eval_set_name}权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={val_neg_weight:.4f} (正负比例={val_pos_count}:{val_neg_count})")
 
     # 按loss保存的最佳模型（条件：预热结束后, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
     best_loss = float('inf')
@@ -254,7 +274,7 @@ def train(model, train_stock_info, test_stock_info,
         if not warmup_scheduler.is_warmup_phase():
             main_scheduler.step()
 
-        # 评估模型
+        # 评估模型（在验证集上）
         stats = evaluate_model(
             model, eval_inputs, eval_targets, eval_cumulative_returns,
             device,
@@ -267,9 +287,10 @@ def train(model, train_stock_info, test_stock_info,
         total_samples = len(epoch_inputs)
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
 
-        test_loss = stats['test_loss']
+        val_loss = stats['test_loss']
+        eval_label = "验证集" if has_val else "测试集"
 
-        print(f'  [模型] 训练损失: {avg_loss:.4f}, 测试损失: {test_loss:.4f}, AUC: {stats["auc"]:.4f}, Prec@10%: {stats["precision_top10"]:.3f}, Prec@5%: {stats["precision_top5"]:.3f}, Prec@3%: {stats["precision_top3"]:.3f} (基线: {stats["base_positive_rate"]:.3f})')
+        print(f'  [模型] 训练损失: {avg_loss:.4f}, {eval_label}损失: {val_loss:.4f}, AUC: {stats["auc"]:.4f}, Prec@10%: {stats["precision_top10"]:.3f}, Prec@5%: {stats["precision_top5"]:.3f}, Prec@3%: {stats["precision_top3"]:.3f} (基线: {stats["base_positive_rate"]:.3f})')
         print(f'         预测均值: {stats["pred_mean"]:.3f}, 高置信(>0.7): {stats["high_conf_count"]}, 低置信(<0.2): {stats["low_conf_count"]}')
         daily_str = f', 日Top{DataConfig.TOP_K}%收益: {stats["daily_top_return"]*100:+.2f}%' if stats.get("daily_top_return") is not None else ''
         print(f'         Top{DataConfig.TOP_K}%收益: {stats["top_return"]*100:+.2f}%{daily_str}')
@@ -286,7 +307,7 @@ def train(model, train_stock_info, test_stock_info,
             'return': stats['top_return'] * 100,
             'daily_return': stats.get('daily_top_return'),
             'train_loss': avg_loss,
-            'test_loss': test_loss,
+            'val_loss': val_loss,
             'auc': stats['auc'],
             'precision_top10': stats['precision_top10'],
             'precision_top5': stats['precision_top5'],
@@ -302,9 +323,9 @@ def train(model, train_stock_info, test_stock_info,
 
         print_dispersion_sparkline(stats.get('all_preds', []), epoch_returns, all_targets=stats.get('all_targets'))
 
-        # 早停检测
+        # 早停检测（基于验证集指标）
         improved, improve_reason = early_stopping.check_improve(
-            avg_loss=test_loss,
+            avg_loss=val_loss,
             top_return=stats['top_return'],
             auc=stats['auc'],
             threshold=stats['top_threshold']
@@ -317,20 +338,20 @@ def train(model, train_stock_info, test_stock_info,
             no_improve_count, patience_limit = early_stopping.get_progress()
             print(f'         ⚠ 无改善 ({no_improve_count}/{patience_limit})')
 
-        # 按loss评估最佳模型（条件：预热结束后, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
+        # 按loss保存最佳模型（基于验证集指标）
         realistic_return = stats['realistic_stats']['avg_realistic_return'] if stats.get('realistic_stats') else 0.0
         if (epoch + 1) > warmup_epochs and realistic_return >= 0.014 and stats['top_return'] > 0.008 and stats['auc'] > 0.65:
-            if test_loss < best_loss:
-                best_loss = test_loss
+            if val_loss < best_loss:
+                best_loss = val_loss
                 best_loss_epoch = epoch + 1
                 best_model_by_loss = copy.deepcopy(model.state_dict())
                 best_return_at_best_loss = stats['top_return']
                 best_auc_at_best_loss = stats['auc']
                 best_threshold_at_best_loss = stats['top_threshold']
                 best_realistic_return_at_best_loss = realistic_return
-                print(f'         ✓ 新最佳模型（loss）！Loss: {best_loss:.4f}, 实战收益率: {best_realistic_return_at_best_loss*100:.1f}% (第{best_loss_epoch}轮)')
+                print(f'         ✓ 新最佳模型（{eval_label} loss）！Loss: {best_loss:.4f}, 实战收益率: {best_realistic_return_at_best_loss*100:.1f}% (第{best_loss_epoch}轮)')
 
-        # 按实战收益率评估最佳模型（预热结束后）
+        # 按实战收益率保存最佳模型（基于验证集指标）
         if (epoch + 1) > warmup_epochs:
             if realistic_return > best_realistic_return:
                 best_realistic_return = realistic_return
@@ -340,7 +361,7 @@ def train(model, train_stock_info, test_stock_info,
                 best_auc_at_best_realistic = stats['auc']
                 best_threshold_at_best_realistic = stats['top_threshold']
                 best_realistic_return_value_at_best = realistic_return
-                print(f'         ✓ 新最佳模型（实战收益率）！实战: {best_realistic_return*100:.1f}%, Top1%: {best_return_at_best_realistic*100:+.2f}% (第{best_realistic_return_epoch}轮)')
+                print(f'         ✓ 新最佳模型（{eval_label}实战收益率）！实战: {best_realistic_return*100:.1f}%, Top1%: {best_return_at_best_realistic*100:+.2f}% (第{best_realistic_return_epoch}轮)')
 
         print("-" * 60)
 
@@ -349,43 +370,122 @@ def train(model, train_stock_info, test_stock_info,
             print(f"\n⚠ 早停触发：连续{patience}轮无改善，停止训练")
             break
 
-    # 保存最佳模型
+    # ========== 最终测试集评估 → 保存模型 ==========
     print("\n" + "=" * 60)
     print(f"训练完成！")
-    print(f"最佳模型（按loss）: 第{best_loss_epoch}轮, Loss: {best_loss:.4f}, 实战收益率: {best_realistic_return_at_best_loss*100:.1f}%")
-    print(f"最佳模型（按实战收益率）: 第{best_realistic_return_epoch}轮, 实战收益率: {best_realistic_return_value_at_best*100:.1f}%, Top1%: {best_return_at_best_realistic*100:+.2f}%")
+    eval_label = "验证集" if has_val else "测试集"
+    print(f"最佳模型（按{eval_label} loss）: 第{best_loss_epoch}轮, Loss: {best_loss:.4f}, 实战收益率: {best_realistic_return_at_best_loss*100:.1f}%")
+    print(f"最佳模型（按{eval_label}实战收益率）: 第{best_realistic_return_epoch}轮, 实战收益率: {best_realistic_return_value_at_best*100:.1f}%, Top1%: {best_return_at_best_realistic*100:+.2f}%")
 
+    # 测试集评估（用测试集指标保存到模型文件中）
+    test_return = 0.0
+    test_realistic_return = 0.0
+
+    # 用于保存的测试集指标（默认用验证集指标，有测试集时覆盖）
+    save_loss_return = best_return_at_best_loss
+    save_loss_threshold = best_threshold_at_best_loss
+    save_loss_auc = best_auc_at_best_loss
+    save_realistic_return = best_return_at_best_realistic
+    save_realistic_threshold = best_threshold_at_best_realistic
+    save_realistic_auc = best_auc_at_best_realistic
+
+    if len(test_eval_inputs) > 0:
+        print("\n" + "=" * 60)
+        print("测试集最终评估（即将保存的模型）")
+        print("=" * 60)
+
+        # 创建测试集评估损失
+        if isinstance(eval_criterion, DynamicWeightedBCE):
+            test_eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+            t_targets = np.array(test_eval_targets)
+            t_pos = np.sum(t_targets >= 0.5)
+            t_neg = np.sum(t_targets < 0.5)
+            if t_pos > 0 and t_neg > 0:
+                t_neg_w = LossConfig.POS_WEIGHT * (t_pos / t_neg)
+            elif t_pos == 0:
+                t_neg_w = float(LossConfig.POS_WEIGHT)
+            else:
+                t_neg_w = 0.1
+            test_eval_criterion.weight_0_0.fill_(t_neg_w)
+        else:
+            test_eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
+
+        # 评估按loss选出的最佳模型
+        if best_model_by_loss is not None:
+            model.load_state_dict(best_model_by_loss)
+            test_stats_loss = evaluate_model(
+                model, test_eval_inputs, test_eval_targets, test_eval_cumulative_returns,
+                device,
+                eval_day_indices=test_eval_day_indices,
+                eval_daily_returns=test_eval_daily_returns,
+                criterion=test_eval_criterion
+            )
+            print(f"\n  [测试集] 模型(loss): "
+                  f"Loss: {test_stats_loss['test_loss']:.4f}, "
+                  f"AUC: {test_stats_loss['auc']:.4f}, "
+                  f"Top{DataConfig.TOP_K}%收益: {test_stats_loss['top_return']*100:+.2f}%")
+            if test_stats_loss.get('realistic_stats'):
+                rs = test_stats_loss['realistic_stats']
+                print(f"           实战收益率: {rs['avg_realistic_return']*100:.1f}%")
+            # 用测试集指标覆盖保存指标
+            save_loss_return = test_stats_loss['top_return']
+            save_loss_threshold = test_stats_loss['top_threshold']
+            save_loss_auc = test_stats_loss['auc']
+            test_return = test_stats_loss['top_return']
+
+        # 评估按实战收益率选出的最佳模型
+        if best_model_by_realistic_return is not None:
+            model.load_state_dict(best_model_by_realistic_return)
+            test_stats_realistic = evaluate_model(
+                model, test_eval_inputs, test_eval_targets, test_eval_cumulative_returns,
+                device,
+                eval_day_indices=test_eval_day_indices,
+                eval_daily_returns=test_eval_daily_returns,
+                criterion=test_eval_criterion
+            )
+            print(f"\n  [测试集] 模型(realistic): "
+                  f"Loss: {test_stats_realistic['test_loss']:.4f}, "
+                  f"AUC: {test_stats_realistic['auc']:.4f}, "
+                  f"Top{DataConfig.TOP_K}%收益: {test_stats_realistic['top_return']*100:+.2f}%")
+            if test_stats_realistic.get('realistic_stats'):
+                rs = test_stats_realistic['realistic_stats']
+                print(f"           实战收益率: {rs['avg_realistic_return']*100:.1f}%")
+            # 用测试集指标覆盖保存指标
+            save_realistic_return = test_stats_realistic['top_return']
+            save_realistic_threshold = test_stats_realistic['top_threshold']
+            save_realistic_auc = test_stats_realistic['auc']
+            test_realistic_return = rs['avg_realistic_return'] if test_stats_realistic.get('realistic_stats') else 0.0
+
+        print("=" * 60)
+
+    # 保存模型（嵌入测试集评估指标）
     if best_model_by_loss is not None:
         save_path = save_model_with_metadata(
             best_model_by_loss,
-            best_return_at_best_loss, best_threshold_at_best_loss, best_auc_at_best_loss,
+            save_loss_return, save_loss_threshold, save_loss_auc,
             best_loss_epoch,
             model_prefix="model_loss",
             output_dir=DataConfig.OUTPUT_DIR,
         )
         print(f"✓ 模型(loss)已保存: {os.path.basename(save_path)}")
-        print(f"  Top1%阈值: {best_threshold_at_best_loss:.4f}")
-        print(f"  实战收益率: {best_realistic_return_at_best_loss*100:.1f}%")
+        print(f"  测试集 Top1%收益: {save_loss_return*100:+.2f}%, AUC: {save_loss_auc:.4f}")
 
     if best_model_by_realistic_return is not None:
         save_path_realistic = save_model_with_metadata(
             best_model_by_realistic_return,
-            best_return_at_best_realistic, best_threshold_at_best_realistic, best_auc_at_best_realistic,
+            save_realistic_return, save_realistic_threshold, save_realistic_auc,
             best_realistic_return_epoch,
             model_prefix="model_realistic",
             output_dir=DataConfig.OUTPUT_DIR,
         )
         print(f"✓ 模型(realistic)已保存: {os.path.basename(save_path_realistic)}")
-        print(f"  Top1%阈值: {best_threshold_at_best_realistic:.4f}")
-        print(f"  实战收益率: {best_realistic_return_value_at_best*100:.1f}%")
-
-    print("=" * 60)
+        print(f"  测试集 Top1%收益: {save_realistic_return*100:+.2f}%, AUC: {save_realistic_auc:.4f}")
 
     # 保存每轮收益率到CSV
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"epoch_returns_{timestamp}.csv")
 
-    fieldnames = ['turn', 'top_return', 'daily_return', 'train_loss', 'test_loss', 'auc', 'prec_top10', 'prec_top5', 'prec_top3', 'avg_realistic_return']
+    fieldnames = ['turn', 'top_return', 'daily_return', 'train_loss', 'val_loss', 'auc', 'prec_top10', 'prec_top5', 'prec_top3', 'avg_realistic_return']
 
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -397,7 +497,7 @@ def train(model, train_stock_info, test_stock_info,
                 'top_return': f"{er['return']:.2f}",
                 'daily_return': f"{er['daily_return']*100:.2f}" if er.get('daily_return') is not None else "",
                 'train_loss': f"{er['train_loss']:.4f}" if er.get('train_loss') is not None else "",
-                'test_loss': f"{er['test_loss']:.4f}" if er.get('test_loss') is not None else "",
+                'val_loss': f"{er['val_loss']:.4f}" if er.get('val_loss') is not None else "",
                 'auc': f"{er['auc']:.4f}" if er.get('auc') is not None else "",
                 'prec_top10': f"{er['precision_top10']:.4f}" if er.get('precision_top10') is not None else "",
                 'prec_top5': f"{er['precision_top5']:.4f}" if er.get('precision_top5') is not None else "",
@@ -407,7 +507,7 @@ def train(model, train_stock_info, test_stock_info,
             writer.writerow(row)
 
     print(f"✓ 训练日志已保存: {os.path.basename(returns_csv_path)}")
-    return best_return_at_best_loss, best_realistic_return_at_best_loss
+    return test_return, test_realistic_return
 
 
 if __name__ == "__main__":
@@ -438,7 +538,7 @@ if __name__ == "__main__":
     print("="*60)
 
     # 加载数据
-    train_stock_info, test_stock_info = load_and_preprocess_data()
+    train_stock_info, val_stock_info, test_stock_info = load_and_preprocess_data()
 
     # 正样本距离保护
     compute_label_distance_exclusions(train_stock_info)
@@ -447,6 +547,7 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("数据集统计")
     print(f" 训练集: {len(train_stock_info)} 只股票")
+    print(f" 验证集: {len(val_stock_info)} 只股票")
     print(f" 测试集: {len(test_stock_info)} 只股票")
 
     # 创建模型（微调模式）
@@ -482,7 +583,7 @@ if __name__ == "__main__":
     # 开始训练
     print("\n开始模型训练...")
     best_return, best_realistic_return = train(
-        model, train_stock_info, test_stock_info,
+        model, train_stock_info, val_stock_info, test_stock_info,
         device=device,
         feature_normalizer=feature_normalizer
     )

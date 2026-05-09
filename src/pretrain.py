@@ -280,7 +280,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # 加载数据
-    train_stock_info, _ = load_and_preprocess_data()
+    train_stock_info, _, _ = load_and_preprocess_data()
 
     # 创建模型（pretrain 模式）
     print(f"\n正在创建预训练模型...")

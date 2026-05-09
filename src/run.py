@@ -146,38 +146,43 @@ def generate_latest_input(stock_data, file_name, feature_normalizer=None):
     if input_seq is None:
         return None
     
-    # 提取股票代码（去掉.csv后缀）
-    stock_code = file_name.replace('.csv', '')
+    # stock_code 现在直接就是股票代码（不再需要从文件名提取）
+    stock_code = file_name
     
     return input_seq, stock_code
 
 
-def load_all_stock_data(data_dir=DataConfig.DATA_DIR):
+def load_all_stock_data(db_path=DataConfig.DB_PATH):
     """
     加载所有股票原始数据（用于选股推理）
-    返回: [(file_name, data_array, latest_date, times_array), ...]
+    从 SQLite 数据库读取训练池(selected)中的股票。
+
+    返回: [(stock_code, data_array, latest_date, times_array), ...]
     """
     import pandas as pd
-    
-    all_files = sorted([f for f in os.listdir(data_dir) if f.endswith('.csv')])
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        query = """SELECT sd.stock_code, sd.date, sd.open, sd.high, sd.low, sd.close,
+                          sd.vwap, sd.volume, sd.exchange, sd.m5, sd.m10, sd.m20
+                   FROM stock_daily sd
+                   JOIN stock_pool sp ON sd.stock_code = sp.stock_code
+                   WHERE sp.pool_type='selected' AND sp.is_active=1
+                   ORDER BY sd.stock_code, sd.date ASC"""
+        df = pd.read_sql_query(query, conn)
+    finally:
+        conn.close()
+
     stock_list = []
-    
-    for fname in all_files:
-        fpath = os.path.join(data_dir, fname)
-        try:
-            df = pd.read_csv(fpath)
-            # 原始数据按时间倒序，翻转为正序（早→晚）
-            df = df.iloc[::-1].reset_index(drop=True)
-            cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange']
-            if 'm5' in df.columns:
-                cols += ['m5', 'm10', 'm20']
-            data = df[cols].values
-            latest_date = str(df['date'].iloc[-1])  # 最新交易日期
-            times = df['date'].values  # 时间戳数组
-            stock_list.append((fname, data, latest_date, times))
-        except Exception as e:
-            pass  # 静默跳过异常文件
-    
+    if len(df) == 0:
+        return stock_list
+    cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange', 'm5', 'm10', 'm20']
+    for stock_code, group in df.groupby('stock_code', sort=False):
+        data = group[cols].values
+        latest_date = str(group['date'].iloc[-1])
+        times = group['date'].values
+        stock_list.append((stock_code, data, latest_date, times))
     return stock_list
 
 

@@ -406,116 +406,118 @@ class FeatureNormalizer:
 
 
 def process_single_file(args):
-    file_path, file_name, test_days, train_start_year = args
+    stock_code, data, times, test_days, train_start_year = args
     """
-    处理单个股票CSV文件，返回包含训练和测试数据的字典
-    
-    数据处理流程：
-    1. 读取CSV并反转时间顺序
-    2. 提取OHLCV数据：['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange']
-    3. 验证数据长度是否满足最低要求
-    
-    数据分割策略（确保训练集和测试集严格分离）：
-    - 测试集：最后 test_days 天的数据，完全冻结用于评估
-    - 训练集：从 train_start_year 开始到 train_end_idx 结束
-    - 缓冲区：训练集结束后有 REQUIRED_LENGTH 天的缓冲区，防止数据泄露
-    
-    关键索引计算：
-    - train_end_idx: 训练集最后一个可用位置 = data_length - test_days - required_length
-    - test_split_point: 测试集起始位置 = data_length - test_days
-    - train_start_idx: 根据 train_start_year 找到的实际起始位置
-    
-    返回数据包含完整的训练和测试数据副本，使用时需根据索引切片访问。
-    
+    处理预加载的股票数据，返回包含训练和测试数据的字典
+
+    由 load_and_preprocess_data 预加载全部数据后调用，
+    不再自行连接数据库，避免多进程重复连接开销。
+
     Args:
-        file_path: CSV文件路径
-        file_name: 文件名
+        stock_code: 股票代码
+        data: 预加载的行情数据 numpy 数组 (N, 11)
+        times: 预加载的日期数组 (N,)
         test_days: 测试集天数
         train_start_year: 训练开始年份
-    
+
     Returns:
         dict or None: 包含股票信息的字典，数据不足时返回None
     """
     try:
-        df = pd.read_csv(file_path)
-        df = df.iloc[::-1].reset_index(drop=True)
-                
-        data = df[['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange', 'm5', 'm10', 'm20']].values
-        times = df['date'].values
-        
         data_length = len(data)
         required_length = DataConfig.REQUIRED_LENGTH
-        
+
         min_required_length = required_length + test_days
         if data_length < min_required_length:
             return None
-        
+
         train_end_idx = data_length - test_days - required_length
-        
+
         test_split_point = data_length - test_days
-        
+
         train_start_date = train_start_year * 10000 + 101
         valid_indices = np.where(times >= train_start_date)[0]
-        
+
         if len(valid_indices) > 0:
             train_start_idx = valid_indices[0]
         else:
             train_start_idx = 0
-        
+
         if train_start_idx >= train_end_idx:
             return None
-        
+
         train_length = train_end_idx - train_start_idx
         if train_length < required_length:
             return None
-        
+
         train_data = data.copy()
         test_data = data.copy()
-        
+
         stock_info = {
-            'file_name': file_name,              # 股票文件名，用于识别不同股票
-            'data_length': data_length,          # 总数据长度（天数），用于验证数据充足性
-            'train_data': train_data,            # 完整数据副本，训练时根据[train_start_idx:train_end_idx]切片访问
-            'test_data': test_data,              # 完整数据副本，测试时根据[test_split_point:]切片访问
-            'train_start_idx': train_start_idx,  # 训练集起始索引，根据train_start_year计算得出
-            'train_end_idx': train_end_idx,      # 训练集结束索引，确保与测试集有缓冲区
-            'train_length': train_length,        # 可用训练数据长度，用于验证训练集是否充足
-            'test_split_point': test_split_point, # 测试集起始索引，固定为最后test_days天的开始位置
-            'times': times                       # 时间戳数组，用于后续分析
+            'file_name': stock_code,
+            'data_length': data_length,
+            'train_data': train_data,
+            'test_data': test_data,
+            'train_start_idx': train_start_idx,
+            'train_end_idx': train_end_idx,
+            'train_length': train_length,
+            'test_split_point': test_split_point,
+            'times': times
         }
-        
+
         return stock_info
     except Exception as e:
-        print(f"处理文件 {file_name} 时出错: {e}")
+        print(f"处理股票 {stock_code} 时出错: {e}")
         return None
 
 
-def load_and_preprocess_data(data_dir=DataConfig.DATA_DIR, test_days=DataConfig.TEST_DAYS, train_start_year=DataConfig.TRAIN_START_YEAR):
+def load_and_preprocess_data(db_path=DataConfig.DB_PATH, test_days=DataConfig.TEST_DAYS, train_start_year=DataConfig.TRAIN_START_YEAR):
     """
     数据加载和预处理，使用多进程并行加载
-    
+
+    从 SQLite 数据库一次性加载训练池(selected)中的全部股票数据，
+    再分发给 worker 做纯计算（索引切分等），避免多进程重复 DB 连接。
+
     采样边界设计：
     - 训练集：从TRAIN_START_YEAR年（或上市日）到 总长度-test_days-REQUIRED_LENGTH
     - 测试集：最近test_days天
     - 最低数据要求：test_days + REQUIRED_LENGTH
     """
-    
-    all_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
-    all_files.sort()
-    
-    print(f"总共 {len(all_files)} 只股票文件")
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    query = """SELECT sd.stock_code, sd.date, sd.open, sd.high, sd.low, sd.close,
+                      sd.vwap, sd.volume, sd.exchange, sd.m5, sd.m10, sd.m20
+               FROM stock_daily sd
+               JOIN stock_pool sp ON sd.stock_code = sp.stock_code
+               WHERE sp.pool_type='selected' AND sp.is_active=1
+               ORDER BY sd.stock_code, sd.date ASC"""
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+
+    cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange', 'm5', 'm10', 'm20']
+    stock_codes = []
+    stock_data_arrays = []
+    stock_times_arrays = []
+    for stock_code, group in df.groupby('stock_code', sort=False):
+        stock_codes.append(stock_code)
+        stock_data_arrays.append(group[cols].values)
+        stock_times_arrays.append(group['date'].values)
+
+    print(f"总共 {len(stock_codes)} 只股票 (训练池)")
     print(f"划分策略:")
     print(f"  - 训练集: {train_start_year}年起（或上市日）到 总长度-{test_days}-{DataConfig.REQUIRED_LENGTH}")
     print(f"  - 测试集: 最近 {test_days} 天")
     print(f"  - 最低数据要求: {test_days + DataConfig.REQUIRED_LENGTH} 天（测试集{test_days}天 + 训练样本{DataConfig.REQUIRED_LENGTH}天）")
-    
-    file_args = [(os.path.join(data_dir, f), f, test_days, train_start_year) for f in all_files]
+
+    file_args = list(zip(stock_codes, stock_data_arrays, stock_times_arrays,
+                         [test_days] * len(stock_codes), [train_start_year] * len(stock_codes)))
     num_workers = min(cpu_count(), 8)
-    
+
     with Pool(num_workers) as pool:
         all_stock_info = [r for r in pool.map(process_single_file, file_args) if r is not None]
-    
-    discarded_count = len(all_files) - len(all_stock_info)
+
+    discarded_count = len(stock_codes) - len(all_stock_info)
     print(f"有效股票: {len(all_stock_info)} 只，丢弃: {discarded_count} 只")
     
     train_stock_info = []

@@ -1,5 +1,4 @@
 out*/
-data*/
 doc*/
 
 *.xlsx
@@ -9,6 +8,7 @@ doc*/
 *.json
 *.jsonl
 *.png
+*.db*
 
 .vscode/
 .vs/

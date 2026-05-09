@@ -14,80 +14,79 @@
 
 ```
 EquiNet/
-├── data_all/                 # 全量股票池
-├── data/                     # 训练数据
-├── out/                      # 模型权重输出
+├── out/                       # 模型权重输出
+├── data_maintenance/          # 数据维护工具包
+│   ├── equinet.db             # SQLite 数据库
+│   ├── database.py            # SQLite 数据库管理
+│   ├── update.py              # 数据更新（Baostock / AKShare）
+│   ├── check.py               # 数据质量检查与修复
+│   ├── select.py              # 股票筛选（全量池 → 训练池）
+│   ├── features.py            # MA 均线偏离度特征计算
+│   └── migration.py           # CSV → SQLite 迁移工具
 ├── src/
-│   ├── train.py              # 主训练脚本
-│   ├── run.py                # 推理/选股脚本
-│   ├── training_utils.py     # 训练工具模块
-│   ├── config.py        	    # 统一配置文件
-│   └── ...              	    # 其他可能的脚本/目录
-├── LICENSE                   # Apache-2.0许可证
+│   ├── train.py               # 主训练脚本
+│   ├── run.py                 # 推理/选股脚本
+│   ├── training_utils.py      # 训练工具模块
+│   ├── config.py              # 统一配置文件
+│   └── ...                    # 其他模块
+├── data_maintenance.py        # 数据维护工具入口
+├── LICENSE                    # Apache-2.0许可证
 └── README.md
 ```
 
-## 数据格式说明
+## 数据架构说明
 
-- 全量数据目录：`data_all/`，训练数据目录：`data/`
-- 每个 `.csv` 文件对应一只股票（不复权）
-- 字段：`date, open, high, low, close, volume, exchange`
-- volume 为成交量（千元），exchange 为换手率
+数据存储采用 SQLite 单数据库（`data_maintenance/equinet.db`），通过股票池（pool）机制管理：
 
-v1参考数据集:https://huggingface.co/datasets/Mhuixs/EquiNet-v1-319_420
+- **全量池 (all)**：所有 A 股行情数据
+- **训练池 (selected)**：经筛选后用于训练的股票子集
+
+### 数据库表结构
+
+- `stock_daily`：日行情数据（stock_code, date, OHLCV, exchange, vwap, m5, m10, m20）
+- `stock_pool`：股票池管理（stock_code, pool_type, is_active）
+- `stock_metadata`：股票元信息（stock_code, stock_name, market, is_st, market_cap）
+
+> 数据维护（`data_maintenance/`）与数据使用（`src/`）完全隔离。`src/` 通过 SQLite 只读查询获取训练数据。
 
 ## 数据管理
 
-采用两级架构：全量股票池（`data_all/`）→ 筛选训练数据（`data/`）
-
-```
-data_update.py ──更新──> data_all/ (全量股票池)
-data_check.py  ──检查──> data_all/
-data_select.py ──筛选──> data/     (训练数据)
-data_update.py --mode train ──增量更新──> data/
-```
-
-### 1. 更新全量股票池
+通过 `data_maintenance.py` 交互式工具管理全部数据操作：
+采用两级池架构：全量股票池→ 筛选训练数据池
 
 ```bash
-python data_update.py                 # 增量更新已有股票的最新数据（默认）
-python data_update.py --mode full     # 全量更新：拉取所有A股完整历史（首次/添加新股）
+python data_maintenance.py
 ```
 
-### 2. 筛选训练数据
+菜单功能：
 
-```bash
-python data_select.py                 # 使用默认配置筛选（市值<MARKET_CAP_MAX and > MARKET_CAP_MIN）
-python data_select.py --dry-run       # 仅查看结果，不复制文件
-python data_select.py --market-cap 200e8  # 自定义市值上限
-```
-
-筛选条件：主板股票 → 排除ST → 排除退市/停牌 → 市值 < MARKET_CAP_MAX and > MARKET_CAP_MIN
-
-### 3. 更新训练数据
-
-```bash
-python data_update.py --mode train    # 增量更新 data/ 中的股票（快，推荐频繁使用）
-```
-
-### 4. 检查数据质量
-
-```bash
-python data_check.py                  # 检查全量股票池最近100天数据
-python data_check.py --days 50        # 指定检查天数
-```
+| 选项 | 功能 | 说明 |
+|------|------|------|
+| 0. shell | 进入交互式shell | 用于调试和自定义操作 |
+| 1. 更新数据 | 从外部数据源同步行情 | 支持增量 / 全量 / 训练池更新 |
+| 2. 筛选股票 | 全量池 → 训练池 | 主板 + 排除ST + 活跃度 + 市值筛选 |
+| 3. 检查数据质量 | 完整性验证与自动修复 | 缺失补拉、价格校验、OHLC逻辑检查 |
+| 4. 计算特征 | MA 均线偏离度 | 填充 m5/m10/m20 列 |
+| 5. CSV → SQLite 迁移 | 旧格式数据导入 | 从 data_all/ 和 data/ 导入 |
+| 6. 数据库状态 | 查看统计信息 | 股票数、数据量、日期范围等 |
+| 7. 备份数据库 | SQLite 内置备份 | 按时间戳保存到 data_maintenance/backup/ |
+| 8. 退出 | 退出交互式工具 | 保存所有操作 |
 
 ### 典型工作流
 
 ```bash
-# 首次使用 / 偶尔维护
-python data_update.py --mode full     # 1. 拉取全量数据（首次需要数小时）
-python data_select.py                 # 2. 筛选训练股票（约数小时）
+# 首次使用（从旧 CSV 迁移）
+python data_maintenance.py       # 选项5: CSV → SQLite 迁移
 
-# 日常训练
-python data_update.py --mode train    # 3. 刷新训练数据（几小时）
-python src/train.py                   # 4. 开始训练
-python src/run.py                     # 5. 选股推理
+# 首次使用（从零开始）
+python data_maintenance.py       # 选项1: 全量更新 → 选项2: 筛选 → 选项4: 计算特征
+
+# 日常维护
+python data_maintenance.py       # 选项1: 增量更新 → 选项3: 检查质量
+
+# 训练 & 推理
+python src/train.py
+python src/run.py
 ```
 
 ## 模型文件名格式说明示例
@@ -133,7 +132,7 @@ ep29 - 第29轮
 
 ## 项目修改LOG
 
-- 2026.5:新增Embedding层预训练机制;实现自监督预训练模块并集成到训练流程;彻底移除克隆模型训练策略+多教师模型纠偏机制
+- 2026.5:数据存储从CSV文件迁移至SQLite数据库;新增Embedding层预训练机制;实现自监督预训练模块并集成到训练流程;彻底移除克隆模型训练策略+多教师模型纠偏机制
 - 2026.5.5:添加日内均价特征(vwap);修复volume数据源错误
 - 2026.4:将transformer的FFN子层替换为SwiGLU子层;移除DFT微调训练脚本及相关文档引用;将量能和换手率归一化方式从固定范围改为基于N日均值的相对变化率;添加Top K%精度指标并更新相关输出;添加PairwiseWeightedBCE损失函数支持排序学习（可选）;添加均线偏离度特征(m5,m10,m20)
 - 2026.4.20谷雨:EquiNet v2归档，v3 start ~，v3转为私有仓库继续开发,方向:应用因子规模化、参数规模化、架构重构，核心聚焦风险与稳定性。

@@ -1,7 +1,7 @@
 """
 MA 均线偏离度特征计算模块
 
-从 data_field.py 重构而来，使用 SQLite 替代 CSV 文件。
+MA 均线偏离度特征计算模块
 
 计算并填充 m5/m10/m20 列：
 - m5:  (close - MA5)  / MA5

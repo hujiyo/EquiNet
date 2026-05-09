@@ -7,9 +7,8 @@ EquiNet 数据维护工具 - 交互式菜单
 2. 筛选股票（全量池 → 训练池）
 3. 检查数据质量（完整性验证与修复）
 4. 计算特征（均线偏离度）
-5. CSV → SQLite 迁移
-6. 数据库状态
-7. 备份数据库
+5. 数据库状态
+6. 备份数据库
 """
 
 import os
@@ -40,10 +39,9 @@ def print_header():
     print(" 2. 筛选股票      (全量池 → 训练池)")
     print(" 3. 检查数据质量  (完整性验证与修复)")
     print(" 4. 计算特征      (均线偏离度)")
-    print(" 5. CSV → SQLite 迁移")
-    print(" 6. 数据库状态")
-    print(" 7. 备份数据库")
-    print(" 8. 退出")
+    print(" 5. 数据库状态")
+    print(" 6. 备份数据库")
+    print(" 7. 退出")
     print("=" * 50)
 
 
@@ -169,28 +167,6 @@ def handle_features(db: DatabaseManager):
     compute_features(db, pool_type, stock_codes, force)
 
 
-def handle_migrate(db: DatabaseManager):
-    """CSV → SQLite 迁移"""
-    print("\n--- CSV → SQLite 迁移 ---")
-    print("这将把 data_all/ 和 data/ 下的 CSV 文件导入到 SQLite 数据库。")
-
-    project_root = _get_project_root()
-    from data_maintenance.migration import CSVMigrator
-
-    migrator = CSVMigrator(db, project_root)
-
-    if not migrator.check_prerequisites():
-        force = input("数据库非空，是否强制覆盖？(y/N): ").strip().lower()
-        if force == 'y':
-            migrator.run(force=True)
-        else:
-            print("取消迁移")
-    else:
-        confirm = input("确认开始迁移？(Y/n): ").strip().lower()
-        if confirm != 'n':
-            migrator.run()
-
-
 def handle_status(db: DatabaseManager):
     """显示数据库状态"""
     print("\n--- 数据库状态 ---")
@@ -221,7 +197,7 @@ def main():
     try:
         while True:
             print_header()
-            choice = input("请选择 [0-8]: ").strip()
+            choice = input("请选择 [0-7]: ").strip()
 
             if choice == '0':
                 handle_sql(db)
@@ -234,12 +210,10 @@ def main():
             elif choice == '4':
                 handle_features(db)
             elif choice == '5':
-                handle_migrate(db)
-            elif choice == '6':
                 handle_status(db)
-            elif choice == '7':
+            elif choice == '6':
                 handle_backup(db)
-            elif choice == '8':
+            elif choice == '7':
                 print("退出")
                 break
             else:

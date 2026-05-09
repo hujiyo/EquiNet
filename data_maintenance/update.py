@@ -1,7 +1,6 @@
 """
 股票数据更新模块
 
-从 data_update.py 重构而来，使用 SQLite 替代 CSV 文件。
 支持 Baostock 和 AKShare 两种数据源。
 
 更新模式：

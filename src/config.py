@@ -16,9 +16,6 @@ class DataConfig:
     DB_PATH = os.path.join(PROJECT_ROOT, 'data_maintenance', 'equinet.db')
     DB_BACKUP_DIR = os.path.join(PROJECT_ROOT, 'data_maintenance', 'backup')
 
-    # CSV 数据目录（仅迁移过渡期使用，迁移完成后废弃）
-    DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
-    DATA_ALL_DIR = os.path.join(PROJECT_ROOT, 'data_all')
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out')
 
     # 数据源配置
@@ -525,7 +522,7 @@ def print_config_summary():
     print(f"  余弦退火轮数: {TrainingConfig.COSINE_ANNEAL_EPOCHS} (后{main_epochs - TrainingConfig.COSINE_ANNEAL_EPOCHS}轮固定在ETA_MIN)")
 
     print(f"数据参数:")
-    print(f"  数据目录: {DataConfig.DATA_DIR}")
+    print(f"  数据库: {DataConfig.DB_PATH}")
     print(f"  采样策略: {DataConfig.SAMPLING_STRATEGY} ({'时间顺序采样' if DataConfig.SAMPLING_STRATEGY == 'temporal' else '随机采样'})")
     print(f"  训练集起始年份: {DataConfig.TRAIN_START_YEAR}年（过滤{DataConfig.TRAIN_START_YEAR-1}年及以前的数据）")
     print(f"  测试集天数: {DataConfig.TEST_DAYS}天")

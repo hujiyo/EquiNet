@@ -21,8 +21,7 @@ EquiNet/
 │   ├── update.py              # 数据更新（Baostock / AKShare）
 │   ├── check.py               # 数据质量检查与修复
 │   ├── select.py              # 股票筛选（全量池 → 训练池）
-│   ├── features.py            # MA 均线偏离度特征计算
-│   └── migration.py           # CSV → SQLite 迁移工具
+│   └── features.py            # MA 均线偏离度特征计算
 ├── src/
 │   ├── train.py               # 主训练脚本
 │   ├── run.py                 # 推理/选股脚本
@@ -62,22 +61,17 @@ python data_maintenance.py
 
 | 选项 | 功能 | 说明 |
 |------|------|------|
-| 0. shell | 进入交互式shell | 用于调试和自定义操作 |
+| 0. SQL 控制台 | 手动执行 SQL | 用于调试和自定义查询 |
 | 1. 更新数据 | 从外部数据源同步行情 | 支持增量 / 全量 / 训练池更新 |
 | 2. 筛选股票 | 全量池 → 训练池 | 主板 + 排除ST + 活跃度 + 市值筛选 |
 | 3. 检查数据质量 | 完整性验证与自动修复 | 缺失补拉、价格校验、OHLC逻辑检查 |
 | 4. 计算特征 | MA 均线偏离度 | 填充 m5/m10/m20 列 |
-| 5. CSV → SQLite 迁移 | 旧格式数据导入 | 从 data_all/ 和 data/ 导入 |
-| 6. 数据库状态 | 查看统计信息 | 股票数、数据量、日期范围等 |
-| 7. 备份数据库 | SQLite 内置备份 | 按时间戳保存到 data_maintenance/backup/ |
-| 8. 退出 | 退出交互式工具 | 保存所有操作 |
+| 5. 数据库状态 | 查看统计信息 | 股票数、数据量、日期范围等 |
+| 6. 备份数据库 | SQLite 内置备份 | 按时间戳保存到 data_maintenance/backup/ |
 
 ### 典型工作流
 
 ```bash
-# 首次使用（从旧 CSV 迁移）
-python data_maintenance.py       # 选项5: CSV → SQLite 迁移
-
 # 首次使用（从零开始）
 python data_maintenance.py       # 选项1: 全量更新 → 选项2: 筛选 → 选项4: 计算特征
 

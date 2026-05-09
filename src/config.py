@@ -12,9 +12,14 @@ PROJECT_ROOT = os.path.dirname(SRC_DIR)
 # ==================== 数据参数 ====================
 class DataConfig:
     """数据相关参数"""
+    # SQLite 数据库配置
+    DB_PATH = os.path.join(PROJECT_ROOT, 'data_maintenance', 'equinet.db')
+    DB_BACKUP_DIR = os.path.join(PROJECT_ROOT, 'data_maintenance', 'backup')
+
+    # CSV 数据目录（仅迁移过渡期使用，迁移完成后废弃）
     DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
+    DATA_ALL_DIR = os.path.join(PROJECT_ROOT, 'data_all')
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out')
-    DATA_ALL_DIR = os.path.join(PROJECT_ROOT, 'data_all')  # 全量股票池目录（data_update incremental/full 模式、data_check 管理此目录）
 
     # 数据源配置
     DATA_SOURCE = 'akshare'  # 'baostock' 或 'akshare'

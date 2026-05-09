@@ -669,7 +669,7 @@ def main():
 
     # 加载数据
     print("[步骤1] 加载训练数据...")
-    train_stock_info, _ = load_and_preprocess_data()
+    train_stock_info, _, _ = load_and_preprocess_data()
 
     print("\n[步骤2] 加载特征归一化器...")
     if os.path.exists(DataConfig.NORMALIZER_PATH):

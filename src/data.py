@@ -406,9 +406,9 @@ class FeatureNormalizer:
 
 
 def process_single_file(args):
-    stock_code, data, times, test_days, train_start_year = args
+    stock_code, data, times, train_start_date, train_end_date, val_start_date, val_end_date, test_start_date = args
     """
-    处理预加载的股票数据，返回包含训练和测试数据的字典
+    处理预加载的股票数据，返回包含训练、验证和测试数据的字典
 
     由 load_and_preprocess_data 预加载全部数据后调用，
     不再自行连接数据库，避免多进程重复连接开销。
@@ -417,8 +417,11 @@ def process_single_file(args):
         stock_code: 股票代码
         data: 预加载的行情数据 numpy 数组 (N, 11)
         times: 预加载的日期数组 (N,)
-        test_days: 测试集天数
-        train_start_year: 训练开始年份
+        train_start_date: 训练集起始日期 (YYYYMMDD)
+        train_end_date: 训练集截止日期 (YYYYMMDD)
+        val_start_date: 验证集起始日期 (YYYYMMDD)，0表示无验证集
+        val_end_date: 验证集截止日期 (YYYYMMDD)
+        test_start_date: 测试集起始日期 (YYYYMMDD)
 
     Returns:
         dict or None: 包含股票信息的字典，数据不足时返回None
@@ -427,21 +430,38 @@ def process_single_file(args):
         data_length = len(data)
         required_length = DataConfig.REQUIRED_LENGTH
 
-        min_required_length = required_length + test_days
-        if data_length < min_required_length:
+        # 找到测试集起始位置
+        test_indices = np.where(times >= test_start_date)[0]
+        if len(test_indices) == 0:
             return None
+        test_split_point = test_indices[0]
 
-        train_end_idx = data_length - test_days - required_length
+        # 找到验证集起始位置（如果配置了验证集）
+        if val_start_date > 0:
+            val_start_indices = np.where(times >= val_start_date)[0]
+            val_split_point = val_start_indices[0] if len(val_start_indices) > 0 else test_split_point
 
-        test_split_point = data_length - test_days
-
-        train_start_date = train_start_year * 10000 + 101
-        valid_indices = np.where(times >= train_start_date)[0]
-
-        if len(valid_indices) > 0:
-            train_start_idx = valid_indices[0]
+            val_end_indices = np.where(times <= val_end_date)[0]
+            val_end_point = val_end_indices[-1] + 1 if len(val_end_indices) > 0 else val_split_point
         else:
+            val_split_point = test_split_point
+            val_end_point = test_split_point
+
+        # 找到训练集起始位置
+        train_start_indices = np.where(times >= train_start_date)[0]
+        if len(train_start_indices) == 0:
             train_start_idx = 0
+        else:
+            train_start_idx = train_start_indices[0]
+
+        # 找到训练集截止位置（train_end_date当天最后一条数据的下一位）
+        train_end_indices = np.where(times <= train_end_date)[0]
+        if len(train_end_indices) == 0:
+            return None
+        # train_end_idx: 训练集可用数据的末尾索引（不含），需留出 REQUIRED_LENGTH 的余量
+        train_end_boundary = train_end_indices[-1] + 1
+        # 训练集截止不能超过验证集起始（确保训练/验证无重叠）
+        train_end_idx = min(train_end_boundary, val_split_point) - required_length
 
         if train_start_idx >= train_end_idx:
             return None
@@ -461,6 +481,8 @@ def process_single_file(args):
             'train_start_idx': train_start_idx,
             'train_end_idx': train_end_idx,
             'train_length': train_length,
+            'val_split_point': val_split_point,
+            'val_end_point': val_end_point,
             'test_split_point': test_split_point,
             'times': times
         }
@@ -471,7 +493,12 @@ def process_single_file(args):
         return None
 
 
-def load_and_preprocess_data(db_path=DataConfig.DB_PATH, test_days=DataConfig.TEST_DAYS, train_start_year=DataConfig.TRAIN_START_YEAR):
+def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
+                             train_start_date=DataConfig.TRAIN_START_DATE,
+                             train_end_date=DataConfig.TRAIN_END_DATE,
+                             val_start_date=DataConfig.VAL_START_DATE,
+                             val_end_date=DataConfig.VAL_END_DATE,
+                             test_start_date=DataConfig.TEST_START_DATE):
     """
     数据加载和预处理，使用多进程并行加载
 
@@ -479,9 +506,9 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH, test_days=DataConfig.TE
     再分发给 worker 做纯计算（索引切分等），避免多进程重复 DB 连接。
 
     采样边界设计：
-    - 训练集：从TRAIN_START_YEAR年（或上市日）到 总长度-test_days-REQUIRED_LENGTH
-    - 测试集：最近test_days天
-    - 最低数据要求：test_days + REQUIRED_LENGTH
+    - 训练集：TRAIN_START_DATE ~ TRAIN_END_DATE
+    - 验证集：VAL_START_DATE ~ VAL_END_DATE（训练时用于模型选择）
+    - 测试集：TEST_START_DATE ~ 数据库最新日期（训练结束后仅评估一次）
     """
     import sqlite3
 
@@ -506,12 +533,16 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH, test_days=DataConfig.TE
 
     print(f"总共 {len(stock_codes)} 只股票 (训练池)")
     print(f"划分策略:")
-    print(f"  - 训练集: {train_start_year}年起（或上市日）到 总长度-{test_days}-{DataConfig.REQUIRED_LENGTH}")
-    print(f"  - 测试集: 最近 {test_days} 天")
-    print(f"  - 最低数据要求: {test_days + DataConfig.REQUIRED_LENGTH} 天（测试集{test_days}天 + 训练样本{DataConfig.REQUIRED_LENGTH}天）")
+    print(f"  - 训练集: {train_start_date} ~ {train_end_date}")
+    print(f"  - 验证集: {val_start_date} ~ {val_end_date}")
+    print(f"  - 测试集: {test_start_date} ~ 最新")
 
     file_args = list(zip(stock_codes, stock_data_arrays, stock_times_arrays,
-                         [test_days] * len(stock_codes), [train_start_year] * len(stock_codes)))
+                         [train_start_date] * len(stock_codes),
+                         [train_end_date] * len(stock_codes),
+                         [val_start_date] * len(stock_codes),
+                         [val_end_date] * len(stock_codes),
+                         [test_start_date] * len(stock_codes)))
     num_workers = min(cpu_count(), 8)
 
     with Pool(num_workers) as pool:
@@ -519,10 +550,11 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH, test_days=DataConfig.TE
 
     discarded_count = len(stock_codes) - len(all_stock_info)
     print(f"有效股票: {len(all_stock_info)} 只，丢弃: {discarded_count} 只")
-    
+
     train_stock_info = []
+    val_stock_info = []
     test_stock_info = []
-    
+
     for stock_info in all_stock_info:
         train_stock_info.append({
             'file_name': stock_info['file_name'],
@@ -532,7 +564,20 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH, test_days=DataConfig.TE
             'train_end_idx': stock_info['train_end_idx'],
             'times': stock_info['times'],
         })
-        
+
+        # 只有当验证集有数据时才添加（val_split_point < test_split_point）
+        val_sp = stock_info.get('val_split_point', stock_info['test_split_point'])
+        test_sp = stock_info['test_split_point']
+        if val_sp < test_sp:
+            val_stock_info.append({
+                'file_name': stock_info['file_name'],
+                'data': stock_info['test_data'],
+                'data_length': stock_info['data_length'],
+                'val_split_point': val_sp,
+                'test_split_point': test_sp,
+                'times': stock_info['times'],
+            })
+
         test_stock_info.append({
             'file_name': stock_info['file_name'],
             'data': stock_info['test_data'],
@@ -540,11 +585,12 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH, test_days=DataConfig.TE
             'test_split_point': stock_info['test_split_point'],
             'times': stock_info['times'],
         })
-    
+
     print(f"训练集: {len(train_stock_info)} 只股票")
+    print(f"验证集: {len(val_stock_info)} 只股票")
     print(f"测试集: {len(test_stock_info)} 只股票")
-    
-    return train_stock_info, test_stock_info
+
+    return train_stock_info, val_stock_info, test_stock_info
 
 def compute_label_distance_exclusions(stock_info_list, distance=None):
     """
@@ -628,8 +674,8 @@ class TemporalSampler:
     时间顺序采样器：采样头在多个股票上同步向前移动，不回头
     
     采样边界设计：
-    - 每只股票的指针初始位置 = train_start_idx（TRAIN_START_YEAR年起始位置+1，或上市第一天+1）
-    - 每只股票的指针末位置 = train_end_idx（总长度 - TEST_DAYS - REQUIRED_LENGTH）
+    - 每只股票的指针初始位置 = train_start_idx（TRAIN_START_DATE起始位置+1，或上市第一天+1）
+    - 每只股票的指针末位置 = train_end_idx（TRAIN_END_DATE边界内，留出REQUIRED_LENGTH余量）
     
     关键设计：start_pos = max(1, train_start_idx + 1)
     原因：每个样本需要前一天数据作为归一化基准（prev_day_data = stock_data[start_idx-1]）
@@ -1001,15 +1047,19 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx, fe
     return (input_seq, cumulative_return, daily_returns, available_days)
 
 
-def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
+def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
+                                     start_key='test_split_point', end_key=None):
     """
     创建固定评估数据集（涨停样本已在generate_sample_from_index中过滤）
-    
+
     只包含完整样本（available_days == FUTURE_DAYS），用于模型评估
-    
+
     Args:
-        test_stock_info: 测试集股票信息列表
+        test_stock_info: 评估集股票信息列表（验证集或测试集）
         feature_normalizer: 可选的特征归一化器实例
+        start_key: stock_info 中评估起始位置的键名（默认 'test_split_point'）
+        end_key: stock_info 中评估结束位置的键名（默认 None，表示到数据末尾）
+                 验证集传 'test_split_point' 表示验证样本截止到测试集之前
 
     返回: (inputs, targets, cumulative_returns, day_indices, daily_returns)
     """
@@ -1022,11 +1072,15 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
     for stock_info in test_stock_info:
         stock_data = stock_info['data']
         data_length = len(stock_data)
-        test_split_point = stock_info.get('test_split_point', max(0, data_length - DataConfig.TEST_DAYS))
+        split_point = stock_info.get(start_key, 0)
 
-        start_min = max(1, test_split_point)
-        start_max = data_length - DataConfig.REQUIRED_LENGTH
-        
+        start_min = max(1, split_point)
+        if end_key is not None:
+            end_point = stock_info.get(end_key, data_length)
+            start_max = min(end_point, data_length) - DataConfig.REQUIRED_LENGTH
+        else:
+            start_max = data_length - DataConfig.REQUIRED_LENGTH
+
         if start_max < start_min:
             continue
 
@@ -1043,7 +1097,7 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None):
             eval_cumulative_returns.append(float(cumulative_return))
             eval_daily_returns.append(daily_returns)
             predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
-            day_index = predict_day_idx - test_split_point
+            day_index = predict_day_idx - split_point
             eval_day_indices.append(day_index)
 
     if len(eval_inputs) == 0:
@@ -1078,8 +1132,8 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
     for stock_info in test_stock_info:
         stock_data = stock_info['data']
         data_length = len(stock_data)
-        test_split_point = stock_info.get('test_split_point', max(0, data_length - DataConfig.TEST_DAYS))
-        
+        test_split_point = stock_info.get('test_split_point', 0)
+
         start_min = max(1, test_split_point)
         start_max = data_length - DataConfig.CONTEXT_LENGTH - 1
         
@@ -1538,7 +1592,7 @@ def fit_feature_normalizer(output_path=None, output_distribution='normal', n_qua
 
     print("\n[步骤1] 加载训练集数据...")
 
-    train_stock_info, test_stock_info = load_and_preprocess_data()
+    train_stock_info, _, _ = load_and_preprocess_data()
 
     print(f"训练集股票数: {len(train_stock_info)}")
     print(f"测试集股票数: {len(test_stock_info)}")

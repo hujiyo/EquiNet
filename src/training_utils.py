@@ -7,7 +7,6 @@
 - DynamicWeightedBCE: 动态加权BCE损失函数
 - EarlyStopping: 早停机制
 - evaluate_model: 模型评估函数
-- generate_pseudo_labels: 伪标签生成
 - save_model_with_metadata: 带元数据的模型保存
 - print_dispersion_sparkline: 预测值分布可视化
 - create_optimizer_from_config: 根据配置创建优化器
@@ -832,62 +831,6 @@ def _calculate_max_drawdown(daily_portfolio_values):
             max_dd = dd
     return max_dd
 
-
-
-def generate_pseudo_labels(pred_scores, original_targets,
-                           pseudo_pos_ratio=0.01,
-                           pseudo_neg_ratio=0.05):
-    """
-    统一的伪标签生成函数（按数量取Top-K%方式）
-
-    核心思想：
-    - 按预测分数排序，取前 pseudo_pos_ratio 比例的样本 → 强制标签=1.0（伪正）
-    - 按预测分数排序，取倒数 pseudo_neg_ratio 比例的样本 → 强制标签=0.0（伪负）
-    - 其余样本保持原始标签不变
-    """
-    if isinstance(pred_scores, torch.Tensor):
-        pred_scores = pred_scores.float().detach().cpu().numpy()
-    if isinstance(original_targets, torch.Tensor):
-        original_targets = original_targets.float().detach().cpu().numpy()
-
-    pred_scores = np.asarray(pred_scores).flatten()
-    original_targets = np.asarray(original_targets).copy()
-
-    if len(pred_scores) == 0:
-        stats = {
-            'pseudo_pos_count': 0,
-            'pseudo_neg_count': 0,
-            'unchanged_count': 0,
-            'threshold_pos': 0.0,
-            'threshold_neg': 0.0,
-        }
-        return original_targets, stats
-
-    k_pos = max(1, int(len(pred_scores) * pseudo_pos_ratio))
-    k_pos = min(k_pos, len(pred_scores))
-    threshold_pos = np.sort(pred_scores)[-k_pos]
-
-    k_neg = max(1, int(len(pred_scores) * pseudo_neg_ratio))
-    k_neg = min(k_neg, len(pred_scores))
-    threshold_neg = np.sort(pred_scores)[k_neg - 1]
-
-    pseudo_targets = original_targets.copy()
-
-    high_mask = pred_scores >= threshold_pos
-    pseudo_targets[high_mask] = 1.0
-
-    low_mask = pred_scores <= threshold_neg
-    pseudo_targets[low_mask] = 0.0
-
-    stats = {
-        'pseudo_pos_count': int(np.sum(high_mask)),
-        'pseudo_neg_count': int(np.sum(low_mask)),
-        'unchanged_count': int(len(pred_scores) - np.sum(high_mask) - np.sum(low_mask)),
-        'threshold_pos': float(threshold_pos),
-        'threshold_neg': float(threshold_neg),
-    }
-
-    return pseudo_targets, stats
 
 
 def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,

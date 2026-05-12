@@ -31,8 +31,8 @@ def parse_model_filename(filename):
     """
     info = {'filename': filename, 'prefix': '', 'return_pct': '', 'threshold': '', 'auc': '', 'epoch': '', 'time': ''}
     
-    # 提取模型前缀 (modelA, modelB, modelB_dft)
-    prefix_match = re.match(r'^(modelA|modelB_dft|modelB)', filename)
+    # 提取模型前缀 (model_loss, model_realistic 等)
+    prefix_match = re.match(r'^(model_[a-z]+)', filename)
     if prefix_match:
         info['prefix'] = prefix_match.group(1)
     
@@ -341,9 +341,11 @@ def select_model(models):
         
         # 格式化显示
         prefix_display = {
-            'modelA': '模型A(原始)',
-            'modelB': '模型B(克隆)',
-            'modelB_dft': '模型B(DFT)',
+            'model_loss': '模型(按loss)',
+            'model_realistic': '模型(按实战收益率)',
+            'modelA': '模型(按loss)',
+            'modelA_realistic': '模型(按实战收益率)',
+            'modelA_loss': '模型(按loss)',
         }.get(info['prefix'], info['prefix'])
         
         detail_parts = []

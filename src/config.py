@@ -154,32 +154,19 @@ class EmbeddingConfig:
     COSINE_ETA_MIN = 1e-5                 # 余弦退火最小学习率
 
     # 损失权重
-    ALPHA = 1.0                           # 对比损失 (InfoNCE) 权重
     BETA = 1.0                            # 重建损失 (MSE) 权重
-    GAMMA = 0.02                          # 均匀性损失权重（正则化，目标贡献≈Contrast的15%）
-
-    # 对比学习参数
-    TEMPERATURE = 0.07                    # InfoNCE 温度（128维球面推荐0.05-0.1）
-    UNIFORMITY_T = 2.0                    # 均匀性损失温度参数（越大越强调均匀）
-
-    # 数据增强参数（生成对比学习正样本对）
-    NOISE_STD = 0.02                      # OHLC/VWAP/MA 高斯噪声标准差
-    FEATURE_MASK_PROB = 0.1               # 特征维度 masking 概率
-    VOLUME_SCALE_RANGE = (0.8, 1.2)       # Volume/Exchange 缩放范围
-
-    # 解码器（仅预训练时使用，训练后丢弃）
-    DECODER_HIDDEN_DIM = 512              # MLP解码器隐藏层维度
-    DECODER_LAYERS = 2                    # 解码器层数
 
     # 数据采集
     MAX_SAMPLES = 200_000               # 每个epoch的训练样本数
     DEDUP_PRECISION = 3                 # 去重时特征量化精度（小数位数）
-    ENTROPY_WEIGHT = 0.1                # 熵正则化损失权重（0=禁用）
-    ENTROPY_INV_TEMPERATURE = 1.0       # 熵正则化逆温度参数
 
-    # 标准差控制（embedding输出std必须与位置编码匹配）
-    TARGET_STD = 0.2                    # 目标标准差（位置编码初始化std≈0.19）
-    SCALE_WEIGHT = 1.0                  # 标准差正则化权重
+    # SIGReg 几何正则 (Balestriero & LeCun, 2025)
+    # 约束嵌入分布趋向各向同性高斯 N(0, target_std²)
+    SIGREG_WEIGHT = 10.0                # SIGReg 损失权重
+    SIGREG_NUM_SLICES = 32              # 随机投影方向数
+    SIGREG_T_MAX = 3                    # Epps-Pulley 积分上限
+    SIGREG_N_POINTS = 17                # Epps-Pulley 积分节点数（奇数）
+    TARGET_STD = 0.2                    # 目标标准差（缩放后 SIGReg 检验 N(0,1)）
 
     # 训练稳定性
     GRADIENT_CLIP_NORM = 1.0              # 梯度裁剪范数

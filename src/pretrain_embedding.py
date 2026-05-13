@@ -1,17 +1,16 @@
 """
 EquiNet Embedding层训练脚本
 
-通过对比学习 + 重建约束 + 球面均匀性，预训练 FFN-Embedding 层，
+通过 SIGReg 几何正则 + 重建约束，预训练 FFN-Embedding 层，
 使其成为一个固定的、具有几何保证的K线特征提取器：
 
-1. InfoNCE 对比损失：相似K线→嵌入距离近，相异K线→嵌入距离远
-2. MLP 解码器重建损失：确保方向信息足以恢复原始10维特征
-3. 均匀性损失：嵌入在单位超球面上均匀分布
+1. SIGReg 几何正则 (Balestriero & LeCun, 2025)：约束嵌入分布趋向各向同性高斯
+   通过 Cramér-Wold + Epps-Pulley 检验，数学上保证无维度/子空间/聚类坍塌
+2. MLP 解码器重建损失：确保嵌入向量足以恢复原始10维特征
 
 用法：
   python src/pretrain_embedding.py                        # 使用默认参数
   python src/pretrain_embedding.py --epochs 300           # 自定义轮数
-  python src/pretrain_embedding.py --temperature 0.05     # 自定义温度
 """
 
 import os
@@ -19,6 +18,7 @@ import sys
 import math
 import argparse
 import time
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,64 +30,7 @@ from config import (ModelConfig, DataConfig, EmbeddingConfig, DeviceConfig,
 from data import (load_and_preprocess_data, FeatureNormalizer,
                   precompute_training_pool)
 from training_utils import _get_amp_context
-
-
-# ==================== 数据增强 ====================
-
-class KLineAugmentation:
-    """
-    K线数据增强器，为对比学习生成正样本对
-
-    对单条K线向量 [batch, 10] 应用增强：
-    - OHLC (col 0-3): 高斯噪声，clip回 [-0.1, 0.1]
-    - VWAP (col 4): 高斯噪声，clip回 [-0.1, 0.1]
-    - Volume/Exchange (col 5-6): 随机缩放
-    - MA偏离度 (col 7-9): 高斯噪声
-
-    每次调用至少激活一种增强（不会是恒等变换）。
-    """
-
-    def __init__(self, noise_std=0.02, mask_prob=0.1,
-                 vol_scale_range=(0.8, 1.2)):
-        self.noise_std = noise_std
-        self.mask_prob = mask_prob
-        self.vol_scale_low = vol_scale_range[0]
-        self.vol_scale_high = vol_scale_range[1]
-
-    def __call__(self, x):
-        """
-        Args:
-            x: [batch, 10] 归一化后的K线特征
-        Returns:
-            augmented: [batch, 10] 增强后的K线特征
-        """
-        augmented = x.clone()
-        batch_size = x.size(0)
-
-        # OHLC (col 0-3): 高斯噪声
-        noise_ohl = torch.randn_like(augmented[:, :4]) * self.noise_std
-        augmented[:, :4] = augmented[:, :4] + noise_ohl
-
-        # VWAP (col 4): 高斯噪声
-        noise_vwap = torch.randn_like(augmented[:, 4:5]) * self.noise_std
-        augmented[:, 4:5] = augmented[:, 4:5] + noise_vwap
-
-        # Volume/Exchange (col 5-6): 随机缩放
-        scale = (torch.rand(batch_size, 2, device=x.device)
-                 * (self.vol_scale_high - self.vol_scale_low)
-                 + self.vol_scale_low)
-        augmented[:, 5:7] = augmented[:, 5:7] * scale
-
-        # MA偏离度 (col 7-9): 高斯噪声
-        noise_ma = torch.randn_like(augmented[:, 7:10]) * self.noise_std
-        augmented[:, 7:10] = augmented[:, 7:10] + noise_ma
-
-        # 随机特征 masking（以一定概率将单个特征维度置零）
-        if self.mask_prob > 0:
-            mask = torch.rand_like(augmented) < self.mask_prob
-            augmented = augmented.masked_fill(mask, 0.0)
-
-        return augmented
+from sigreg import SIGRegLoss
 
 
 # ==================== 模型定义 ====================
@@ -130,148 +73,38 @@ class KLineEmbedding(nn.Module):
 
 class PretrainModel(nn.Module):
     """
-    Embedding层训练模型 = KLineEmbedding + LayerNorm + MLP解码器
+    Embedding层训练模型 = KLineEmbedding + 线性解码器
 
-    LayerNorm 模拟下游 StockTransformer 的 Pre-Norm 行为：
-    下游 Transformer 的第一层会对 embedding 输出做 LayerNorm，
-    因此预训练的对比损失和重建损失也应作用在 LayerNorm 之后。
+    X → Embedding → S → Linear → Y
+                      ↑            ↑
+                  SIGReg(S)    MSE(Y, X)
 
-    使用 elementwise_affine=False（无可训练 γ/β），
-    因为下游模型有自己的 LayerNorm 参数。
-
+    线性解码器迫使 embedding 将信息编码在128维空间的线性可提取方向上，
+    不给 embedding 通过非线性查表偷懒的空间。
     解码器在预训练完成后丢弃，只保留 embedding 权重。
     """
 
-    def __init__(self, input_dim=10, d_model=128, decoder_hidden_dim=512,
-                 decoder_layers=2):
+    def __init__(self, input_dim=10, d_model=128):
         super().__init__()
         self.embedding = KLineEmbedding(input_dim, d_model)
         self.input_dim = input_dim
 
-        # 模拟下游 Pre-Norm：纯标准化，无可训练参数
-        self.embed_norm = nn.LayerNorm(d_model, elementwise_affine=False)
-
-        # MLP 解码器：逐日向量重建，不需要序列级 transformer
-        layers = []
-        in_dim = d_model
-        for _ in range(decoder_layers - 1):
-            layers.append(nn.Linear(in_dim, decoder_hidden_dim))
-            layers.append(nn.GELU())
-            in_dim = decoder_hidden_dim
-        layers.append(nn.Linear(in_dim, input_dim))
-        self.decoder = nn.Sequential(*layers)
-
-        # 解码器初始化
-        for m in self.decoder:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
+        # 线性解码器: x̂ = Wz + b, W ∈ R^(10×128)
+        self.decoder = nn.Linear(d_model, input_dim)
+        nn.init.xavier_uniform_(self.decoder.weight)
+        nn.init.zeros_(self.decoder.bias)
 
     def forward(self, x):
         """
         Args:
             x: [batch, 10]
         Returns:
-            z_normed: [batch, d_model] LayerNorm 后的嵌入（模拟下游 Transformer 看到的）
-            x_recon: [batch, 10] 重建的原始输入
+            z: [batch, d_model] 嵌入向量 S（用于 SIGReg）
+            recon: [batch, 10] 重建的原始输入 Y
         """
         z = self.embedding(x)
-        z_normed = self.embed_norm(z)  # 模拟下游 Pre-Norm
-        x_recon = self.decoder(z_normed)
-        return z_normed, x_recon
-
-
-# ==================== 损失函数 ====================
-
-def info_nce_loss(z1, z2, temperature=0.07):
-    """
-    InfoNCE 对比损失
-
-    正样本对 = 同一K线的两种增强视角
-    负样本对 = batch内所有不同K线
-
-    Args:
-        z1: [batch, d] 视角1的嵌入向量
-        z2: [batch, d] 视角2的嵌入向量
-        temperature: softmax温度
-    """
-    batch_size = z1.size(0)
-    # 拼接两个视角: [2*batch, d]
-    z = torch.cat([z1, z2], dim=0)
-
-    # 余弦相似度矩阵（输入已归一化，点积=余弦相似度）
-    sim = torch.mm(z, z.t()) / temperature
-
-    # 遮蔽对角线（自身不作为正/负样本）
-    mask = torch.eye(2 * batch_size, device=z.device).bool()
-    sim.masked_fill_(mask, -1e9)
-
-    # 标签：z1[i] 的正样本是 z2[i]，即位置 i+batch
-    labels = torch.cat([
-        torch.arange(batch_size, 2 * batch_size, device=z.device),
-        torch.arange(0, batch_size, device=z.device)
-    ])
-
-    return F.cross_entropy(sim, labels)
-
-
-def uniformity_loss(z, t=None):
-    """
-    超球面均匀性损失 (Wang & Isola, 2020)
-
-    最小化高斯核势能 → 等价于 Thomson 问题的连续松弛。
-    值越小（越负），分布越均匀。
-
-    Args:
-        z: [batch, d] 嵌入向量
-        t: 温度参数（默认使用 EmbeddingConfig.UNIFORMITY_T）
-    """
-    if t is None:
-        t = EmbeddingConfig.UNIFORMITY_T
-    pw_dists = torch.pdist(z, p=2)
-    return pw_dists.pow(2).mul(-t).exp().mean().log()
-
-
-def entropy_regularization_loss(z, inv_temperature=1.0):
-    """
-    熵正则化损失：鼓励嵌入空间各维度均匀利用
-
-    对 batch 内每个维度计算 soft sign 分布（正/负比例），
-    最大化二值熵 → 每个维度在 batch 内正负均衡。
-
-    受 Kronos 的 Binary Spherical Quantization 启发，
-    但适配连续嵌入场景，使用 sigmoid soft quantization。
-
-    Args:
-        z: [batch, d_model] 嵌入向量
-        inv_temperature: 控制soft sign的锐度
-    Returns:
-        loss: 标量，范围 [-1, 0]，0 = 完全均匀利用
-    """
-    scale = math.sqrt(z.shape[-1]) * inv_temperature
-    p = torch.sigmoid(z * scale)
-    avg_p = p.mean(dim=0)
-    entropy = -(avg_p * torch.log(avg_p + 1e-8) +
-                (1 - avg_p) * torch.log(1 - avg_p + 1e-8))
-    max_entropy = math.log(2) * z.shape[-1]
-    return -entropy.sum() / max_entropy
-
-
-def scale_regularization(z, target_std):
-    """
-    标准差正则化：约束 embedding 原始输出的标准差接近目标值
-
-    embedding 输出和位置编码在主模型中直接相加，
-    两者的标准差必须匹配（≈0.2），否则信号比失衡。
-
-    Args:
-        z: [batch, d_model] embedding 原始输出（LayerNorm 之前）
-        target_std: 目标标准差（应与位置编码的 std 一致）
-    Returns:
-        loss: 标量，0 = 完美匹配
-    """
-    actual_std = z.std()
-    return ((actual_std - target_std) / target_std) ** 2
+        recon = self.decoder(z)
+        return z, recon
 
 
 # ==================== 数据收集 ====================
@@ -365,9 +198,7 @@ class WarmupCosineScheduler:
 
     def _get_lr(self):
         if self.current_epoch <= self.warmup_epochs:
-            # 线性预热
             return self.base_lrs[0] * self.current_epoch / max(1, self.warmup_epochs)
-        # 余弦退火
         progress = (self.current_epoch - self.warmup_epochs) / max(
             1, self.total_epochs - self.warmup_epochs)
         return self.eta_min + 0.5 * (self.base_lrs[0] - self.eta_min) * \
@@ -398,11 +229,8 @@ def save_pretrained_embedding(embedding, path, metrics=None):
             'epochs': EmbeddingConfig.EPOCHS,
             'batch_size': EmbeddingConfig.BATCH_SIZE,
             'learning_rate': EmbeddingConfig.LEARNING_RATE,
-            'temperature': EmbeddingConfig.TEMPERATURE,
-            'alpha': EmbeddingConfig.ALPHA,
             'beta': EmbeddingConfig.BETA,
-            'gamma': EmbeddingConfig.GAMMA,
-            'entropy_weight': EmbeddingConfig.ENTROPY_WEIGHT,
+            'sigreg_weight': EmbeddingConfig.SIGREG_WEIGHT,
         },
     }
     if metrics:
@@ -415,14 +243,13 @@ def save_pretrained_embedding(embedding, path, metrics=None):
 # ==================== 主训练函数 ====================
 
 def pretrain(train_stock_info, feature_normalizer=None, device=None,
-             epochs=None, batch_size=None, lr=None, temperature=None):
+             epochs=None, batch_size=None, lr=None):
     """
     Embedding层训练-主函数
     """
     epochs = epochs or EmbeddingConfig.EPOCHS
     batch_size = batch_size if batch_size is not None else EmbeddingConfig.BATCH_SIZE
     lr = lr if lr is not None else EmbeddingConfig.LEARNING_RATE
-    temperature = temperature if temperature is not None else EmbeddingConfig.TEMPERATURE
 
     # 1. 收集并去重K线数据（返回完整池）
     kline_pool = collect_kline_data(train_stock_info, feature_normalizer)
@@ -450,8 +277,6 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
     model = PretrainModel(
         input_dim=EmbeddingConfig.INPUT_DIM,
         d_model=EmbeddingConfig.D_MODEL,
-        decoder_hidden_dim=EmbeddingConfig.DECODER_HIDDEN_DIM,
-        decoder_layers=EmbeddingConfig.DECODER_LAYERS,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -470,43 +295,41 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
         eta_min=EmbeddingConfig.COSINE_ETA_MIN
     )
 
-    # 5. 数据增强
-    augmentation = KLineAugmentation(
-        noise_std=EmbeddingConfig.NOISE_STD,
-        mask_prob=EmbeddingConfig.FEATURE_MASK_PROB,
-        vol_scale_range=EmbeddingConfig.VOLUME_SCALE_RANGE,
-    )
-
     # 损失权重
-    alpha = EmbeddingConfig.ALPHA
     beta = EmbeddingConfig.BETA
-    gamma = EmbeddingConfig.GAMMA
-    delta = EmbeddingConfig.ENTROPY_WEIGHT
+    sigreg_weight = EmbeddingConfig.SIGREG_WEIGHT
+    target_std = EmbeddingConfig.TARGET_STD
 
-    # 6. 训练循环
+    # SIGReg 几何正则
+    sigreg_loss_fn = SIGRegLoss(
+        d_model=EmbeddingConfig.D_MODEL,
+        num_slices=EmbeddingConfig.SIGREG_NUM_SLICES,
+        t_max=EmbeddingConfig.SIGREG_T_MAX,
+        n_points=EmbeddingConfig.SIGREG_N_POINTS,
+    ).to(device)
+
+    # 5. 训练循环
     print(f"\n{'='*60}")
     amp_str = "BF16混合精度" if TrainingConfig.USE_AMP and device.type == 'cuda' else "FP32精度"
     print(f"开始 Embedding 预训练")
-    print(f"  轮数={epochs}  batch={batch_size}  lr={lr}  τ={temperature}")
+    print(f"  轮数={epochs}  batch={batch_size}  lr={lr}")
     print(f"  精度={amp_str}  设备={device}")
-    print(f"  损失权重: α(对比)={alpha}  β(重建)={beta}  "
-          f"γ(均匀)={gamma}  δ(熵)={delta}")
+    print(f"  损失权重: β(重建)={beta}  λ(SIGReg)={sigreg_weight}")
     print(f"{'='*60}")
 
     best_loss = float('inf')
+    best_epoch = 0
+    best_model_state = None
+    best_metrics = None
     output_dir = EmbeddingConfig.OUTPUT_DIR
 
     amp_ctx = _get_amp_context(device)
-    entropy_inv_temp = EmbeddingConfig.ENTROPY_INV_TEMPERATURE
 
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
-        epoch_contrast = 0.0
         epoch_recon = 0.0
-        epoch_uniform = 0.0
-        epoch_entropy = 0.0
-        epoch_scale = 0.0
+        epoch_sigreg = 0.0
         n_batches = 0
 
         t0 = time.time()
@@ -519,43 +342,17 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
         for (batch,) in loader:
             batch = batch.to(device)
 
-            # 生成两个增强视角
-            view1 = augmentation(batch)
-            view2 = augmentation(batch)
-
-            # 前向传播 + 损失计算（AMP混合精度）
             optimizer.zero_grad()
             with amp_ctx:
-                # 原始 embedding 输出（LayerNorm 之前）用于 std 控制
-                z1_raw = model.embedding(view1)
-                z2_raw = model.embedding(view2)
+                z, recon = model(batch)
 
-                # LayerNorm 后的向量用于对比/重建/均匀/熵损失
-                z1 = model.embed_norm(z1_raw)
-                z2 = model.embed_norm(z2_raw)
-                recon1 = model.decoder(z1)
-                recon2 = model.decoder(z2)
+                # SIGReg: 缩放到 N(0,1) 目标，EP 检验各向同性高斯
+                loss_sigreg = sigreg_loss_fn(z / target_std)
 
-                z1_cos = F.normalize(z1, p=2, dim=-1)
-                z2_cos = F.normalize(z2, p=2, dim=-1)
-                loss_contrast = info_nce_loss(z1_cos, z2_cos, temperature)
-                loss_recon = (F.mse_loss(recon1, batch) +
-                             F.mse_loss(recon2, batch)) / 2
-                loss_uniform = (uniformity_loss(z1) + uniformity_loss(z2)) / 2
-                loss_entropy = entropy_regularization_loss(
-                    torch.cat([z1, z2], dim=0), entropy_inv_temp)
+                # 重建损失
+                loss_recon = F.mse_loss(recon, batch)
 
-                # 标准差正则化：原始输出 std 必须与位置编码匹配
-                target_std = EmbeddingConfig.TARGET_STD
-                loss_scale = (scale_regularization(z1_raw, target_std) +
-                             scale_regularization(z2_raw, target_std)) / 2
-
-                epsilon = EmbeddingConfig.SCALE_WEIGHT
-                loss = (alpha * loss_contrast +
-                        beta * loss_recon +
-                        gamma * loss_uniform +
-                        delta * loss_entropy +
-                        epsilon * loss_scale)
+                loss = beta * loss_recon + sigreg_weight * loss_sigreg
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(),
@@ -564,53 +361,45 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
 
             # 统计
             epoch_loss += loss.item()
-            epoch_contrast += loss_contrast.item()
             epoch_recon += loss_recon.item()
-            epoch_uniform += loss_uniform.item()
-            epoch_entropy += loss_entropy.item()
-            epoch_scale += loss_scale.item()
+            epoch_sigreg += loss_sigreg.item()
             n_batches += 1
 
         scheduler.step()
         elapsed = time.time() - t0
 
         avg_loss = epoch_loss / n_batches
-        avg_contrast = epoch_contrast / n_batches
         avg_recon = epoch_recon / n_batches
-        avg_uniform = epoch_uniform / n_batches
-        avg_entropy = epoch_entropy / n_batches
-        avg_scale = epoch_scale / n_batches
+        avg_sigreg = epoch_sigreg / n_batches
         current_lr = scheduler.get_lr()
 
         # 打印日志
         print(f"  Epoch {epoch:3d}/{epochs}  "
               f"Loss={avg_loss:.4f}  "
-              f"Contrast={avg_contrast:.4f}  "
               f"Recon={avg_recon:.4f}  "
-              f"Uniform={avg_uniform:.4f}  "
-              f"Entropy={avg_entropy:.4f}  "
-              f"Scale={avg_scale:.4f}  "
+              f"SIGReg={avg_sigreg:.4f}  "
               f"LR={current_lr:.6f}  "
               f"Time={elapsed:.1f}s")
 
-        # 保存最佳模型
+        # 记录最佳模型（仅存内存，不写磁盘）
         if avg_loss < best_loss:
             best_loss = avg_loss
-            best_path = os.path.join(output_dir, 'best_embedding.pth')
-            save_pretrained_embedding(
-                model.embedding, best_path,
-                metrics={
-                    'epoch': epoch,
-                    'loss': avg_loss,
-                    'contrast_loss': avg_contrast,
-                    'recon_loss': avg_recon,
-                    'uniform_loss': avg_uniform,
-                    'entropy_loss': avg_entropy,
-                }
-            )
+            best_epoch = epoch
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_metrics = {
+                'epoch': epoch,
+                'loss': avg_loss,
+                'recon_loss': avg_recon,
+                'sigreg_loss': avg_sigreg,
+            }
 
+    # 训练结束后一次性保存到磁盘
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        best_path = os.path.join(output_dir, 'best_embedding.pth')
+        save_pretrained_embedding(model.embedding, best_path,
+                                  metrics=best_metrics)
 
-    # 保存最终模型
     final_path = os.path.join(output_dir, 'pretrained_embedding.pth')
     save_pretrained_embedding(model.embedding, final_path,
                               metrics={
@@ -619,7 +408,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
                                   'best_loss': best_loss,
                               })
 
-    print(f"\n预训练完成！最佳 Loss={best_loss:.4f}")
+    print(f"\n预训练完成！最佳 Loss={best_loss:.4f} (第{best_epoch}轮)")
     print(f"权重保存位置: {output_dir}")
 
     return model.embedding
@@ -638,14 +427,10 @@ def main():
                         help=f'批大小 (默认 {EmbeddingConfig.BATCH_SIZE})')
     parser.add_argument('--lr', type=float, default=None,
                         help=f'学习率 (默认 {EmbeddingConfig.LEARNING_RATE})')
-    parser.add_argument('--temperature', type=float, default=None,
-                        help=f'InfoNCE温度 (默认 {EmbeddingConfig.TEMPERATURE})')
-    parser.add_argument('--alpha', type=float, default=None,
-                        help=f'对比损失权重 (默认 {EmbeddingConfig.ALPHA})')
     parser.add_argument('--beta', type=float, default=None,
                         help=f'重建损失权重 (默认 {EmbeddingConfig.BETA})')
-    parser.add_argument('--gamma', type=float, default=None,
-                        help=f'均匀性损失权重 (默认 {EmbeddingConfig.GAMMA})')
+    parser.add_argument('--sigreg-weight', type=float, default=None,
+                        help=f'SIGReg损失权重 (默认 {EmbeddingConfig.SIGREG_WEIGHT})')
     parser.add_argument('--output-dir', type=str, default=None,
                         help=f'输出目录')
 
@@ -656,12 +441,10 @@ def main():
         EmbeddingConfig.EPOCHS = args.epochs
     if args.batch_size:
         EmbeddingConfig.BATCH_SIZE = args.batch_size
-    if args.alpha is not None:
-        EmbeddingConfig.ALPHA = args.alpha
     if args.beta is not None:
         EmbeddingConfig.BETA = args.beta
-    if args.gamma is not None:
-        EmbeddingConfig.GAMMA = args.gamma
+    if args.sigreg_weight is not None:
+        EmbeddingConfig.SIGREG_WEIGHT = args.sigreg_weight
     if args.output_dir:
         EmbeddingConfig.OUTPUT_DIR = args.output_dir
 
@@ -687,7 +470,6 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        temperature=args.temperature,
     )
 
 

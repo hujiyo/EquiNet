@@ -13,7 +13,7 @@ import copy
 import random
 import csv
 from datetime import datetime
-from config import (TrainingConfig,DataConfig,DeviceConfig,ModelConfig,print_config_summary,LossConfig,EmbeddingConfig,PretrainConfig)
+from config import (TrainingConfig,DataConfig,DeviceConfig,ModelConfig,print_config_summary,LossConfig,EmbeddingConfig)
 
 from model import create_model
 
@@ -553,7 +553,7 @@ if __name__ == "__main__":
     # 创建模型（微调模式）
     amp_str = "BF16混合精度" if TrainingConfig.USE_AMP else "FP32精度"
     print(f"\n正在创建模型 ({amp_str})...")
-    model = create_model(mode='finetune', seq_len=PretrainConfig.SEQ_LEN).to(device)
+    model = create_model(seq_len=DataConfig.CONTEXT_LENGTH).to(device)
 
     # 加载预训练 Embedding
     embedding_path = EmbeddingConfig.BEST_EMBEDDING_PATH
@@ -565,16 +565,6 @@ if __name__ == "__main__":
         print(f"错误: 预训练 Embedding 不存在: {embedding_path}")
         print("请先运行: python src/pretrain_embedding.py")
         sys.exit(1)
-
-    # 加载预训练 Backbone（冻结，解冻最后N层Transformer）
-    pretrain_path = PretrainConfig.BEST_PRETRAIN_PATH
-    if os.path.exists(pretrain_path):
-        print(f"加载预训练 Backbone: {pretrain_path}")
-        model.load_pretrained_backbone(pretrain_path)
-        model.freeze_backbone(unfreeze_last_n=PretrainConfig.FINETUNE_UNFREEZE_LAYERS)
-    else:
-        print(f"⚠ 预训练 Backbone 不存在: {pretrain_path}")
-        print("将从头训练（无预训练权重）")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -532,10 +532,9 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
         stock_times_arrays.append(group['date'].values)
 
     print(f"总共 {len(stock_codes)} 只股票 (训练池)")
-    print(f"划分策略:")
-    print(f"  - 训练集: {train_start_date} ~ {train_end_date}")
-    print(f"  - 验证集: {val_start_date} ~ {val_end_date}")
-    print(f"  - 测试集: {test_start_date} ~ 最新")
+    print(f"- 训练集: {train_start_date} ~ {train_end_date}")
+    print(f"- 验证集: {val_start_date} ~ {val_end_date}")
+    print(f"- 测试集: {test_start_date} ~ 最新")
 
     file_args = list(zip(stock_codes, stock_data_arrays, stock_times_arrays,
                          [train_start_date] * len(stock_codes),
@@ -1030,8 +1029,13 @@ def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx, fe
         daily_lows[d] = day_low
         daily_closes[d] = day_close
 
-        base_close = t_day_close if d == 0 else daily_closes[d - 1]
-        daily_price_changes[d] = (day_close - base_close) / base_close
+        if d == 0:
+            if DataConfig.LABEL_DAY1_USE_OPEN:
+                daily_price_changes[d] = (day_close - day_open) / day_open
+            else:
+                daily_price_changes[d] = (day_close - t_day_close) / t_day_close
+        else:
+            daily_price_changes[d] = (day_close - daily_closes[d - 1]) / daily_closes[d - 1]
 
     cumulative_return, daily_returns = calculate_returns(
         t1_open=daily_opens[0],
@@ -1123,7 +1127,15 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
             eval_daily_returns)
 
 
-def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
+def create_recent_days_dataset(test_stock_info, feature_normalizer=None, max_days=15):
+    """
+    创建最近几天的数据集（包含临时样本，用于展示）
+
+    Args:
+        test_stock_info: 测试集股票信息列表
+        feature_normalizer: 可选的特征归一化器实例
+        max_days: 只生成最近 max_days 天的样本，避免遍历整个测试期
+    """
     recent_inputs = []
     recent_cumulative_returns = []
     recent_day_indices = []
@@ -1134,9 +1146,10 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None):
         data_length = len(stock_data)
         test_split_point = stock_info.get('test_split_point', 0)
 
-        start_min = max(1, test_split_point)
         start_max = data_length - DataConfig.CONTEXT_LENGTH - 1
-        
+        # 只取最近 max_days 天的样本，避免遍历整个测试期
+        start_min = max(1, test_split_point, start_max - max_days + 1)
+
         if start_max < start_min:
             continue
 

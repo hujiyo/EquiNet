@@ -86,6 +86,8 @@ class DataConfig:
     TOP_K = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
     TOP_N_PER_DAY = 0                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
     MAX_SELECT_PER_DAY = 4             # 全局阈值模式下每天最多选股数量（0表示不限制）
+    MAX_HOLDINGS = 4                  # 最大并发持仓数（由用户实际资金体量决定）
+    MAX_BUY_PER_DAY = 0                # 每天最多买入数量（0表示不限制，填满所有空位）
 
 # ==================== 模型架构参数 ====================
 class ModelConfig:
@@ -485,6 +487,7 @@ def print_config_summary():
     print(f"  上下文长度: {DataConfig.CONTEXT_LENGTH}")
     print(f"  涨停过滤: {'开启' if DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP else '关闭'}")
     print(f"  评估批处理大小: {DataConfig.EVAL_BATCH_SIZE}")
+    print(f"  最大持仓: {DataConfig.MAX_HOLDINGS}  每日买入上限: {DataConfig.MAX_BUY_PER_DAY if DataConfig.MAX_BUY_PER_DAY > 0 else '不限'}")
     print(f"标签参数:")
     print(f"  正样本距离保护: {DataConfig.LABEL_DISTANCE}")
     print(f"  Day1基准: {'开盘价(日内涨幅)' if DataConfig.LABEL_DAY1_USE_OPEN else '前日收盘(含跳空)'}")

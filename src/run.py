@@ -260,22 +260,20 @@ def score_all_stocks(model, stock_list, device, feature_normalizer=None):
 
 def print_banner():
     """打印欢迎界面"""
-    print()
-    print("╔" + "═"*62 + "╗")
+    print("╔" + "═"*56 + "╗")
     print("║" + " "*14 + "EquiNet · 模型推理与选股" + " "*14 + "    ║")
-    print("╚" + "═"*62 + "╝")
-    print()
+    print("╚" + "═"*56 + "╝")
 
 
 def print_section(title):
     """打印分节标题"""
     print()
-    print(f"┌─── {title} " + "─" * max(1, 55 - len(title)*2) + "┐")
+    print(f"┌─── {title} " + "─" * max(1, 55 - len(title)*2))
 
 
 def print_section_end():
     """打印分节结束"""
-    print(f"└" + "─"*62 + "┘")
+    print(f"└" + "─"*62)
 
 
 def visualize_classification(preds, targets, title="模型分类能力可视化"):
@@ -332,7 +330,7 @@ def visualize_classification(preds, targets, title="模型分类能力可视化"
     save_path = os.path.join('output', 'classification_visualization.png')
     os.makedirs('output', exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f'  分类可视化已保存: {save_path}')
+    print(f'分类可视化已保存: {save_path}')
     plt.close()
 
 
@@ -376,7 +374,7 @@ def select_model(models):
     
     while True:
         try:
-            choice = input(f"\n  请选择模型 [1-{len(models)}]（输入 q 退出）: ").strip()
+            choice = input(f"\n请选择模型 [1-{len(models)}]（输入 q 退出）: ").strip()
             if choice.lower() == 'q':
                 print("  已退出。")
                 sys.exit(0)
@@ -396,14 +394,13 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     Args:
         feature_normalizer: 可选的特征归一化器实例
     """
-    print_section("模型评估")
-    print(f"│  正在创建评估数据集...")
+    print(f"正在创建评估数据集...")
 
     eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = \
         create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
     
-    print(f"│  评估样本数: {len(eval_inputs)}")
-    print(f"│  正在评估模型...")
+    print(f"- 评估样本数: {len(eval_inputs)}")
+    print(f"正在评估模型...")
 
     # 创建评估损失函数（与 train.py 一致）
     if LossConfig.LOSS_TYPE.lower() == 'dynamic_bce':
@@ -436,71 +433,60 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     test_loss = stats['test_loss']
     
     # 打印评估结果（与 train.py 格式一致）
-    print(f"│")
-    print(f"│  ┌── 评估结果 ──────────────────────────────────┐")
-    print(f"│  │  测试损失:          {test_loss:.4f}")
-    print(f"│  │  AUC:              {stats['auc']:.4f}")
+    print()
+    print(f"┌── 评估结果 ──────────────────────────────────┐")
+    print(f"│  测试损失:          {test_loss:.4f}")
+    print(f"│  AUC:              {stats['auc']:.4f}")
     base_rate = stats.get('base_positive_rate', 0)
-    print(f"│  │  正样本基线:       {base_rate:.3f}")
-    print(f"│  │  Prec@10%:         {stats.get('precision_top10', 0):.3f}  ({stats.get('precision_top10', 0)/base_rate:.1f}x)" if base_rate > 0 else f"│  │  Prec@10%:         {stats.get('precision_top10', 0):.3f}")
-    print(f"│  │  Prec@5%:          {stats.get('precision_top5', 0):.3f}  ({stats.get('precision_top5', 0)/base_rate:.1f}x)" if base_rate > 0 else f"│  │  Prec@5%:          {stats.get('precision_top5', 0):.3f}")
-    print(f"│  │  Prec@3%:          {stats.get('precision_top3', 0):.3f}  ({stats.get('precision_top3', 0)/base_rate:.1f}x)" if base_rate > 0 else f"│  │  Prec@3%:          {stats.get('precision_top3', 0):.3f}")
-    print(f"│  │  预测均值:          {stats['pred_mean']:.3f}")
-    print(f"│  │  预测标准差:        {stats['pred_std']:.4f}")
-    print(f"│  │  高置信(>0.7):      {stats['high_conf_count']} 个")
-    print(f"│  │  低置信(<0.2):      {stats['low_conf_count']} 个")
-    print(f"│  │  Top{DataConfig.TOP_K}%样本数:        {stats['top_count']} 个")
-    print(f"│  │  Top{DataConfig.TOP_K}%平均收益:      {stats['top_return']*100:+.2f}%")
+    print(f"│  正样本基线:       {base_rate:.3f}")
+    print(f"│  Prec@10%:         {stats.get('precision_top10', 0):.3f}  ({stats.get('precision_top10', 0)/base_rate:.1f}x)" if base_rate > 0 else f"│  Prec@10%:         {stats.get('precision_top10', 0):.3f}")
+    print(f"│  Prec@5%:          {stats.get('precision_top5', 0):.3f}  ({stats.get('precision_top5', 0)/base_rate:.1f}x)" if base_rate > 0 else f"│  Prec@5%:          {stats.get('precision_top5', 0):.3f}")
+    print(f"│  Prec@3%:          {stats.get('precision_top3', 0):.3f}  ({stats.get('precision_top3', 0)/base_rate:.1f}x)" if base_rate > 0 else f"│  Prec@3%:          {stats.get('precision_top3', 0):.3f}")
+    print(f"│  预测均值:          {stats['pred_mean']:.3f}")
+    print(f"│  预测标准差:        {stats['pred_std']:.4f}")
+    print(f"│  高置信(>0.7):      {stats['high_conf_count']} 个")
+    print(f"│  低置信(<0.2):      {stats['low_conf_count']} 个")
+    print(f"│  Top{DataConfig.TOP_K}%样本数:        {stats['top_count']} 个")
+    print(f"│  Top{DataConfig.TOP_K}%平均收益:      {stats['top_return']*100:+.2f}%")
     if stats.get('daily_top_return') is not None:
-        print(f"│  │  日Top{DataConfig.TOP_K}%平均收益:    {stats['daily_top_return']*100:+.2f}%")
-    print(f"│  │")
-    print(f"│  │  ★ Top{DataConfig.TOP_K}%阈值:        {stats['top_threshold']:.10f}")
-    print(f"│  │")
+        print(f"│  日Top{DataConfig.TOP_K}%平均收益:    {stats['daily_top_return']*100:+.2f}%")
+    print(f"│")
+    print(f"│  ★ Top{DataConfig.TOP_K}%阈值:        {stats['top_threshold']:.10f}")
+    print(f"│")
     
     # 实战收益率
     if stats['realistic_stats'] is not None:
         rs = stats['realistic_stats']
         daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
         mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if rs.get('mode') == 'top_n_per_day' else \
-                   f"全局阈值,每日上限{DataConfig.MAX_SELECT_PER_DAY}" if DataConfig.MAX_SELECT_PER_DAY > 0 else \
+                   f"全局阈值,每日上限{DataConfig.MAX_SELECT_PER_DAY},最大持仓{DataConfig.MAX_HOLDINGS}" if DataConfig.MAX_SELECT_PER_DAY > 0 else \
                    "全局阈值,不限数量"
-        print(f"│  │  【实战收益率({mode_str})】")
-        print(f"│  │  每日统计: {{{daily_stats_str}}}")
-        print(f"│  │  平均实战收益率: {rs['avg_realistic_return']*100:.1f}%")
-        print(f"│  │")
+        print(f"│  【实战收益率({mode_str})】")
+        print(f"│  每日统计: {{{daily_stats_str}}}")
+        print(f"│  平均实战收益率: {rs['avg_realistic_return']*100:.1f}%")
+        print(f"│")
     
     if stats.get('portfolio_stats') is not None:
         ps = stats['portfolio_stats']
         if ps['total_days'] > 0:
-            print(f"│  │  【实战资金模拟（串行逐日买卖）】")
-            print(f"│  │  总交易日: {ps['total_days']}天")
-            print(f"│  │  总交易笔数: {ps['trade_count']}笔（买入{ps['buy_count']}, 卖出{ps['sell_count']}）")
-            print(f"│  │  最终资金: {ps['final_value']:.4f}")
-            print(f"│  │  总收益率: {ps['total_return_pct']:+.2f}%")
-            print(f"│  │  最大回撤: {ps['max_drawdown']*100:.2f}%")
+            print(f"│  【实战资金模拟（串行逐日买卖）】")
+            print(f"│  总交易日: {ps['total_days']}天")
+            print(f"│  总交易笔数: {ps['trade_count']}笔（买入{ps['buy_count']}, 卖出{ps['sell_count']}）")
+            print(f"│  最终资金: {ps['final_value']:.4f}")
+            print(f"│  总收益率: {ps['total_return_pct']:+.2f}%")
+            print(f"│  最大回撤: {ps['max_drawdown']*100:.2f}%")
             
             dt = ps['daily_trades']
-            sample_step = max(1, len(dt) // 10)
-            print(f"│  │  ┌── 逐日交易明细（每{sample_step}天抽样 + 首尾） ──┐")
-            
-            indices_to_show = [0]
-            for i in range(sample_step, len(dt) - 1, sample_step):
-                indices_to_show.append(i)
-            if len(dt) > 1:
-                indices_to_show.append(len(dt) - 1)
-            indices_to_show = sorted(set(indices_to_show))
-            
-            for i in indices_to_show:
-                d = dt[i]
+            print(f"│")
+            print(f"│  *** 逐日交易明细（共{len(dt)}天） ***")
+            for d in dt:
                 cash_pct = d['cash_ratio'] * 100
                 pv = d['portfolio_value']
-                print(f"│  │  │  Day{d['day']:>3}: 买{d['buys']} 卖{d['open_sells']+d['close_sells']} "
+                print(f"│  Day{d['day']:>3}: 买{d['buys']} 卖{d['open_sells']+d['close_sells']} "
                       f"资金={pv:.4f} (现金{cash_pct:.0f}%)")
-            print(f"│  │  └───────────────────────────────────────┘")
-            print(f"│  │")
+            print(f"│")
     
-    print(f"│  └───────────────────────────────────────────────┘")
-    print_section_end()
+    print(f"└───────────────────────────────────────────────┘")
 
     stats['eval_targets'] = np.array(eval_targets)
 
@@ -565,11 +551,11 @@ def run_stock_selection(model, threshold, device, feature_normalizer=None):
     
     # 打印选股列表
     print()
-    print("╔" + "═"*78 + "╗")
+    print("╔" + "═"*73 + "╗")
     print("║" + " "*26 + "选 股 结 果 列 表" + " "*26 + "    ║")
-    print("╠" + "═"*78 + "╣")
-    print(f"║  {'排名':^4}  {'代码':^8}  {'模型分数':^10}  {'收盘价':^8}  {'涨跌幅':^8}  {'日期':^10}  {'':^6}  ║")
-    print("╠" + "═"*78 + "╣")
+    print("╠" + "═"*73 + "╣")
+    print(f"║  {'排名':^4} {'代码':^7}{'模型分数':^10} {'收盘价':^7}{'涨跌幅':^8}{'日期':^10}{'':^6} ║")
+    print("╠" + "═"*73 + "╣")
     
     # 决定显示多少条
     # 阈值线上方全部显示 + 阈值线下方显示到前30名或阈值线后10条（取较大者）
@@ -593,7 +579,7 @@ def run_stock_selection(model, threshold, device, feature_normalizer=None):
     for item in display_ranges:
         if isinstance(item, tuple) and item[0] == 'ellipsis':
             if not any(i in printed_indices for i in range(item[1], item[2])):
-                print(f"║  {'':^4}  {'...':^8}  {'':^10}  {'':^8}  {'':^8}  {'':^10}  {'':^6}  ║")
+                print(f"║  {'':^4}  {'...':^8}  {'':^10}  {'':^8}  {'':^8}  {'':^10}  {'':^6}    ║")
             continue
         
         start_r, end_r = item if isinstance(item, tuple) else item
@@ -611,26 +597,26 @@ def run_stock_selection(model, threshold, device, feature_normalizer=None):
             # 阈值标记
             marker = ""
             if i == threshold_idx - 1 and threshold_idx > 0:
-                marker = "┈阈值┈"
+                marker = "-阈值-"
             elif i == threshold_idx:
                 marker = "  ↓  "
             elif i < threshold_idx:
                 marker = "  ★  "
             
-            print(f"║  {rank:>4}   {code:>8}   {score:>10.8f}   {close:>8.2f}  {change_str:>8}   {date:>10}  {marker:^6}  ║")
+            print(f"║  {rank:>4}   {code:>8}   {score:>10.8f}   {close:>8.2f}  {change_str:>8}   {date:>10} {marker:^6}  ║")
             
             # 在阈值分界处画线
             if i == threshold_idx - 1 and threshold_idx < len(results):
-                print("╠" + "─"*78 + "╣")
-                print(f"║  {'':^4}  {'':^8}  {'↑ 超过阈值 ↑':^10}  {'│':^8}  {'↓ 低于阈值 ↓':^8}  {'':^10}  {'':^6}  ║")
-                print("╠" + "─"*78 + "╣")
+                print("╠" + "─"*73 + "╣")
+                print(f"║  {'':^4}  {'':^8}  {'↑ 超过阈值 ↑':^10}  {'│':^8}  {'↓ 低于阈值 ↓':^8}  {'':^10}     ║")
+                print("╠" + "─"*73 + "╣")
     
     # 如果还有更多未显示的
     remaining = len(results) - len(printed_indices)
     if remaining > 0:
-        print(f"║  {'':^4}  {'':^8}  {f'... 还有 {remaining} 只未显示':^10}  {'':^8}  {'':^8}  {'':^10}  {'':^6}  ║")
+        print(f"║  {'':^4}  {'':^8}  {f'... 还有 {remaining} 只未显示':^10}  {'':^8}  {'':^8}     {'':^6}  ║")
     
-    print("╚" + "═"*78 + "╝")
+    print("╚" + "═"*73 + "╝")
     
     # 打印汇总统计
     print()
@@ -672,11 +658,11 @@ def print_recent_days_chart(daily_stats, last_n=10):
     
     print()
     print("╔" + "═"*52 + "╗")
-    title = f"最近{last_n}天实战收益率"
-    padding = (52 - 2 - len(title)) // 2
-    print("║" + " "*padding + title + " "*(52 - 2 - padding - len(title)) + "║")
+    title = f"Situation in the last {last_n} days"
+    padding = (52 - len(title)) // 2
+    print("║" + " "*padding + title + " "*(52 - padding - len(title)) + "║")
     print("╠" + "═"*52 + "╣")
-    print("║  Day  │ Count │ Return   │ 相对日期   │ 数据      ║")
+    print("║  Day  │ Count │ Return   │ 相对日期   │ 数据       ║")
     print("╠" + "─"*52 + "╣")
     
     for i, (count, ret, available_days) in enumerate(recent_stats):
@@ -684,14 +670,7 @@ def print_recent_days_chart(daily_stats, last_n=10):
         day_num = last_n - i
         
         # 相对日期
-        if i == last_n - 1:
-            relative_date = "昨天"
-        elif i == last_n - 2:
-            relative_date = "前天"
-        elif i == last_n - 3:
-            relative_date = "大前天"
-        else:
-            relative_date = f"T-{day_num}"
+        relative_date = f"T-{day_num}"
         
         if available_days == DataConfig.FUTURE_DAYS:
             data_status = "完整"
@@ -704,7 +683,7 @@ def print_recent_days_chart(daily_stats, last_n=10):
         
         ret_str = f"{ret*100:+.1f}%"
         
-        print(f"║  {day_num:>3}  │  {count:>3}  │ {ret_str:>8} │ {relative_date:<8} │ {data_status:<9} ║")
+        print(f"║  {day_num:>3}  │  {count:>3}  │ {ret_str:>8} │ {relative_date:<8}   │ {data_status:<9}║")
     
     print("╚" + "═"*52 + "╝")
 
@@ -729,7 +708,7 @@ def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4,
     返回: daily_stats [(count, return, available_days), ...]
     """
     recent_inputs, recent_returns, recent_day_indices, recent_available_days = \
-        create_recent_days_dataset(test_stock_info, feature_normalizer)
+        create_recent_days_dataset(test_stock_info, feature_normalizer, max_days=15)
     
     if recent_inputs is None or len(recent_inputs) == 0:
         return []
@@ -836,7 +815,7 @@ def main():
     selected_file = models[model_idx]
     model_path = os.path.join(DataConfig.OUTPUT_DIR, selected_file)
     
-    print(f"\n  正在加载模型: {selected_file}")
+    print(f"正在加载模型: {selected_file}")
     model, metadata = load_model(model_path, device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  模型参数量: {total_params:,}")
@@ -860,17 +839,14 @@ def main():
         print(f"  └───────────────────────────────────────────────")
     else:
         print(f"  (旧格式模型，无内嵌元数据，使用当前 config.py 参数)")
-
-    print(f"  ✓ 模型加载成功")
     
     # 加载数据并评估
-    print(f"\n  正在加载数据集...")
+    print(f"\n正在加载数据集...")
 
     # ========== 特征归一化器配置 ==========
     if os.path.exists(DataConfig.NORMALIZER_PATH):
-        print(f"\n  [特征归一化] 正在加载归一化器...")
+        print(f"正在加载归一化器...")
         feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
-        print(f"  [特征归一化] ✓ 已启用")
     else:
         print(f"\n  ⚠ 错误: 归一化器文件不存在: {DataConfig.NORMALIZER_PATH}")
         print(f"  请先运行: python data.py")
@@ -891,7 +867,7 @@ def main():
     # 询问是否选股
     print()
     while True:
-        choice = input("  是否进入选股模式？(y/n): ").strip().lower()
+        choice = input("是否进入选股模式？(y/n): ").strip().lower()
         if choice in ('y', 'yes', ''):
             break
         elif choice in ('n', 'no', 'q'):
@@ -932,7 +908,7 @@ def main():
                     print(f"\n  推荐关注:")
                     for i in range(min(threshold_idx, 20)):
                         code, score, date, close, change = results[i]
-                        marker = "┈阈值┈" if i == threshold_idx - 1 else "  ★  "
+                        marker = "-阈值-" if i == threshold_idx - 1 else "  ★  "
                         print(f"    {i+1:>3}. {code}  分数={score:.8f}  价格={close:.2f}  涨跌={change:+.2f}%  {marker}")
                     if threshold_idx > 20:
                         print(f"    ... 还有 {threshold_idx - 20} 只")

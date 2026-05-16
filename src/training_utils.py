@@ -582,27 +582,24 @@ def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_perc
 def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_returns,
                                     all_day_indices, top_percent=1.0, top_n_per_day=None):
     """
-    实战资金管理模拟（串行逐日模拟买卖过程）
-    
-    核心规则：
-    1. 任何时刻最多持有 MAX_SELECT_PER_DAY（默认4）只股票
-    2. 第D天收盘后运行模型得到推荐列表（按分数排序）
-    3. 第D+1天开盘：
-       a. 先处理今天的卖出（开盘止损卖出）
-       b. 所有卖出资金（含昨日收盘卖出、今日开盘卖出）合并为可用资金
-       c. 根据当前持仓空位数，从推荐列表中取前N只（N=空位数）
-       d. 用可用资金等权买入这N只股票
-    4. 第D+1天收盘：处理收盘卖出，资金累计到次日
-    5. 如果某天推荐列表为空（模型无推荐），则该天空仓，资金闲置
-    
-    
+    实战资金管理模拟（逐日滚动买卖）
+
+    模拟A股实盘规则：
+    - 每天收盘后模型打分，生成推荐列表
+    - 次日开盘：用开盘前可用资金买入推荐股票（受 MAX_BUY_PER_DAY 限制）
+    - 开盘/收盘：所有卖出资金一律次日可用（买入以开盘价成交，与卖出同时发生）
+    - 最大并发持仓：MAX_HOLDINGS（独立于 MAX_SELECT_PER_DAY）
+    - 每日最大买入：MAX_BUY_PER_DAY（0=不限制，填满空位）
+
     卖出时机（从 daily_returns 长度推导）：
-    - len=1: Day1大跌止损 → 买入次日开盘卖出
-    - len=2: 累计亏损/弱势止损 → 买入次日收盘卖出
-    - len=3: 正常持有满3天 → 买入第3天收盘卖出
+    - len=1: Day1大跌止损 → 次日开盘卖出
+    - len=2: 累计亏损/弱势止损 → 次日收盘卖出
+    - len=3: 正常持有满3天 → 第3天收盘卖出
     """
-    max_holdings = DataConfig.MAX_SELECT_PER_DAY if DataConfig.MAX_SELECT_PER_DAY > 0 else 4
-    
+    max_holdings = DataConfig.MAX_HOLDINGS if DataConfig.MAX_HOLDINGS > 0 else \
+                   DataConfig.MAX_SELECT_PER_DAY if DataConfig.MAX_SELECT_PER_DAY > 0 else 4
+    max_buy_per_day = DataConfig.MAX_BUY_PER_DAY if DataConfig.MAX_BUY_PER_DAY > 0 else max_holdings
+
     unique_days = np.sort(np.unique(all_day_indices))
     
     daily_selections = {}
@@ -709,34 +706,25 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
     for current_day in range(min_event_day, max_event_day + 1):
         day_open_sells = 0
         day_close_sells = 0
-        
-        # === Phase 1: 开盘卖出 ===
-        open_sell_released = 0.0
-        remaining = []
-        for h in holdings:
-            if h['sell_day'] == current_day and h['sell_type'] == 'open':
-                released = h['amount'] * (1.0 + h['return'])
-                open_sell_released += released
-                day_open_sells += 1
-                total_sell_count += 1
-            else:
-                remaining.append(h)
-        holdings = remaining
-        
-        # 开盘卖出的资金当天不能买入，放入 pending_cash
-        pending_cash += open_sell_released
-        
+
+        # === Phase 1: 资金到账 ===
+        # 昨日所有卖出（开盘+收盘）的资金今日可用
+        cash += pending_cash
+        pending_cash = 0.0
+
         # === Phase 2: 开盘买入 ===
-        # 前一天的 predict_day = current_day - 1
+        # 买卖都是在开盘前挂单的，是同时进行的，因此卖出时已经是开盘后了
+        # 所以买入时只能用昨日已到账的资金，且卖出释放的仓位在买入时还不可用
         predict_day = current_day - 1
         recommendations = recommendation_map.get(predict_day, [])
         
         available_slots = max_holdings - len(holdings)
+        max_buy = min(available_slots, max_buy_per_day)
         actual_buys = 0
         invested_today = 0.0
-        
-        if available_slots > 0 and len(recommendations) > 0 and cash > 1e-10:
-            buy_count = min(available_slots, len(recommendations))
+
+        if max_buy > 0 and len(recommendations) > 0 and cash > 1e-10:
+            buy_count = min(max_buy, len(recommendations))
             amount_per_stock = cash / buy_count
             
             for i in range(buy_count):
@@ -750,9 +738,24 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
                 invested_today += amount_per_stock
                 actual_buys += 1
                 total_buy_count += 1
-            cash = 0.0
-        
-        # === Phase 3: 收盘卖出 ===
+            cash -= invested_today
+
+        # === Phase 3: 开盘卖出 ===
+        # 止损卖出，资金次日可用
+        open_sell_released = 0.0
+        remaining = []
+        for h in holdings:
+            if h['sell_day'] == current_day and h['sell_type'] == 'open':
+                released = h['amount'] * (1.0 + h['return'])
+                open_sell_released += released
+                day_open_sells += 1
+                total_sell_count += 1
+            else:
+                remaining.append(h)
+        holdings = remaining
+        pending_cash += open_sell_released
+
+        # === Phase 4: 收盘卖出 ===
         close_sell_released = 0.0
         remaining = []
         for h in holdings:
@@ -764,22 +767,16 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
             else:
                 remaining.append(h)
         holdings = remaining
-        
-        # 收盘卖出的资金次日可用，放入 pending_cash
         pending_cash += close_sell_released
-        
-        # === Phase 4: 日终结算 ===
-        # pending_cash 转为明日可用的 cash
-        cash += pending_cash
-        pending_cash = 0.0
-        
+
+        # === Phase 5: 日终快照 ===
         holdings_value = sum(h['amount'] * (1.0 + h['return']) for h in holdings)
-        portfolio_value = cash + holdings_value
-        
+        portfolio_value = cash + pending_cash + holdings_value
+
         daily_portfolio_values.append({
             'day': current_day,
             'portfolio_value': portfolio_value,
-            'cash': cash,
+            'cash': cash + pending_cash,
             'holdings_count': len(holdings),
             'buy_count': actual_buys,
             'sell_count': day_open_sells + day_close_sells,
@@ -792,7 +789,7 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
             'open_sells': day_open_sells,
             'close_sells': day_close_sells,
             'portfolio_value': portfolio_value,
-            'cash_ratio': cash / portfolio_value if portfolio_value > 0 else 0,
+            'cash_ratio': (cash + pending_cash) / portfolio_value if portfolio_value > 0 else 0,
             'holdings_count': len(holdings),
         })
     

@@ -188,6 +188,10 @@ class WarmupCosineScheduler:
         self.eta_min = eta_min
         self.base_lrs = [group['lr'] for group in optimizer.param_groups]
         self.current_epoch = 0
+        # 第一个epoch使用warmup起始lr，避免随机初始化+全LR的不稳定更新
+        warmup_start_lr = self.base_lrs[0] / max(1, warmup_epochs)
+        for group in optimizer.param_groups:
+            group['lr'] = warmup_start_lr
 
     def step(self):
         self.current_epoch += 1
@@ -197,8 +201,8 @@ class WarmupCosineScheduler:
             param_group['lr'] = lr
 
     def _get_lr(self):
-        if self.current_epoch <= self.warmup_epochs:
-            return self.base_lrs[0] * self.current_epoch / max(1, self.warmup_epochs)
+        if self.current_epoch < self.warmup_epochs:
+            return self.base_lrs[0] * (self.current_epoch + 1) / self.warmup_epochs
         progress = (self.current_epoch - self.warmup_epochs) / max(
             1, self.total_epochs - self.warmup_epochs)
         return self.eta_min + 0.5 * (self.base_lrs[0] - self.eta_min) * \

@@ -21,7 +21,7 @@ def init_weights(module):
     当代主流Transformer初始化策略
 
     设计原则：
-    1. FFN-Embedding层: 第一层gain=0.58(线性投影), 第二层gain=1.7(补偿GELU压缩)
+    1. FFN-Embedding层: 第一层gain=0.53(线性投影), 第二层gain=1.7(补偿GELU压缩)
     2. SwiGLU w1/w3层: Xavier初始化，gain=1.7
     3. SwiGLU w2层: Xavier初始化，gain=1.0（无激活函数）
     4. 输出层: 小增益，避免sigmoid饱和
@@ -32,10 +32,10 @@ def init_weights(module):
     - Embedding层: 输出std = gain × sqrt(2/(vocab_size+embedding_dim))
 
     各层gain计算结果：
-    - FFN-Embedding第一层 (Linear 9→128): gain=0.58, 输出std≈0.2
+    - FFN-Embedding第一层 (Linear 10→128): gain=0.53, 输出std≈0.2
     - FFN-Embedding GELU: 有效增益≈0.588, 输出std≈0.118
     - FFN-Embedding第二层 (Linear 128→128): gain=1.7, 输出std≈0.2 (由StockTransformer.__init__显式设置)
-    - Position Embedding (Embedding 30→128): gain=1.78
+    - Position Embedding (Embedding 45→128): gain=1.86
     - Query Token (Parameter 128): gain=2.26
     """
     ffn_hidden_dim = ModelConfig.D_MODEL * ModelConfig.FFN_EXPAND_RATIO
@@ -66,7 +66,7 @@ def init_weights(module):
         nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
         # Position Embedding初始化
-        # vocab_size = CONTEXT_LENGTH = 30
+        # vocab_size = CONTEXT_LENGTH = 45
         if module.weight.shape[0] == DataConfig.CONTEXT_LENGTH:
             nn.init.xavier_uniform_(module.weight, gain=ModelConfig.POSITION_EMBEDDING_INIT_GAIN)
         else:

@@ -107,8 +107,8 @@ class ModelConfig:
     # ========== FFN-Embedding 参数初始化配置 ==========
     # 目标：让FFN-Embedding和Position embedding的输出std统一为0.2，确保训练初期信息势均力敌
     #
-    # FFN-Embedding结构：Linear(9→128) → GELU → Linear(128→128)
-    # - 第一层(9→128): 线性投影，gain=0.58, 输出std≈0.2
+    # FFN-Embedding结构：Linear(10→128) → GELU → Linear(128→128)
+    # - 第一层(10→128): 线性投影，gain=0.53, 输出std≈0.2
     # - GELU: 有效增益≈0.588, 输出std≈0.118
     # - 第二层(128→128): 补偿GELU压缩，gain=1.7, 输出std≈0.2 (在model.py中显式设置)
     #
@@ -118,12 +118,12 @@ class ModelConfig:
     # 假设：输入数据经过归一化后std≈1.0
     #
     # 计算过程：
-    # - FFN-Embedding第一层 (Linear 9→128): gain ≈ 0.58
+    # - FFN-Embedding第一层 (Linear 10→128): gain = 0.2 / sqrt(20/138) ≈ 0.53
     # - FFN-Embedding第二层 (Linear 128→128): gain = 1.7 (复用FFN_INIT_GAIN，补偿GELU压缩)
-    # - Position Embedding (Embedding 30→128): gain = 0.2 / sqrt(2/158) ≈ 1.78
+    # - Position Embedding (Embedding 45→128): gain = 0.2 / sqrt(2/173) ≈ 1.86
     # - Query Token (Parameter 128): gain = 0.2 / sqrt(2/256) ≈ 2.26
-    EMBEDDING_INIT_GAIN = 0.58           # FFN-Embedding第一层 (Linear 9→128)
-    POSITION_EMBEDDING_INIT_GAIN = 1.78  # Position Embedding (Embedding 30→128)
+    EMBEDDING_INIT_GAIN = 0.53           # FFN-Embedding第一层 (Linear 10→128)
+    POSITION_EMBEDDING_INIT_GAIN = 1.86  # Position Embedding (Embedding 45→128)
     QUERY_INIT_GAIN = 2.26               # Query Token (AttentionPooling)
 
     # SwiGLU FFN层初始化配置
@@ -138,7 +138,7 @@ class ModelConfig:
     # - 目标值在[0,1]范围，初始输出应接近先验概率
     # - gain=0.1: 很小范围 (±0.06), 让初始预测logits接近0
     # - prior=0.25: data.py中定义的正样本比例（25%）
-    OUTPUT_LAYER_GAIN = 3.0          # 输出层权重初始化增益
+    OUTPUT_LAYER_GAIN = 0.1          # 输出层权重初始化增益
 
 # ==================== Embedding预训练参数 ====================
 class EmbeddingConfig:

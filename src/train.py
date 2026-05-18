@@ -340,7 +340,7 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
 
         # 按loss保存最佳模型（基于验证集指标）
         realistic_return = stats['realistic_stats']['avg_realistic_return'] if stats.get('realistic_stats') else 0.0
-        if (epoch + 1) > warmup_epochs and realistic_return >= 0.014 and stats['top_return'] > 0.008 and stats['auc'] > 0.65:
+        if (epoch + 1) > warmup_epochs and stats['top_return'] >= 0.006 and stats['auc'] > 0.69:
             if val_loss < best_loss:
                 best_loss = val_loss
                 best_loss_epoch = epoch + 1

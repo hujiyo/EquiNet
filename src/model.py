@@ -127,10 +127,12 @@ class TransformerLayer(nn.Module):
         self.attn_norm = nn.LayerNorm(d_model)
 
         # SwiGLU前馈网络: w2(SiLU(w1(x)) * w3(x))
+        # bias=False: Shazeer (2020) 原始设计，LLaMA/PaLM/DeepSeek/Qwen 均不使用 bias
+        # GLU 逐元素乘法中 bias 会产生交叉项，导致信号偏移被平方级放大
         ffn_hidden_dim = int(d_model * ModelConfig.FFN_EXPAND_RATIO)
-        self.ffn_w1 = nn.Linear(d_model, ffn_hidden_dim)
-        self.ffn_w3 = nn.Linear(d_model, ffn_hidden_dim)
-        self.ffn_w2 = nn.Linear(ffn_hidden_dim, d_model)
+        self.ffn_w1 = nn.Linear(d_model, ffn_hidden_dim, bias=False)
+        self.ffn_w3 = nn.Linear(d_model, ffn_hidden_dim, bias=False)
+        self.ffn_w2 = nn.Linear(ffn_hidden_dim, d_model, bias=False)
         self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn_dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 

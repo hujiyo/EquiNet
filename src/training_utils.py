@@ -426,7 +426,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     # 头部分类性：Top K% 样本的正样本比例（Precision@K%）
     base_positive_rate = float(np.mean(all_targets))
     precision_at = {'base_positive_rate': base_positive_rate}
-    for top_pct in [10, 5, 3]:
+    for top_pct in [10, 3, 1]:
         k = max(10, int(len(all_preds) * top_pct / 100))
         subset_targets = all_targets[sorted_indices[:k]]
         precision_at[f'precision_top{top_pct}'] = float(np.mean(subset_targets))

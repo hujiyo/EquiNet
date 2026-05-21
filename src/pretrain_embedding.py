@@ -25,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from config import (DataConfig, EmbeddingConfig, DeviceConfig,
+from config import (DataConfig, EmbeddingConfig, DeviceConfig,ModelConfig,
                      TrainingConfig)
 from data import (load_and_preprocess_data, FeatureNormalizer,
                   precompute_training_pool)
@@ -275,8 +275,8 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
 
     # 3. 创建模型
     model = PretrainModel(
-        input_dim=EmbeddingConfig.INPUT_DIM,
-        d_model=EmbeddingConfig.D_MODEL,
+        input_dim=ModelConfig.INPUT_DIM,
+        d_model=ModelConfig.INPUT_DIM,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -302,7 +302,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
 
     # SIGReg 几何正则
     sigreg_loss_fn = SIGRegLoss(
-        d_model=EmbeddingConfig.D_MODEL,
+        d_model=ModelConfig.D_MODEL,
         num_slices=EmbeddingConfig.SIGREG_NUM_SLICES,
         t_max=EmbeddingConfig.SIGREG_T_MAX,
         n_points=EmbeddingConfig.SIGREG_N_POINTS,
@@ -406,9 +406,9 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
         print("\n[输出std验证]")
         model.eval()
         with torch.no_grad():
-            test_input = torch.randn(10000, EmbeddingConfig.INPUT_DIM, device=device)
+            test_input = torch.randn(10000, ModelConfig.INPUT_DIM, device=device)
             ckpt = torch.load(best_path, map_location=device, weights_only=True)
-            tmp = KLineEmbedding(EmbeddingConfig.INPUT_DIM, EmbeddingConfig.D_MODEL).to(device)
+            tmp = KLineEmbedding(ModelConfig.INPUT_DIM, ModelConfig.INPUT_DIM).to(device)
             tmp.embed_proj.weight.data.copy_(ckpt['embed_proj_weight'])
             tmp.embed_mlp[1].weight.data.copy_(ckpt['embed_mlp_1_weight'])
             z = tmp(test_input)

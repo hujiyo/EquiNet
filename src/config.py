@@ -120,10 +120,6 @@ class ModelConfig:
 # ==================== Embedding预训练参数 ====================
 class EmbeddingConfig:
     """Embedding层参数（src/pretrain_embedding.py 使用）"""
-    # 架构（必须与 ModelConfig 一致）
-    INPUT_DIM = ModelConfig.INPUT_DIM     # 10
-    D_MODEL = ModelConfig.D_MODEL         # 128
-
     # 训练超参数
     EPOCHS = 100                          # 预训练轮数
     BATCH_SIZE = 2560                     # 大batch，对比学习需要充足负样本

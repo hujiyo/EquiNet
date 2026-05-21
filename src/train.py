@@ -290,7 +290,7 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         val_loss = stats['test_loss']
         eval_label = "验证集" if has_val else "测试集"
 
-        print(f'  [模型] 训练损失: {avg_loss:.4f}, {eval_label}损失: {val_loss:.4f}, AUC: {stats["auc"]:.4f}, Prec@10%: {stats["precision_top10"]:.3f}, Prec@5%: {stats["precision_top5"]:.3f}, Prec@3%: {stats["precision_top3"]:.3f} (基线: {stats["base_positive_rate"]:.3f})')
+        print(f'  [模型] 训练损失: {avg_loss:.4f}, {eval_label}损失: {val_loss:.4f}, AUC: {stats["auc"]:.4f}, Prec@10%: {stats["precision_top10"]:.3f}, Prec@3%: {stats["precision_top3"]:.3f}, Prec@1%: {stats["precision_top1"]:.3f} (基线: {stats["base_positive_rate"]:.3f})')
         print(f'         预测均值: {stats["pred_mean"]:.3f}, 高置信(>0.7): {stats["high_conf_count"]}, 低置信(<0.2): {stats["low_conf_count"]}')
         daily_str = f', 日Top{DataConfig.TOP_K}%收益: {stats["daily_top_return"]*100:+.2f}%' if stats.get("daily_top_return") is not None else ''
         print(f'         Top{DataConfig.TOP_K}%收益: {stats["top_return"]*100:+.2f}%{daily_str}')
@@ -310,8 +310,8 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             'val_loss': val_loss,
             'auc': stats['auc'],
             'precision_top10': stats['precision_top10'],
-            'precision_top5': stats['precision_top5'],
             'precision_top3': stats['precision_top3'],
+            'precision_top1': stats['precision_top1'],
             'avg_realistic_return': stats['realistic_stats']['avg_realistic_return'] if stats.get('realistic_stats') else None,
             'dispersion_std': stats.get('dispersion_std', 0),
             'dispersion_range': stats.get('dispersion_range', 0),
@@ -500,8 +500,8 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
                 'val_loss': f"{er['val_loss']:.4f}" if er.get('val_loss') is not None else "",
                 'auc': f"{er['auc']:.4f}" if er.get('auc') is not None else "",
                 'prec_top10': f"{er['precision_top10']:.4f}" if er.get('precision_top10') is not None else "",
-                'prec_top5': f"{er['precision_top5']:.4f}" if er.get('precision_top5') is not None else "",
                 'prec_top3': f"{er['precision_top3']:.4f}" if er.get('precision_top3') is not None else "",
+                'prec_top1': f"{er['precision_top1']:.4f}" if er.get('precision_top1') is not None else "",
                 'avg_realistic_return': f"{er['avg_realistic_return']*100:.1f}" if er.get('avg_realistic_return') is not None else "",
             }
             writer.writerow(row)

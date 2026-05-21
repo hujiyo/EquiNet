@@ -25,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from config import (ModelConfig, DataConfig, EmbeddingConfig, DeviceConfig,
+from config import (DataConfig, EmbeddingConfig, DeviceConfig,
                      TrainingConfig)
 from data import (load_and_preprocess_data, FeatureNormalizer,
                   precompute_training_pool)
@@ -45,19 +45,19 @@ class KLineEmbedding(nn.Module):
 
     def __init__(self, input_dim=10, d_model=128):
         super().__init__()
-        self.embed_proj = nn.Linear(input_dim, d_model)
+        self.embed_proj = nn.Linear(input_dim, d_model, bias=False)
         self.embed_mlp = nn.Sequential(
             nn.GELU(),
-            nn.Linear(d_model, d_model)
+            nn.Linear(d_model, d_model, bias=False)
         )
-
-        # 与 StockTransformer 一致的初始化
-        nn.init.xavier_uniform_(self.embed_proj.weight,
-                                gain=ModelConfig.EMBEDDING_INIT_GAIN)
-        nn.init.zeros_(self.embed_proj.bias)
-        nn.init.xavier_uniform_(self.embed_mlp[1].weight,
-                                gain=ModelConfig.FFN_INIT_GAIN)
-        nn.init.zeros_(self.embed_mlp[1].bias)
+        # 残差等贡献初始化（非逐层调参，从架构推导）
+        # 原理：残差分支输出std = 主路径输出std，确保128维空间充分覆盖
+        # GELU有效增益≈0.588 → MLP层σ = 1/(√d·0.588) ≈ 0.150
+        # 两条路径各贡献std≈0.141 → 合计std≈0.2（匹配SIGReg目标）
+        nn.init.normal_(self.embed_mlp[1].weight,
+                        std=1.0 / (math.sqrt(d_model) * 0.588))
+        nn.init.normal_(self.embed_proj.weight,
+                        std=0.2 / (math.sqrt(2) * math.sqrt(input_dim)))
 
     def forward(self, x):
         """
@@ -90,9 +90,7 @@ class PretrainModel(nn.Module):
         self.input_dim = input_dim
 
         # 线性解码器: x̂ = Wz + b, W ∈ R^(10×128)
-        self.decoder = nn.Linear(d_model, input_dim)
-        nn.init.xavier_uniform_(self.decoder.weight)
-        nn.init.zeros_(self.decoder.bias)
+        self.decoder = nn.Linear(d_model, input_dim, bias=False)
 
     def forward(self, x):
         """
@@ -224,9 +222,7 @@ def save_pretrained_embedding(embedding, path, metrics=None):
 
     checkpoint = {
         'embed_proj_weight': embedding.embed_proj.weight.data.cpu(),
-        'embed_proj_bias': embedding.embed_proj.bias.data.cpu(),
         'embed_mlp_1_weight': embedding.embed_mlp[1].weight.data.cpu(),
-        'embed_mlp_1_bias': embedding.embed_mlp[1].bias.data.cpu(),
         'input_dim': embedding.embed_proj.in_features,
         'd_model': embedding.embed_proj.out_features,
         'config': {
@@ -397,20 +393,26 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
                 'sigreg_loss': avg_sigreg,
             }
 
-    # 训练结束后一次性保存到磁盘
+    # 训练结束后保存最佳模型到磁盘
+    best_path = None
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         best_path = os.path.join(output_dir, 'best_embedding.pth')
         save_pretrained_embedding(model.embedding, best_path,
                                   metrics=best_metrics)
 
-    final_path = os.path.join(output_dir, 'pretrained_embedding.pth')
-    save_pretrained_embedding(model.embedding, final_path,
-                              metrics={
-                                  'epoch': epochs,
-                                  'loss': avg_loss,
-                                  'best_loss': best_loss,
-                              })
+    # 测量保存文件的输出std
+    if best_path is not None:
+        print("\n[输出std验证]")
+        model.eval()
+        with torch.no_grad():
+            test_input = torch.randn(10000, EmbeddingConfig.INPUT_DIM, device=device)
+            ckpt = torch.load(best_path, map_location=device, weights_only=True)
+            tmp = KLineEmbedding(EmbeddingConfig.INPUT_DIM, EmbeddingConfig.D_MODEL).to(device)
+            tmp.embed_proj.weight.data.copy_(ckpt['embed_proj_weight'])
+            tmp.embed_mlp[1].weight.data.copy_(ckpt['embed_mlp_1_weight'])
+            z = tmp(test_input)
+            print(f"  {os.path.basename(best_path)}: 输出std = {z.std().item():.4f}")
 
     print(f"\n预训练完成！最佳 Loss={best_loss:.4f} (第{best_epoch}轮)")
     print(f"权重保存位置: {output_dir}")

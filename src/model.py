@@ -16,62 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from config import ModelConfig, DataConfig
 
-def init_weights(module):
-    """
-    当代主流Transformer初始化策略
-
-    设计原则：
-    1. FFN-Embedding层: 第一层gain=0.53(线性投影), 第二层gain=1.7(补偿GELU压缩)
-    2. SwiGLU w1/w3层: Xavier初始化，gain=1.7
-    3. SwiGLU w2层: Xavier初始化，gain=1.0（无激活函数）
-    4. 输出层: 小增益，避免sigmoid饱和
-    5. LayerNorm: weight=1, bias=0
-
-    Embedding初始化计算（目标std=0.2）：
-    - Linear层: 输出std = σ_input × gain × sqrt(2×fan_in/(fan_in+fan_out))
-    - Embedding层: 输出std = gain × sqrt(2/(vocab_size+embedding_dim))
-
-    各层gain计算结果：
-    - FFN-Embedding第一层 (Linear 10→128): gain=0.53, 输出std≈0.2
-    - FFN-Embedding GELU: 有效增益≈0.588, 输出std≈0.118
-    - FFN-Embedding第二层 (Linear 128→128): gain=1.7, 输出std≈0.2 (由StockTransformer.__init__显式设置)
-    - Position Embedding (Embedding 45→128): gain=1.86
-    - Query Token (Parameter 128): gain=2.26
-    """
-    ffn_hidden_dim = ModelConfig.D_MODEL * ModelConfig.FFN_EXPAND_RATIO
-
-    if isinstance(module, nn.Linear):
-        if module.out_features == 1:
-            nn.init.xavier_uniform_(module.weight, gain=ModelConfig.OUTPUT_LAYER_GAIN)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif module.in_features == ModelConfig.INPUT_DIM and module.out_features == ModelConfig.D_MODEL:
-            nn.init.xavier_uniform_(module.weight, gain=ModelConfig.EMBEDDING_INIT_GAIN)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif module.in_features == ModelConfig.D_MODEL and module.out_features == ffn_hidden_dim:
-            nn.init.xavier_uniform_(module.weight, gain=ModelConfig.FFN_INIT_GAIN)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif module.in_features == ffn_hidden_dim and module.out_features == ModelConfig.D_MODEL:
-            nn.init.xavier_uniform_(module.weight, gain=1.0)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        else:
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-    elif isinstance(module, nn.LayerNorm):
-        nn.init.ones_(module.weight)
-        nn.init.zeros_(module.bias)
-    elif isinstance(module, nn.Embedding):
-        # Position Embedding初始化
-        # vocab_size = CONTEXT_LENGTH = 45
-        if module.weight.shape[0] == DataConfig.CONTEXT_LENGTH:
-            nn.init.xavier_uniform_(module.weight, gain=ModelConfig.POSITION_EMBEDDING_INIT_GAIN)
-        else:
-            nn.init.xavier_uniform_(module.weight, gain=1.0)
-
 
 class PositionalEncoding(nn.Module):
     """
@@ -82,9 +26,12 @@ class PositionalEncoding(nn.Module):
     def __init__(self, d_model, seq_len=DataConfig.CONTEXT_LENGTH):
         super(PositionalEncoding, self).__init__()
         self.pe = nn.Embedding(seq_len, d_model)
+        # gain推导: 使position embedding输出std匹配FFN-Embedding输出std≈0.25
+        # xavier_uniform_输出std = gain × √(2/(45+128)) = gain × 0.10752
+        # 令其=0.25 → gain = 0.25/0.10752 ≈ 2.32
+        nn.init.xavier_uniform_(self.pe.weight, gain=2.32)
 
     def forward(self, x):
-        #添加位置编码，LayerNorm在后续层中可能使用
         seq_len = x.size(1)
         positions = torch.arange(seq_len, device=x.device)
         return x + self.pe(positions).unsqueeze(0)
@@ -101,7 +48,7 @@ class MultiHeadAttention(nn.Module):
         self.nhead = nhead
         assert d_model % nhead == 0
         
-        self.attention = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.attention = nn.MultiheadAttention(d_model, nhead, bias=False, batch_first=True)
         self.dropout = nn.Dropout(ModelConfig.ATTENTION_DROPOUT)
 
     def forward(self, x, attn_mask=None):
@@ -137,10 +84,8 @@ class TransformerLayer(nn.Module):
         self.ffn_dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
     def forward(self, x):
-        # 注意力子层: x = x + Dropout(Attention(LayerNorm(x)))
         x = x + self.attn(self.attn_norm(x), attn_mask=None)
 
-        # SwiGLU前馈网络: x = x + Dropout(w2(SiLU(w1(h)) * w3(h)))
         h = self.ffn_norm(x)
         x = x + self.ffn_dropout(self.ffn_w2(F.silu(self.ffn_w1(h)) * self.ffn_w3(h)))
 
@@ -160,43 +105,28 @@ class AttentionPooling(nn.Module):
     def __init__(self, d_model, nhead):
         super(AttentionPooling, self).__init__()
 
-        # 可学习的 query token: [1, 1, d_model]
-        self.query = nn.Parameter(torch.empty(1, 1, d_model))
+        self.query = nn.Parameter(torch.randn(1, 1, d_model))
+        # 匹配cross-attn初始输出std≈0.15，使残差连接在训练初期有意义
+        with torch.no_grad():
+            self.query.data.normal_(std=0.15)
 
-        # Pre-Norm: 分别对 query 和 key-value 进行归一化
         self.norm_q = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_model)
 
-        # 多头 cross-attention: query 关注序列所有位置
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, bias=False, batch_first=True)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
-        # 初始化 query token（使用Xavier初始化）
-        nn.init.xavier_uniform_(self.query, gain=ModelConfig.QUERY_INIT_GAIN)
-
     def forward(self, x):
-        """
-        Args:
-            x: [batch_size, seq_len, d_model] - Transformer 编码后的序列
-
-        Returns:
-            pooled: [batch_size, d_model] - 聚合后的表示向量
-        """
         batch_size = x.size(0)
 
-        # 将 query 扩展到 batch 维度: [1, 1, d_model] -> [batch_size, 1, d_model]
         query = self.query.expand(batch_size, -1, -1)
 
-        # Pre-Norm
         query_normed = self.norm_q(query)
         kv_normed = self.norm_kv(x)
 
-        # Cross-attention: query 关注序列所有位置
-        # attn_output: [batch_size, 1, d_model]
         attn_output, _ = self.cross_attn(query_normed, kv_normed, kv_normed)
 
-        # 残差连接 + 去掉 seq_len=1 的维度
-        pooled = (query + self.dropout(attn_output)).squeeze(1)  # [batch_size, d_model]
+        pooled = (query + self.dropout(attn_output)).squeeze(1)
 
         return pooled
 
@@ -218,68 +148,45 @@ class StockTransformer(nn.Module):
         # Linear(9→128): 基础线性映射，保底传递原始特征信息
         # GELU + Linear(128→128): 残差分支，专注学习非线性交互（K线形态翻转等）
         # 残差连接: 线性映射永远保底，MLP只负责"加增量"
-        self.embed_proj = nn.Linear(input_dim, d_model)
+        self.embed_proj = nn.Linear(input_dim, d_model, bias=False)
         self.embed_mlp = nn.Sequential(
             nn.GELU(),
-            nn.Linear(d_model, d_model)
+            nn.Linear(d_model, d_model, bias=False)
         )
 
         # 使用标准位置编码
         self.pos_encoding = PositionalEncoding(d_model, seq_len)
 
-        # 统一架构：所有层都使用 Attention + FFN
         self.layers = nn.ModuleList([
             TransformerLayer(d_model, nhead)
             for i in range(num_layers)
         ])
 
-        # Pre-Norm架构：在最后添加一个LayerNorm
-        # 因为Pre-Norm的最后一层没有归一化输出
         self.final_norm = nn.LayerNorm(d_model)
 
-        # 多头注意力聚合：通过 cross-attention 聚合序列信息
-        # 相比单向量点积，每个注意力头可以学到不同的时间聚合模式
         self.attention_pooling = AttentionPooling(d_model, nhead)
 
-        # Pooling输出归一化：与backbone的Pre-Norm风格一致，稳定分类头输入
         self.head_norm = nn.LayerNorm(d_model)
 
-        # 单层线性分类头（主流做法），让backbone承担特征学习
-        self.output_projection = nn.Linear(d_model, output_dim)
+        self.output_projection = nn.Linear(d_model, output_dim, bias=True)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
-        # 应用初始化
-        self.apply(init_weights)
-
-        # FFN-Embedding残差MLP第二层显式初始化：补偿GELU压缩
-        nn.init.xavier_uniform_(self.embed_mlp[1].weight, gain=ModelConfig.FFN_INIT_GAIN)
-        nn.init.zeros_(self.embed_mlp[1].bias)
-
     def forward(self, x):
-        # x: [batch_size, seq_len, 10] (OHLC + vwap + volume + exchange + m5 + m10 + m20)
+        x = self.embed_proj(x)
+        x = x + self.embed_mlp(x)
 
-        # 1. FFN-Embedding：线性投影 + 残差MLP
-        x = self.embed_proj(x)          # 线性映射保底
-        x = x + self.embed_mlp(x)       # MLP学非线性交互，残差保护线性映射
-
-        # 位置编码
         x = self.pos_encoding(x)
         x = self.dropout(x)
 
-        # 3. Transformer层（Pre-Norm架构）
         for layer in self.layers:
             x = layer(x)
 
-        # 4. Pre-Norm架构需要在最后进行归一化
-        #    因为每层的输出没有经过归一化
         x = self.final_norm(x)
 
-        # 5. 多头注意力聚合
-        aggregated = self.attention_pooling(x)  # [batch_size, d_model]
+        aggregated = self.attention_pooling(x)
 
-        # 6. Pooling归一化 + 分类头
         aggregated = self.head_norm(aggregated)
-        output = self.output_projection(aggregated)  # [batch_size, output_dim]
+        output = self.output_projection(aggregated)
         return output
 
     def load_pretrained_embedding(self, path):
@@ -292,11 +199,8 @@ class StockTransformer(nn.Module):
         checkpoint = torch.load(path, map_location='cpu', weights_only=True)
 
         self.embed_proj.weight.data.copy_(checkpoint['embed_proj_weight'])
-        self.embed_proj.bias.data.copy_(checkpoint['embed_proj_bias'])
-        # embed_mlp 结构为 Sequential(GELU, Linear)，通过类型定位 Linear 层
         linear_layer = next(m for m in self.embed_mlp if isinstance(m, nn.Linear))
         linear_layer.weight.data.copy_(checkpoint['embed_mlp_1_weight'])
-        linear_layer.bias.data.copy_(checkpoint['embed_mlp_1_bias'])
 
         print(f"  已加载预训练 Embedding: {path}")
 
@@ -349,6 +253,12 @@ def create_model(input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL,
         output_dim=output_dim,
         seq_len=seq_len,
     )
+
+    # 输出层初始化：小 gain 防止 sigmoid 饱和，bias 设为先验 logit
+    nn.init.xavier_uniform_(model.output_projection.weight, gain=ModelConfig.OUTPUT_LAYER_GAIN)
+    # sigmoid(logit(prior)) = prior, 先验≈0.25 → bias = log(0.25/0.75) ≈ -1.1
+    prior = 0.25
+    model.output_projection.bias.data.fill_(math.log(prior / (1.0 - prior)))
 
     # 打印模型信息
     total_params = sum(p.numel() for p in model.parameters())

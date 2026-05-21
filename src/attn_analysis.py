@@ -52,7 +52,6 @@ def _mask_mha_head(mha, head_idx, head_dim):
             s = offset + head_idx * head_dim
             e = offset + (head_idx + 1) * head_dim
             mha.in_proj_weight[s:e, :] = 0
-            mha.in_proj_bias[s:e] = 0
 
 
 def _create_eval_criterion(eval_targets):

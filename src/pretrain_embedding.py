@@ -6,7 +6,7 @@ EquiNet Embedding层训练脚本
 
 1. SIGReg 几何正则 (Balestriero & LeCun, 2025)：约束嵌入分布趋向各向同性高斯
    通过 Cramér-Wold + Epps-Pulley 检验，数学上保证无维度/子空间/聚类坍塌
-2. MLP 解码器重建损失：确保嵌入向量足以恢复原始10维特征
+2. MLP 解码器重建损失：确保嵌入向量足以恢复原始15维特征
 
 用法：
   python src/pretrain_embedding.py                        # 使用默认参数
@@ -39,11 +39,11 @@ class KLineEmbedding(nn.Module):
     """
     单日K线嵌入模块（结构与 StockTransformer 的 FFN-Embedding 完全一致）
 
-    Linear(10→128) → GELU → Linear(128→128) + 残差连接
+    Linear(15→128) → GELU → Linear(128→128) + 残差连接
     保留完整向量信息（方向 + 幅度）。
     """
 
-    def __init__(self, input_dim=10, d_model=128):
+    def __init__(self, input_dim=15, d_model=128):
         super().__init__()
         self.embed_proj = nn.Linear(input_dim, d_model, bias=False)
         self.embed_mlp = nn.Sequential(
@@ -62,7 +62,7 @@ class KLineEmbedding(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [batch, 10] 归一化K线特征
+            x: [batch, 15] 归一化K线特征
         Returns:
             z: [batch, d_model] 嵌入向量（保留方向+幅度）
         """
@@ -84,7 +84,7 @@ class PretrainModel(nn.Module):
     解码器在预训练完成后丢弃，只保留 embedding 权重。
     """
 
-    def __init__(self, input_dim=10, d_model=128):
+    def __init__(self, input_dim=15, d_model=128):
         super().__init__()
         self.embedding = KLineEmbedding(input_dim, d_model)
         self.input_dim = input_dim
@@ -95,10 +95,10 @@ class PretrainModel(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [batch, 10]
+            x: [batch, 15]
         Returns:
             z: [batch, d_model] 嵌入向量 S（用于 SIGReg）
-            recon: [batch, 10] 重建的原始输入 Y
+            recon: [batch, 15] 重建的原始输入 Y
         """
         z = self.embedding(x)
         recon = self.decoder(z)
@@ -138,7 +138,7 @@ def collect_kline_data(train_stock_info, feature_normalizer=None):
         feature_normalizer: 特征归一化器
 
     Returns:
-        kline_data: [M, 10] numpy array (去重后的完整池)
+        kline_data: [M, 15] numpy array (去重后的完整池)
     """
     print("\n[数据收集] 提取逐日K线向量...")
 
@@ -166,7 +166,9 @@ def collect_kline_data(train_stock_info, feature_normalizer=None):
     print(f"  特征范围:")
     for i, name in enumerate(['Open', 'High', 'Low', 'Close',
                                'VWAP', 'Volume', 'Exchange',
-                               'MA5', 'MA10', 'MA20']):
+                               'MA5', 'MA10', 'MA20',
+                               'DIF', 'DEA', 'MACD_Hist',
+                               'BB_Upper', 'BB_Lower']):
         col = kline_data[:, i]
         print(f"    {name:>8s}: [{col.min():.4f}, {col.max():.4f}]  "
               f"μ={col.mean():.4f}  σ={col.std():.4f}")
@@ -276,7 +278,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
     # 3. 创建模型
     model = PretrainModel(
         input_dim=ModelConfig.INPUT_DIM,
-        d_model=ModelConfig.INPUT_DIM,
+        d_model=ModelConfig.D_MODEL,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -408,7 +410,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
         with torch.no_grad():
             test_input = torch.randn(10000, ModelConfig.INPUT_DIM, device=device)
             ckpt = torch.load(best_path, map_location=device, weights_only=True)
-            tmp = KLineEmbedding(ModelConfig.INPUT_DIM, ModelConfig.INPUT_DIM).to(device)
+            tmp = KLineEmbedding(ModelConfig.INPUT_DIM, ModelConfig.D_MODEL).to(device)
             tmp.embed_proj.weight.data.copy_(ckpt['embed_proj_weight'])
             tmp.embed_mlp[1].weight.data.copy_(ckpt['embed_mlp_1_weight'])
             z = tmp(test_input)

@@ -19,7 +19,7 @@ class DataConfig:
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out')
 
     # 数据源配置
-    DATA_SOURCE = 'akshare'  # 'baostock' 或 'akshare'
+    DATA_SOURCE = 'baostock'  # 'baostock' 或 'akshare'
     MARKET_CAP_MAX = 200e8  # 市值上限（元），200亿
     MARKET_CAP_MIN = 10e8   # 市值下限（元），10亿
     VALID_STOCK_PREFIXES = ['600', '601', '603', '605', '000', '001', '002', '003']  # 主板股票代码前缀
@@ -93,7 +93,7 @@ class DataConfig:
 class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
-    INPUT_DIM = 10                   # 输入特征维度数（OHLC + vwap + volume + exchange + m5 + m10 + m20）
+    INPUT_DIM = 15                   # 输入特征维度数（OHLC + vwap + volume + exchange + m5 + m10 + m20 + dif + dea + macd_hist + bb_upper + bb_lower）
     D_MODEL = 128                    # 模型维度（Transformer 内部维度）
     FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数

@@ -123,12 +123,42 @@ class StockDataUpdater:
             print(f"✗ {stock_code} 数据处理异常：{e}")
             return None
 
+    @staticmethod
+    def _latest_possible_trading_date() -> int:
+        """
+        推算当前时刻最近一个「已收盘的交易日」日期（YYYYMMDD 整数）。
+
+        规则：
+        1. A 股 15:00 收盘，收盘前当天数据不完整，应取前一交易日。
+        2. 周末（周六/周日）自动回退到周五。
+        3. 法定节假日无法穷举，保守处理：只跳过确定的周末，
+           其余情况不跳过，留给服务端判断。
+        """
+        now = datetime.datetime.now()
+        # 服务器通常 18:00 后才有当日数据，此前视为未更新
+        if now.hour < 18:
+            now -= datetime.timedelta(days=1)
+
+        weekday = now.weekday()  # 0=Mon ... 6=Sun
+        if weekday == 5:         # 周六 → 回退到周五
+            now -= datetime.timedelta(days=1)
+        elif weekday == 6:       # 周日 → 回退到周五
+            now -= datetime.timedelta(days=2)
+
+        return int(now.strftime("%Y%m%d"))
+
     def update_single_stock(self, stock_code: str, incremental: bool = True,
                             pool_type: str = 'all') -> bool:
         """更新单只股票数据到数据库"""
         if incremental:
             last_date = self.db.get_latest_date(stock_code)
             if last_date:
+                # 本地预判：如果该票最新日期已经达到最近可能交易日，直接跳过
+                cutoff = self._latest_possible_trading_date()
+                if last_date >= cutoff:
+                    print(f"✓ {stock_code} 已最新 (最新：{last_date})")
+                    return True
+
                 start_str = f"{str(last_date)[:4]}-{str(last_date)[4:6]}-{str(last_date)[6:]}"
                 next_date = (datetime.datetime.strptime(start_str, "%Y-%m-%d")
                             + datetime.timedelta(days=1)).strftime("%Y-%m-%d")

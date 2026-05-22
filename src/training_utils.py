@@ -401,7 +401,8 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
             batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], dtype=torch.float32, device=device)
             with amp_ctx:
                 logits = model(batch_inputs)
-            scores = torch.sigmoid(logits.float())
+            logits = logits.float()
+            scores = torch.sigmoid(logits)
             all_preds.append(scores.cpu().numpy().flatten())
 
             if criterion is not None:

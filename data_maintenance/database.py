@@ -38,6 +38,11 @@ class DatabaseManager:
         m5          REAL,
         m10         REAL,
         m20         REAL,
+        dif         REAL,
+        dea         REAL,
+        macd_hist   REAL,
+        bb_upper    REAL,
+        bb_lower    REAL,
         updated_at  TEXT    DEFAULT (datetime('now')),
         PRIMARY KEY (stock_code, date)
     );
@@ -90,6 +95,13 @@ class DatabaseManager:
             "INSERT OR IGNORE INTO schema_info (key, value) VALUES (?, ?)",
             ('version', '1')
         )
+
+        # 增量迁移：添加 MACD 特征列
+        existing_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(stock_daily)")}
+        for col in ('dif', 'dea', 'macd_hist', 'bb_upper', 'bb_lower'):
+            if col not in existing_cols:
+                self._conn.execute(f"ALTER TABLE stock_daily ADD COLUMN {col} REAL")
+
         self._conn.commit()
 
     # ==================== 行情数据写入 ====================
@@ -97,7 +109,8 @@ class DatabaseManager:
     def upsert_daily_data(self, stock_code: str, df: pd.DataFrame):
         """将 DataFrame 格式的行情数据写入数据库（UPSERT），向量化构建"""
         cols = ['open', 'high', 'low', 'close', 'amount', 'volume',
-                'exchange', 'vwap', 'm5', 'm10', 'm20']
+                'exchange', 'vwap', 'm5', 'm10', 'm20', 'dif', 'dea', 'macd_hist',
+                'bb_upper', 'bb_lower']
 
         n = len(df)
         codes = [stock_code] * n
@@ -127,7 +140,8 @@ class DatabaseManager:
     def bulk_upsert_daily(self, records: List[tuple]):
         """批量写入行情数据。records: [(stock_code, date, open, high, ...), ...]"""
         cols = ['stock_code', 'date', 'open', 'high', 'low', 'close',
-                'amount', 'volume', 'exchange', 'vwap', 'm5', 'm10', 'm20']
+                'amount', 'volume', 'exchange', 'vwap', 'm5', 'm10', 'm20',
+                'dif', 'dea', 'macd_hist', 'bb_upper', 'bb_lower']
         placeholders = ', '.join(['?'] * len(cols))
         col_str = ', '.join(cols)
         self._conn.executemany(
@@ -137,11 +151,13 @@ class DatabaseManager:
         self._conn.commit()
 
     def update_features(self, stock_code: str, feature_records: List[tuple]):
-        """更新指定股票的 m5/m10/m20 特征。feature_records: [(date, m5, m10, m20), ...]"""
+        """更新指定股票的衍生特征。
+        feature_records: [(date, m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower), ...]"""
         self._conn.executemany(
-            "UPDATE stock_daily SET m5=?, m10=?, m20=? "
+            "UPDATE stock_daily SET m5=?, m10=?, m20=?, dif=?, dea=?, macd_hist=?, bb_upper=?, bb_lower=? "
             "WHERE stock_code=? AND date=?",
-            [(m5, m10, m20, stock_code, date) for date, m5, m10, m20 in feature_records]
+            [(m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower, stock_code, date)
+             for date, m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower in feature_records]
         )
         self._conn.commit()
 
@@ -197,7 +213,7 @@ class DatabaseManager:
         Returns:
             DataFrame，包含 date 列和请求的数据列
         """
-        col_str = ', '.join(columns) if columns else 'date, open, high, low, close, amount, volume, exchange, vwap, m5, m10, m20'
+        col_str = ', '.join(columns) if columns else 'date, open, high, low, close, amount, volume, exchange, vwap, m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower'
 
         conditions = ["stock_code = ?"]
         params = [stock_code]
@@ -250,11 +266,12 @@ class DatabaseManager:
         return cursor.fetchone()[0]
 
     def get_stocks_missing_features(self, pool_type='selected') -> List[str]:
-        """获取指定池中缺少 m5/m10/m20 特征的股票"""
+        """获取指定池中缺少特征（m5/m10/m20 或 MACD）的股票"""
         cursor = self._conn.execute(
             "SELECT sp.stock_code FROM stock_pool sp "
             "JOIN stock_daily sd ON sp.stock_code = sd.stock_code "
-            "WHERE sp.pool_type=? AND sp.is_active=1 AND sd.m5 IS NULL "
+            "WHERE sp.pool_type=? AND sp.is_active=1 "
+            "AND (sd.m5 IS NULL OR sd.dif IS NULL OR sd.bb_upper IS NULL) "
             "GROUP BY sp.stock_code",
             (pool_type,)
         )
@@ -397,7 +414,7 @@ class DatabaseManager:
         cursor = self._conn.execute(
             "SELECT COUNT(DISTINCT sd.stock_code) FROM stock_daily sd "
             "JOIN stock_pool sp ON sd.stock_code = sp.stock_code "
-            "WHERE sp.pool_type='selected' AND sp.is_active=1 AND sd.m5 IS NULL"
+            "WHERE sp.pool_type='selected' AND sp.is_active=1 AND (sd.m5 IS NULL OR sd.dif IS NULL OR sd.bb_upper IS NULL)"
         )
         stats['stocks_missing_features'] = cursor.fetchone()[0]
 

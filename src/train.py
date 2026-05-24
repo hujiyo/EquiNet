@@ -485,7 +485,7 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"epoch_returns_{timestamp}.csv")
 
-    fieldnames = ['turn', 'top_return', 'daily_return', 'train_loss', 'val_loss', 'auc', 'prec_top10', 'prec_top5', 'prec_top3', 'avg_realistic_return']
+    fieldnames = ['turn', 'top_return', 'daily_return', 'train_loss', 'val_loss', 'auc', 'prec_top10', 'prec_top3', 'prec_top1', 'avg_realistic_return']
 
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

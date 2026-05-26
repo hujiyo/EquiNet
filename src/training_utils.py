@@ -65,9 +65,6 @@ class WarmupScheduler:
     
     def get_last_lr(self):
         return [group['lr'] for group in self.optimizer.param_groups]
-    
-    def is_warmup_phase(self):
-        return self.current_epoch < self.warmup_epochs
 
 
 class CosineAnnealFreezeLR:
@@ -873,8 +870,6 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
             'epochs':           TrainingConfig.EPOCHS,
             'learning_rate':    TrainingConfig.get_base_lr(),
             'batch_size':       TrainingConfig.BATCH_SIZE,
-            'use_adamw':        TrainingConfig.OPTIMIZER_TYPE == 'adamw',
-            'use_mano':         TrainingConfig.OPTIMIZER_TYPE == 'mano',
             'optimizer_type':   TrainingConfig.OPTIMIZER_TYPE,
             'weight_decay':     TrainingConfig.get_base_wd(),
             'loss_type':        LossConfig.LOSS_TYPE,
@@ -1100,7 +1095,7 @@ def training_step(model, optimizer, loss_fn):
 
     Args:
         model: PyTorch模型
-        optimizer: 优化器实例（AdamW、Lion、Mano等）
+        optimizer: 优化器实例（AdamW、Lion、Muon等）
         loss_fn: 无参回调函数，返回 (loss_tensor, output_tensor)。
                  调用方在闭包中封装具体的loss计算逻辑。
 
@@ -1132,24 +1127,11 @@ def create_optimizer_from_config(model, lr=None):
     Returns:
         optimizer: 创建的优化器实例
     """
-    from optimizers import create_optimizer
-
     actual_lr = lr if lr is not None else TrainingConfig.get_base_lr()
     wd = TrainingConfig.get_base_wd()
     optimizer_type = TrainingConfig.OPTIMIZER_TYPE.lower()
 
-    if optimizer_type == 'mano':
-        optimizer = create_optimizer(
-            model,
-            optimizer_type='mano',
-            lr=actual_lr,
-            momentum=TrainingConfig.MANO_MOMENTUM,
-            weight_decay=wd,
-            betas=TrainingConfig.MANO_ADAMW_BETAS,
-            nesterov=TrainingConfig.MANO_NESTEROV,
-            dual_dim_projection=TrainingConfig.MANO_DUAL_DIM_PROJECTION
-        )
-    elif optimizer_type == 'lion':
+    if optimizer_type == 'lion':
         optimizer = Lion(model.parameters(), lr=actual_lr, betas=TrainingConfig.LION_BETAS, weight_decay=wd)
         print(f"优化器: Lion (lr={actual_lr}, wd={wd}, betas={TrainingConfig.LION_BETAS})")
     elif optimizer_type == 'muon':
@@ -1193,29 +1175,7 @@ def create_optimizer_from_config_for_params(params, lr=None):
     wd = TrainingConfig.get_base_wd()
     optimizer_type = TrainingConfig.OPTIMIZER_TYPE.lower()
 
-    if optimizer_type == 'mano':
-        from optimizers import create_optimizer
-
-        class _ParamContainer:
-            """包装参数列表，让 create_optimizer 能像 model 一样使用"""
-            def __init__(self, params):
-                self._params = list(params)
-            def parameters(self):
-                return iter(self._params)
-            def named_parameters(self):
-                return ((f"param_{i}", p) for i, p in enumerate(self._params))
-
-        optimizer = create_optimizer(
-            _ParamContainer(params),
-            optimizer_type='mano',
-            lr=actual_lr,
-            momentum=TrainingConfig.MANO_MOMENTUM,
-            weight_decay=wd,
-            betas=TrainingConfig.MANO_ADAMW_BETAS,
-            nesterov=TrainingConfig.MANO_NESTEROV,
-            dual_dim_projection=TrainingConfig.MANO_DUAL_DIM_PROJECTION
-        )
-    elif optimizer_type == 'lion':
+    if optimizer_type == 'lion':
         optimizer = Lion(params, lr=actual_lr, betas=TrainingConfig.LION_BETAS, weight_decay=wd)
         print(f"优化器(部分参数): Lion (lr={actual_lr}, wd={wd}, betas={TrainingConfig.LION_BETAS})")
     elif optimizer_type == 'muon':

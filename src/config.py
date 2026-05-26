@@ -173,8 +173,7 @@ class TrainingConfig:
     # 'adamw':    标准AdamW
     # 'lion':     Lion（符号动量），内存省、泛化好（lion-pytorch库）
     # 'muon':     Muon（Newton-Schulz正交化），收敛快（KellerJordan/Muon库）
-    # 'mano':     Mano混合优化器
-    OPTIMIZER_TYPE = 'mano'
+    OPTIMIZER_TYPE = 'adamw'
 
     # 自动混合精度（AMP）
     USE_AMP = True                   # 启用BF16自动混合精度（矩阵乘法用BF16，归一化/激活/损失保持FP32）
@@ -191,14 +190,6 @@ class TrainingConfig:
     LION_LR = 0.0003                # Lion 学习率（AdamW的~1/3，论文推荐1/3~1/10）
     LION_WEIGHT_DECAY = 0.01        # Lion 权重衰减（比AdamW大约1000倍，论文推荐1e-2量级）
     LION_BETAS = (0.9, 0.99)        # Lion 动量系数
-
-    # Mano 参数（OPTIMIZER_TYPE='mano'时生效）
-    MANO_LR = 0.001                 # Mano 学习率
-    MANO_WEIGHT_DECAY = 1e-5        # Mano 权重衰减
-    MANO_MOMENTUM = 0.95             # Mano动量系数
-    MANO_ADAMW_BETAS = (0.9, 0.95)   # 混合优化器中AdamW部分的beta参数
-    MANO_NESTEROV = True             # 是否使用Nesterov动量（v2默认True）
-    MANO_DUAL_DIM_PROJECTION = True  # 是否使用双维度投影（v2新功能，默认True）
 
     # Muon 参数（OPTIMIZER_TYPE='muon'时生效）
     # Muon通过Newton-Schulz迭代对2D权重矩阵的梯度动量进行正交化，加速收敛
@@ -219,8 +210,6 @@ class TrainingConfig:
         opt = TrainingConfig.OPTIMIZER_TYPE.lower()
         if opt.startswith('lion'):
             return TrainingConfig.LION_LR
-        if opt == 'mano':
-            return TrainingConfig.MANO_LR
         if opt == 'muon':
             return TrainingConfig.MUON_LR
         return TrainingConfig.ADAMW_LR
@@ -231,8 +220,6 @@ class TrainingConfig:
         opt = TrainingConfig.OPTIMIZER_TYPE.lower()
         if opt.startswith('lion'):
             return TrainingConfig.LION_WEIGHT_DECAY
-        if opt == 'mano':
-            return TrainingConfig.MANO_WEIGHT_DECAY
         if opt == 'muon':
             return TrainingConfig.MUON_WEIGHT_DECAY
         return TrainingConfig.ADAMW_WEIGHT_DECAY
@@ -435,7 +422,7 @@ def print_config_summary():
     print(f"  输出维度: {ModelConfig.OUTPUT_DIM}")
     print(f"  序列长度: {DataConfig.CONTEXT_LENGTH}")
 
-    optimizer_names = {'adamw': 'AdamW', 'lion': 'Lion', 'mano': 'Mano'}
+    optimizer_names = {'adamw': 'AdamW', 'lion': 'Lion', 'muon': 'Muon'}
     optimizer_display = optimizer_names.get(TrainingConfig.OPTIMIZER_TYPE.lower(), TrainingConfig.OPTIMIZER_TYPE)
 
     print(f"训练参数:")

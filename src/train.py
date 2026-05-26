@@ -199,7 +199,7 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         total_loss = 0
 
         # 学习率更新
-        if warmup_scheduler.is_warmup_phase():
+        if epoch < warmup_epochs:
             current_lr = warmup_scheduler.step(epoch)
             lr_status = f"预热阶段 ({epoch + 1}/{warmup_epochs})"
         else:
@@ -271,7 +271,7 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             torch.cuda.empty_cache()
 
         # 更新学习率
-        if not warmup_scheduler.is_warmup_phase():
+        if epoch >= warmup_epochs:
             main_scheduler.step()
 
         # 评估模型（在验证集上）

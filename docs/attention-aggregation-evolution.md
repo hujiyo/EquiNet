@@ -12,7 +12,7 @@
 |------|------|----------|----------|--------|----------|
 | **V1** | `878deed5^` | Last Hidden State | 直接取最后时间步 | 0 | ⭐ |
 | **V2** | `878deed5` | Single-Vector Attention | 单向量点积 + softmax | d_model | ⭐⭐ |
-| **V3** | `435c94e` | Multi-Head Attention Pooling | 可学习 query + cross-attention | d_model + 2×Norm | ⭐⭐⭐⭐ |
+| **V3** | `435c94e` | Multi-Head Attention Pooling | 可学习 query + cross-attention | d_model + 1×Norm | ⭐⭐⭐⭐ |
 
 ---
 
@@ -170,16 +170,15 @@ class AttentionPooling(nn.Module):
         # 可学习的 query token: [1, 1, d_model]
         self.query = nn.Parameter(torch.empty(1, 1, d_model))
 
-        # Pre-Norm: 分别对 query 和 key-value 进行归一化
+        # Post-Norm: 归一化在残差连接之后
         self.norm_q = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
 
         # 多头 cross-attention: query 关注序列所有位置
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, bias=False, batch_first=True)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
         # 初始化 query token
-        nn.init.xavier_uniform_(self.query)
+        self.query.data.normal_(std=0.15)
 
     def forward(self, x):
         """
@@ -194,16 +193,12 @@ class AttentionPooling(nn.Module):
         # 将 query 扩展到 batch 维度: [1, 1, d_model] -> [batch_size, 1, d_model]
         query = self.query.expand(batch_size, -1, -1)
 
-        # Pre-Norm
-        query_normed = self.norm_q(query)
-        kv_normed = self.norm_kv(x)
-
         # Cross-attention: query 关注序列所有位置
         # attn_output: [batch_size, 1, d_model]
-        attn_output, _ = self.cross_attn(query_normed, kv_normed, kv_normed)
+        attn_output, _ = self.cross_attn(query, x, x)
 
-        # 残差连接 + 去掉 seq_len=1 的维度
-        pooled = (query + self.dropout(attn_output)).squeeze(1)  # [batch_size, d_model]
+        # Post-Norm: 残差连接 + 归一化 + 去掉 seq_len=1 的维度
+        pooled = self.norm_q((query + self.dropout(attn_output)).squeeze(1))  # [batch_size, d_model]
 
         return pooled
 ```
@@ -218,6 +213,8 @@ class AttentionPooling(nn.Module):
 [batch, 1, 48]            ← 每个头独立学习聚合模式
        ↓ Residual Connection
 [batch, 48]               ← query + attn_output
+       ↓ LayerNorm
+[batch, 48]               ← 归一化后的表示
        ↓ Linear(48→24→1)
 [batch, 1]                ← 最终输出
 ```
@@ -236,12 +233,12 @@ class AttentionPooling(nn.Module):
    - Key/Value: 完整序列 `[T, d_model]`
    - 让模型学习"如何提问"而非"如何回答"
 
-3. **Pre-Norm + 残差连接**:
+3. **Post-Norm + 残差连接**:
    ```python
-   pooled = query + Dropout(CrossAttn(LayerNorm(query), LayerNorm(x)))
+   pooled = LayerNorm(query + Dropout(CrossAttn(query, x)))
    ```
    - 与 Transformer 主架构保持一致
-   - 提升训练稳定性
+   - Post-Norm 在浅层网络（≤6层）中更稳定、收敛质量更高
 
 4. **可学习 Query Token**:
    - 初始化: Xavier uniform
@@ -257,7 +254,7 @@ class AttentionPooling(nn.Module):
 ### 缺点
 
 - ❌ **计算复杂度更高**: Cross-attention 比简单的点积复杂
-- ❌ **参数量增加**: 增加了 query token + 2 个 LayerNorm
+- ❌ **参数量增加**: 增加了 query token + 1 个 LayerNorm
 - ❌ **训练难度**: 更多的参数可能需要更多的数据才能充分训练
 
 ### 参数量对比
@@ -265,9 +262,9 @@ class AttentionPooling(nn.Module):
 | 组件 | V2 (单向量) | V3 (多头池化) | 增加 |
 |------|-------------|---------------|------|
 | Attention Query | 48 | 48 | 0 |
-| LayerNorm × 2 | 0 | 2×48×2 = 192 | +192 |
+| LayerNorm × 1 | 0 | 48×2 = 96 | +96 |
 | Cross-Attn (Q/K/V/O) | 0 | 4×(48×12)×4 = 9,216 | +9,216 |
-| **总计** | **48** | **9,456** | **+9,408** |
+| **总计** | **48** | **9,360** | **+9,312** |
 
 ### 数学表达
 
@@ -295,7 +292,7 @@ $$
 | 信息利用率 | 3.3% (1/30) | 100% (自适应加权) | 100% (多模式加权) |
 | 表达能力 | ⭐ | ⭐⭐ | ⭐⭐⭐⭐ |
 | 计算复杂度 | O(1) | O(Td) | O(Td²/h) |
-| 参数量 | 0 | d | d + 2×d + 4×4d²/h ≈ 9.5d |
+| 参数量 | 0 | d | d + d + 4×4d²/h ≈ 9.4d |
 | 训练稳定性 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ |
 | 可解释性 | 低 | 中 | 高 |
 

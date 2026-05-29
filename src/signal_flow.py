@@ -47,7 +47,6 @@ def _register_gradient_hooks(model):
     for i, layer in enumerate(model.layers):
         targets[f"L{i+1}.attn_norm"] = layer.attn_norm
         targets[f"L{i+1}.ffn_norm"] = layer.ffn_norm
-    targets["final_norm"] = model.final_norm
     targets["head_norm"] = model.head_norm
 
     for name, module in targets.items():
@@ -96,43 +95,35 @@ def _print_forward_flow(model, eval_inputs, device):
 
         print(f"  proj {_s2(proj)}  mlp分支 {_s2(mlp)}  +残差 {_s2(after_mlp)}  +pos {_s2(after_pos)}")
 
-        # Transformer layers
+        # Transformer layers (Post-Norm: sublayer → +residual → norm)
+        # Post-Norm 每层输出经 LayerNorm，std 恒≈1，无诊断价值
+        # 只记录归一化前各子层的信号强度
         rows = []
         for i, layer in enumerate(model.layers):
             entry = _std(x)
-            h = layer.attn_norm(x)
-            anorm = _std(h)
-            attn_out = layer.attn(h, attn_mask=None)
+            attn_out = layer.attn(x, attn_mask=None)
             attn = _std(attn_out)
-            x = x + attn_out
-            a_res = _std(x)
-            h2 = layer.ffn_norm(x)
-            fnorm = _std(h2)
-            ffn_gated = torch.nn.functional.silu(layer.ffn_w1(h2)) * layer.ffn_w3(h2)
+            x = layer.attn_norm(x + attn_out)
+            ffn_gated = torch.nn.functional.silu(layer.ffn_w1(x)) * layer.ffn_w3(x)
             ffn_out = layer.ffn_dropout(layer.ffn_w2(ffn_gated))
             ffn = _std(ffn_out)
-            x = x + ffn_out
-            f_res = _std(x)
-            rows.append((i + 1, entry, anorm, attn, a_res, fnorm, ffn, f_res))
+            x = layer.ffn_norm(x + ffn_out)
+            rows.append((i + 1, entry, attn, ffn))
 
         print()
-        print(f"       {'res_in':>7}  {'anorm':>7}  {'attn':>7}  {'a+res':>7}  {'fnorm':>7}  {'ffn':>7}  {'f+res':>7}")
-        print(f"  {'─' * 68}")
-        for (li, entry, anorm, attn, a_res, fnorm, ffn, f_res) in rows:
-            print(f"  L{li:<3} {_s2(entry)}  {_s2(anorm)}  {_s2(attn)}  {_s2(a_res)}  {_s2(fnorm)}  {_s2(ffn)}  {_s2(f_res)}")
+        print(f"       {'res_in':>7}  {'attn':>7}  {'ffn':>7}")
+        print(f"  {'─' * 36}")
+        for (li, entry, attn, ffn) in rows:
+            print(f"  L{li:<3} {_s2(entry)}  {_s2(attn)}  {_s2(ffn)}")
 
         # Head
-        x = model.final_norm(x)
-        fn = _std(x)
         pooled = model.attention_pooling(x)
         pool = _std(pooled)
-        h = model.head_norm(pooled)
-        head = _std(h)
-        out = model.output_projection(h)
+        out = model.output_projection(model.head_norm(pooled))
         output = _std(out)
 
         print()
-        print(f"  fnorm {_s2(fn)}  pool {_s2(pool)}  head {_s2(head)}  output {_s2(output)}")
+        print(f"  pool {_s2(pool)}  output {_s2(output)}")
 
     print("─" * 72)
 

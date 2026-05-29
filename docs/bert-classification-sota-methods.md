@@ -198,9 +198,8 @@ class MultiHeadAttentionPooling(nn.Module):
     def __init__(self, d_model, nhead):
         super().__init__()
         self.query = nn.Parameter(torch.randn(1, 1, d_model))
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, bias=False, batch_first=True)
         self.norm_q = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x, attention_mask=None):
@@ -214,16 +213,14 @@ class MultiHeadAttentionPooling(nn.Module):
         batch_size = x.size(0)
         query = self.query.expand(batch_size, -1, -1)
 
-        query_normed = self.norm_q(query)
-        kv_normed = self.norm_kv(x)
-
         # Cross-attention with attention mask
         attn_output, _ = self.cross_attn(
-            query_normed, kv_normed, kv_normed,
+            query, x, x,
             key_padding_mask=~attention_mask.bool() if attention_mask is not None else None
         )
 
-        pooled = (query + self.dropout(attn_output)).squeeze(1)
+        # Post-Norm: 残差连接后归一化
+        pooled = self.norm_q((query + self.dropout(attn_output)).squeeze(1))
         return pooled
 ```
 
@@ -569,19 +566,18 @@ class FlexiblePooling(nn.Module):
 
 2. **架构设计合理**
    - Cross-attention 而非简单的点积
-   - Pre-Norm + 残差连接，训练稳定
+   - Post-Norm + 残差连接，浅层网络更稳定
 
 #### 💡 改进建议
 
 **建议 1: 添加层间聚合**
 ```python
 # 当前：只用最后一层
-x = self.final_norm(x)  # 最后一层
+x = self.layers[-1](x)  # Post-Norm 最后一层输出已归一化
 
 # 改进：聚合最后多层
 last_k_layers = outputs[-4:]  # 最后4层
 x = torch.cat(last_k_layers, dim=-1)  # 或加权平均
-x = self.final_norm(x)
 ```
 
 **理由**: BERT 研究表明，中间层包含更丰富的语义信息

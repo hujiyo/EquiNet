@@ -62,7 +62,7 @@ class MultiHeadAttention(nn.Module):
 
 class TransformerLayer(nn.Module):
     """
-    标准 Transformer 层（Pre-Norm架构，SwiGLU前馈网络）
+    标准 Transformer 层（Post-Norm架构，SwiGLU前馈网络）
     SwiGLU: w2(SiLU(w1(x)) * w3(x))，门控机制提供选择性信息流动
     参考: Shazeer, "GLU Variants Improve Transformer" (2020)
     """
@@ -84,10 +84,9 @@ class TransformerLayer(nn.Module):
         self.ffn_dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
     def forward(self, x):
-        x = x + self.attn(self.attn_norm(x), attn_mask=None)
+        x = self.attn_norm(x + self.attn(x, attn_mask=None))
 
-        h = self.ffn_norm(x)
-        x = x + self.ffn_dropout(self.ffn_w2(F.silu(self.ffn_w1(h)) * self.ffn_w3(h)))
+        x = self.ffn_norm(x + self.ffn_dropout(self.ffn_w2(F.silu(self.ffn_w1(x)) * self.ffn_w3(x))))
 
         return x
 
@@ -111,7 +110,6 @@ class AttentionPooling(nn.Module):
             self.query.data.normal_(std=0.15)
 
         self.norm_q = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
 
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, bias=False, batch_first=True)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
@@ -121,19 +119,16 @@ class AttentionPooling(nn.Module):
 
         query = self.query.expand(batch_size, -1, -1)
 
-        query_normed = self.norm_q(query)
-        kv_normed = self.norm_kv(x)
+        attn_output, _ = self.cross_attn(query, x, x)
 
-        attn_output, _ = self.cross_attn(query_normed, kv_normed, kv_normed)
-
-        pooled = (query + self.dropout(attn_output)).squeeze(1)
+        pooled = self.norm_q((query + self.dropout(attn_output)).squeeze(1))
 
         return pooled
 
 
 class StockTransformer(nn.Module):
     """
-    Transformer 模型（Pre-Norm 架构 + FFN-Embedding）
+    Transformer 模型（Post-Norm 架构 + FFN-Embedding）
 
     核心设计：
     - FFN-Embedding: Linear(9→128) → GELU → Linear(128→128)
@@ -162,8 +157,6 @@ class StockTransformer(nn.Module):
             for i in range(num_layers)
         ])
 
-        self.final_norm = nn.LayerNorm(d_model)
-
         self.attention_pooling = AttentionPooling(d_model, nhead)
 
         self.head_norm = nn.LayerNorm(d_model)
@@ -180,8 +173,6 @@ class StockTransformer(nn.Module):
 
         for layer in self.layers:
             x = layer(x)
-
-        x = self.final_norm(x)
 
         aggregated = self.attention_pooling(x)
 

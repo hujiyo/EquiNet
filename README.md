@@ -124,6 +124,25 @@ ep29 - 第29轮
    python src/run.py
    ```
 
+## 注意力可视化工具
+
+```bash
+python src/visualize_attention.py
+```
+
+![注意力可视化示例](docs/attention_visualizer_example.png)
+
+界面由上到下分为四个区域：
+
+| 区域 | 内容 | 说明 |
+|------|------|------|
+| **K线图** | 45天OHLC蜡烛图 | 橙色背景高亮为 Rollout 注意力覆盖层，颜色越亮表示该天对预测的贡献越大 |
+| **成交量** | 每日成交量柱状图 | 与K线共享时间轴 |
+| **注意力强度条** | Rollout 归一化色带 | 一行薄色带，直观展示各天的综合注意力贡献强弱 |
+| **注意力热力图** | 逐层/逐头注意力矩阵 | 行为各层自注意力均值 + Pooling 聚合注意力 + Attention Rollout，列为45个交易日 |
+
+交互操作：`Space` 下一个样本 / `Backspace` 上一个 / `L` 切换逐层/逐头视图 / `R` 开关Rollout覆盖层 / `Q` 退出
+
 ## 项目修改LOG
 
 - 2026.5.29:模型采用Post-Norm架构

@@ -51,13 +51,20 @@ class MultiHeadAttention(nn.Module):
         self.attention = nn.MultiheadAttention(d_model, nhead, bias=False, batch_first=True)
         self.dropout = nn.Dropout(ModelConfig.ATTENTION_DROPOUT)
 
-    def forward(self, x, attn_mask=None):
+    def forward(self, x, attn_mask=None, return_attn=False):
         mask = None
         if attn_mask is not None:
             mask = attn_mask.to(dtype=x.dtype, device=x.device)
-        
-        attn_output, _ = self.attention(x, x, x, attn_mask=mask)
-        return self.dropout(attn_output)
+
+        attn_output, attn_weights = self.attention(
+            x, x, x, attn_mask=mask,
+            need_weights=return_attn,
+            average_attn_weights=False
+        )
+        attn_output = self.dropout(attn_output)
+        if return_attn:
+            return attn_output, attn_weights
+        return attn_output
 
 
 class TransformerLayer(nn.Module):
@@ -83,11 +90,17 @@ class TransformerLayer(nn.Module):
         self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn_dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
-    def forward(self, x):
-        x = self.attn_norm(x + self.attn(x, attn_mask=None))
+    def forward(self, x, return_attn=False):
+        if return_attn:
+            attn_out, attn_w = self.attn(x, attn_mask=None, return_attn=True)
+            x = self.attn_norm(x + attn_out)
+        else:
+            x = self.attn_norm(x + self.attn(x))
 
         x = self.ffn_norm(x + self.ffn_dropout(self.ffn_w2(F.silu(self.ffn_w1(x)) * self.ffn_w3(x))))
 
+        if return_attn:
+            return x, attn_w
         return x
 
 
@@ -114,15 +127,21 @@ class AttentionPooling(nn.Module):
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, bias=False, batch_first=True)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
-    def forward(self, x):
+    def forward(self, x, return_attn=False):
         batch_size = x.size(0)
 
         query = self.query.expand(batch_size, -1, -1)
 
-        attn_output, _ = self.cross_attn(query, x, x)
+        attn_output, attn_weights = self.cross_attn(
+            query, x, x,
+            need_weights=return_attn,
+            average_attn_weights=False
+        )
 
         pooled = self.norm_q((query + self.dropout(attn_output)).squeeze(1))
 
+        if return_attn:
+            return pooled, attn_weights
         return pooled
 
 
@@ -164,20 +183,32 @@ class StockTransformer(nn.Module):
         self.output_projection = nn.Linear(d_model, output_dim, bias=True)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
-    def forward(self, x):
+    def forward(self, x, return_attn=False):
         x = self.embed_proj(x)
         x = x + self.embed_mlp(x)
 
         x = self.pos_encoding(x)
         x = self.dropout(x)
 
+        attn_weights = [] if return_attn else None
         for layer in self.layers:
-            x = layer(x)
+            if return_attn:
+                x, w = layer(x, return_attn=True)
+                attn_weights.append(w)
+            else:
+                x = layer(x)
 
-        aggregated = self.attention_pooling(x)
+        if return_attn:
+            aggregated, pool_w = self.attention_pooling(x, return_attn=True)
+            attn_weights.append(pool_w)
+        else:
+            aggregated = self.attention_pooling(x)
 
         aggregated = self.head_norm(aggregated)
         output = self.output_projection(aggregated)
+
+        if return_attn:
+            return output, attn_weights
         return output
 
     def load_pretrained_embedding(self, path):

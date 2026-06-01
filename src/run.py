@@ -165,7 +165,8 @@ def load_all_stock_data(db_path=DataConfig.DB_PATH):
     conn = sqlite3.connect(db_path)
     try:
         query = """SELECT sd.stock_code, sd.date, sd.open, sd.high, sd.low, sd.close,
-                          sd.vwap, sd.volume, sd.exchange, sd.m5, sd.m10, sd.m20
+                          sd.vwap, sd.volume, sd.exchange, sd.m5, sd.m10, sd.m20,
+                          sd.dif, sd.dea, sd.macd_hist, sd.bb_upper, sd.bb_lower
                    FROM stock_daily sd
                    JOIN stock_pool sp ON sd.stock_code = sp.stock_code
                    WHERE sp.pool_type='selected' AND sp.is_active=1
@@ -177,7 +178,7 @@ def load_all_stock_data(db_path=DataConfig.DB_PATH):
     stock_list = []
     if len(df) == 0:
         return stock_list
-    cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange', 'm5', 'm10', 'm20']
+    cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange', 'm5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'bb_upper', 'bb_lower']
     for stock_code, group in df.groupby('stock_code', sort=False):
         data = group[cols].values
         latest_date = str(group['date'].iloc[-1])

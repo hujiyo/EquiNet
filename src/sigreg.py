@@ -56,17 +56,27 @@ class SIGRegLoss(nn.Module):
     将高维 embedding 投影到多个随机 1D 方向，
     对每个方向计算 EP 统计量，衡量偏离 N(0,1) 的程度。
     梯度回传推动 embedding 分布趋向各向同性高斯。
+
+    每次 forward 用 global_step 作为种子重新生成随机投影矩阵，
+    与 LeJEPA 官方实现 (Balestriero & LeCun, 2025) 一致：
+    - 累积 SGD 步数覆盖足够多的随机方向 (Cramér-Wold)
+    - 投影矩阵在 torch.no_grad() 下生成，梯度仅通过 embedding 回传
     """
 
-    def __init__(self, d_model=128, num_slices=32, t_max=3, n_points=17):
+    def __init__(self, d_model=128, num_slices=256, t_max=3, n_points=17):
         super().__init__()
+        self.d_model = d_model
         self.num_slices = num_slices
-
-        A = torch.randn(d_model, num_slices)
-        A = A / A.norm(p=2, dim=0, keepdim=True)
-        self.register_buffer('projection', A)
-
         self.ep_test = EppsPulley(t_max=t_max, n_points=n_points)
+        self.global_step = torch.zeros(1, dtype=torch.long)
+        self._generators = {}
+
+    def _get_generator(self, device, seed):
+        if device not in self._generators:
+            self._generators[device] = torch.Generator(device=device)
+        g = self._generators[device]
+        g.manual_seed(seed)
+        return g
 
     def forward(self, z):
         """
@@ -75,7 +85,15 @@ class SIGRegLoss(nn.Module):
         Returns:
             scalar: SIGReg 损失值
         """
-        z_proj = z @ self.projection
+        with torch.no_grad():
+            seed = self.global_step.item()
+            g = self._get_generator(z.device, seed)
+            A = torch.randn(self.d_model, self.num_slices,
+                            device=z.device, dtype=z.dtype, generator=g)
+            A = A / A.norm(p=2, dim=0, keepdim=True)
+            self.global_step.add_(1)
+
+        z_proj = z @ A
         z_proj = z_proj.unsqueeze(0)
         stats = self.ep_test(z_proj)
         return stats.mean()

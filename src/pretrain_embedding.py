@@ -7,6 +7,7 @@ EquiNet Embedding层训练脚本
 1. SIGReg 几何正则 (Balestriero & LeCun, 2025)：约束嵌入分布趋向各向同性高斯
    通过 Cramér-Wold + Epps-Pulley 检验，数学上保证无维度/子空间/聚类坍塌
 2. MLP 解码器重建损失：确保嵌入向量足以恢复原始15维特征
+   非线性解码器允许 embedding 自由学习特征融合，而不仅限于线性可编码的表示
 
 用法：
   python src/pretrain_embedding.py                        # 使用默认参数
@@ -24,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+
 
 from config import (DataConfig, EmbeddingConfig, DeviceConfig,ModelConfig,
                      TrainingConfig)
@@ -73,14 +75,16 @@ class KLineEmbedding(nn.Module):
 
 class PretrainModel(nn.Module):
     """
-    Embedding层训练模型 = KLineEmbedding + 线性解码器
+    Embedding层训练模型 = KLineEmbedding + MLP解码器
 
-    X → Embedding → S → Linear → Y
-                      ↑            ↑
-                  SIGReg(S)    MSE(Y, X)
+    X → Embedding → S → MLP → Y
+                      ↑           ↑
+                  SIGReg(S)   MSE(Y, X)
 
-    线性解码器迫使 embedding 将信息编码在128维空间的线性可提取方向上，
-    不给 embedding 通过非线性查表偷懒的空间。
+    非线性解码器允许 embedding 自由学习特征融合表示，
+    不强制要求信息线性可编码。
+    下游 Transformer（6层 FFN 128→512→128）的解码能力远超此解码器，
+    只要解码器能恢复的信息，backbone 一定能提取。
     解码器在预训练完成后丢弃，只保留 embedding 权重。
     """
 
@@ -89,8 +93,12 @@ class PretrainModel(nn.Module):
         self.embedding = KLineEmbedding(input_dim, d_model)
         self.input_dim = input_dim
 
-        # 线性解码器: x̂ = Wz + b, W ∈ R^(10×128)
-        self.decoder = nn.Linear(d_model, input_dim, bias=False)
+        # MLP解码器: Linear → GELU → Linear（与 embedding 对称）
+        self.decoder = nn.Sequential(
+            nn.Linear(d_model, d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(d_model, input_dim, bias=False),
+        )
 
     def forward(self, x):
         """
@@ -107,38 +115,19 @@ class PretrainModel(nn.Module):
 
 # ==================== 数据收集 ====================
 
-def _deduplicate_klines(data, precision=3):
-    """
-    对K线向量去重
-
-    将特征量化到指定精度后，移除完全相同的行，
-    保证后续采样的样本多样性。
-    """
-    n_before = len(data)
-    rounded = np.round(data, precision)
-    _, unique_idx = np.unique(rounded, axis=0, return_index=True)
-    unique_idx = np.sort(unique_idx)
-    data = data[unique_idx]
-    n_after = len(data)
-    print(f"  去重: {n_before:,} → {n_after:,} "
-          f"(去除 {n_before - n_after:,} 条重复, "
-          f"保留 {n_after / n_before * 100:.1f}%)")
-    return data
-
-
 def collect_kline_data(train_stock_info, feature_normalizer=None):
     """
-    从训练集中提取逐日K线特征向量，去重后返回完整池
+    从训练集中提取逐日K线特征向量，返回完整池（不去重）
 
-    利用 precompute_training_pool 获取所有合法的 [N, 45, 10] 样本，
-    展平为 [N*45, 10] 逐日向量，去重后返回。
+    去重由 sample_diverse_batch() 在每个 batch 采样时执行，
+    保证 batch 内多样性，同时池子保留最大信息量。
 
     Args:
         train_stock_info: 训练集股票信息列表
         feature_normalizer: 特征归一化器
 
     Returns:
-        kline_data: [M, 15] numpy array (去重后的完整池)
+        kline_data: [M, 15] numpy array (完整池)
     """
     print("\n[数据收集] 提取逐日K线向量...")
 
@@ -154,15 +143,14 @@ def collect_kline_data(train_stock_info, feature_normalizer=None):
     kline_data = kline_data[valid_mask]
     print(f"  有效K线数: {len(kline_data):,}")
 
-    # 数据量过大时先随机预采样，避免 np.unique 内存爆炸
-    max_dedup_size = EmbeddingConfig.MAX_SAMPLES * EmbeddingConfig.EPOCHS * 3
-    if len(kline_data) > max_dedup_size:
-        print(f"  预采样: {len(kline_data):,} → {max_dedup_size:,} 条")
-        idx = np.random.choice(len(kline_data), max_dedup_size, replace=False)
+    # 数据量过大时预采样（仅受内存限制，不做去重）
+    max_pool_size = EmbeddingConfig.MAX_SAMPLES * EmbeddingConfig.EPOCHS * 5
+    if len(kline_data) > max_pool_size:
+        print(f"  预采样: {len(kline_data):,} → {max_pool_size:,} 条")
+        idx = np.random.choice(len(kline_data), max_pool_size, replace=False)
         kline_data = kline_data[idx]
 
-    kline_data = _deduplicate_klines(kline_data, EmbeddingConfig.DEDUP_PRECISION)
-
+    print(f"  池大小: {len(kline_data):,} (不去重)")
     print(f"  特征范围:")
     for i, name in enumerate(['Open', 'High', 'Low', 'Close',
                                'VWAP', 'Volume', 'Exchange',
@@ -174,6 +162,38 @@ def collect_kline_data(train_stock_info, feature_normalizer=None):
               f"μ={col.mean():.4f}  σ={col.std():.4f}")
 
     return kline_data
+
+
+def sample_diverse_batch(pool, batch_size, precision,
+                         oversample_factor=EmbeddingConfig.BATCH_DEDUP_OVERSAMPLE):
+    """
+    从池中采样一个多样性有保证的 batch
+
+    1. 过采样 oversample_factor × batch_size 条 K 线
+    2. round 到 precision 位小数后去重
+    3. 取前 batch_size 条（保留原始精度数值）
+    """
+    n_oversample = int(batch_size * oversample_factor)
+    n_oversample = min(n_oversample, len(pool))
+
+    # replace=True: 后续会去重，允许少量重复索引
+    # replace=False 在大池子上会触发全排列，极慢
+    indices = np.random.choice(len(pool), n_oversample, replace=True)
+    candidates = pool[indices]
+
+    rounded = np.round(candidates, precision)
+    _, unique_idx = np.unique(rounded, axis=0, return_index=True)
+    unique_idx = np.sort(unique_idx)
+    deduped = candidates[unique_idx]
+
+    n_deduped = len(deduped)
+    if n_deduped >= batch_size:
+        return deduped[:batch_size], n_oversample, n_deduped
+    else:
+        # 极端情况：去重后不够，补采凑满
+        extra_needed = batch_size - n_deduped
+        extra_idx = np.random.choice(len(pool), extra_needed, replace=len(pool) < extra_needed)
+        return np.vstack([deduped, pool[extra_idx]])[:batch_size], n_oversample, n_deduped
 
 
 # ==================== 学习率调度器 ====================
@@ -214,11 +234,12 @@ class WarmupCosineScheduler:
 
 # ==================== 保存函数 ====================
 
-def save_pretrained_embedding(embedding, path, metrics=None):
+def save_pretrained_embedding(embedding, path, metrics=None, decoder=None):
     """
-    保存预训练 embedding 权重
+    保存预训练 embedding 权重（及可选解码器）
 
     格式与 StockTransformer 的 embed_proj / embed_mlp 直接兼容。
+    传入 decoder 时同时保存解码器权重，供重建可视化等用途。
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -231,15 +252,18 @@ def save_pretrained_embedding(embedding, path, metrics=None):
             'epochs': EmbeddingConfig.EPOCHS,
             'batch_size': EmbeddingConfig.BATCH_SIZE,
             'learning_rate': EmbeddingConfig.LEARNING_RATE,
-            'beta': EmbeddingConfig.BETA,
             'sigreg_weight': EmbeddingConfig.SIGREG_WEIGHT,
         },
     }
     if metrics:
         checkpoint['metrics'] = metrics
+    if decoder is not None:
+        # MLP解码器: 保存所有层权重
+        checkpoint['decoder_state_dict'] = decoder.state_dict()
 
     torch.save(checkpoint, path)
-    print(f"  Embedding权重已保存: {path}")
+    print(f"  Embedding权重已保存: {path}"
+          f"{' (含解码器)' if decoder is not None else ''}")
 
 
 # ==================== 主训练函数 ====================
@@ -253,27 +277,32 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
     batch_size = batch_size if batch_size is not None else EmbeddingConfig.BATCH_SIZE
     lr = lr if lr is not None else EmbeddingConfig.LEARNING_RATE
 
-    # 1. 收集并去重K线数据（返回完整池）
+    # 1. 收集K线数据（不去重，保留完整池）
     kline_pool = collect_kline_data(train_stock_info, feature_normalizer)
     pool_size = len(kline_pool)
 
     # 2. 预采样 MAX_SAMPLES * EPOCHS 条，供所有 epoch 使用
     samples_per_epoch = EmbeddingConfig.MAX_SAMPLES
     total_needed = samples_per_epoch * epochs
+    precision = EmbeddingConfig.DEDUP_PRECISION
+    oversample = int(EmbeddingConfig.BATCH_DEDUP_OVERSAMPLE)
+    loader_batch_size = batch_size * oversample
 
-    if pool_size >= total_needed:
-        indices = np.random.choice(pool_size, total_needed, replace=False)
-        print(f"\n[数据] 池中有 {pool_size:,} 条唯一K线，"
-              f"无重复采样 {total_needed:,} 条")
+    if pool_size >= total_needed * oversample:
+        indices = np.random.choice(pool_size, total_needed * oversample, replace=False)
+        print(f"\n[数据] 池中有 {pool_size:,} 条K线，"
+              f"无重复采样 {total_needed * oversample:,} 条")
     else:
-        indices = np.random.choice(pool_size, total_needed, replace=True)
-        repeat_ratio = total_needed / pool_size
-        print(f"\n[数据] 池中有 {pool_size:,} 条唯一K线，"
-              f"需 {total_needed:,} 条（平均重复 {repeat_ratio:.1f} 次）")
+        indices = np.random.choice(pool_size, total_needed * oversample, replace=True)
+        repeat_ratio = total_needed * oversample / pool_size
+        print(f"\n[数据] 池中有 {pool_size:,} 条K线，"
+              f"需 {total_needed * oversample:,} 条（平均重复 {repeat_ratio:.1f} 次）")
 
     pre_sampled = kline_pool[indices]
-    epoch_data = pre_sampled.reshape(epochs, samples_per_epoch, -1)
-    print(f"  分配: {epochs} 个 epoch × {samples_per_epoch:,} 条/epoch")
+    epoch_data = pre_sampled.reshape(epochs, samples_per_epoch * oversample, -1)
+    print(f"  分配: {epochs} 个 epoch × {samples_per_epoch * oversample:,} 条/epoch")
+    print(f"  batch 内去重: precision={precision}, "
+          f"oversample={oversample}x → DataLoader batch={loader_batch_size}")
 
     # 3. 创建模型
     model = PretrainModel(
@@ -297,10 +326,14 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
         eta_min=EmbeddingConfig.COSINE_ETA_MIN
     )
 
-    # 损失权重
-    beta = EmbeddingConfig.BETA
+    # 损失权重 (凸组合: λ·SIGReg + (1-λ)·Recon)
     sigreg_weight = EmbeddingConfig.SIGREG_WEIGHT
     target_std = EmbeddingConfig.TARGET_STD
+
+    # 自适应归一化: EMA 跟踪各损失量级，归一化至 O(1) 后再做凸组合
+    sigreg_ema = None
+    recon_ema = None
+    ema_momentum = 0.9
 
     # SIGReg 几何正则
     sigreg_loss_fn = SIGRegLoss(
@@ -316,7 +349,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
     print(f"开始 Embedding 预训练")
     print(f"  轮数={epochs}  batch={batch_size}  lr={lr}")
     print(f"  精度={amp_str}  设备={device}")
-    print(f"  损失权重: β(重建)={beta}  λ(SIGReg)={sigreg_weight}")
+    print(f"  损失公式: {sigreg_weight:.0%}·(SIGReg/ema) + {1 - sigreg_weight:.0%}·(Recon/ema)")
     print(f"{'='*60}")
 
     best_loss = float('inf')
@@ -330,19 +363,32 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
-        epoch_recon = 0.0
-        epoch_sigreg = 0.0
+        epoch_sigreg_w = 0.0  # SIGReg 加权贡献 (λ·sigreg/ema)
+        epoch_recon_w = 0.0   # Recon 加权贡献 ((1-λ)·recon/ema)
+        epoch_sigreg_raw = 0.0  # SIGReg 原始值
+        epoch_recon_raw = 0.0   # Recon 原始值
+        epoch_dedup_total = 0   # batch内去重去掉的条数
         n_batches = 0
 
         t0 = time.time()
 
         dataset = TensorDataset(
             torch.tensor(epoch_data[epoch - 1], dtype=torch.float32))
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+        loader = DataLoader(dataset, batch_size=loader_batch_size, shuffle=True,
                             drop_last=True, num_workers=0, pin_memory=True)
 
-        for (batch,) in loader:
-            batch = batch.to(device)
+        for (raw_batch,) in loader:
+            # batch 内去重：round → unique → 取前 batch_size
+            raw_np = raw_batch.numpy()
+            rounded = np.round(raw_np, precision)
+            _, unique_idx = np.unique(rounded, axis=0, return_index=True)
+            unique_idx = np.sort(unique_idx)
+            deduped = raw_np[unique_idx]
+            epoch_dedup_total += len(raw_np) - len(deduped)
+
+            # 取 batch_size 条（不够则全部用上）
+            batch = torch.tensor(
+                deduped[:batch_size], dtype=torch.float32).to(device)
 
             optimizer.zero_grad()
             with amp_ctx:
@@ -354,7 +400,14 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
                 # 重建损失
                 loss_recon = F.mse_loss(recon, batch)
 
-                loss = beta * loss_recon + sigreg_weight * loss_sigreg
+                # 首次迭代用原始值初始化 EMA
+                if sigreg_ema is None:
+                    sigreg_ema = loss_sigreg.item()
+                    recon_ema = loss_recon.item()
+
+                # 自适应归一化凸组合 (归一化后各 ≈O(1)，λ 真实反映占比)
+                loss = (sigreg_weight * (loss_sigreg / sigreg_ema)
+                        + (1 - sigreg_weight) * (loss_recon / recon_ema))
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(),
@@ -362,25 +415,38 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
             optimizer.step()
 
             # 统计
-            epoch_loss += loss.item()
-            epoch_recon += loss_recon.item()
-            epoch_sigreg += loss_sigreg.item()
+            raw_sigreg = loss_sigreg.item()
+            raw_recon = loss_recon.item()
+            sigreg_w = sigreg_weight * raw_sigreg / sigreg_ema
+            recon_w = (1 - sigreg_weight) * raw_recon / recon_ema
+            epoch_loss += sigreg_w + recon_w
+            epoch_sigreg_w += sigreg_w
+            epoch_recon_w += recon_w
+            epoch_sigreg_raw += raw_sigreg
+            epoch_recon_raw += raw_recon
             n_batches += 1
+
+            # 更新归一化基准
+            sigreg_ema = ema_momentum * sigreg_ema + (1 - ema_momentum) * raw_sigreg
+            recon_ema = ema_momentum * recon_ema + (1 - ema_momentum) * raw_recon
 
         scheduler.step()
         elapsed = time.time() - t0
 
         avg_loss = epoch_loss / n_batches
-        avg_recon = epoch_recon / n_batches
-        avg_sigreg = epoch_sigreg / n_batches
+        avg_sigreg_w = epoch_sigreg_w / n_batches
+        avg_recon_w = epoch_recon_w / n_batches
+        avg_sigreg_raw = epoch_sigreg_raw / n_batches
+        avg_recon_raw = epoch_recon_raw / n_batches
         current_lr = scheduler.get_lr()
 
         # 打印日志
+        avg_dedup = epoch_dedup_total / max(1, n_batches)
         print(f"  Epoch {epoch:3d}/{epochs}  "
-              f"Loss={avg_loss:.4f}  "
-              f"Recon={avg_recon:.4f}  "
-              f"SIGReg={avg_sigreg:.4f}  "
+              f"Loss={avg_loss:.4f} ({avg_sigreg_w:.4f}·SIGReg + {avg_recon_w:.4f}·Recon)  "
+              f"SIGReg={avg_sigreg_raw:.4f}  Recon={avg_recon_raw:.4f}  "
               f"LR={current_lr:.6f}  "
+              f"Dedup={avg_dedup:.0f}/batch  "
               f"Time={elapsed:.1f}s")
 
         # 记录最佳模型（仅存内存，不写磁盘）
@@ -391,8 +457,8 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
             best_metrics = {
                 'epoch': epoch,
                 'loss': avg_loss,
-                'recon_loss': avg_recon,
-                'sigreg_loss': avg_sigreg,
+                'sigreg_weighted': avg_sigreg_w,
+                'recon_weighted': avg_recon_w,
             }
 
     # 训练结束后保存最佳模型到磁盘
@@ -401,7 +467,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
         model.load_state_dict(best_model_state)
         best_path = os.path.join(output_dir, 'best_embedding.pth')
         save_pretrained_embedding(model.embedding, best_path,
-                                  metrics=best_metrics)
+                                  metrics=best_metrics, decoder=model.decoder)
 
     # 测量保存文件的输出std
     if best_path is not None:
@@ -435,10 +501,8 @@ def main():
                         help=f'批大小 (默认 {EmbeddingConfig.BATCH_SIZE})')
     parser.add_argument('--lr', type=float, default=None,
                         help=f'学习率 (默认 {EmbeddingConfig.LEARNING_RATE})')
-    parser.add_argument('--beta', type=float, default=None,
-                        help=f'重建损失权重 (默认 {EmbeddingConfig.BETA})')
     parser.add_argument('--sigreg-weight', type=float, default=None,
-                        help=f'SIGReg损失权重 (默认 {EmbeddingConfig.SIGREG_WEIGHT})')
+                        help=f'SIGReg损失权重λ (默认 {EmbeddingConfig.SIGREG_WEIGHT})')
     parser.add_argument('--output-dir', type=str, default=None,
                         help=f'输出目录')
 
@@ -449,8 +513,6 @@ def main():
         EmbeddingConfig.EPOCHS = args.epochs
     if args.batch_size:
         EmbeddingConfig.BATCH_SIZE = args.batch_size
-    if args.beta is not None:
-        EmbeddingConfig.BETA = args.beta
     if args.sigreg_weight is not None:
         EmbeddingConfig.SIGREG_WEIGHT = args.sigreg_weight
     if args.output_dir:

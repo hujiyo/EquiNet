@@ -125,20 +125,19 @@ class EmbeddingConfig:
     BATCH_SIZE = 2560                     # 大batch，对比学习需要充足负样本
     LEARNING_RATE = 3e-3                  # 预训练学习率
     WEIGHT_DECAY = 1e-4                   # 权重衰减
-    WARMUP_EPOCHS = 5                    # 预热轮数
-    COSINE_ETA_MIN = 3e-5                 # 余弦退火最小学习率
-
-    # 损失权重
-    BETA = 1.0                            # 重建损失 (MSE) 权重
+    WARMUP_EPOCHS = 10                   # 预热轮数
+    COSINE_ETA_MIN = 1e-4                 # 余弦退火最小学习率
 
     # 数据采集
     MAX_SAMPLES = 200_000               # 每个epoch的训练样本数
-    DEDUP_PRECISION = 3                 # 去重时特征量化精度（小数位数）
+    DEDUP_PRECISION = 1                 # batch内去重精度（小数位数），值越小去重越激进
+    BATCH_DEDUP_OVERSAMPLE = 2.0        # batch内去重过采样倍数（先多采再去重，保证多样性）
 
     # SIGReg 几何正则 (Balestriero & LeCun, 2025)
     # 约束嵌入分布趋向各向同性高斯 N(0, target_std²)
-    SIGREG_WEIGHT = 10.0                # SIGReg 损失权重
-    SIGREG_NUM_SLICES = 32              # 随机投影方向数
+    # 损失公式: loss = λ·SIGReg + (1-λ)·Recon  (凸组合)
+    SIGREG_WEIGHT = 0.98                # λ, SIGReg 权重 (自适应归一化下逐步调高至Recon刚退化)
+    SIGREG_NUM_SLICES = 256             # 随机投影方向数 (官方最小示例: 256)
     SIGREG_T_MAX = 3                    # Epps-Pulley 积分上限
     SIGREG_N_POINTS = 17                # Epps-Pulley 积分节点数（奇数）
     TARGET_STD = 0.2                    # 目标标准差（缩放后 SIGReg 检验 N(0,1)）

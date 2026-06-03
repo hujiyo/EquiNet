@@ -174,44 +174,52 @@ def compute_bb_features(closes: np.ndarray) -> tuple:
     return bb_upper, bb_lower
 
 
+def compute_features_for_stock(db: DatabaseManager, stock_code: str, auto_commit: bool = True) -> bool:
+    """为单只股票计算并写入衍生特征（内联版本，复用已有数据库连接）。
+
+    数据更新后直接调用即可，读取完整历史 → 计算 MA/MACD/BB → 写回，
+    单股耗时在毫秒级，无需多进程开销。
+    """
+    df = db.get_stock_data(stock_code, chronological=True)
+
+    if len(df) == 0:
+        return False
+
+    closes = df['close'].values.astype(np.float64)
+    dates = df['date'].values
+
+    m5 = compute_ma_features(closes, 5).astype(np.float32)
+    m10 = compute_ma_features(closes, 10).astype(np.float32)
+    m20 = compute_ma_features(closes, 20).astype(np.float32)
+
+    dif, dea, macd_hist = compute_macd_features(closes)
+
+    bb_upper, bb_lower = compute_bb_features(closes)
+
+    feature_records = list(zip(
+        dates.tolist(),
+        m5.tolist(),
+        m10.tolist(),
+        m20.tolist(),
+        dif.tolist(),
+        dea.tolist(),
+        macd_hist.tolist(),
+        bb_upper.tolist(),
+        bb_lower.tolist()
+    ))
+
+    db.update_features(stock_code, feature_records, auto_commit=auto_commit)
+    return True
+
+
 def _process_single_stock(args):
-    """处理单只股票的特征计算（多进程 worker）"""
+    """处理单只股票的特征计算（多进程 worker，批量补算时使用）"""
     db_path, stock_code = args
     try:
         db = DatabaseManager(db_path)
-        df = db.get_stock_data(stock_code, chronological=True)
-
-        if len(df) == 0:
-            db.close()
-            return (stock_code, 'empty')
-
-        closes = df['close'].values.astype(np.float64)
-        dates = df['date'].values
-
-        m5 = compute_ma_features(closes, 5).astype(np.float32)
-        m10 = compute_ma_features(closes, 10).astype(np.float32)
-        m20 = compute_ma_features(closes, 20).astype(np.float32)
-
-        dif, dea, macd_hist = compute_macd_features(closes)
-
-        bb_upper, bb_lower = compute_bb_features(closes)
-
-        feature_records = list(zip(
-            dates.tolist(),
-            m5.tolist(),
-            m10.tolist(),
-            m20.tolist(),
-            dif.tolist(),
-            dea.tolist(),
-            macd_hist.tolist(),
-            bb_upper.tolist(),
-            bb_lower.tolist()
-        ))
-
-        db.update_features(stock_code, feature_records)
+        ok = compute_features_for_stock(db, stock_code)
         db.close()
-
-        return (stock_code, 'ok')
+        return (stock_code, 'ok' if ok else 'empty')
     except Exception as e:
         return (stock_code, f'error: {e}')
 

@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .database import DatabaseManager
+from .features import compute_features_for_stock
+from .utils import normalize_stock_df
 
 
 class CheckStatus(Enum):
@@ -94,20 +96,7 @@ class DataChecker:
                 return None
 
             df = pd.DataFrame(data_list, columns=rs.fields)
-            df['date'] = df['date'].str.replace('-', '')
-            df = df[df['date'] != '']
-            if len(df) == 0:
-                return None
-
-            df['date'] = df['date'].astype(str)
-            for col in ['open', 'high', 'low', 'close']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0.0)
-            df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
-            df['turn'] = pd.to_numeric(df['turn'], errors='coerce')
-            df = df.dropna(subset=['open', 'high', 'low', 'close'])
-
-            return df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'turn']]
+            return normalize_stock_df(df, source='baostock')
         except Exception as e:
             print(f"获取 Baostock 数据失败：{e}")
             return None
@@ -152,7 +141,7 @@ class DataChecker:
             )
 
         local_dates = set(str(d) for d in local_df['date'].values)
-        bs_dates = set(bs_data['date'].values)
+        bs_dates = set(str(d) for d in bs_data['date'].values)
         missing_dates = bs_dates - local_dates
 
         if missing_dates:
@@ -164,7 +153,7 @@ class DataChecker:
 
         merged = pd.merge(
             local_df.assign(date_str=local_df['date'].astype(str)),
-            bs_data.assign(date_str=bs_data['date']),
+            bs_data.assign(date_str=bs_data['date'].astype(str)),
             on='date_str', suffixes=('', '_bs')
         )
 
@@ -204,7 +193,7 @@ class DataChecker:
         )
 
     def check_ohlc_logic(self, stock_code: str) -> CheckResult:
-        """检查 OHLC 逻辑"""
+        """检查 OHLC 逻辑（向量化）"""
         df = self.db.get_stock_data(
             stock_code,
             columns=['date', 'open', 'high', 'low', 'close'],
@@ -214,25 +203,33 @@ class DataChecker:
             return CheckResult(stock_code, CheckStatus.FAIL, "数据为空")
 
         df = df.head(self.check_days)
-        for _, row in df.iterrows():
-            if row['high'] < row['low']:
-                return CheckResult(stock_code, CheckStatus.FAIL,
-                                   f"最高价 < 最低价 ({row['date']})",
-                                   {'date': row['date'], 'high': row['high'], 'low': row['low']})
-            if row['open'] < row['low'] or row['open'] > row['high']:
-                return CheckResult(stock_code, CheckStatus.FAIL,
-                                   f"开盘价超出范围 ({row['date']})",
-                                   {'date': row['date'], 'open': row['open'], 'high': row['high'], 'low': row['low']})
-            if row['close'] < row['low'] or row['close'] > row['high']:
-                return CheckResult(stock_code, CheckStatus.FAIL,
-                                   f"收盘价超出范围 ({row['date']})",
-                                   {'date': row['date'], 'close': row['close'], 'high': row['high'], 'low': row['low']})
+
+        bad = df[df['high'] < df['low']]
+        if not bad.empty:
+            r = bad.iloc[0]
+            return CheckResult(stock_code, CheckStatus.FAIL,
+                               f"最高价 < 最低价 ({r['date']})",
+                               {'date': r['date'], 'high': r['high'], 'low': r['low']})
+
+        bad = df[(df['open'] < df['low']) | (df['open'] > df['high'])]
+        if not bad.empty:
+            r = bad.iloc[0]
+            return CheckResult(stock_code, CheckStatus.FAIL,
+                               f"开盘价超出范围 ({r['date']})",
+                               {'date': r['date'], 'open': r['open'], 'high': r['high'], 'low': r['low']})
+
+        bad = df[(df['close'] < df['low']) | (df['close'] > df['high'])]
+        if not bad.empty:
+            r = bad.iloc[0]
+            return CheckResult(stock_code, CheckStatus.FAIL,
+                               f"收盘价超出范围 ({r['date']})",
+                               {'date': r['date'], 'close': r['close'], 'high': r['high'], 'low': r['low']})
 
         return CheckResult(stock_code, CheckStatus.PASS,
                            f"OHLC 逻辑正确 (检查 {len(df)} 天)")
 
     def check_price_changes(self, stock_code: str) -> CheckResult:
-        """检查涨跌幅是否合理"""
+        """检查涨跌幅是否合理（向量化）"""
         df = self.db.get_stock_data(
             stock_code,
             columns=['date', 'close'],
@@ -242,15 +239,16 @@ class DataChecker:
             return CheckResult(stock_code, CheckStatus.SKIP, "数据不足")
 
         df = df.head(self.check_days).reset_index(drop=True)
-        for i in range(1, len(df)):
-            prev_close = df.iloc[i - 1]['close']
-            curr_close = df.iloc[i]['close']
-            if prev_close > 0:
-                change_pct = (curr_close - prev_close) / prev_close
-                if abs(change_pct) > 0.20:
-                    return CheckResult(stock_code, CheckStatus.WARNING,
-                                       f"涨跌幅异常 ({df.iloc[i]['date']}): {change_pct * 100:.2f}%",
-                                       {'date': df.iloc[i]['date'], 'change': change_pct})
+        prev_close = df['close'].shift(1)
+        valid = prev_close > 0
+        change_pct = (df['close'] - prev_close) / prev_close
+        abnormal = valid & (change_pct.abs() > 0.20)
+
+        if abnormal.any():
+            idx = abnormal.idxmax()
+            return CheckResult(stock_code, CheckStatus.WARNING,
+                               f"涨跌幅异常 ({df.iloc[idx]['date']}): {change_pct.iloc[idx] * 100:.2f}%",
+                               {'date': df.iloc[idx]['date'], 'change': change_pct.iloc[idx]})
 
         return CheckResult(stock_code, CheckStatus.PASS,
                            f"涨跌幅正常 (检查 {len(df) - 1} 次)")
@@ -270,11 +268,6 @@ class DataChecker:
                 print(f"  ✗ 无法获取补丁数据")
                 return False
             try:
-                patch_df = patch_df.rename(columns={'turn': 'exchange'})
-                patch_df['vwap'] = patch_df['amount'] / patch_df['volume'].replace(0, float('nan'))
-                patch_df['vwap'] = patch_df['vwap'].fillna(patch_df['close'])
-                patch_df['date'] = patch_df['date'].astype(int)
-                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
                 # 过滤已有日期
                 existing_dates = set(str(d) for d in self.db.get_stock_data(
                     stock_code, columns=['date'], chronological=False)['date'].values)
@@ -289,7 +282,7 @@ class DataChecker:
                 print(f"  ✗ 写入失败：{e}")
                 return False
 
-        # 情况2：价格不匹配 / OHLC 逻辑错误 → 全量重拉
+        # 情况2：价格不匹配 / OHLC 逻辑错误 → 全量重拉（INSERT OR REPLACE 覆盖，无需先删）
         if any(k in msg for k in ["不匹配", "OHLC", "超出范围", "无法读取", "最高价"]):
             print(f"  → 修复：重新全量拉取 {stock_code}")
             df = self.fetch_external_data(
@@ -300,13 +293,8 @@ class DataChecker:
                 print(f"  ✗ 全量拉取失败")
                 return False
             try:
-                df = df.rename(columns={'turn': 'exchange'})
-                df['vwap'] = df['amount'] / df['volume'].replace(0, float('nan'))
-                df['vwap'] = df['vwap'].fillna(df['close'])
-                df['date'] = df['date'].astype(int)
-                df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
-                self.db.delete_daily_data(stock_code)
                 self.db.upsert_daily_data(stock_code, df)
+                compute_features_for_stock(self.db, stock_code)
                 print(f"  ✓ 全量写入 {len(df)} 条")
                 return True
             except Exception as e:
@@ -328,12 +316,8 @@ class DataChecker:
                 print(f"  ⚠ 无新数据可补")
                 return True
             try:
-                patch_df = patch_df.rename(columns={'turn': 'exchange'})
-                patch_df['vwap'] = patch_df['amount'] / patch_df['volume'].replace(0, float('nan'))
-                patch_df['vwap'] = patch_df['vwap'].fillna(patch_df['close'])
-                patch_df['date'] = patch_df['date'].astype(int)
-                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
                 self.db.upsert_daily_data(stock_code, patch_df)
+                compute_features_for_stock(self.db, stock_code)
                 new_latest = self.db.get_latest_date(stock_code)
                 print(f"  ✓ 补入 {len(patch_df)} 条，最新：{new_latest}")
                 return True
@@ -497,125 +481,13 @@ class AKShareDataChecker(DataChecker):
             )
             if df is None or len(df) == 0:
                 return None
-
-            df = df.rename(columns={
-                '日期': 'date', '开盘': 'open', '最高': 'high',
-                '最低': 'low', '收盘': 'close',
-                '成交量': 'volume', '成交额': 'amount', '换手率': 'turn'
-            })
-            df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'turn']]
-            df['date'] = df['date'].astype(str).str.replace('-', '')
-            for col in ['open', 'high', 'low', 'close']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0.0)
-            df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0) * 100
-            df['turn'] = pd.to_numeric(df['turn'], errors='coerce')
-            df = df.dropna(subset=['open', 'high', 'low', 'close'])
-            return df
+            return normalize_stock_df(df, source='akshare', volume_scale_factor=100.0)
         except Exception as e:
             print(f"AKShare 获取数据失败：{e}")
             return None
 
     def _format_stock_code(self, stock_code: str):
         return stock_code
-
-    def repair_stock_data(self, stock_code: str, result: CheckResult) -> bool:
-        msg = result.message
-
-        # 情况1：缺失交易日
-        if "缺失" in msg and result.details and 'missing_dates' in result.details:
-            missing_dates = result.details['missing_dates']
-            print(f"  → 修复：补拉 {len(missing_dates)} 个缺失交易日")
-            start_bs = f"{missing_dates[0][:4]}{missing_dates[0][4:6]}{missing_dates[0][6:]}"
-            end_bs = f"{missing_dates[-1][:4]}{missing_dates[-1][4:6]}{missing_dates[-1][6:]}"
-            patch_df = self.fetch_external_data(stock_code, start_bs, end_bs)
-            if patch_df is None or len(patch_df) == 0:
-                print(f"  ✗ 无法获取补丁数据")
-                return False
-            try:
-                patch_df = patch_df.rename(columns={'turn': 'exchange'})
-                patch_df['vwap'] = patch_df['amount'] / patch_df['volume'].replace(0, float('nan'))
-                patch_df['vwap'] = patch_df['vwap'].fillna(patch_df['close'])
-                patch_df['date'] = patch_df['date'].astype(int)
-                patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
-                existing_dates = set(str(d) for d in self.db.get_stock_data(
-                    stock_code, columns=['date'], chronological=False)['date'].values)
-                patch_df = patch_df[~patch_df['date'].astype(str).isin(existing_dates)]
-                if len(patch_df) == 0:
-                    return True
-                self.db.upsert_daily_data(stock_code, patch_df)
-                print(f"  ✓ 补入 {len(patch_df)} 条")
-                return True
-            except Exception as e:
-                print(f"  ✗ 写入失败：{e}")
-                return False
-
-        # 情况2/3：全量重拉或增量补更
-        if any(k in msg for k in ["不匹配", "OHLC", "超出范围", "无法读取", "最高价", "滞后"]):
-            if "滞后" in msg and result.details and 'latest_date' in result.details:
-                latest = result.details['latest_date']
-                start_date = f"{str(latest)[:4]}-{str(latest)[4:6]}-{str(latest)[6:]}"
-                next_day = (datetime.datetime.strptime(start_date, "%Y-%m-%d")
-                            + datetime.timedelta(days=1)).strftime("%Y%m%d")
-                print(f"  → 修复：增量补更 {stock_code}（从 {next_day} 起）")
-                patch_df = self.fetch_external_data(
-                    stock_code, next_day,
-                    datetime.datetime.now().strftime("%Y%m%d")
-                )
-                if patch_df is None or len(patch_df) == 0:
-                    print(f"  ⚠ 无新数据可补")
-                    return True
-                try:
-                    patch_df = patch_df.rename(columns={'turn': 'exchange'})
-                    patch_df['vwap'] = patch_df['amount'] / patch_df['volume'].replace(0, float('nan'))
-                    patch_df['vwap'] = patch_df['vwap'].fillna(patch_df['close'])
-                    patch_df['date'] = patch_df['date'].astype(int)
-                    patch_df = patch_df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
-                    self.db.upsert_daily_data(stock_code, patch_df)
-                    print(f"  ✓ 补入 {len(patch_df)} 条")
-                    return True
-                except Exception as e:
-                    print(f"  ✗ 写入失败：{e}")
-                    return False
-            else:
-                # 全量重拉
-                print(f"  → 修复：重新全量拉取 {stock_code}")
-                try:
-                    df = self.ak.stock_zh_a_hist(
-                        symbol=stock_code, period="daily",
-                        start_date="20100101",
-                        end_date=datetime.datetime.now().strftime("%Y%m%d"),
-                        adjust=""
-                    )
-                    if df is None or len(df) == 0:
-                        print(f"  ✗ 未获取到数据")
-                        return False
-                    df = df.rename(columns={
-                        '日期': 'date', '开盘': 'open', '最高': 'high',
-                        '最低': 'low', '收盘': 'close',
-                        '成交量': 'volume', '成交额': 'amount', '换手率': 'exchange'
-                    })
-                    df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange']]
-                    df['date'] = df['date'].astype(str).str.replace('-', '').astype(int)
-                    for col in ['open', 'high', 'low', 'close']:
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                    df = df.dropna(subset=['open', 'high', 'low', 'close'])
-                    df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0.0)
-                    df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0) * 100
-                    df['exchange'] = pd.to_numeric(df['exchange'], errors='coerce').fillna(0.0)
-                    df['vwap'] = df['amount'] / df['volume'].replace(0, float('nan'))
-                    df['vwap'] = df['vwap'].fillna(df['close'])
-                    df = df[['date', 'open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap']]
-                    self.db.delete_daily_data(stock_code)
-                    self.db.upsert_daily_data(stock_code, df)
-                    print(f"  ✓ 全量写入 {len(df)} 条")
-                    return True
-                except Exception as e:
-                    print(f"  ✗ 写入失败：{e}")
-                    return False
-
-        print(f"  ⚠ 无对应修复策略：{msg}")
-        return False
 
 
 def create_checker(db: DatabaseManager, data_source: str = 'akshare',

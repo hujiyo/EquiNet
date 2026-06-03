@@ -55,13 +55,14 @@ class DataSelector:
         return filtered
 
     def _filter_by_active(self, stock_codes: List[str], max_days_behind: int = 30) -> List[str]:
-        """排除退市或长期停牌股票"""
+        """排除退市或长期停牌股票（批量查询）"""
         today = datetime.datetime.now()
+        all_latest = self.db.get_all_latest_dates()
         active = []
         inactive_count = 0
 
         for code in stock_codes:
-            latest_date = self.db.get_latest_date(code)
+            latest_date = all_latest.get(code)
             if latest_date is None:
                 inactive_count += 1
                 continue
@@ -100,7 +101,8 @@ class DataSelector:
                     raw_code = str(row['代码'])
                     if raw_code.startswith('bj'):
                         continue
-                    code = raw_code.zfill(6)
+                    # AKShare 返回带交易所前缀（sh600053 / sz000001），取后 6 位纯数字
+                    code = raw_code[-6:]
                     name = str(row['名称'])
                     code_to_name[code] = name
 
@@ -114,23 +116,15 @@ class DataSelector:
                     print(f"  [AKShare] 获取失败: {e}")
                     return {}
 
-    def _calculate_market_cap(self, stock_code: str) -> Optional[float]:
-        """从数据库计算流通市值：成交额 × 100 / 换手率"""
-        try:
-            df = self.db.get_stock_data(stock_code, chronological=False)
-            if len(df) == 0:
-                return None
-
-            latest = df.iloc[0]
-            amount = latest['amount']
-            turnover_pct = latest['exchange']
-
-            if pd.isna(amount) or pd.isna(turnover_pct) or turnover_pct <= 0:
-                return None
-
-            return amount * 100 / turnover_pct
-        except Exception:
-            return None
+    def _batch_market_caps(self, stock_codes: List[str]) -> Dict[str, float]:
+        """批量计算流通市值：成交额 × 100 / 换手率（一次 SQL）"""
+        latest_df = self.db.get_latest_records_batch(stock_codes)
+        if latest_df.empty:
+            return {}
+        valid = latest_df['exchange'].notna() & (latest_df['exchange'] > 0) & latest_df['amount'].notna()
+        valid_df = latest_df[valid].copy()
+        valid_df['market_cap'] = valid_df['amount'] * 100 / valid_df['exchange']
+        return dict(zip(valid_df['stock_code'], valid_df['market_cap']))
 
     def select(self) -> List[str]:
         """执行完整的筛选流程"""
@@ -157,6 +151,7 @@ class DataSelector:
 
         # Step 3: 市值 + ST 过滤
         code_to_name = self._get_stock_names()
+        market_caps = self._batch_market_caps(codes)
         filtered = []
         st_count = 0
         under_cap_count = 0
@@ -165,12 +160,11 @@ class DataSelector:
 
         for code in codes:
             name = code_to_name.get(code, '')
-            is_st = 'ST' in name or 'st' in name.lower()
-            if is_st:
+            if 'ST' in name.upper():
                 st_count += 1
                 continue
 
-            market_cap = self._calculate_market_cap(code)
+            market_cap = market_caps.get(code)
             if market_cap is None:
                 no_data_count += 1
                 continue

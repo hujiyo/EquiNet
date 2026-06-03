@@ -6,9 +6,8 @@ EquiNet 数据维护工具 - 交互式菜单
 1. 更新数据（从外部数据源同步）
 2. 筛选股票（全量池 → 训练池）
 3. 检查数据质量（完整性验证与修复）
-4. 计算特征（均线偏离度）
-5. 数据库状态
-6. 备份数据库
+4. 数据库状态
+5. 备份数据库
 """
 
 import os
@@ -38,10 +37,9 @@ def print_header():
     print(" 1. 更新数据      (从外部数据源同步)")
     print(" 2. 筛选股票      (全量池 → 训练池)")
     print(" 3. 检查数据质量  (完整性验证与修复)")
-    print(" 4. 计算特征      (均线偏离度)")
-    print(" 5. 数据库状态")
-    print(" 6. 备份数据库")
-    print(" 7. 退出")
+    print(" 4. 数据库状态")
+    print(" 5. 备份数据库")
+    print(" 6. 退出")
     print("=" * 50)
 
 
@@ -151,22 +149,6 @@ def handle_check(db: DatabaseManager):
     checker.run_full_check(stock_codes, pool_type, verbose)
 
 
-def handle_features(db: DatabaseManager):
-    """计算 MA 特征"""
-    print("\n--- 计算特征 (均线偏离度) ---")
-
-    pool_choice = input("目标池 (1=全量池, 2=训练池) [2]: ").strip()
-    pool_type = 'all' if pool_choice == '1' else 'selected'
-
-    force = input("强制重新计算？(y/N): ").strip().lower() == 'y'
-
-    custom_stocks = input("指定股票 (留空=全部): ").strip()
-    stock_codes = custom_stocks.split() if custom_stocks else None
-
-    from data_maintenance.features import compute_features
-    compute_features(db, pool_type, stock_codes, force)
-
-
 def handle_status(db: DatabaseManager):
     """显示数据库状态"""
     print("\n--- 数据库状态 ---")
@@ -197,7 +179,7 @@ def main():
     try:
         while True:
             print_header()
-            choice = input("请选择 [0-7]: ").strip()
+            choice = input("请选择 [0-6]: ").strip()
 
             if choice == '0':
                 handle_sql(db)
@@ -208,12 +190,10 @@ def main():
             elif choice == '3':
                 handle_check(db)
             elif choice == '4':
-                handle_features(db)
-            elif choice == '5':
                 handle_status(db)
-            elif choice == '6':
+            elif choice == '5':
                 handle_backup(db)
-            elif choice == '7':
+            elif choice == '6':
                 print("退出")
                 break
             else:

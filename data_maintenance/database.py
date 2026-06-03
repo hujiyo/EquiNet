@@ -13,6 +13,7 @@ import os
 import sqlite3
 import datetime
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -22,6 +23,11 @@ import pandas as pd
 
 class DatabaseManager:
     """EquiNet SQLite 数据库管理器"""
+
+    # 行情列：upsert 时允许覆盖
+    MARKET_COLS = ('open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap')
+    # 特征列：upsert 时保留原值，仅由 update_features() 修改
+    FEATURE_COLS = ('m5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'bb_upper', 'bb_lower')
 
     SCHEMA_SQL = """
     CREATE TABLE IF NOT EXISTS stock_daily (
@@ -73,6 +79,10 @@ class DatabaseManager:
     );
     """
 
+    _STOCK_DAILY_COLUMNS = ('date', 'open', 'high', 'low', 'close', 'amount', 'volume',
+                            'exchange', 'vwap', 'm5', 'm10', 'm20', 'dif', 'dea',
+                            'macd_hist', 'bb_upper', 'bb_lower')
+
     def __init__(self, db_path=None):
         if db_path is None:
             db_path = self._default_db_path()
@@ -104,20 +114,42 @@ class DatabaseManager:
 
         self._conn.commit()
 
+    @contextmanager
+    def transaction(self):
+        """用 savepoint 实现原子多步操作。
+
+        用法::
+
+            with db.transaction():
+                db.upsert_daily_data(..., auto_commit=False)
+                compute_features_for_stock(db, ..., auto_commit=False)
+
+        成功时 RELEASE（提交），异常时 ROLLBACK TO + RELEASE（撤销并清理）。
+        """
+        self._conn.execute("SAVEPOINT equinet_tx")
+        try:
+            yield
+            self._conn.execute("RELEASE equinet_tx")
+        except BaseException:
+            self._conn.execute("ROLLBACK TO equinet_tx")
+            self._conn.execute("RELEASE equinet_tx")
+            raise
+
     # ==================== 行情数据写入 ====================
 
-    def upsert_daily_data(self, stock_code: str, df: pd.DataFrame):
-        """将 DataFrame 格式的行情数据写入数据库（UPSERT），向量化构建"""
-        cols = ['open', 'high', 'low', 'close', 'amount', 'volume',
-                'exchange', 'vwap', 'm5', 'm10', 'm20', 'dif', 'dea', 'macd_hist',
-                'bb_upper', 'bb_lower']
+    def upsert_daily_data(self, stock_code: str, df: pd.DataFrame, auto_commit: bool = True):
+        """将 DataFrame 格式的行情数据写入数据库（UPSERT），向量化构建。
+
+        只更新行情列（open/close/volume 等），ON CONFLICT 时不覆盖已有的特征列。
+        """
+        all_cols = self.MARKET_COLS + self.FEATURE_COLS
 
         n = len(df)
         codes = [stock_code] * n
-        dates = df['date'].values.astype(np.int64).tolist()
+        dates = pd.to_numeric(df['date'], errors='coerce').astype(np.int64).tolist()
 
         col_data = {}
-        for c in cols:
+        for c in all_cols:
             if c in df.columns:
                 arr = df[c].values.astype(np.float64)
                 obj_arr = arr.astype(object)
@@ -127,30 +159,34 @@ class DatabaseManager:
                 col_data[c] = [None] * n
 
         records = list(zip(codes, dates,
-                           * [col_data[c] for c in cols]))
+                           *[col_data[c] for c in all_cols]))
 
+        # ON CONFLICT 时只更新行情列，不覆盖特征列
+        update_set = ', '.join(f"{c}=excluded.{c}" for c in self.MARKET_COLS)
         self._conn.executemany(
-            f"INSERT OR REPLACE INTO stock_daily "
-            f"(stock_code, date, {', '.join(cols)}) "
-            f"VALUES (?, ?, {', '.join(['?'] * len(cols))})",
+            f"INSERT INTO stock_daily (stock_code, date, {', '.join(all_cols)}) "
+            f"VALUES (?, ?, {', '.join(['?'] * len(all_cols))}) "
+            f"ON CONFLICT(stock_code, date) DO UPDATE SET {update_set}",
             records
         )
-        self._conn.commit()
+        if auto_commit:
+            self._conn.commit()
 
-    def bulk_upsert_daily(self, records: List[tuple]):
+    def bulk_upsert_daily(self, records: List[tuple], auto_commit: bool = True):
         """批量写入行情数据。records: [(stock_code, date, open, high, ...), ...]"""
-        cols = ['stock_code', 'date', 'open', 'high', 'low', 'close',
-                'amount', 'volume', 'exchange', 'vwap', 'm5', 'm10', 'm20',
-                'dif', 'dea', 'macd_hist', 'bb_upper', 'bb_lower']
+        cols = ['stock_code', 'date'] + list(self.MARKET_COLS) + list(self.FEATURE_COLS)
         placeholders = ', '.join(['?'] * len(cols))
         col_str = ', '.join(cols)
+        update_set = ', '.join(f"{c}=excluded.{c}" for c in self.MARKET_COLS)
         self._conn.executemany(
-            f"INSERT OR REPLACE INTO stock_daily ({col_str}) VALUES ({placeholders})",
+            f"INSERT INTO stock_daily ({col_str}) VALUES ({placeholders}) "
+            f"ON CONFLICT(stock_code, date) DO UPDATE SET {update_set}",
             records
         )
-        self._conn.commit()
+        if auto_commit:
+            self._conn.commit()
 
-    def update_features(self, stock_code: str, feature_records: List[tuple]):
+    def update_features(self, stock_code: str, feature_records: List[tuple], auto_commit: bool = True):
         """更新指定股票的衍生特征。
         feature_records: [(date, m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower), ...]"""
         self._conn.executemany(
@@ -159,7 +195,8 @@ class DatabaseManager:
             [(m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower, stock_code, date)
              for date, m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower in feature_records]
         )
-        self._conn.commit()
+        if auto_commit:
+            self._conn.commit()
 
     def delete_daily_data(self, stock_code: str, start_date=None, end_date=None):
         """删除指定股票的行情数据"""
@@ -213,7 +250,13 @@ class DatabaseManager:
         Returns:
             DataFrame，包含 date 列和请求的数据列
         """
-        col_str = ', '.join(columns) if columns else 'date, open, high, low, close, amount, volume, exchange, vwap, m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower'
+        if columns:
+            invalid = set(columns) - set(self._STOCK_DAILY_COLUMNS)
+            if invalid:
+                raise ValueError(f"Invalid column names: {invalid}")
+            col_str = ', '.join(columns)
+        else:
+            col_str = ', '.join(self._STOCK_DAILY_COLUMNS)
 
         conditions = ["stock_code = ?"]
         params = [stock_code]
@@ -265,6 +308,29 @@ class DatabaseManager:
         )
         return cursor.fetchone()[0]
 
+    def get_all_latest_dates(self) -> Dict[str, int]:
+        """获取所有股票的最新交易日期（批量，单次 SQL）"""
+        cursor = self._conn.execute(
+            "SELECT stock_code, MAX(date) FROM stock_daily GROUP BY stock_code"
+        )
+        return {row[0]: int(row[1]) for row in cursor.fetchall() if row[1] is not None}
+
+    def get_latest_records_batch(self, stock_codes: List[str]) -> pd.DataFrame:
+        """批量获取多只股票最新行情记录（amount, exchange），用于市值计算"""
+        if not stock_codes:
+            return pd.DataFrame()
+        placeholders = ','.join(['?'] * len(stock_codes))
+        query = (
+            f"SELECT sd.stock_code, sd.amount, sd.exchange "
+            f"FROM stock_daily sd "
+            f"INNER JOIN ("
+            f"  SELECT stock_code, MAX(date) as max_date "
+            f"  FROM stock_daily WHERE stock_code IN ({placeholders}) "
+            f"  GROUP BY stock_code"
+            f") latest ON sd.stock_code = latest.stock_code AND sd.date = latest.max_date"
+        )
+        return pd.read_sql_query(query, self._conn, params=stock_codes)
+
     def get_stocks_missing_features(self, pool_type='selected') -> List[str]:
         """获取指定池中缺少特征（m5/m10/m20 或 MACD）的股票"""
         cursor = self._conn.execute(
@@ -279,14 +345,15 @@ class DatabaseManager:
 
     # ==================== 股票池管理 ====================
 
-    def add_to_pool(self, stock_codes: List[str], pool_type: str):
+    def add_to_pool(self, stock_codes: List[str], pool_type: str, auto_commit: bool = True):
         """将股票添加到指定池"""
         records = [(code, pool_type) for code in stock_codes]
         self._conn.executemany(
             "INSERT OR IGNORE INTO stock_pool (stock_code, pool_type) VALUES (?, ?)",
             records
         )
-        self._conn.commit()
+        if auto_commit:
+            self._conn.commit()
 
     def remove_from_pool(self, stock_codes: List[str], pool_type: str):
         """从指定池中移除股票"""
@@ -349,16 +416,15 @@ class DatabaseManager:
         if not records:
             return
         cols = [k for k in records[0].keys() if k != 'stock_code']
-        for rec in records:
-            vals = [rec.get(c) for c in cols]
-            col_str = ', '.join(cols)
-            placeholder_str = ', '.join(['?'] * len(cols))
-            update_str = ', '.join(f"{c}=excluded.{c}" for c in cols)
-            self._conn.execute(
-                f"INSERT INTO stock_metadata (stock_code, {col_str}) VALUES (?, {placeholder_str}) "
-                f"ON CONFLICT(stock_code) DO UPDATE SET {update_str}",
-                [rec['stock_code']] + vals
-            )
+        col_str = ', '.join(cols)
+        placeholder_str = ', '.join(['?'] * len(cols))
+        update_str = ', '.join(f"{c}=excluded.{c}" for c in cols)
+        rows = [([rec['stock_code']] + [rec.get(c) for c in cols]) for rec in records]
+        self._conn.executemany(
+            f"INSERT INTO stock_metadata (stock_code, {col_str}) VALUES (?, {placeholder_str}) "
+            f"ON CONFLICT(stock_code) DO UPDATE SET {update_str}",
+            rows
+        )
         self._conn.commit()
 
     def get_metadata(self, stock_code: str) -> Optional[Dict]:

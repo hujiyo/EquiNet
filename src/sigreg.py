@@ -57,9 +57,13 @@ class SIGRegLoss(nn.Module):
     对每个方向计算 EP 统计量，衡量偏离 N(0,1) 的程度。
     梯度回传推动 embedding 分布趋向各向同性高斯。
 
-    每次 forward 用 global_step 作为种子重新生成随机投影矩阵，
-    与 LeJEPA 官方实现 (Balestriero & LeCun, 2025) 一致：
-    - 累积 SGD 步数覆盖足够多的随机方向 (Cramér-Wold)
+    每次 forward 用 global_step 作种子在独立 torch.Generator 上重新生成投影矩阵
+    （项目自创机制，不是 LeJEPA 官方实现 —— 官方 MINIMAL.md 直接用
+    `torch.randn(..., device=...)` 走全局 RNG，无 manual_seed、无 step 索引）：
+    - 算法上等价：每步拿到 IID 高斯列向量，列归一化后即可累积足够多随机方向
+      满足 Cramér-Wold 假设（K 步累计 K·num_slices 个不同方向）
+    - 工程动机：将 SIGReg 的随机源从全局 RNG 隔离，避免别处 `torch.randn/rand`
+      调用顺序变动破坏投影序列的复现性
     - 投影矩阵在 torch.no_grad() 下生成，梯度仅通过 embedding 回传
     """
 

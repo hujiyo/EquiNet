@@ -3,7 +3,8 @@ EquiNet 模型定义文件
 
 包含所有模型架构相关的类：
 - PositionalEncoding: 位置编码
-- MultiHeadAttention: 多头注意力机制
+- RMSNorm: RMS 归一化（per-head Q/K Norm，LLaMA2 风格）
+- MultiHeadAttention: 多头注意力机制（手写 MHA，参考 MiniMind）
 - TransformerLayer: Transformer层
 - AttentionPooling: 多注意力聚合（可学习query token + cross-attention）
 - StockTransformer: 连续值模型
@@ -37,34 +38,104 @@ class PositionalEncoding(nn.Module):
         return x + self.pe(positions).unsqueeze(0)
 
 
+class RMSNorm(nn.Module):
+    """
+    RMSNorm - 仅缩放不平移, 数值更稳且 FLOPs 更省
+
+    参考 MiniMind (model_minimind.py) 的 RMSNorm 实现,
+    用于本项目 MultiHeadAttention 中的 per-head Q/K 归一化
+    """
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        return (self.weight * self._norm(x.float())).type_as(x)
+
+
 class MultiHeadAttention(nn.Module):
     """
-    多头自注意力模块（不含残差连接和归一化）
-    仅负责注意力计算，残差连接由上层TransformerLayer统一管理
+    手写多头自注意力 (MHA 模式, 适配 EquiNet 短序列双向场景)
+
+    参考 MiniMind (model_minimind.py) 的手写 Attention 风格:
+    - 显式 q_proj / k_proj / v_proj / o_proj 四套线性层 (替代 nn.MultiheadAttention 黑盒)
+    - LLaMA2 风格 per-head Q/K RMSNorm (投影后 K 之前归一化, 稳定训练 + bf16 友好)
+    - 纯 torch.matmul + softmax (短序列下比 SDPA/Flash 更快, 无 kernel launch overhead)
+    - 两处 dropout: attn_dropout (权重上) + resid_dropout (输出投影后)
+    - 不含残差 / LayerNorm, 由上层 TransformerLayer 统一管理
+
+    砍掉的 MiniMind 特性 (与 EquiNet 场景不匹配):
+    - GQA: Q/K/V 头数都 = nhead, 无 repeat_kv
+    - RoPE: 位置编码在外部由 PositionalEncoding 一次性加入
+    - Causal mask: 双向注意力 (时序分类任务)
+    - KV Cache: 训练任务, 不需要增量推理
+    - SDPA/Flash dispatch: 短序列场景下纯 matmul 更优
     """
     def __init__(self, d_model, nhead):
         super(MultiHeadAttention, self).__init__()
+        assert d_model % nhead == 0
         self.d_model = d_model
         self.nhead = nhead
-        assert d_model % nhead == 0
-        
-        self.attention = nn.MultiheadAttention(d_model, nhead, bias=False, batch_first=True)
-        self.dropout = nn.Dropout(ModelConfig.ATTENTION_DROPOUT)
+        self.head_dim = d_model // nhead
+
+        # MHA 模式: Q/K/V 头数一致, 投影输出维度 = d_model
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # LLaMA2 风格 per-head Q/K Norm (沿 head_dim 维归一化)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
+        self.attn_dropout = nn.Dropout(ModelConfig.ATTENTION_DROPOUT)
+        self.resid_dropout = nn.Dropout(ModelConfig.ATTENTION_DROPOUT)
+        # 预计算 1/sqrt(head_dim) 避免每步除法
+        self.scaling = self.head_dim ** -0.5
 
     def forward(self, x, attn_mask=None, return_attn=False):
-        mask = None
+        B, S, _ = x.shape
+
+        # 1. 投影 + 拆多头: (B, S, d_model) -> (B, S, nhead, head_dim)
+        xq = self.q_proj(x).view(B, S, self.nhead, self.head_dim)
+        xk = self.k_proj(x).view(B, S, self.nhead, self.head_dim)
+        xv = self.v_proj(x).view(B, S, self.nhead, self.head_dim)
+
+        # 2. LLaMA2 风格 Q/K Norm (per-head RMSNorm, 投影后 K 之前)
+        xq = self.q_norm(xq)
+        xk = self.k_norm(xk)
+
+        # 3. 转置到多头在前: (B, nhead, S, head_dim)
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+
+        # 4. 缩放点积: (B, nhead, S, S)
+        scores = torch.matmul(xq, xk.transpose(-2, -1)) * self.scaling
+
+        # 5. 可选掩码 (EquiNet 当前双向, 无 mask; 保留 additive 约定, -inf 表示不参与)
         if attn_mask is not None:
             mask = attn_mask.to(dtype=x.dtype, device=x.device)
+            scores = scores + mask
 
-        attn_output, attn_weights = self.attention(
-            x, x, x, attn_mask=mask,
-            need_weights=return_attn,
-            average_attn_weights=False
-        )
-        attn_output = self.dropout(attn_output)
+        # 6. softmax (fp32 计算保证 bf16 数值稳定) + dropout
+        attn_weights = F.softmax(scores.float(), dim=-1).type_as(xq)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # 7. 加权求和
+        output = torch.matmul(attn_weights, xv)  # (B, nhead, S, head_dim)
+
+        # 8. 合并多头 + 输出投影 + residual dropout
+        output = output.transpose(1, 2).reshape(B, S, self.d_model)
+        output = self.resid_dropout(self.o_proj(output))
+
         if return_attn:
-            return attn_output, attn_weights
-        return attn_output
+            return output, attn_weights
+        return output
 
 
 class TransformerLayer(nn.Module):

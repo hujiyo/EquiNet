@@ -41,25 +41,28 @@ class KLineEmbedding(nn.Module):
     """
     单日K线嵌入模块（结构与 StockTransformer 的 FFN-Embedding 完全一致）
 
-    Linear(15→128) → GELU → Linear(128→128) + 残差连接
-    保留完整向量信息（方向 + 幅度）。
+    MLP(15→128→256→GELU→128)
+    网络足够浅（3层），无需残差连接，纯 MLP 即可充分学习非线性特征交互。
     """
 
-    def __init__(self, input_dim=15, d_model=128):
+    def __init__(self, input_dim=15, d_model=128, expand_ratio=2):
         super().__init__()
+        hidden_dim = d_model * expand_ratio
         self.embed_proj = nn.Linear(input_dim, d_model, bias=False)
         self.embed_mlp = nn.Sequential(
+            nn.Linear(d_model, hidden_dim, bias=False),
             nn.GELU(),
-            nn.Linear(d_model, d_model, bias=False)
+            nn.Linear(hidden_dim, d_model, bias=False)
         )
-        # 残差等贡献初始化（非逐层调参，从架构推导）
-        # 原理：残差分支输出std = 主路径输出std，确保128维空间充分覆盖
-        # GELU有效增益≈0.588 → MLP层σ = 1/(√d·0.588) ≈ 0.150
-        # 两条路径各贡献std≈0.141 → 合计std≈0.2（匹配SIGReg目标）
-        nn.init.normal_(self.embed_mlp[1].weight,
-                        std=1.0 / (math.sqrt(d_model) * 0.588))
+        # 初始化（非逐层调参，从架构推导）
+        # MLP分支增益=1（σ1·σ2·0.588·√(d·h) = 1），输出std = embed_proj输出std
+        # 合计std≈0.141（接近SIGReg目标std=0.2，训练中SIGReg会微调至精确目标）
         nn.init.normal_(self.embed_proj.weight,
                         std=0.2 / (math.sqrt(2) * math.sqrt(input_dim)))
+        nn.init.normal_(self.embed_mlp[0].weight,
+                        std=1.0 / math.sqrt(d_model))
+        nn.init.normal_(self.embed_mlp[2].weight,
+                        std=1.0 / (0.588 * math.sqrt(hidden_dim)))
 
     def forward(self, x):
         """
@@ -69,7 +72,7 @@ class KLineEmbedding(nn.Module):
             z: [batch, d_model] 嵌入向量（保留方向+幅度）
         """
         h = self.embed_proj(x)
-        h = h + self.embed_mlp(h)
+        h = self.embed_mlp(h)
         return h
 
 
@@ -88,15 +91,17 @@ class PretrainModel(nn.Module):
     解码器在预训练完成后丢弃，只保留 embedding 权重。
     """
 
-    def __init__(self, input_dim=15, d_model=128):
+    def __init__(self, input_dim=15, d_model=128, expand_ratio=2):
         super().__init__()
-        self.embedding = KLineEmbedding(input_dim, d_model)
+        self.embedding = KLineEmbedding(input_dim, d_model, expand_ratio)
         self.input_dim = input_dim
 
-        # MLP解码器: Linear → GELU → Linear（与 embedding 对称）
+        # MLP解码器: 128→256→GELU→128→15（逐步压缩，避免大跨度降维）
+        hidden_dim = d_model * expand_ratio
         self.decoder = nn.Sequential(
-            nn.Linear(d_model, d_model, bias=False),
+            nn.Linear(d_model, hidden_dim, bias=False),
             nn.GELU(),
+            nn.Linear(hidden_dim, d_model, bias=False),
             nn.Linear(d_model, input_dim, bias=False),
         )
 
@@ -245,9 +250,11 @@ def save_pretrained_embedding(embedding, path, metrics=None, decoder=None):
 
     checkpoint = {
         'embed_proj_weight': embedding.embed_proj.weight.data.cpu(),
-        'embed_mlp_1_weight': embedding.embed_mlp[1].weight.data.cpu(),
+        'embed_mlp_0_weight': embedding.embed_mlp[0].weight.data.cpu(),
+        'embed_mlp_2_weight': embedding.embed_mlp[2].weight.data.cpu(),
         'input_dim': embedding.embed_proj.in_features,
         'd_model': embedding.embed_proj.out_features,
+        'expand_ratio': embedding.embed_mlp[0].out_features // embedding.embed_proj.out_features,
         'config': {
             'epochs': EmbeddingConfig.EPOCHS,
             'batch_size': EmbeddingConfig.BATCH_SIZE,
@@ -478,7 +485,8 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
             ckpt = torch.load(best_path, map_location=device, weights_only=True)
             tmp = KLineEmbedding(ModelConfig.INPUT_DIM, ModelConfig.D_MODEL).to(device)
             tmp.embed_proj.weight.data.copy_(ckpt['embed_proj_weight'])
-            tmp.embed_mlp[1].weight.data.copy_(ckpt['embed_mlp_1_weight'])
+            tmp.embed_mlp[0].weight.data.copy_(ckpt['embed_mlp_0_weight'])
+            tmp.embed_mlp[2].weight.data.copy_(ckpt['embed_mlp_2_weight'])
             z = tmp(test_input)
             print(f"  {os.path.basename(best_path)}: 输出std = {z.std().item():.4f}")
 

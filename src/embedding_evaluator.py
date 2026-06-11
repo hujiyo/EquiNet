@@ -238,7 +238,8 @@ class EmbeddingModuleAnalyzer:
 
                 key_map = {
                     'embed_proj_weight': 'embed_proj.weight',
-                    'embed_mlp_1_weight': 'embed_mlp.1.weight',
+                    'embed_mlp_0_weight': 'embed_mlp.0.weight',
+                    'embed_mlp_2_weight': 'embed_mlp.2.weight',
                 }
 
                 current_state = self.model.state_dict()

@@ -2,7 +2,7 @@
 
 `embedding_evaluator.py` 各评估环节的原理说明。
 
-评估对象：粗处理后数据 → 细处理(FeatureNormalizer) → FFN-Embedding(Linear(15→128) + 残差 GELU 分支)
+评估对象：粗处理后数据 → 细处理(FeatureNormalizer) → FFN-Embedding(MLP: Linear(15→128) → Linear(128→256) → GELU → Linear(256→128))
 
 ---
 

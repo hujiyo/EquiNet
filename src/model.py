@@ -150,22 +150,23 @@ class StockTransformer(nn.Module):
     Transformer 模型（Post-Norm 架构 + FFN-Embedding）
 
     核心设计：
-    - FFN-Embedding: Linear(9→128) → GELU → Linear(128→128)
-      相比纯线性映射，GELU在中间层提供非线性特征组合能力
-      让第一层Transformer就能访问到特征间的非线性交互（如上影线、实体大小等）
+    - FFN-Embedding: MLP(input_dim→d_model→hidden→GELU→d_model)
+      纯 MLP 结构，3层网络无需残差连接即可充分学习非线性特征交互。
     - Transformer 层：标准 Attention + FFN 结构，专注于跨时间模式识别
     """
-    def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, seq_len):
+    def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, seq_len,
+                 embed_expand_ratio=2):
         super(StockTransformer, self).__init__()
 
-        # FFN-Embedding：线性投影 + 残差MLP（非线性特征交互）
-        # Linear(9→128): 基础线性映射，保底传递原始特征信息
-        # GELU + Linear(128→128): 残差分支，专注学习非线性交互（K线形态翻转等）
-        # 残差连接: 线性映射永远保底，MLP只负责"加增量"
+        # FFN-Embedding：MLP（非线性特征交互）
+        # Linear(input_dim→d_model): 维度扩展
+        # MLP(d_model→hidden→GELU→d_model): 学习非线性交互（K线形态翻转等）
+        hidden_dim = d_model * embed_expand_ratio
         self.embed_proj = nn.Linear(input_dim, d_model, bias=False)
         self.embed_mlp = nn.Sequential(
+            nn.Linear(d_model, hidden_dim, bias=False),
             nn.GELU(),
-            nn.Linear(d_model, d_model, bias=False)
+            nn.Linear(hidden_dim, d_model, bias=False)
         )
 
         # 使用标准位置编码
@@ -185,7 +186,7 @@ class StockTransformer(nn.Module):
 
     def forward(self, x, return_attn=False):
         x = self.embed_proj(x)
-        x = x + self.embed_mlp(x)
+        x = self.embed_mlp(x)
 
         x = self.pos_encoding(x)
         x = self.dropout(x)
@@ -221,8 +222,8 @@ class StockTransformer(nn.Module):
         checkpoint = torch.load(path, map_location='cpu', weights_only=True)
 
         self.embed_proj.weight.data.copy_(checkpoint['embed_proj_weight'])
-        linear_layer = next(m for m in self.embed_mlp if isinstance(m, nn.Linear))
-        linear_layer.weight.data.copy_(checkpoint['embed_mlp_1_weight'])
+        self.embed_mlp[0].weight.data.copy_(checkpoint['embed_mlp_0_weight'])
+        self.embed_mlp[2].weight.data.copy_(checkpoint['embed_mlp_2_weight'])
 
         print(f"  已加载预训练 Embedding: {path}")
 

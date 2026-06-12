@@ -1064,7 +1064,7 @@ def main():
     train_stock_info, val_stock_info, test_stock_info = load_and_preprocess_data()
 
     print("\n[步骤2] 准备测试样本...")
-    from data import coarse_normalize_context_window
+    from data import normalize_and_validate_context_window
     eval_ctx = DataConfig.CONTEXT_LENGTH
     eval_req = DataConfig.REQUIRED_LENGTH
     all_inputs = []
@@ -1072,8 +1072,9 @@ def main():
         data = stock['data']
         test_split = stock['test_split_point']
         for i in range(test_split, min(test_split + 10, len(data) - eval_req)):
-            input_seq = coarse_normalize_context_window(
-                data, i, eval_ctx, check_limit_up=False, required_length=eval_req
+            input_seq = normalize_and_validate_context_window(
+                data, i, eval_ctx, check_limit_up=False, required_length=eval_req,
+                feature_normalizer=None, apply_fine_normalization=False
             )
             if input_seq is not None:
                 all_inputs.append(input_seq)

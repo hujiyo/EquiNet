@@ -56,14 +56,19 @@ class FeatureNormalizer:
         self.n_quantiles = n_quantiles
         self.random_state = random_state
 
+        # 特征组定义：(名称, 列切片)
+        self._feature_groups = [
+            ('ohl',     slice(0, 4)),
+            ('vwap',    slice(4, 5)),
+            ('amount',  slice(5, 6)),
+            ('exchange',slice(6, 7)),
+            ('ma',      slice(7, 10)),
+            ('macd',    slice(10, 13)),
+            ('bb',      slice(13, 15)),
+        ]
+
         # 为每个特征组创建独立的 pipeline
-        self.ohl_pipeline = self._create_pipeline()
-        self.vwap_pipeline = self._create_pipeline()
-        self.amount_pipeline = self._create_pipeline()
-        self.exchange_pipeline = self._create_pipeline()
-        self.ma_pipeline = self._create_pipeline()
-        self.macd_pipeline = self._create_pipeline()
-        self.bb_pipeline = self._create_pipeline()
+        self.pipelines = {name: self._create_pipeline() for name, _ in self._feature_groups}
 
         self.is_fitted = False
 
@@ -87,22 +92,16 @@ class FeatureNormalizer:
             ('scaler', StandardScaler())
         ])
 
-    def _collect_training_features(self, train_stock_info: List[Dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _collect_training_features(self, train_stock_info: List[Dict]) -> Dict[str, np.ndarray]:
         """
         从训练集收集所有特征值（避免数据泄漏）
         关键：只使用每只股票的训练集部分（train_end_idx 之前）
         使用向量化批处理进行粗处理，确保与训练时的数据处理逻辑完全一致
 
         Returns:
-            ohl_data, vwap_data, amount_data, exchange_data, ma_data, macd_data, bb_data
+            {name: flat_values} 每个特征组的展平值
         """
-        ohl_data = []
-        vwap_data = []
-        amount_data = []
-        exchange_data = []
-        ma_data = []
-        macd_data = []
-        bb_data = []
+        buckets = {name: [] for name, _ in self._feature_groups}
 
         context_length = DataConfig.CONTEXT_LENGTH
         max_windows = 100000
@@ -156,32 +155,18 @@ class FeatureNormalizer:
 
             total_windows += len(inputs)
 
-            ohl_data.append(inputs[:, :, :4].flatten())
-            vwap_data.append(inputs[:, :, 4].flatten())
-            amount_data.append(inputs[:, :, 5].flatten())
-            exchange_data.append(inputs[:, :, 6].flatten())
-            ma_data.append(inputs[:, :, 7:10].flatten())
-            macd_data.append(inputs[:, :, 10:13].flatten())
-            bb_data.append(inputs[:, :, 13:15].flatten())
+            for name, col_slice in self._feature_groups:
+                buckets[name].append(inputs[:, :, col_slice].flatten())
 
-        ohl_data = np.concatenate(ohl_data) if ohl_data else np.array([])
-        vwap_data = np.concatenate(vwap_data) if vwap_data else np.array([])
-        amount_data = np.concatenate(amount_data) if amount_data else np.array([])
-        exchange_data = np.concatenate(exchange_data) if exchange_data else np.array([])
-        ma_data = np.concatenate(ma_data) if ma_data else np.array([])
-        macd_data = np.concatenate(macd_data) if macd_data else np.array([])
-        bb_data = np.concatenate(bb_data) if bb_data else np.array([])
+        result = {}
+        for name in buckets:
+            result[name] = np.concatenate(buckets[name]) if buckets[name] else np.array([])
 
         print(f"[FeatureNormalizer] 收集到的训练数据 ({total_windows} 个窗口):")
-        print(f"  OHLC: {len(ohl_data)} 个值")
-        print(f"  VWAP: {len(vwap_data)} 个值")
-        print(f"  Amount: {len(amount_data)} 个值")
-        print(f"  Exchange: {len(exchange_data)} 个值")
-        print(f"  MA: {len(ma_data)} 个值")
-        print(f"  MACD: {len(macd_data)} 个值")
-        print(f"  BB: {len(bb_data)} 个值")
+        for name, _ in self._feature_groups:
+            print(f"  {name.upper()}: {len(result[name])} 个值")
 
-        return ohl_data, vwap_data, amount_data, exchange_data, ma_data, macd_data, bb_data
+        return result
 
     def fit(self, train_stock_info: List[Dict]):
         """
@@ -198,78 +183,29 @@ class FeatureNormalizer:
         print(f"  分位数数量: {self.n_quantiles}")
 
         # 收集训练数据
-        ohl_data, vwap_data, amount_data, exchange_data, ma_data, macd_data, bb_data = self._collect_training_features(
-            train_stock_info
-        )
+        feature_data = self._collect_training_features(train_stock_info)
 
         # 拟合每个特征组的 pipeline
         print("\n[FeatureNormalizer] 拟合每个特征的 pipeline...")
-        self.ohl_pipeline.fit(ohl_data.reshape(-1, 1))
-        self.vwap_pipeline.fit(vwap_data.reshape(-1, 1))
-        self.amount_pipeline.fit(amount_data.reshape(-1, 1))
-        self.exchange_pipeline.fit(exchange_data.reshape(-1, 1))
-        self.ma_pipeline.fit(ma_data.reshape(-1, 1))
-        self.macd_pipeline.fit(macd_data.reshape(-1, 1))
-        self.bb_pipeline.fit(bb_data.reshape(-1, 1))
+        for name, _ in self._feature_groups:
+            self.pipelines[name].fit(feature_data[name].reshape(-1, 1))
         self.is_fitted = True
 
-        self._print_transform_stats(ohl_data, vwap_data, amount_data, exchange_data, ma_data, macd_data, bb_data)
+        self._print_transform_stats(feature_data)
         print("\n[FeatureNormalizer] ✓ 拟合完成！")
 
-    def _print_transform_stats(self, ohl_data, vwap_data, amount_data, exchange_data, ma_data, macd_data, bb_data):
-        """
-        打印变换后的统计信息，验证归一化效果
-        """
+    def _print_transform_stats(self, feature_data: Dict[str, np.ndarray]):
+        """打印变换后的统计信息，验证归一化效果"""
         print("\n[FeatureNormalizer] 变换后的统计信息:")
 
-        # OHLC
-        ohl_transformed = self.ohl_pipeline.transform(ohl_data.reshape(-1, 1)).flatten()
-        print(f"  OHLC:")
-        print(f"    均值: {ohl_transformed.mean():.6f}")
-        print(f"    标准差: {ohl_transformed.std():.6f}")
-        print(f"    范围: [{ohl_transformed.min():.6f}, {ohl_transformed.max():.6f}]")
-
-        # VWAP
-        vwap_transformed = self.vwap_pipeline.transform(vwap_data.reshape(-1, 1)).flatten()
-        print(f"  VWAP:")
-        print(f"    均值: {vwap_transformed.mean():.6f}")
-        print(f"    标准差: {vwap_transformed.std():.6f}")
-        print(f"    范围: [{vwap_transformed.min():.6f}, {vwap_transformed.max():.6f}]")
-
-        # Amount
-        amount_transformed = self.amount_pipeline.transform(amount_data.reshape(-1, 1)).flatten()
-        print(f"  Amount:")
-        print(f"    均值: {amount_transformed.mean():.6f}")
-        print(f"    标准差: {amount_transformed.std():.6f}")
-        print(f"    范围: [{amount_transformed.min():.6f}, {amount_transformed.max():.6f}]")
-
-        # Exchange
-        exchange_transformed = self.exchange_pipeline.transform(exchange_data.reshape(-1, 1)).flatten()
-        print(f"  Exchange:")
-        print(f"    均值: {exchange_transformed.mean():.6f}")
-        print(f"    标准差: {exchange_transformed.std():.6f}")
-        print(f"    范围: [{exchange_transformed.min():.6f}, {exchange_transformed.max():.6f}]")
-
-        # MA
-        ma_transformed = self.ma_pipeline.transform(ma_data.reshape(-1, 1)).flatten()
-        print(f"  MA:")
-        print(f"    均值: {ma_transformed.mean():.6f}")
-        print(f"    标准差: {ma_transformed.std():.6f}")
-        print(f"    范围: [{ma_transformed.min():.6f}, {ma_transformed.max():.6f}]")
-
-        # MACD
-        macd_transformed = self.macd_pipeline.transform(macd_data.reshape(-1, 1)).flatten()
-        print(f"  MACD:")
-        print(f"    均值: {macd_transformed.mean():.6f}")
-        print(f"    标准差: {macd_transformed.std():.6f}")
-        print(f"    范围: [{macd_transformed.min():.6f}, {macd_transformed.max():.6f}]")
-
-        # BB
-        bb_transformed = self.bb_pipeline.transform(bb_data.reshape(-1, 1)).flatten()
-        print(f"  BB:")
-        print(f"    均值: {bb_transformed.mean():.6f}")
-        print(f"    标准差: {bb_transformed.std():.6f}")
-        print(f"    范围: [{bb_transformed.min():.6f}, {bb_transformed.max():.6f}]")
+        for name, _ in self._feature_groups:
+            transformed = self.pipelines[name].transform(
+                feature_data[name].reshape(-1, 1)
+            ).flatten()
+            print(f"  {name.upper()}:")
+            print(f"    均值: {transformed.mean():.6f}")
+            print(f"    标准差: {transformed.std():.6f}")
+            print(f"    范围: [{transformed.min():.6f}, {transformed.max():.6f}]")
 
     def transform(self, input_seq: np.ndarray) -> np.ndarray:
         """
@@ -286,43 +222,10 @@ class FeatureNormalizer:
 
         normalized = np.empty_like(input_seq, dtype=np.float32)
 
-        ohl_flat = input_seq[:, :4].flatten()
-        vwap_flat = input_seq[:, 4].flatten()
-        amount_flat = input_seq[:, 5].flatten()
-        exchange_flat = input_seq[:, 6].flatten()
-        ma_flat = input_seq[:, 7:10].flatten()
-        macd_flat = input_seq[:, 10:13].flatten()
-        bb_flat = input_seq[:, 13:15].flatten()
-
-        normalized_ohl = self.ohl_pipeline.transform(
-            ohl_flat.reshape(-1, 1)
-        ).flatten()
-        normalized_vwap = self.vwap_pipeline.transform(
-            vwap_flat.reshape(-1, 1)
-        ).flatten()
-        normalized_amount = self.amount_pipeline.transform(
-            amount_flat.reshape(-1, 1)
-        ).flatten()
-        normalized_exchange = self.exchange_pipeline.transform(
-            exchange_flat.reshape(-1, 1)
-        ).flatten()
-        normalized_ma = self.ma_pipeline.transform(
-            ma_flat.reshape(-1, 1)
-        ).flatten()
-        normalized_macd = self.macd_pipeline.transform(
-            macd_flat.reshape(-1, 1)
-        ).flatten()
-        normalized_bb = self.bb_pipeline.transform(
-            bb_flat.reshape(-1, 1)
-        ).flatten()
-
-        normalized[:, :4] = normalized_ohl.reshape(input_seq[:, :4].shape)
-        normalized[:, 4] = normalized_vwap
-        normalized[:, 5] = normalized_amount
-        normalized[:, 6] = normalized_exchange
-        normalized[:, 7:10] = normalized_ma.reshape(input_seq[:, 7:10].shape)
-        normalized[:, 10:13] = normalized_macd.reshape(input_seq[:, 10:13].shape)
-        normalized[:, 13:15] = normalized_bb.reshape(input_seq[:, 13:15].shape)
+        for name, col_slice in self._feature_groups:
+            flat = input_seq[:, col_slice].flatten()
+            transformed = self.pipelines[name].transform(flat.reshape(-1, 1)).flatten()
+            normalized[:, col_slice] = transformed.reshape(input_seq[:, col_slice].shape)
 
         return normalized
 
@@ -345,33 +248,11 @@ class FeatureNormalizer:
         batch_size, context_length = input_seqs.shape[0], input_seqs.shape[1]
         normalized = np.empty_like(input_seqs, dtype=np.float32)
 
-        normalized[:, :, :4] = self.ohl_pipeline.transform(
-            input_seqs[:, :, :4].reshape(-1, 1)
-        ).reshape(batch_size, context_length, 4)
-
-        normalized[:, :, 4] = self.vwap_pipeline.transform(
-            input_seqs[:, :, 4].reshape(-1, 1)
-        ).reshape(batch_size, context_length)
-
-        normalized[:, :, 5] = self.amount_pipeline.transform(
-            input_seqs[:, :, 5].reshape(-1, 1)
-        ).reshape(batch_size, context_length)
-
-        normalized[:, :, 6] = self.exchange_pipeline.transform(
-            input_seqs[:, :, 6].reshape(-1, 1)
-        ).reshape(batch_size, context_length)
-
-        normalized[:, :, 7:10] = self.ma_pipeline.transform(
-            input_seqs[:, :, 7:10].reshape(-1, 1)
-        ).reshape(batch_size, context_length, 3)
-
-        normalized[:, :, 10:13] = self.macd_pipeline.transform(
-            input_seqs[:, :, 10:13].reshape(-1, 1)
-        ).reshape(batch_size, context_length, 3)
-
-        normalized[:, :, 13:15] = self.bb_pipeline.transform(
-            input_seqs[:, :, 13:15].reshape(-1, 1)
-        ).reshape(batch_size, context_length, 2)
+        for name, col_slice in self._feature_groups:
+            orig_shape = input_seqs[:, :, col_slice].shape
+            normalized[:, :, col_slice] = self.pipelines[name].transform(
+                input_seqs[:, :, col_slice].reshape(-1, 1)
+            ).reshape(orig_shape)
 
         return normalized
 
@@ -400,13 +281,7 @@ class FeatureNormalizer:
 
         with open(path, 'wb') as f:
             pickle.dump({
-                'ohl_pipeline': self.ohl_pipeline,
-                'vwap_pipeline': self.vwap_pipeline,
-                'amount_pipeline': self.amount_pipeline,
-                'exchange_pipeline': self.exchange_pipeline,
-                'ma_pipeline': self.ma_pipeline,
-                'macd_pipeline': self.macd_pipeline,
-                'bb_pipeline': self.bb_pipeline,
+                'pipelines': self.pipelines,
                 'is_fitted': self.is_fitted,
                 'output_distribution': self.output_distribution,
                 'n_quantiles': self.n_quantiles,
@@ -432,21 +307,14 @@ class FeatureNormalizer:
         with open(path, 'rb') as f:
             data = pickle.load(f)
 
-        # 创建新实例
+        # 创建新实例（__init__ 会创建空的 pipelines，直接覆盖）
         normalizer = cls(
             output_distribution=data['output_distribution'],
             n_quantiles=data['n_quantiles'],
             random_state=data['random_state']
         )
 
-        # 恢复状态
-        normalizer.ohl_pipeline = data['ohl_pipeline']
-        normalizer.vwap_pipeline = data['vwap_pipeline']
-        normalizer.amount_pipeline = data['amount_pipeline']
-        normalizer.exchange_pipeline = data['exchange_pipeline']
-        normalizer.ma_pipeline = data['ma_pipeline']
-        normalizer.macd_pipeline = data['macd_pipeline']
-        normalizer.bb_pipeline = data['bb_pipeline']
+        normalizer.pipelines = data['pipelines']
         normalizer.is_fitted = data['is_fitted']
 
         print(f" ✓ 归一化器已从 {path} 加载")
@@ -762,7 +630,8 @@ class TemporalSampler:
             self.stock_positions.append(start_pos)
             self.stock_start_positions.append(start_pos)
             self.stock_max_positions.append(max_pos)
-            self.can_loop.append(data_length > 600)
+            # 无效区间（start > max）的股票即使数据量足够也不应循环
+            self.can_loop.append(start_pos <= max_pos and data_length > 600)
 
         valid_stocks = sum(1 for i in range(len(stock_info_list)) 
                          if self.stock_positions[i] <= self.stock_max_positions[i])
@@ -804,8 +673,9 @@ class TemporalSampler:
                     all_samples.append((stock_idx, current_pos))
                     self.stock_positions[stock_idx] += 1
 
-            if not any(self.stock_positions[i] <= self.stock_max_positions[i] 
-                      for i in range(len(self.stock_info_list))):
+            if not any(self.stock_positions[i] <= self.stock_max_positions[i]
+                       or self.can_loop[i]
+                       for i in range(len(self.stock_info_list))):
                 break
 
         return all_samples
@@ -826,105 +696,6 @@ class TemporalSampler:
         total_loops = sum(self.loop_counts)
         return looped_stocks_count, total_loops
 
-
-class RandomSampler:
-    """
-    随机采样器：每次随机选择股票和位置进行采样
-    
-    与TemporalSampler的区别：
-    - TemporalSampler: 时间顺序前进，指针不回头（除非循环）
-    - RandomSampler: 每次完全随机选择样本，无时间顺序
-    
-    适用场景：
-    - 对比实验：评估时间顺序采样对模型效果的影响
-    - 数据增强：打破时间依赖，增加样本多样性
-    """
-    def __init__(self, stock_info_list):
-        self.stock_info_list = stock_info_list
-        self.required_length = DataConfig.REQUIRED_LENGTH
-        
-        self.valid_stock_indices = []
-        self.stock_sample_ranges = []
-        
-        for stock_idx, stock_info in enumerate(stock_info_list):
-            train_start_idx = stock_info.get('train_start_idx', 0)
-            train_end_idx = stock_info.get('train_end_idx', len(stock_info['data']))
-            
-            # 关键设计：start_pos = max(1, train_start_idx + 1)
-            # 原因：每个样本需要前一天数据作为归一化基准（prev_day_data = stock_data[start_idx-1]）
-            # 因此第一个有效样本必须从 index=1 开始，确保 index=0 存在作为基准日
-            start_pos = max(1, train_start_idx + 1)
-            max_pos = train_end_idx
-            
-            if start_pos <= max_pos:
-                self.valid_stock_indices.append(stock_idx)
-                self.stock_sample_ranges.append((start_pos, max_pos))
-        
-        valid_stocks = len(self.valid_stock_indices)
-        total_samples = sum(max_pos - start_pos + 1 
-                          for start_pos, max_pos in self.stock_sample_ranges)
-        
-        if valid_stocks == 0:
-            raise ValueError(
-                f"没有有效的训练股票！\n"
-                f"  总股票数: {len(stock_info_list)}\n"
-                f"  请检查数据质量或调整参数"
-            )
-        
-        print(f"  初始化随机采样器: {valid_stocks}只有效股票, 总样本数={total_samples}")
-        print(f"  采样策略: 完全随机采样，每次随机选择股票和位置")
-
-    def sample_batch_rounds(self, num_rounds, rng=None):
-        """
-        随机采样多轮：按样本数量加权随机采样
-
-        参数:
-            num_rounds: 要采样的轮数（每轮采样 valid_stocks 个样本）
-            rng: 随机数生成器（用于可复现性）
-
-        返回: [(stock_idx, start_idx), ...] 所有轮次的样本索引列表
-        
-        加权策略：
-            - 每只股票被选中的概率与其样本数量成正比
-            - 样本多的股票被采样次数多，样本少的股票被采样次数少
-            - 确保每个样本被采样的期望概率相等
-        """
-        if rng is None:
-            rng = random.Random()
-        
-        all_samples = []
-        num_samples_per_round = len(self.valid_stock_indices)
-        total_samples_to_generate = num_rounds * num_samples_per_round
-        
-        sample_weights = [max_pos - start_pos + 1
-                         for start_pos, max_pos in self.stock_sample_ranges]
-
-        stock_to_range = {
-            stock_idx: self.stock_sample_ranges[i]
-            for i, stock_idx in enumerate(self.valid_stock_indices)
-        }
-
-        # 批量选择股票（一次调用替代N次循环，避免重复构建累积权重）
-        selected_stocks = rng.choices(
-            self.valid_stock_indices,
-            weights=sample_weights,
-            k=total_samples_to_generate
-        )
-
-        for stock_idx in selected_stocks:
-            start_pos, max_pos = stock_to_range[stock_idx]
-            start_idx = rng.randint(start_pos, max_pos)
-            all_samples.append((stock_idx, start_idx))
-        
-        return all_samples
-    
-    def get_progress(self):
-        """随机采样器无进度概念，返回 (0, 1) 表示无限采样"""
-        return 0, 1
-
-    def get_loop_stats(self):
-        """随机采样器无循环概念"""
-        return 0, 0
 
 
 def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
@@ -1551,55 +1322,6 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
 
     return input_seqs, targets, returns_arr, keys, available_days, daily_returns_list
 
-
-def coarse_normalize_context_window(stock_data, start_idx, context_length,
-                                     check_limit_up=True, required_length=None):
-    """
-    粗处理：CSV → OHLE 格式
-
-    只执行粗处理阶段，不应用细处理（特征归一化器）。
-    输出数据范围：
-        - OHLC: -0.1 ~ 0.1（日环比变化率）
-        - VWAP: -0.1 ~ 0.1（日环比变化率）
-        - Amount: 相对N日均值变化率（无固定范围，由 QuantileTransformer 统一）
-        - Exchange: 相对N日均值变化率（无固定范围，由 QuantileTransformer 统一）
-
-    Args:
-        stock_data: 股票原始数据 [N, 15]
-        start_idx: 上下文窗口起始索引（需要 >= 1，因为需要前一天作为基准）
-        context_length: 上下文窗口长度
-        check_limit_up: 是否检查涨停（默认 True）
-        required_length: 完整采样窗口长度（用于涨停过滤），如果为 None 则只检查上下文窗口
-
-    Returns:
-        input_seq: [context_length, 15] 粗处理后的输入序列，或 None（如果验证失败）
-    """
-    return normalize_and_validate_context_window(
-        stock_data, start_idx, context_length,
-        check_limit_up=check_limit_up,
-        required_length=required_length,
-        feature_normalizer=None,
-        apply_fine_normalization=False
-    )
-
-
-def fine_normalize_batch(input_seq, feature_normalizer):
-    """
-    细处理：OHLE → 标准化数据
-
-    将粗处理后的数据送入细处理阶段，应用特征归一化器。
-    输出数据特性：均值≈0，方差≈1
-
-    Args:
-        input_seq: 粗处理后的数据
-            - 单个样本: [seq_len, 6]
-            - 批量样本: [batch_size, seq_len, 9]
-        feature_normalizer: 特征归一化器实例
-
-    Returns:
-        normalized_seq: 标准化后的数据，形状与输入相同
-    """
-    return feature_normalizer.transform(input_seq)
 
 
 def fit_feature_normalizer(output_path=None):

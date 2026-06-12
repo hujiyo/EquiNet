@@ -90,17 +90,12 @@ class FeatureNormalizer:
     def _collect_training_features(self, train_stock_info: List[Dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         从训练集收集所有特征值（避免数据泄漏）
-
         关键：只使用每只股票的训练集部分（train_end_idx 之前）
-
-        使用 data.py 中的 coarse_normalize_context_window() 进行粗处理，
-        确保与训练时的数据处理逻辑完全一致。
+        使用向量化批处理进行粗处理，确保与训练时的数据处理逻辑完全一致
 
         Returns:
             ohl_data, vwap_data, amount_data, exchange_data, ma_data, macd_data, bb_data
         """
-        from data import coarse_normalize_context_window, DataConfig
-
         ohl_data = []
         vwap_data = []
         amount_data = []
@@ -113,7 +108,7 @@ class FeatureNormalizer:
         max_windows = 100000
         total_windows = 0
 
-        for stock in train_stock_info:
+        for stock_idx, stock in enumerate(train_stock_info):
             if total_windows >= max_windows:
                 break
 
@@ -121,33 +116,53 @@ class FeatureNormalizer:
             train_start_idx = stock.get('train_start_idx', 1)
             train_end_idx = stock.get('train_end_idx', len(data))
 
-            available = train_end_idx - context_length - train_start_idx
-            if available <= 0:
+            range_min = max(1, train_start_idx + 1)
+            range_max = train_end_idx - context_length
+
+            if range_max < range_min:
                 continue
 
-            stride = max(1, available // (max_windows // max(len(train_stock_info), 1)))
+            # 计算采样步长，控制总量在 max_windows 以内
+            available = range_max - range_min + 1
+            remaining = max_windows - total_windows
+            stride = max(1, available // max(1, remaining))
 
-            for i in range(train_start_idx, train_end_idx - context_length, stride):
-                if total_windows >= max_windows:
-                    break
+            # 向量化处理：只做粗归一化，不需要标签、收益和未来数据
+            inputs, _, _, _, _, _ = _vectorized_process_stock(
+                stock, stock_idx,
+                context_length,
+                DataConfig.FUTURE_DAYS,
+                context_length,        # required_length=context_length（不检查未来窗口）
+                DataConfig.MA_WINDOW,
+                DataConfig.LIMIT_THRESHOLD,
+                DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP,
+                DataConfig.LABEL_DAY1_USE_OPEN,
+                generate_label, calculate_returns,
+                check_limit_up=False,
+                require_full_future=False,
+                compute_labels=False,
+                compute_returns=False,
+                start_min_override=range_min,
+                start_max_override=range_max,
+            )
 
-                input_seq = coarse_normalize_context_window(
-                    data, i, context_length,
-                    check_limit_up=False,
-                    required_length=context_length
-                )
+            if inputs is None:
+                continue
 
-                if input_seq is None:
-                    continue
+            # 按 stride 采样，控制总量
+            if stride > 1 and len(inputs) > remaining:
+                indices = np.arange(0, len(inputs), stride)[:remaining]
+                inputs = inputs[indices]
 
-                ohl_data.append(input_seq[:, :4].flatten())
-                vwap_data.append(input_seq[:, 4].flatten())
-                amount_data.append(input_seq[:, 5].flatten())
-                exchange_data.append(input_seq[:, 6].flatten())
-                ma_data.append(input_seq[:, 7:10].flatten())
-                macd_data.append(input_seq[:, 10:13].flatten())
-                bb_data.append(input_seq[:, 13:15].flatten())
-                total_windows += 1
+            total_windows += len(inputs)
+
+            ohl_data.append(inputs[:, :, :4].flatten())
+            vwap_data.append(inputs[:, :, 4].flatten())
+            amount_data.append(inputs[:, :, 5].flatten())
+            exchange_data.append(inputs[:, :, 6].flatten())
+            ma_data.append(inputs[:, :, 7:10].flatten())
+            macd_data.append(inputs[:, :, 10:13].flatten())
+            bb_data.append(inputs[:, :, 13:15].flatten())
 
         ohl_data = np.concatenate(ohl_data) if ohl_data else np.array([])
         vwap_data = np.concatenate(vwap_data) if vwap_data else np.array([])
@@ -661,7 +676,7 @@ def compute_label_distance_exclusions(stock_info_list, distance=None):
         future_days = DataConfig.FUTURE_DAYS
 
         # 轻量级标签计算：只用价格数据，不做完整样本验证
-        # 必须与 generate_sample_from_index() 中的标签计算逻辑保持一致
+        # 必须与 _vectorized_process_stock() 中的标签计算逻辑保持一致
         labels = {}
         use_open = DataConfig.LABEL_DAY1_USE_OPEN
         for pos in range(max(1, train_start + 1), train_end + 1):
@@ -912,184 +927,10 @@ class RandomSampler:
         return 0, 0
 
 
-def generate_sample_from_index(stock_info_list, stock_idx, start_idx, feature_normalizer=None):
-    """
-    根据预生成的索引生成单个样本（向量化优化版）
-
-    参数:
-        stock_info_list: 股票信息列表
-        stock_idx: 股票索引
-        start_idx: 样本起始索引
-        feature_normalizer: 可选的特征归一化器实例
-
-    返回: (input_seq, target, cumulative_return, daily_returns) 或 None（如果样本无效）
-    """
-    stock_info = stock_info_list[stock_idx]
-
-    # 正样本距离保护：检查当前位置是否被排除
-    excluded = stock_info.get('excluded_positions', None)
-    if excluded is not None and start_idx in excluded:
-        return None
-
-    stock_data = stock_info['data']
-    context_length = DataConfig.CONTEXT_LENGTH
-    future_days = DataConfig.FUTURE_DAYS
-    required_length = DataConfig.REQUIRED_LENGTH
-
-    input_seq = normalize_and_validate_context_window(
-        stock_data, start_idx, context_length,
-        check_limit_up=True, required_length=required_length,
-        feature_normalizer=feature_normalizer
-    )
-    
-    if input_seq is None:
-        return None
-
-    input_seq_raw = stock_data[start_idx:start_idx + context_length]
-    closes = input_seq_raw[:, 3]
-    prev_close = closes[-1]
-
-    daily_opens = []
-    daily_highs = []
-    daily_lows = []
-    daily_closes = []
-    daily_price_changes = []
-
-    for d in range(future_days):
-        idx = start_idx + context_length + d
-        day_open = stock_data[idx, 0]
-        day_high = stock_data[idx, 1]
-        day_low = stock_data[idx, 2]
-        day_close = stock_data[idx, 3]
-
-        if day_open == 0 or day_close == 0:
-            return None
-
-        daily_opens.append(day_open)
-        daily_highs.append(day_high)
-        daily_lows.append(day_low)
-        daily_closes.append(day_close)
-
-        if d == 0:
-            if DataConfig.LABEL_DAY1_USE_OPEN:
-                # day1使用开盘到收盘的日内涨幅，对齐实际买入价（消除跳空缺口干扰）
-                daily_price_changes.append((day_close - day_open) / day_open)
-            else:
-                # day1使用收盘到收盘涨跌幅（原始行为，包含隔夜跳空）
-                daily_price_changes.append((day_close - prev_close) / prev_close)
-        else:
-            base_close = daily_closes[d - 1]
-            daily_price_changes.append((day_close - base_close) / base_close)
-
-    cumulative_return, daily_returns = calculate_returns(
-        t1_open=daily_opens[0],
-        t1_close=daily_closes[0],
-        t2_open=daily_opens[1] if future_days >= 2 else None,
-        t2_close=daily_closes[1] if future_days >= 2 else None,
-        t3_close=daily_closes[2] if future_days >= 3 else None,
-        day1_change=daily_price_changes[0],
-        day2_change=daily_price_changes[1] if future_days >= 2 else None,
-        day3_change=daily_price_changes[2] if future_days >= 3 else None
-    )
-
-    target = float(generate_label(
-        day1_change=daily_price_changes[0],
-        day2_change=daily_price_changes[1] if future_days >= 2 else 0.0,
-        day3_change=daily_price_changes[2] if future_days >= 3 else 0.0
-    ))
-
-    return (input_seq, target, cumulative_return, daily_returns)
-
-
-def generate_sample_from_index_partial(stock_info_list, stock_idx, start_idx, feature_normalizer=None):
-    """
-    生成样本，支持不完整的未来数据（用于最近几天的临时评估）
-
-    与generate_sample_from_index的区别：
-    - 由run.py使用，与模型训练阶段脚本无关
-    - 允许未来数据不足 FUTURE_DAYS 天
-    - 返回可用天数信息
-    - 不生成标签（仅用于推理展示）
-
-    返回: (input_seq, cumulative_return, daily_returns, available_days) 或 None
-    """
-    stock_info = stock_info_list[stock_idx]
-    stock_data = stock_info['data']
-    context_length = DataConfig.CONTEXT_LENGTH
-    future_days = DataConfig.FUTURE_DAYS
-    data_length = len(stock_data)
-
-    required_length = min(DataConfig.REQUIRED_LENGTH, data_length - start_idx)
-    
-    input_seq = normalize_and_validate_context_window(
-        stock_data, start_idx, context_length,
-        check_limit_up=True, required_length=required_length,
-        feature_normalizer=feature_normalizer
-    )
-    
-    if input_seq is None:
-        return None
-
-    available_days = 0
-    for d in range(future_days):
-        idx = start_idx + context_length + d
-        if idx < data_length:
-            available_days = d + 1
-        else:
-            break
-    
-    if available_days == 0:
-        return None
-    
-    t_day_close = stock_data[start_idx + context_length - 1, 3]
-
-    daily_opens = [None] * future_days
-    daily_highs = [None] * future_days
-    daily_lows = [None] * future_days
-    daily_closes = [None] * future_days
-    daily_price_changes = [None] * future_days
-
-    for d in range(available_days):
-        idx = start_idx + context_length + d
-        day_open = stock_data[idx, 0]
-        day_high = stock_data[idx, 1]
-        day_low = stock_data[idx, 2]
-        day_close = stock_data[idx, 3]
-
-        if day_open == 0 or day_close == 0:
-            return None
-
-        daily_opens[d] = day_open
-        daily_highs[d] = day_high
-        daily_lows[d] = day_low
-        daily_closes[d] = day_close
-
-        if d == 0:
-            if DataConfig.LABEL_DAY1_USE_OPEN:
-                daily_price_changes[d] = (day_close - day_open) / day_open
-            else:
-                daily_price_changes[d] = (day_close - t_day_close) / t_day_close
-        else:
-            daily_price_changes[d] = (day_close - daily_closes[d - 1]) / daily_closes[d - 1]
-
-    cumulative_return, daily_returns = calculate_returns(
-        t1_open=daily_opens[0],
-        t1_close=daily_closes[0],
-        t2_open=daily_opens[1] if available_days >= 2 else None,
-        t2_close=daily_closes[1] if available_days >= 2 else None,
-        t3_close=daily_closes[2] if available_days >= 3 else None,
-        day1_change=daily_price_changes[0],
-        day2_change=daily_price_changes[1] if available_days >= 2 else None,
-        day3_change=daily_price_changes[2] if available_days >= 3 else None
-    )
-
-    return (input_seq, cumulative_return, daily_returns, available_days)
-
-
 def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
                                      start_key='test_split_point', end_key=None):
     """
-    创建固定评估数据集（涨停样本已在generate_sample_from_index中过滤）
+    创建固定评估数据集（向量化批处理）
 
     只包含完整样本（available_days == FUTURE_DAYS），用于模型评估
 
@@ -1102,48 +943,66 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
 
     返回: (inputs, targets, cumulative_returns, day_indices, daily_returns)
     """
+    context_length = DataConfig.CONTEXT_LENGTH
+    future_days = DataConfig.FUTURE_DAYS
+    required_length = DataConfig.REQUIRED_LENGTH
+    ma_window = DataConfig.MA_WINDOW
+    limit_threshold = DataConfig.LIMIT_THRESHOLD
+    filter_last_day = DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP
+    label_day1_use_open = DataConfig.LABEL_DAY1_USE_OPEN
+
     eval_inputs = []
     eval_targets = []
     eval_cumulative_returns = []
     eval_day_indices = []
     eval_daily_returns = []
 
-    for stock_info in test_stock_info:
-        stock_data = stock_info['data']
-        data_length = len(stock_data)
+    for stock_idx, stock_info in enumerate(test_stock_info):
+        data_length = len(stock_info['data'])
         split_point = stock_info.get(start_key, 0)
 
         start_min = max(1, split_point)
         if end_key is not None:
             end_point = stock_info.get(end_key, data_length)
-            start_max = min(end_point, data_length) - DataConfig.REQUIRED_LENGTH
+            start_max = min(end_point, data_length) - required_length
         else:
-            start_max = data_length - DataConfig.REQUIRED_LENGTH
+            start_max = data_length - required_length
 
         if start_max < start_min:
             continue
 
-        stock_times = stock_info.get('times', None)
-        for start_idx in range(start_min, start_max + 1):
-            # 不传归一化器，只做粗处理（后续批量细处理）
-            sample = generate_sample_from_index([stock_info], 0, start_idx, None)
-            if sample is None:
-                continue
+        inputs, targets, returns_arr, keys, _, daily_rets = _vectorized_process_stock(
+            stock_info, stock_idx,
+            context_length, future_days, required_length,
+            ma_window, limit_threshold, filter_last_day,
+            label_day1_use_open,
+            generate_label, calculate_returns,
+            start_min_override=start_min,
+            start_max_override=start_max,
+        )
 
-            input_seq, target, cumulative_return, daily_returns = sample
-            eval_inputs.append(input_seq)
-            eval_targets.append(target)
-            eval_cumulative_returns.append(float(cumulative_return))
-            eval_daily_returns.append(daily_returns)
-            predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
-            day_index = predict_day_idx - split_point
-            eval_day_indices.append(day_index)
+        if inputs is None:
+            continue
+
+        eval_inputs.append(inputs)
+        eval_targets.append(targets)
+        eval_cumulative_returns.append(returns_arr)
+
+        # 计算 day_index（predict_day - split_point）
+        for _, start_idx in keys:
+            eval_day_indices.append(start_idx + context_length - split_point)
+
+        # daily_returns：从向量化批处理中收集逐样本的逐日收益
+        eval_daily_returns.extend(daily_rets)
 
     if len(eval_inputs) == 0:
         raise ValueError("固定评估集为空：test_stock_info中没有可用样本")
 
-    # 批量细处理：将所有粗处理后的样本一次性归一化（比逐样本处理快10-100倍）
-    eval_inputs_array = np.asarray(eval_inputs)
+    eval_inputs_array = np.concatenate(eval_inputs, axis=0)
+    eval_targets_array = np.concatenate(eval_targets, axis=0)
+    eval_returns_array = np.concatenate(eval_cumulative_returns, axis=0)
+
+    # 批量细处理：将所有粗处理后的样本一次性归一化
     if feature_normalizer is not None:
         eval_inputs_array = feature_normalizer.transform_batch(eval_inputs_array)
         # 过滤归一化后产生的NaN/Inf样本
@@ -1152,62 +1011,93 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
             removed = np.sum(~finite_mask)
             print(f"  ⚠ 归一化后{removed}个样本包含NaN/Inf，已过滤")
             eval_inputs_array = eval_inputs_array[finite_mask]
-            eval_targets = [t for t, m in zip(eval_targets, finite_mask) if m]
-            eval_cumulative_returns = [r for r, m in zip(eval_cumulative_returns, finite_mask) if m]
-            eval_daily_returns = [r for r, m in zip(eval_daily_returns, finite_mask) if m]
+            eval_targets_array = eval_targets_array[finite_mask]
+            eval_returns_array = eval_returns_array[finite_mask]
             eval_day_indices = [d for d, m in zip(eval_day_indices, finite_mask) if m]
+            eval_daily_returns = [r for r, m in zip(eval_daily_returns, finite_mask) if m]
 
-    return (eval_inputs_array, np.asarray(eval_targets),
-            np.asarray(eval_cumulative_returns), np.asarray(eval_day_indices),
+    return (eval_inputs_array, eval_targets_array,
+            eval_returns_array, np.asarray(eval_day_indices),
             eval_daily_returns)
 
 
 def create_recent_days_dataset(test_stock_info, feature_normalizer=None, max_days=15):
     """
-    创建最近几天的数据集（包含临时样本，用于展示）
+    创建最近几天的数据集（向量化批处理版，包含临时样本，用于展示）
 
     Args:
         test_stock_info: 测试集股票信息列表
         feature_normalizer: 可选的特征归一化器实例
         max_days: 只生成最近 max_days 天的样本，避免遍历整个测试期
     """
+    context_length = DataConfig.CONTEXT_LENGTH
+    future_days = DataConfig.FUTURE_DAYS
+    required_length = DataConfig.REQUIRED_LENGTH
+    ma_window = DataConfig.MA_WINDOW
+    limit_threshold = DataConfig.LIMIT_THRESHOLD
+    filter_last_day = DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP
+    label_day1_use_open = DataConfig.LABEL_DAY1_USE_OPEN
+
     recent_inputs = []
     recent_cumulative_returns = []
     recent_day_indices = []
     recent_available_days = []
 
-    for stock_info in test_stock_info:
-        stock_data = stock_info['data']
-        data_length = len(stock_data)
+    for stock_idx, stock_info in enumerate(test_stock_info):
+        data_length = len(stock_info['data'])
         test_split_point = stock_info.get('test_split_point', 0)
 
-        start_max = data_length - DataConfig.CONTEXT_LENGTH - 1
-        # 只取最近 max_days 天的样本，避免遍历整个测试期
+        start_max = data_length - context_length - 1
         start_min = max(1, test_split_point, start_max - max_days + 1)
 
         if start_max < start_min:
             continue
 
-        stock_times = stock_info.get('times', None)
-        for start_idx in range(start_min, start_max + 1):
-            sample = generate_sample_from_index_partial([stock_info], 0, start_idx, feature_normalizer)
-            if sample is None:
-                continue
+        # require_full_future=False: 允许不完整的未来数据（最近几天可能还没走完）
+        # compute_labels=False: 不需要标签（仅用于推理展示）
+        inputs, _, returns_arr, keys, avail, _ = _vectorized_process_stock(
+            stock_info, stock_idx,
+            context_length, future_days,
+            min(required_length, data_length - start_min),
+            ma_window, limit_threshold, filter_last_day,
+            label_day1_use_open,
+            generate_label, calculate_returns,
+            check_limit_up=True,
+            require_full_future=False,
+            compute_labels=False,
+            compute_returns=True,
+            start_min_override=start_min,
+            start_max_override=start_max,
+        )
 
-            input_seq, cumulative_return, daily_returns, available_days = sample
+        if inputs is None:
+            continue
 
-            predict_day_idx = start_idx + DataConfig.CONTEXT_LENGTH
-            recent_inputs.append(input_seq)
-            recent_cumulative_returns.append(float(cumulative_return))
-            recent_available_days.append(available_days)
-            day_index = predict_day_idx - test_split_point
+        # 批量细处理
+        if feature_normalizer is not None:
+            inputs = feature_normalizer.transform_batch(inputs)
+            finite_mask = np.all(np.isfinite(inputs.reshape(len(inputs), -1)), axis=1)
+            if not np.all(finite_mask):
+                inputs = inputs[finite_mask]
+                returns_arr = returns_arr[finite_mask]
+                avail = avail[finite_mask]
+                keys = [k for k, m in zip(keys, finite_mask) if m]
+
+        recent_inputs.append(inputs)
+        recent_cumulative_returns.append(returns_arr)
+        recent_available_days.append(avail)
+
+        for _, start_idx in keys:
+            day_index = start_idx + context_length - test_split_point
             recent_day_indices.append(day_index)
 
     if len(recent_inputs) == 0:
         return None, None, None, None
 
-    return (np.asarray(recent_inputs), np.asarray(recent_cumulative_returns),
-            np.asarray(recent_day_indices), np.asarray(recent_available_days))
+    return (np.concatenate(recent_inputs),
+            np.concatenate(recent_cumulative_returns),
+            np.asarray(recent_day_indices),
+            np.concatenate(recent_available_days))
 
 
 def normalize_and_validate_context_window(stock_data, start_idx, context_length,
@@ -1218,7 +1108,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     统一的上下文窗口归一化和验证函数
 
     用于消除 run.py 和 data.py 中的代码重复。
-    执行完整的数据验证和归一化流程，与 generate_sample_from_index 保持一致。
+    执行完整的数据验证和归一化流程，与 _vectorized_process_stock 保持一致。
 
     数据处理分两阶段：
         - 粗处理：CSV → 归一化格式
@@ -1372,9 +1262,15 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
 def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days,
                               required_length, ma_window, limit_threshold,
                               filter_last_day_limit_up, label_day1_use_open,
-                              label_fn, returns_fn):
+                              label_fn, returns_fn,
+                              check_limit_up=True,
+                              require_full_future=True,
+                              compute_labels=True,
+                              compute_returns=True,
+                              start_min_override=None,
+                              start_max_override=None):
     """
-    向量化处理单只股票的所有合法窗口（替代逐样本 generate_sample_from_index 循环）
+    向量化处理单只股票的所有合法窗口
 
     将原本 N 次 Python 函数调用合并为一次 numpy 批处理，
     消除 Python 循环调度开销，预期加速 10-20 倍。
@@ -1391,31 +1287,50 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
         label_day1_use_open: Day1是否使用开盘价
         label_fn: generate_label 函数引用
         returns_fn: calculate_returns 函数引用
+        check_limit_up: 是否检查涨停过滤（默认 True）
+        require_full_future: 是否要求完整的 future_days 数据（默认 True）
+            False 时允许部分未来数据，仅要求至少 1 天
+        compute_labels: 是否计算标签（默认 True）
+        compute_returns: 是否计算累计收益（默认 True）
+        start_min_override: 覆盖默认的采样起始范围（用于评估集等非训练场景）
+        start_max_override: 覆盖默认的采样截止范围
 
     Returns:
-        (inputs, targets, returns_list, keys) 或 (None, None, None, None)
+        (inputs, targets, returns_arr, keys, available_days, daily_returns_list) 或
+        (None, None, None, None, None, None)
+        available_days: [Nv] int 数组，每行有多少天有效的未来数据
+        daily_returns_list: list[list[float]]，每样本的逐日收益（变长 1-3）
     """
     stock_data = stock_info['data']
     T = len(stock_data)
 
-    train_start = max(1, stock_info.get('train_start_idx', 0) + 1)
-    train_end = stock_info.get('train_end_idx', T)
+    # 范围计算：支持 override（评估集等非训练场景不使用 train_start/train_end）
+    if start_min_override is not None:
+        range_min = max(1, start_min_override)
+    else:
+        range_min = max(1, stock_info.get('train_start_idx', 0) + 1)
+
+    if start_max_override is not None:
+        range_max = start_max_override
+    else:
+        range_max = stock_info.get('train_end_idx', T)
+
     excluded = stock_info.get('excluded_positions', set())
 
     max_valid_start = T - required_length
-    if max_valid_start < train_start:
-        return None, None, None, None
+    if max_valid_start < range_min:
+        return None, None, None, None, None, None
 
-    all_starts = np.arange(train_start, min(train_end, max_valid_start) + 1)
+    all_starts = np.arange(range_min, min(range_max, max_valid_start) + 1)
 
-    if excluded:
+    if excluded and not start_min_override:
         excl_arr = np.array(sorted(excluded), dtype=np.intp)
         mask = ~np.isin(all_starts, excl_arr)
         all_starts = all_starts[mask]
 
     N = len(all_starts)
     if N == 0:
-        return None, None, None, None
+        return None, None, None, None, None, None
 
     C = context_length
     offsets = np.arange(C, dtype=np.intp)
@@ -1432,22 +1347,24 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
     valid &= np.all(raw_windows[:, :, 5] != 0, axis=1)
     valid &= raw_windows[:, -1, 3] <= 40
 
-    sample_offsets = np.arange(required_length + 1, dtype=np.intp)
-    sample_idx = (all_starts[:, None] - 1) + sample_offsets[None, :]
-    sample_idx = np.clip(sample_idx, 0, T - 1)
+    # 涨停过滤（可选）
+    if check_limit_up:
+        sample_offsets = np.arange(required_length + 1, dtype=np.intp)
+        sample_idx = (all_starts[:, None] - 1) + sample_offsets[None, :]
+        sample_idx = np.clip(sample_idx, 0, T - 1)
 
-    sample_closes = stock_data[sample_idx][:, :, 3]
-    prev_c = sample_closes[:, :-1]
-    curr_c = sample_closes[:, 1:]
-    valid &= np.all(prev_c != 0, axis=1)
-    safe_prev_c = np.where(prev_c != 0, prev_c, 1.0)
-    daily_rets_sample = (curr_c - prev_c) / safe_prev_c
+        sample_closes = stock_data[sample_idx][:, :, 3]
+        prev_c = sample_closes[:, :-1]
+        curr_c = sample_closes[:, 1:]
+        valid &= np.all(prev_c != 0, axis=1)
+        safe_prev_c = np.where(prev_c != 0, prev_c, 1.0)
+        daily_rets_sample = (curr_c - prev_c) / safe_prev_c
 
-    in_bounds = sample_idx < T
-    in_bounds &= sample_idx >= 0
-    in_bounds_inner = in_bounds[:, 1:]
-    daily_rets_sample = np.where(in_bounds_inner, daily_rets_sample, 0.0)
-    valid &= np.all(np.abs(daily_rets_sample) <= 0.11, axis=1)
+        in_bounds = sample_idx < T
+        in_bounds &= sample_idx >= 0
+        in_bounds_inner = in_bounds[:, 1:]
+        daily_rets_sample = np.where(in_bounds_inner, daily_rets_sample, 0.0)
+        valid &= np.all(np.abs(daily_rets_sample) <= 0.11, axis=1)
 
     if filter_last_day_limit_up:
         last_close = raw_windows[:, -1, 3]
@@ -1457,7 +1374,7 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
         valid &= last_ret < limit_threshold
 
     if not np.any(valid):
-        return None, None, None, None
+        return None, None, None, None, None, None
 
     vs = all_starts[valid]
     raw_w = raw_windows[valid]
@@ -1491,10 +1408,17 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
         np.cumsum(full_col, out=cs[1:])
 
         left = np.maximum(abs_idx - ma_window, 0)
-        actual_count = abs_idx - left
-        actual_count = np.maximum(actual_count, 1)
+        deficit = ma_window - (abs_idx - left)
 
-        ma_vals = (cs[abs_idx] - cs[left]) / actual_count
+        # 历史区间 [left, abs_idx) 的和
+        hist_sum = cs[abs_idx] - cs[left]
+        # 借未来区间 [abs_idx+1, abs_idx+1+deficit) 的和，跳过当前日
+        # deficit==0 时区间为空，future_sum 自动为 0，退化为纯历史均值
+        future_end = np.minimum(abs_idx + 1 + deficit, T)
+        future_sum = cs[future_end] - cs[abs_idx + 1]
+
+        # 始终除以 ma_window（凑满N天的语义，与标量版一致）
+        ma_vals = (hist_sum + future_sum) / ma_window
 
         raw_vals = raw_w[:, :, col]
         safe_ma = np.where(ma_vals > 0, ma_vals, 1.0)
@@ -1515,69 +1439,117 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
     nan_rows = np.any(~np.isfinite(input_seqs), axis=(1, 2))
     good = ~nan_rows
     if not np.any(good):
-        return None, None, None, None
+        return None, None, None, None, None, None
 
     input_seqs = input_seqs[good]
     vs = vs[good]
     Nv = len(vs)
 
+    # ========== 未来数据处理 ==========
+    # 不需要标签和收益时，跳过未来数据验证（如归一化器训练数据收集）
+    if not compute_labels and not compute_returns:
+        keys = [(stock_idx, int(s)) for s in vs]
+        return input_seqs, np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32), keys, np.empty(0, dtype=np.int32), []
+
     future_offsets = np.arange(future_days, dtype=np.intp)
     future_idx = (vs[:, None] + C) + future_offsets[None, :]
-    future_idx = np.clip(future_idx, 0, T - 1)
-    future_data = stock_data[future_idx]
+    future_idx_clipped = np.clip(future_idx, 0, T - 1)
+    future_data = stock_data[future_idx_clipped]
 
-    future_valid = ((vs[:, None] + C) + future_offsets[None, :]) < T
-    future_valid &= future_data[:, :, 0] != 0
-    future_valid &= future_data[:, :, 3] != 0
-    fv_rows = np.all(future_valid, axis=1)
+    # 计算每行实际可用的未来天数
+    available_days = np.clip(T - (vs + C), 0, future_days).astype(np.int32)
+
+    if require_full_future:
+        # 要求全部 future_days 天存在且非零
+        future_valid = ((vs[:, None] + C) + future_offsets[None, :]) < T
+        future_valid &= future_data[:, :, 0] != 0
+        future_valid &= future_data[:, :, 3] != 0
+        fv_rows = np.all(future_valid, axis=1)
+    else:
+        # 允许部分未来数据：要求至少1天存在且非零
+        future_valid = np.ones((Nv, future_days), dtype=bool)
+        for d in range(future_days):
+            day_exists = (vs + C + d) < T
+            day_ok = day_exists & (future_data[:, d, 0] != 0) & (future_data[:, d, 3] != 0)
+            future_valid[:, d] = day_ok
+        fv_rows = np.any(future_valid, axis=1) & (available_days >= 1)
+
     if not np.all(fv_rows):
         input_seqs = input_seqs[fv_rows]
         vs = vs[fv_rows]
         future_data = future_data[fv_rows]
+        available_days = available_days[fv_rows]
         Nv = len(vs)
 
     if Nv == 0:
-        return None, None, None, None
+        return None, None, None, None, None, None
 
     f_closes = future_data[:, :, 3]
     context_last_close = stock_data[vs + C - 1, 3]
 
+    # 计算每日涨跌幅，不可用的天填 0
+    day1_valid = available_days >= 1
+    safe_f_open0 = np.where(future_data[:, 0, 0] != 0, future_data[:, 0, 0], 1.0)
+    safe_ctx_close = np.where(context_last_close != 0, context_last_close, 1.0)
+
     day1_change = np.where(
-        label_day1_use_open,
-        (f_closes[:, 0] - future_data[:, 0, 0]) / np.where(future_data[:, 0, 0] != 0, future_data[:, 0, 0], 1.0),
-        (f_closes[:, 0] - context_last_close) / np.where(context_last_close != 0, context_last_close, 1.0)
-    )
-    day2_change = (f_closes[:, 1] - f_closes[:, 0]) / np.where(f_closes[:, 0] != 0, f_closes[:, 0], 1.0)
-    day3_change = (f_closes[:, 2] - f_closes[:, 1]) / np.where(f_closes[:, 1] != 0, f_closes[:, 1], 1.0)
+        day1_valid,
+        np.where(label_day1_use_open,
+                 (f_closes[:, 0] - future_data[:, 0, 0]) / safe_f_open0,
+                 (f_closes[:, 0] - context_last_close) / safe_ctx_close),
+        0.0)
 
-    targets = np.zeros(Nv, dtype=np.float32)
-    for i in range(Nv):
-        targets[i] = float(label_fn(
-            day1_change=day1_change[i],
-            day2_change=day2_change[i],
-            day3_change=day3_change[i]
-        ))
+    day2_valid = available_days >= 2
+    safe_f_closes0 = np.where(f_closes[:, 0] != 0, f_closes[:, 0], 1.0)
+    day2_change = np.where(
+        day2_valid,
+        (f_closes[:, 1] - f_closes[:, 0]) / safe_f_closes0,
+        0.0)
 
-    returns_arr = np.zeros(Nv, dtype=np.float32)
-    for i in range(Nv):
-        t1_open = future_data[i, 0, 0]
-        t1_close = f_closes[i, 0]
-        t2_open = future_data[i, 1, 0] if future_days >= 2 else None
-        t2_close = f_closes[i, 1] if future_days >= 2 else None
-        t3_close = f_closes[i, 2] if future_days >= 3 else None
-        cum_ret, _ = returns_fn(
-            t1_open=t1_open, t1_close=t1_close,
-            t2_open=t2_open, t2_close=t2_close,
-            t3_close=t3_close,
-            day1_change=day1_change[i],
-            day2_change=day2_change[i] if future_days >= 2 else None,
-            day3_change=day3_change[i] if future_days >= 3 else None,
-        )
-        returns_arr[i] = cum_ret
+    day3_valid = available_days >= 3
+    safe_f_closes1 = np.where(f_closes[:, 1] != 0, f_closes[:, 1], 1.0)
+    day3_change = np.where(
+        day3_valid,
+        (f_closes[:, 2] - f_closes[:, 1]) / safe_f_closes1,
+        0.0)
+
+    # 标签计算（可选）
+    targets = np.empty(0, dtype=np.float32)
+    if compute_labels:
+        targets = np.zeros(Nv, dtype=np.float32)
+        for i in range(Nv):
+            targets[i] = float(label_fn(
+                day1_change=day1_change[i],
+                day2_change=day2_change[i],
+                day3_change=day3_change[i]
+            ))
+
+    # 收益计算（可选）
+    returns_arr = np.empty(0, dtype=np.float32)
+    daily_returns_list = []
+    if compute_returns:
+        returns_arr = np.zeros(Nv, dtype=np.float32)
+        daily_returns_list = [None] * Nv
+        for i in range(Nv):
+            t1_open = future_data[i, 0, 0]
+            t1_close = f_closes[i, 0]
+            t2_open = future_data[i, 1, 0] if available_days[i] >= 2 else None
+            t2_close = f_closes[i, 1] if available_days[i] >= 2 else None
+            t3_close = f_closes[i, 2] if available_days[i] >= 3 else None
+            cum_ret, dr = returns_fn(
+                t1_open=t1_open, t1_close=t1_close,
+                t2_open=t2_open, t2_close=t2_close,
+                t3_close=t3_close,
+                day1_change=day1_change[i],
+                day2_change=day2_change[i] if available_days[i] >= 2 else None,
+                day3_change=day3_change[i] if available_days[i] >= 3 else None,
+            )
+            returns_arr[i] = cum_ret
+            daily_returns_list[i] = dr
 
     keys = [(stock_idx, int(s)) for s in vs]
 
-    return input_seqs, targets, returns_arr, keys
+    return input_seqs, targets, returns_arr, keys, available_days, daily_returns_list
 
 
 def coarse_normalize_context_window(stock_data, start_idx, context_length,
@@ -1708,7 +1680,7 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None):
             label_day1_use_open,
             generate_label, calculate_returns
         )
-        inputs, targets, returns_arr, keys = result
+        inputs, targets, returns_arr, keys, _, _ = result
 
         if inputs is None:
             continue
@@ -1752,8 +1724,7 @@ def sample_temporal_from_pool(sampler, train_stock_info,
                               batch_size, batches_per_epoch):
     """
     时间顺序采样（预计算池化版）：用 TemporalSampler 的有状态指针推进生成索引，
-    通过 sample_key_to_pool_idx 映射从预计算池中取数据，避免重复调用
-    generate_sample_from_index。
+    通过 sample_key_to_pool_idx 映射从预计算池中取数据。
 
     正负池动态攒取逻辑与旧 sample_with_pools 完全一致：
     - 按时间顺序逐个获取样本，分入正/负池

@@ -39,7 +39,7 @@ class DataConfig:
     REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS + (1 if BUFFER_DAY else 0)
 
     # 量能/换手率归一化配置
-    MA_WINDOW = 10                   # 量能与换手率相对均值的滑动窗口大小（N日均值基准）
+    MA_WINDOW = 10                   # 量能与换手率相对均值的滑动窗口大小（N日均值基准）,左侧数据不够时自动向右侧借数据为预期机制
 
     # 涨跌停配置
     LIMIT_THRESHOLD = 0.095          # 涨跌停判断阈值（9.5%，覆盖普通板±10%）

@@ -357,7 +357,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
                    criterion=None, enable_portfolio_simulation=False):
     """
     模型评估函数
-    涨停样本已在generate_sample_from_index中过滤，无需再次过滤
+    涨停样本已在向量化批处理中过滤，无需再次过滤
 
     分批处理，减少显存占用
 

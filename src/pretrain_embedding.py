@@ -417,8 +417,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
                         + (1 - sigreg_weight) * (loss_recon / recon_ema))
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(),
-                                            EmbeddingConfig.GRADIENT_CLIP_NORM)
+            torch.nn.utils.clip_grad_norm_(model.parameters(),TrainingConfig.GRADIENT_CLIP_NORM)
             optimizer.step()
 
             # 统计

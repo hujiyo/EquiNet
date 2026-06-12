@@ -13,7 +13,6 @@ EquiNet 数据处理模块
 import os
 import sys
 import random
-import argparse
 import pickle
 import numpy as np
 import pandas as pd
@@ -189,31 +188,17 @@ class FeatureNormalizer:
         )
 
         # 拟合每个特征组的 pipeline
-        print("\n[FeatureNormalizer] 拟合 OHLC 特征...")
+        print("\n[FeatureNormalizer] 拟合每个特征的 pipeline...")
         self.ohl_pipeline.fit(ohl_data.reshape(-1, 1))
-
-        print("[FeatureNormalizer] 拟合 VWAP 特征...")
         self.vwap_pipeline.fit(vwap_data.reshape(-1, 1))
-
-        print("[FeatureNormalizer] 拟合 Amount 特征...")
         self.amount_pipeline.fit(amount_data.reshape(-1, 1))
-
-        print("[FeatureNormalizer] 拟合 Exchange 特征...")
         self.exchange_pipeline.fit(exchange_data.reshape(-1, 1))
-
-        print("[FeatureNormalizer] 拟合 MA 特征...")
         self.ma_pipeline.fit(ma_data.reshape(-1, 1))
-
-        print("[FeatureNormalizer] 拟合 MACD 特征...")
         self.macd_pipeline.fit(macd_data.reshape(-1, 1))
-
-        print("[FeatureNormalizer] 拟合 BB 特征...")
         self.bb_pipeline.fit(bb_data.reshape(-1, 1))
-
         self.is_fitted = True
 
         self._print_transform_stats(ohl_data, vwap_data, amount_data, exchange_data, ma_data, macd_data, bb_data)
-
         print("\n[FeatureNormalizer] ✓ 拟合完成！")
 
     def _print_transform_stats(self, ohl_data, vwap_data, amount_data, exchange_data, ma_data, macd_data, bb_data):
@@ -270,6 +255,7 @@ class FeatureNormalizer:
         print(f"    均值: {bb_transformed.mean():.6f}")
         print(f"    标准差: {bb_transformed.std():.6f}")
         print(f"    范围: [{bb_transformed.min():.6f}, {bb_transformed.max():.6f}]")
+
     def transform(self, input_seq: np.ndarray) -> np.ndarray:
         """
         对单个样本应用归一化
@@ -1644,14 +1630,12 @@ def fine_normalize_batch(input_seq, feature_normalizer):
     return feature_normalizer.transform(input_seq)
 
 
-def fit_feature_normalizer(output_path=None, output_distribution='normal', n_quantiles=1000):
+def fit_feature_normalizer(output_path=None):
     """
     在训练集上拟合特征归一化器并保存到文件
 
     Args:
         output_path: 归一化器输出文件路径（默认使用 DataConfig.NORMALIZER_PATH）
-        output_distribution: 输出分布类型 ('normal' 或 'uniform')
-        n_quantiles: 分位数数量
 
     Returns:
         normalizer: 拟合后的 FeatureNormalizer 实例
@@ -1666,16 +1650,15 @@ def fit_feature_normalizer(output_path=None, output_distribution='normal', n_qua
 
     print("\n[步骤1] 加载训练集数据...")
 
-    train_stock_info, test_stock_info, _ = load_and_preprocess_data()
-
+    train_stock_info, val_stock_info, test_stock_info = load_and_preprocess_data()
     print(f"训练集股票数: {len(train_stock_info)}")
-    print(f"测试集股票数: {len(test_stock_info)}")
 
     print("\n[步骤2] 创建特征归一化器...")
-    print(f"  输出分布: {output_distribution}")
-    print(f"  分位数数量: {n_quantiles}")
+    print(f"  输出分布: {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION}")
+    print(f"  分位数数量: {DataConfig.NORMALIZER_N_QUANTILES}")
 
-    normalizer = FeatureNormalizer(output_distribution=output_distribution,n_quantiles=n_quantiles)
+    normalizer = FeatureNormalizer(
+    output_distribution=DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION,n_quantiles=DataConfig.NORMALIZER_N_QUANTILES)
 
     print("\n[步骤3] 在训练集上拟合归一化器...")
     normalizer.fit(train_stock_info)
@@ -1791,7 +1774,7 @@ def sample_temporal_from_pool(sampler, train_stock_info,
         epoch_targets: [batches_per_epoch * batch_size]
         epoch_returns: [batches_per_epoch * batch_size]
     """
-    positive_ratio = 0.25
+    positive_ratio = DataConfig.POSITIVE_RATIO
     pos_quota = max(1, int(batch_size * positive_ratio))
     neg_quota = batch_size - pos_quota
 
@@ -1895,7 +1878,7 @@ def sample_from_pool(all_inputs, all_targets, all_returns,
         epoch_targets: [batches_per_epoch * batch_size]
         epoch_returns: [batches_per_epoch * batch_size]
     """
-    pos_quota = max(1, int(batch_size * 0.25))
+    pos_quota = max(1, int(batch_size * DataConfig.POSITIVE_RATIO))
     neg_quota = batch_size - pos_quota
     total_pos_needed = pos_quota * batches_per_epoch
     total_neg_needed = neg_quota * batches_per_epoch
@@ -1936,25 +1919,8 @@ def sample_from_pool(all_inputs, all_targets, all_returns,
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='数据处理模块 兼 拟合特征归一化器训练脚本',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-用法示例：
-  python data.py                                           # 使用默认参数拟合归一化器
-  python data.py --output-distribution uniform             # 使用均匀分布拟合
-  python data.py --n-quantiles 500                         # 使用500个分位数拟合
-        '''
-    )
-    parser.add_argument('--output-distribution', type=str, default=DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION, choices=['normal', 'uniform'],
-                        help=f'输出分布类型: normal (标准正态) 或 uniform (均匀分布)，默认 {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION}')
-    parser.add_argument('--n-quantiles', type=int, default=DataConfig.NORMALIZER_N_QUANTILES, help=f'分位数数量（默认{DataConfig.NORMALIZER_N_QUANTILES}，越大越精确但越慢）')
-
-    args = parser.parse_args()
-    fit_feature_normalizer(
-        output_distribution=args.output_distribution,
-        n_quantiles=args.n_quantiles
-    )
+    """数据处理模块 兼 拟合特征归一化器训练脚本"""
+    fit_feature_normalizer()
     print(f"✓ 特征归一化器训练完成！已保存到: {DataConfig.NORMALIZER_PATH}")
 
 if __name__ == "__main__":

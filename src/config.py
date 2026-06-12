@@ -45,6 +45,11 @@ class DataConfig:
     LIMIT_THRESHOLD = 0.095          # 涨跌停判断阈值（9.5%，覆盖普通板±10%）
     LIMIT_CHECK_MODE = 'ohlc'        # 'simple': 仅看涨跌幅 | 'ohlc': 通过OHLC判断是否开板
 
+    # 正负样本比例配置
+    # 每个 batch 中正样本的占比，用于应对正负样本极度不平衡（正样本约 3-5%）
+    # 设为 0.25 即每 batch 中 25% 正样本 + 75% 负样本，通过上采样正样本实现类别平衡
+    POSITIVE_RATIO = 0.25
+
     # 采样策略配置
     # 'temporal': 时间顺序采样（指针在训练集上循环滑动）
     # 'random': 随机采样（每次随机选择股票和位置）
@@ -57,7 +62,7 @@ class DataConfig:
 
     # 正样本距离保护参数
     # 如果位置i是正样本，则i-LABEL_DISTANCE到i-1的负样本不参与训练（排除）
-    # distance=0时不排除任何样本（等价于原始行为）
+    # distance=0时不排除任何样本
     # 目的：消除正样本左侧特征高度重叠但标签相反的矛盾训练信号
     LABEL_DISTANCE = 3
 
@@ -77,7 +82,6 @@ class DataConfig:
     #   2. 自动处理特征范围不同（Amount/Exchange vs OHLC）
     #   3. 自动处理特征集中度不同（Amount 99%集中在小范围）
     #   4. 自动处理异常值和偏态分布
-
     # 归一化器配置
     NORMALIZER_OUTPUT_DISTRIBUTION = 'normal'  # 'normal' (标准正态) 或 'uniform' (均匀分布)
     NORMALIZER_N_QUANTILES = 1000            # 分位数数量（越大越精确但越慢）
@@ -124,7 +128,7 @@ class EmbeddingConfig:
     EPOCHS = 100                          # 预训练轮数
     BATCH_SIZE = 2560                     # 大batch，对比学习需要充足负样本
     LEARNING_RATE = 3e-3                  # 预训练学习率
-    WEIGHT_DECAY = 1e-4                   # 权重衰减
+    WEIGHT_DECAY = 0.1                   # 权重衰减
     WARMUP_EPOCHS = 10                   # 预热轮数
     COSINE_ETA_MIN = 1e-4                 # 余弦退火最小学习率
 
@@ -142,9 +146,6 @@ class EmbeddingConfig:
     SIGREG_N_POINTS = 17                # Epps-Pulley 积分节点数（奇数）
     TARGET_STD = 0.2                    # 目标标准差（缩放后 SIGReg 检验 N(0,1)）
 
-    # 训练稳定性
-    GRADIENT_CLIP_NORM = 1.0              # 梯度裁剪范数
-
     # 输出
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out', 'embedding_pretrain')
     BEST_EMBEDDING_PATH = os.path.join(OUTPUT_DIR, 'best_embedding.pth')
@@ -161,12 +162,9 @@ class TrainingConfig:
     COSINE_ETA_MIN = 1e-4          # 余弦退火最小学习率 / 固定阶段学习率
     WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
 
-    LEARNING_RATE = 0.001            # AdamW/Adam基础学习率
-    WEIGHT_DECAY = 1e-5              # AdamW/Adam权重衰减
-
     # 训练批处理
     BATCH_SIZE = 512                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 240            # 每轮训练的批次数（调低以适配时间序采样）
+    BATCHES_PER_EPOCH = 120            # 每轮训练的批次数（调低以适配时间序采样）
 
     # 优化器选择（字符串，互斥）
     # 'adamw':    标准AdamW
@@ -183,7 +181,7 @@ class TrainingConfig:
 
     # AdamW 参数（OPTIMIZER_TYPE='adamw'时生效）
     ADAMW_LR = 0.001                 # AdamW 学习率
-    ADAMW_WEIGHT_DECAY = 1e-5        # AdamW 权重衰减
+    ADAMW_WEIGHT_DECAY = 0.1         # AdamW 权重衰减
 
     # Lion 参数（OPTIMIZER_TYPE='lion'时生效）
     LION_LR = 0.0003                # Lion 学习率（AdamW的~1/3，论文推荐1/3~1/10）
@@ -231,7 +229,7 @@ class LossConfig:
 
     POS_WEIGHT = 4.0  # DynamicWeightedBCE 的正样本权重
 
-    # --- Pairwise排序损失（LOSS_TYPE='pairwise_bce'时生效）---
+    # Pairwise排序损失配置（LOSS_TYPE='pairwise_bce'时生效）
     PAIRWISE_WEIGHT = 0.5           # Pairwise损失权重系数（总损失 = BCE + PAIRWISE_WEIGHT * Pairwise）
     PAIRWISE_TOP_K = 0.10           # Top K%预测区域（构建pair的样本范围）
     PAIRWISE_POS_WEIGHT = 2.0       # 正负对的额外权重（放大排序梯度）
@@ -242,8 +240,7 @@ class LossConfig:
 # ==================== 用户自定义标签生成函数 ====================
 def generate_label(day1_change, day2_change, day3_change):
     """
-    此函数定义什么是"强势买入信号"。
-    只要返回 0（无信号）或 1（有信号）即可。
+    此函数定义什么是"强势买入信号":返回 0=无强势信号,1=有强势信号
 
     ========== 核心概念区分 ==========
     【涨跌幅】vs【收益率】：
@@ -282,8 +279,6 @@ def generate_label(day1_change, day2_change, day3_change):
     max_day = max(day1_change, day2_change, day3_change)
 
     # ========== 五条件规则（默认实现，可完全自定义）==========
-    # 满足任一条件即返回1（强势信号）
-
     # 规则1：单日爆发 + 累计兜底
     if day1_change >= 0.05 and cum_3day >= 0.03:
         return 1

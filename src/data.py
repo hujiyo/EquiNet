@@ -443,9 +443,9 @@ class FeatureNormalizer:
         normalizer.vwap_pipeline = data['vwap_pipeline']
         normalizer.amount_pipeline = data['amount_pipeline']
         normalizer.exchange_pipeline = data['exchange_pipeline']
-        normalizer.ma_pipeline = data.get('ma_pipeline', normalizer.ma_pipeline)
-        normalizer.macd_pipeline = data.get('macd_pipeline', normalizer.macd_pipeline)
-        normalizer.bb_pipeline = data.get('bb_pipeline', normalizer.bb_pipeline)
+        normalizer.ma_pipeline = data['ma_pipeline']
+        normalizer.macd_pipeline = data['macd_pipeline']
+        normalizer.bb_pipeline = data['bb_pipeline']
         normalizer.is_fitted = data['is_fitted']
 
         print(f" ✓ 归一化器已从 {path} 加载")

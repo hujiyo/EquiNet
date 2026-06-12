@@ -35,13 +35,36 @@ from data import load_and_preprocess_data, FeatureNormalizer
 from config import DataConfig, ModelConfig, PROJECT_ROOT
 
 
+def _validate_state_dict_match(current_state, loaded_state, source_path):
+    """严格校验 loaded_state 与 current_state 完全匹配，不一致直接报错"""
+    missing_keys = set(current_state.keys()) - set(loaded_state.keys())
+    extra_keys = set(loaded_state.keys()) - set(current_state.keys())
+    shape_mismatches = []
+
+    for key in current_state:
+        if key in loaded_state and current_state[key].shape != loaded_state[key].shape:
+            shape_mismatches.append(
+                f"  {key}: checkpoint {list(loaded_state[key].shape)} vs 模型 {list(current_state[key].shape)}")
+
+    if missing_keys or shape_mismatches or extra_keys:
+        parts = [f"模型权重与 checkpoint 不匹配: {source_path}"]
+        if missing_keys:
+            parts.append(f"  缺少的权重 ({len(missing_keys)}): {sorted(missing_keys)}")
+        if extra_keys:
+            parts.append(f"  多余的权重 ({len(extra_keys)}): {sorted(extra_keys)}")
+        if shape_mismatches:
+            parts.append(f"  shape 不一致 ({len(shape_mismatches)}):")
+            parts.extend(shape_mismatches)
+        raise ValueError('\n'.join(parts))
+
+
 class FFNEmbeddingWrapper(nn.Module):
     """
-    FFN-Embedding wrapper：将 embed_proj + embed_mlp 残差封装为单一模块
+    FFN-Embedding wrapper：将 embed_proj + embed_mlp 封装为单一模块
 
     对应 StockTransformer 中的:
         x = self.embed_proj(x)
-        x = x + self.embed_mlp(x)
+        x = self.embed_mlp(x)
     """
     def __init__(self, embed_proj, embed_mlp):
         super().__init__()
@@ -50,7 +73,7 @@ class FFNEmbeddingWrapper(nn.Module):
 
     def forward(self, x):
         x = self.embed_proj(x)
-        x = x + self.embed_mlp(x)
+        x = self.embed_mlp(x)
         return x
 
 
@@ -213,24 +236,19 @@ class EmbeddingModuleAnalyzer:
         if self.model_path and os.path.exists(self.model_path):
             checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
             if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                model_arch = checkpoint.get('model_arch', {})
+                # 带元数据的完整模型 checkpoint
+                if 'model_arch' not in checkpoint:
+                    raise ValueError(f"checkpoint 缺少必需的 'model_arch' 元数据: {self.model_path}")
+                model_arch = checkpoint['model_arch']
                 self.model = create_model(model_arch=model_arch).to(self.device)
 
                 current_state = self.model.state_dict()
                 loaded_state = checkpoint['state_dict']
 
-                matched_state = {}
-                for key in current_state:
-                    if key in loaded_state:
-                        if current_state[key].shape == loaded_state[key].shape:
-                            matched_state[key] = loaded_state[key]
-                        else:
-                            print(f"  跳过不匹配的权重: {key}")
-                    else:
-                        print(f"  跳过缺失的权重: {key}")
+                # 严格匹配：shape 不一致或 key 缺失直接报错
+                _validate_state_dict_match(current_state, loaded_state, self.model_path)
 
-                current_state.update(matched_state)
-                self.model.load_state_dict(current_state)
+                self.model.load_state_dict(loaded_state)
                 print(f"加载训练好的模型: {self.model_path}")
             elif isinstance(checkpoint, dict) and 'embed_proj_weight' in checkpoint:
                 # 预训练 Embedding 格式（来自 pretrain_embedding.py）
@@ -242,30 +260,24 @@ class EmbeddingModuleAnalyzer:
                     'embed_mlp_2_weight': 'embed_mlp.2.weight',
                 }
 
-                current_state = self.model.state_dict()
-                matched_state = {}
+                # 严格匹配：所有 key 必须存在且 shape 一致
                 for src_key, dst_key in key_map.items():
-                    if src_key in checkpoint and dst_key in current_state:
-                        if checkpoint[src_key].shape == current_state[dst_key].shape:
-                            matched_state[dst_key] = checkpoint[src_key]
+                    if src_key not in checkpoint:
+                        raise ValueError(f"预训练 Embedding 缺少必需的权重 '{src_key}': {self.model_path}")
+                    if dst_key not in self.model.state_dict():
+                        raise ValueError(f"模型缺少对应的目标权重 '{dst_key}'，架构不兼容")
+                    if checkpoint[src_key].shape != self.model.state_dict()[dst_key].shape:
+                        raise ValueError(
+                            f"权重 '{src_key}' shape 不匹配: "
+                            f"checkpoint {checkpoint[src_key].shape} vs 模型 {self.model.state_dict()[dst_key].shape}")
 
-                current_state.update(matched_state)
-                self.model.load_state_dict(current_state)
+                state = self.model.state_dict()
+                for src_key, dst_key in key_map.items():
+                    state[dst_key] = checkpoint[src_key]
+                self.model.load_state_dict(state)
                 print(f"加载预训练Embedding: {self.model_path}")
-                print(f"  匹配权重: {len(matched_state)} 组")
             else:
-                self.model = create_model().to(self.device)
-                current_state = self.model.state_dict()
-
-                matched_state = {}
-                for key in current_state:
-                    if key in checkpoint:
-                        if current_state[key].shape == checkpoint[key].shape:
-                            matched_state[key] = checkpoint[key]
-
-                current_state.update(matched_state)
-                self.model.load_state_dict(current_state)
-                print(f"加载训练好的模型(旧格式): {self.model_path}")
+                raise ValueError(f"无法识别的 checkpoint 格式: {self.model_path}")
         else:
             self.model = create_model().to(self.device)
             print("使用随机初始化模型")
@@ -273,7 +285,7 @@ class EmbeddingModuleAnalyzer:
 
         if hasattr(self.model, 'embed_proj') and hasattr(self.model, 'embed_mlp'):
             embedding_layer = FFNEmbeddingWrapper(self.model.embed_proj, self.model.embed_mlp)
-            print("检测到FFN-Embedding结构（embed_proj + embed_mlp 残差）")
+            print("检测到FFN-Embedding结构（embed_proj + embed_mlp）")
         elif hasattr(self.model, 'embedding'):
             embedding_layer = self.model.embedding
             print("检测到传统Embedding结构（单一embedding层）")

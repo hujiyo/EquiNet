@@ -3,7 +3,7 @@ EquiNet 模型定义文件
 
 包含所有模型架构相关的类：
 - PositionalEncoding: 位置编码
-- RMSNorm: RMS 归一化（per-head Q/K Norm，LLaMA2 风格）
+- RMSNorm: Zero-Centered RMSNorm（Qwen3.5 风格，全栈归一化）
 - MultiHeadAttention: 多头注意力机制（手写 MHA，参考 MiniMind）
 - TransformerLayer: Transformer层
 - AttentionPooling: 多注意力聚合（可学习query token + cross-attention）
@@ -40,21 +40,30 @@ class PositionalEncoding(nn.Module):
 
 class RMSNorm(nn.Module):
     """
-    RMSNorm - 仅缩放不平移, 数值更稳且 FLOPs 更省
+    Zero-Centered RMSNorm (Qwen3.5 / Qwen3-Next 风格)
 
-    参考 MiniMind (model_minimind.py) 的 RMSNorm 实现,
-    用于本项目 MultiHeadAttention 中的 per-head Q/K 归一化
+    与标准 RMSNorm (LLaMA) 的差异:
+      - weight 初始化为 zeros (非 ones)
+      - scale = (1.0 + weight) * norm(x)  (非 weight * norm(x))
+
+    优势: weight 围绕 0 波动, 配合 weight decay 可防止 norm 权重无界增长
+    (Qwen3 论文指出标准 RMSNorm 的 weight 会变得异常大)
+    参考: Qwen3NextRMSNorm, modeling_qwen3_next.py
+
+    用于 per-head Q/K Norm 和 TransformerLayer 的全栈归一化
     """
-    def __init__(self, dim: int, eps: float = 1e-5):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.zeros(dim))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        return (self.weight * self._norm(x.float())).type_as(x)
+        output = self._norm(x.float())
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
 
 
 class MultiHeadAttention(nn.Module):
@@ -149,7 +158,7 @@ class TransformerLayer(nn.Module):
 
         # 注意力子层
         self.attn = MultiHeadAttention(d_model, nhead)
-        self.attn_norm = nn.LayerNorm(d_model)
+        self.attn_norm = RMSNorm(d_model)
 
         # SwiGLU前馈网络: w2(SiLU(w1(x)) * w3(x))
         # bias=False: Shazeer (2020) 原始设计，LLaMA/PaLM/DeepSeek/Qwen 均不使用 bias
@@ -158,7 +167,7 @@ class TransformerLayer(nn.Module):
         self.ffn_w1 = nn.Linear(d_model, ffn_hidden_dim, bias=False)
         self.ffn_w3 = nn.Linear(d_model, ffn_hidden_dim, bias=False)
         self.ffn_w2 = nn.Linear(ffn_hidden_dim, d_model, bias=False)
-        self.ffn_norm = nn.LayerNorm(d_model)
+        self.ffn_norm = RMSNorm(d_model)
         self.ffn_dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
     def forward(self, x, return_attn=False):
@@ -193,7 +202,7 @@ class AttentionPooling(nn.Module):
         with torch.no_grad():
             self.query.data.normal_(std=0.15)
 
-        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_q = RMSNorm(d_model)
 
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, bias=False, batch_first=True)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
@@ -250,7 +259,7 @@ class StockTransformer(nn.Module):
 
         self.attention_pooling = AttentionPooling(d_model, nhead)
 
-        self.head_norm = nn.LayerNorm(d_model)
+        self.head_norm = RMSNorm(d_model)
 
         self.output_projection = nn.Linear(d_model, output_dim, bias=True)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)

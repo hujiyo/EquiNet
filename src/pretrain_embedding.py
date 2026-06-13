@@ -12,6 +12,7 @@ EquiNet Embedding层训练脚本
 用法：
   python src/pretrain_embedding.py                        # 使用默认参数
   python src/pretrain_embedding.py --epochs 300           # 自定义轮数
+  python src/pretrain_embedding.py --test                 # 测试已保存权重的输出std
 """
 
 import os
@@ -19,7 +20,6 @@ import sys
 import math
 import argparse
 import time
-import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -273,6 +273,49 @@ def save_pretrained_embedding(embedding, path, metrics=None, decoder=None):
           f"{' (含解码器)' if decoder is not None else ''}")
 
 
+def measure_embedding_std(checkpoint_path, kline_pool, device, n_probe=10000):
+    """
+    测量已保存的 embedding 权重在真实归一化K线上的输出std
+
+    从磁盘加载权重（save/load round-trip 验证），用真实K线池抽样探测，
+    反映 embedding 在真实数据分布上是否达成 SIGReg 的 TARGET_STD 目标。
+
+    Args:
+        checkpoint_path: .pth 权重文件路径
+        kline_pool: [M, 15] 真实归一化K线池（numpy）
+        device: 计算设备
+        n_probe: 探测样本数（默认 10000）
+
+    Returns:
+        std: 输出标准差（float）；文件不存在时返回 None
+    """
+    if not os.path.exists(checkpoint_path):
+        print(f"  ✗ 权重文件不存在: {checkpoint_path}")
+        return None
+
+    print(f"\n[输出std验证] 加载权重: {checkpoint_path}")
+    with torch.no_grad():
+        # 从池中抽 n_probe 条真实归一化K线作为探测输入
+        # （比合成 N(0,1) 噪声更贴近推理时的输入分布：真实特征间高度相关）
+        n = min(n_probe, len(kline_pool))
+        probe_idx = np.random.choice(len(kline_pool), n, replace=False)
+        test_input = torch.tensor(kline_pool[probe_idx], dtype=torch.float32).to(device)
+
+        # 从磁盘加载权重，新建模型灌入（验证落盘文件可正确还原）
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        tmp = KLineEmbedding(ModelConfig.INPUT_DIM, ModelConfig.D_MODEL).to(device)
+        tmp.embed_proj.weight.data.copy_(ckpt['embed_proj_weight'])
+        tmp.embed_mlp[0].weight.data.copy_(ckpt['embed_mlp_0_weight'])
+        tmp.embed_mlp[2].weight.data.copy_(ckpt['embed_mlp_2_weight'])
+        tmp.eval()
+        z = tmp(test_input)
+        std = z.std().item()
+        target = EmbeddingConfig.TARGET_STD
+        print(f"  {os.path.basename(checkpoint_path)}: 输出std = {std:.4f}  "
+              f"(目标 {target}, 基于真实K线 {n} 条)")
+    return std
+
+
 # ==================== 主训练函数 ====================
 
 def pretrain(train_stock_info, feature_normalizer=None, device=None,
@@ -359,10 +402,6 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
     print(f"  损失公式: {sigreg_weight:.0%}·(SIGReg/ema) + {1 - sigreg_weight:.0%}·(Recon/ema)")
     print(f"{'='*60}")
 
-    best_loss = float('inf')
-    best_epoch = 0
-    best_model_state = None
-    best_metrics = None
     output_dir = EmbeddingConfig.OUTPUT_DIR
 
     amp_ctx = _get_amp_context(device)
@@ -455,41 +494,23 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
               f"Dedup={avg_dedup:.0f}/batch  "
               f"Time={elapsed:.1f}s")
 
-        # 记录最佳模型（仅存内存，不写磁盘）
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            best_epoch = epoch
-            best_model_state = copy.deepcopy(model.state_dict())
-            best_metrics = {
-                'epoch': epoch,
-                'loss': avg_loss,
-                'sigreg_weighted': avg_sigreg_w,
-                'recon_weighted': avg_recon_w,
-            }
+    # 训练结束后保存最后一轮模型到磁盘
+    # （不按 loss 挑选：各轮 loss 经自适应归一化均稳定在 1 附近，
+    #   最低 loss 不可靠，直接保留最后一轮的权重）
+    last_metrics = {
+        'epoch': epochs,
+        'loss': avg_loss,
+        'sigreg_weighted': avg_sigreg_w,
+        'recon_weighted': avg_recon_w,
+    }
+    best_path = os.path.join(output_dir, 'best_embedding.pth')
+    save_pretrained_embedding(model.embedding, best_path,
+                              metrics=last_metrics, decoder=model.decoder)
 
-    # 训练结束后保存最佳模型到磁盘
-    best_path = None
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        best_path = os.path.join(output_dir, 'best_embedding.pth')
-        save_pretrained_embedding(model.embedding, best_path,
-                                  metrics=best_metrics, decoder=model.decoder)
+    # 测量保存文件的输出std（真实归一化K线探测）
+    measure_embedding_std(best_path, kline_pool, device)
 
-    # 测量保存文件的输出std
-    if best_path is not None:
-        print("\n[输出std验证]")
-        model.eval()
-        with torch.no_grad():
-            test_input = torch.randn(10000, ModelConfig.INPUT_DIM, device=device)
-            ckpt = torch.load(best_path, map_location=device, weights_only=True)
-            tmp = KLineEmbedding(ModelConfig.INPUT_DIM, ModelConfig.D_MODEL).to(device)
-            tmp.embed_proj.weight.data.copy_(ckpt['embed_proj_weight'])
-            tmp.embed_mlp[0].weight.data.copy_(ckpt['embed_mlp_0_weight'])
-            tmp.embed_mlp[2].weight.data.copy_(ckpt['embed_mlp_2_weight'])
-            z = tmp(test_input)
-            print(f"  {os.path.basename(best_path)}: 输出std = {z.std().item():.4f}")
-
-    print(f"\n预训练完成！最佳 Loss={best_loss:.4f} (第{best_epoch}轮)")
+    print(f"\n预训练完成！最后一轮 Loss={avg_loss:.4f} (第{epochs}轮)")
     print(f"权重保存位置: {output_dir}")
 
     return model.embedding
@@ -512,6 +533,10 @@ def main():
                         help=f'SIGReg损失权重λ (默认 {EmbeddingConfig.SIGREG_WEIGHT})')
     parser.add_argument('--output-dir', type=str, default=None,
                         help=f'输出目录')
+    parser.add_argument('--test', action='store_true',
+                        help='只测试已保存 embedding 权重的输出std，不训练')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help=f'--test 模式加载的权重文件 (默认 <output-dir>/best_embedding.pth)')
 
     args = parser.parse_args()
 
@@ -537,6 +562,15 @@ def main():
     else:
         print("  归一化器不存在，先运行 python src/data.py 创建")
         sys.exit(1)
+
+    # 测试模式：只测已保存权重的输出std，跳过训练
+    if args.test:
+        ckpt_path = (args.checkpoint
+                     or os.path.join(EmbeddingConfig.OUTPUT_DIR, 'best_embedding.pth'))
+        print(f"\n[测试模式] 测量已训练 embedding 的输出std")
+        kline_pool = collect_kline_data(train_stock_info, feature_normalizer)
+        measure_embedding_std(ckpt_path, kline_pool, device)
+        return
 
     # 预训练
     print("\n[步骤3] 开始 Embedding 预训练...")

@@ -21,7 +21,6 @@ from multiprocessing import Pool, cpu_count
 from sklearn.preprocessing import QuantileTransformer, StandardScaler
 from typing import Dict, List, Tuple
 
-
 class FeatureNormalizer:
     """
     特征归一化器 - 两阶段归一化
@@ -58,7 +57,7 @@ class FeatureNormalizer:
 
         # 特征组定义：(名称, 列切片)
         self._feature_groups = [
-            ('ohl',     slice(0, 4)),
+            ('ohlc',    slice(0, 4)),
             ('vwap',    slice(4, 5)),
             ('amount',  slice(5, 6)),
             ('exchange',slice(6, 7)),
@@ -321,7 +320,6 @@ class FeatureNormalizer:
 
         return normalizer
 
-
 def process_single_file(args):
     stock_code, data, times, train_start_date, train_end_date, val_start_date, val_end_date, test_start_date = args
     """
@@ -408,7 +406,6 @@ def process_single_file(args):
     except Exception as e:
         print(f"处理股票 {stock_code} 时出错: {e}")
         return None
-
 
 def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
                              train_start_date=DataConfig.TRAIN_START_DATE,
@@ -696,8 +693,6 @@ class TemporalSampler:
         total_loops = sum(self.loop_counts)
         return looped_stocks_count, total_loops
 
-
-
 def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
                                      start_key='test_split_point', end_key=None):
     """
@@ -791,7 +786,6 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
             eval_returns_array, np.asarray(eval_day_indices),
             eval_daily_returns)
 
-
 def create_recent_days_dataset(test_stock_info, feature_normalizer=None, max_days=15):
     """
     创建最近几天的数据集（向量化批处理版，包含临时样本，用于展示）
@@ -869,7 +863,6 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None, max_day
             np.concatenate(recent_cumulative_returns),
             np.asarray(recent_day_indices),
             np.concatenate(recent_available_days))
-
 
 def normalize_and_validate_context_window(stock_data, start_idx, context_length,
                                           check_limit_up=True, required_length=None,
@@ -1322,8 +1315,6 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
 
     return input_seqs, targets, returns_arr, keys, available_days, daily_returns_list
 
-
-
 def fit_feature_normalizer(output_path=None):
     """
     在训练集上拟合特征归一化器并保存到文件
@@ -1361,7 +1352,6 @@ def fit_feature_normalizer(output_path=None):
     normalizer.save(output_path)
 
     return normalizer
-
 
 def precompute_training_pool(train_stock_info, feature_normalizer=None):
     """
@@ -1438,7 +1428,6 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None):
           f"耗时 {elapsed:.1f}s，占用 {mem_mb:.0f}MB")
 
     return all_inputs, all_targets, all_returns, pos_indices, neg_indices, sample_key_to_pool_idx
-
 
 def sample_temporal_from_pool(sampler, train_stock_info,
                               all_inputs, all_targets, all_returns,
@@ -1549,7 +1538,6 @@ def sample_temporal_from_pool(sampler, train_stock_info,
     batch_idx = np.array(all_batch_indices)
     return all_inputs[batch_idx], np.asarray(all_batch_targets), all_returns[batch_idx]
 
-
 def sample_from_pool(all_inputs, all_targets, all_returns,
                      pos_indices, neg_indices,
                      batch_size, batches_per_epoch, rng):
@@ -1609,7 +1597,6 @@ def sample_from_pool(all_inputs, all_targets, all_returns,
         epoch_returns[offset:offset + batch_size] = all_returns[batch_idx]
 
     return epoch_inputs, epoch_targets, epoch_returns
-
 
 def main():
     """数据处理模块 兼 拟合特征归一化器训练脚本"""

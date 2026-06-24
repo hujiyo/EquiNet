@@ -82,18 +82,16 @@ def _print_forward_flow(model, eval_inputs, device):
     print("─" * 72)
 
     with torch.no_grad():
-        # Embedding
+        # Embedding (与 model.py 一致: proj → mlp, 无残差)
         x = model.embed_proj(batch)
         proj = _std(x)
-        mlp_out = model.embed_mlp(x)
-        mlp = _std(mlp_out)
-        x = x + mlp_out
-        after_mlp = _std(x)
+        x = model.embed_mlp(x)
+        mlp = _std(x)
         x = model.pos_encoding(x)
         after_pos = _std(x)
         x = model.dropout(x)
 
-        print(f"  proj {_s2(proj)}  mlp分支 {_s2(mlp)}  +残差 {_s2(after_mlp)}  +pos {_s2(after_pos)}")
+        print(f"  proj {_s2(proj)}  mlp输出 {_s2(mlp)}  +pos {_s2(after_pos)}")
 
         # Transformer layers (Post-Norm: sublayer → +residual → norm)
         # Post-Norm 每层输出经 LayerNorm，std 恒≈1，无诊断价值
@@ -140,8 +138,10 @@ def _print_weight_stats(model, num_layers):
     print("\n权重 std")
     print("─" * 45)
     print(f"  embed_proj        {_s2(model.embed_proj.weight.std().item())}")
+    print(f"  embed_mlp[0]      {_s2(model.embed_mlp[0].weight.std().item())}")
+    print(f"  embed_mlp[2]      {_s2(model.embed_mlp[2].weight.std().item())}")
     for i, layer in enumerate(model.layers):
-        mha = layer.attn.attention
+        mha = layer.attn
         if hasattr(mha, 'in_proj_weight') and mha.in_proj_weight is not None:
             print(f"  L{i+1}.in_proj      {_s2(mha.in_proj_weight.std().item())}")
         if hasattr(mha, 'out_proj') and mha.out_proj.weight is not None:

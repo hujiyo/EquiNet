@@ -110,7 +110,7 @@ def _compute_auc_and_loss(model, eval_inputs, eval_targets, device, criterion=No
 
 
 def _mask_layer_all_heads(layer, nhead, head_dim):
-    mha = layer.attn.attention
+    mha = layer.attn
     for h in range(nhead):
         _mask_mha_head(mha, h, head_dim)
 
@@ -320,7 +320,7 @@ def main():
         for head_idx in range(nhead):
             desc = f"L{layer_idx + 1}.H{head_idx + 1}"
             model.load_state_dict(copy.deepcopy(original_state_dict))
-            _mask_mha_head(model.layers[layer_idx].attn.attention, head_idx, head_dim)
+            _mask_mha_head(model.layers[layer_idx].attn, head_idx, head_dim)
 
             masked_auc, masked_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion)
             auc_change = masked_auc - baseline_auc

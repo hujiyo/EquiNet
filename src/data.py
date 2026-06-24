@@ -229,15 +229,17 @@ class FeatureNormalizer:
 
         return normalized
 
-    def transform_batch(self, input_seqs: np.ndarray) -> np.ndarray:
+    def transform_batch(self, input_seqs: np.ndarray, chunk_size: int = 100000) -> np.ndarray:
         """
         批量归一化多个样本（比逐个调用transform高效10-100倍）
 
-        内部将所有样本的特征展平后一次性送入sklearn pipeline，
-        避免了逐样本调用时的重复开销（输入验证、维度检查等）。
+        内部将所有样本的特征展平后送入sklearn pipeline。为避免大评估集（如 run.py
+        的 --begin 多年回测，样本数可达数百万）一次性展平导致内存爆炸（QuantileTransformer
+        内部 np.interp 会再分配等大数组），按 chunk_size 分块处理，峰值内存仅与单块大小相关。
 
         Args:
             input_seqs: [batch_size, context_length, 15] 原始输入序列
+            chunk_size: 每块处理的样本数（默认 10万，单块峰值内存约数百MB）
 
         Returns:
             [batch_size, context_length, 15] 归一化后的序列
@@ -245,14 +247,17 @@ class FeatureNormalizer:
         if not self.is_fitted:
             raise RuntimeError("归一化器未拟合！请先调用 fit() 方法")
 
-        batch_size, context_length = input_seqs.shape[0], input_seqs.shape[1]
+        total, context_length = input_seqs.shape[0], input_seqs.shape[1]
         normalized = np.empty_like(input_seqs, dtype=np.float32)
 
-        for name, col_slice in self._feature_groups:
-            orig_shape = input_seqs[:, :, col_slice].shape
-            normalized[:, :, col_slice] = self.pipelines[name].transform(
-                input_seqs[:, :, col_slice].reshape(-1, 1)
-            ).reshape(orig_shape)
+        for start in range(0, total, chunk_size):
+            end = min(start + chunk_size, total)
+            chunk = input_seqs[start:end]
+            for name, col_slice in self._feature_groups:
+                orig_shape = chunk[:, :, col_slice].shape
+                normalized[start:end, :, col_slice] = self.pipelines[name].transform(
+                    chunk[:, :, col_slice].reshape(-1, 1)
+                ).reshape(orig_shape)
 
         return normalized
 
@@ -695,7 +700,8 @@ class TemporalSampler:
         return looped_stocks_count, total_loops
 
 def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
-                                     start_key='test_split_point', end_key=None):
+                                     start_key='test_split_point', end_key=None,
+                                     start_date=None):
     """
     创建固定评估数据集（向量化批处理）
 
@@ -707,6 +713,10 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
         start_key: stock_info 中评估起始位置的键名（默认 'test_split_point'）
         end_key: stock_info 中评估结束位置的键名（默认 None，表示到数据末尾）
                  验证集传 'test_split_point' 表示验证样本截止到测试集之前
+        start_date: 可选(int YYYYMMDD)。给定后忽略 start_key/end_key，评估范围变为
+                    [start_date, 数据末尾]——即 run.py 的 --begin 全区间回测口径，
+                    不再区分训练/验证/测试集。每只股票的 split_point 取其 times 中
+                    首个 >= start_date 的索引。
 
     返回: (inputs, targets, cumulative_returns, day_indices, daily_returns)
     """
@@ -726,14 +736,30 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
 
     for stock_idx, stock_info in enumerate(test_stock_info):
         data_length = len(stock_info['data'])
-        split_point = stock_info.get(start_key, 0)
 
-        start_min = max(1, split_point)
-        if end_key is not None:
-            end_point = stock_info.get(end_key, data_length)
-            start_max = min(end_point, data_length) - required_length
-        else:
+        if start_date is not None:
+            # --begin 口径：评估区间 = [start_date, 数据末尾]，忽略 train/val/test 划分。
+            # split_point 取 begin_idx - CONTEXT_LENGTH + 1（并夹到 >=1），
+            # 使"首个预测日"恰好落在 begin 当天——模型用 begin 之前的历史做上下文，
+            # 回测从 begin 开始（而非 begin+45 天后）。--begin 无训练/测试之分，无泄漏顾虑。
+            times = stock_info.get('times')
+            if times is None:
+                continue
+            mask = np.where(np.asarray(times) >= start_date)[0]
+            if len(mask) == 0:
+                continue
+            begin_idx = int(mask[0])
+            split_point = max(1, begin_idx - context_length + 1)
+            start_min = max(1, split_point)
             start_max = data_length - required_length
+        else:
+            split_point = stock_info.get(start_key, 0)
+            start_min = max(1, split_point)
+            if end_key is not None:
+                end_point = stock_info.get(end_key, data_length)
+                start_max = min(end_point, data_length) - required_length
+            else:
+                start_max = data_length - required_length
 
         if start_max < start_min:
             continue
@@ -768,12 +794,19 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
     eval_inputs_array = np.concatenate(eval_inputs, axis=0)
     eval_targets_array = np.concatenate(eval_targets, axis=0)
     eval_returns_array = np.concatenate(eval_cumulative_returns, axis=0)
+    # 释放分块列表（其总大小与拼接后的 array 相当），降低大评估集(--begin 多年)峰值内存
+    del eval_inputs, eval_targets, eval_cumulative_returns
 
-    # 批量细处理：将所有粗处理后的样本一次性归一化
+    # 批量细处理：分块归一化（大评估集如 --begin 多年回测时避免内存爆炸）
     if feature_normalizer is not None:
         eval_inputs_array = feature_normalizer.transform_batch(eval_inputs_array)
-        # 过滤归一化后产生的NaN/Inf样本
-        finite_mask = np.all(np.isfinite(eval_inputs_array.reshape(len(eval_inputs_array), -1)), axis=1)
+        # 过滤归一化后产生的NaN/Inf样本（分块计算 finite_mask，避免 [N, ctx*feat] 整体展开占内存）
+        n_eval = len(eval_inputs_array)
+        finite_mask = np.ones(n_eval, dtype=bool)
+        feat_chunk = 100000
+        for s in range(0, n_eval, feat_chunk):
+            e = min(s + feat_chunk, n_eval)
+            finite_mask[s:e] = np.all(np.isfinite(eval_inputs_array[s:e].reshape(e - s, -1)), axis=1)
         if not np.all(finite_mask):
             removed = np.sum(~finite_mask)
             print(f"  ⚠ 归一化后{removed}个样本包含NaN/Inf，已过滤")

@@ -72,6 +72,15 @@ class DataConfig:
     # False: day1使用收盘到收盘的涨跌幅 (close[T+1]-close[T])/close[T]，包含隔夜跳空
     LABEL_DAY1_USE_OPEN = True
 
+    # ========== 极端行情过滤 ==========
+    # 市场普涨/普跌日的标签由 beta 驱动而非个股主力运作，属于噪声标签。
+    # 涨跌比（上涨家数/下跌家数）超过 EXTREME_UP_DOWN_RATIO 的日期视为极端行情日，
+    # 未来窗口落在这些日期的样本既不作正样本也不作负样本，直接剔除。
+    # 使用前需先运行 src/market_index.py 生成 out/market_index.json
+    MARKET_BREADTH_PATH = os.path.join(OUTPUT_DIR, 'market_index.json')
+    EXCLUDE_EXTREME_MARKET = True     # 是否启用极端行情过滤
+    EXTREME_UP_DOWN_RATIO = 50.0      # 涨跌比阈值（上涨家数/下跌家数 ≥ 此值视为极端）
+
     # 评估参数
     EVAL_BATCH_SIZE = 4096            # 评估批处理大小（分批处理，减少显存占用）
 

@@ -14,12 +14,13 @@ import os
 import sys
 import random
 import pickle
+import json
 import numpy as np
 import pandas as pd
 from config import DataConfig, generate_label, calculate_returns
 from multiprocessing import Pool, cpu_count
 from sklearn.preprocessing import QuantileTransformer, StandardScaler
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Optional
 
 class FeatureNormalizer:
     """
@@ -1032,7 +1033,8 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
                               compute_labels=True,
                               compute_returns=True,
                               start_min_override=None,
-                              start_max_override=None):
+                              start_max_override=None,
+                              excluded_market_dates=None):
     """
     向量化处理单只股票的所有合法窗口
 
@@ -1136,6 +1138,19 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
         safe_plc = np.where(prev_last_close != 0, prev_last_close, 1.0)
         last_ret = (last_close - prev_last_close) / safe_plc
         valid &= last_ret < limit_threshold
+
+    # 极端行情过滤：未来窗口（T+1 ~ T+future_days）落在极端日期的样本直接剔除
+    if excluded_market_dates:
+        times_arr = stock_info.get('times')
+        if times_arr is not None:
+            times_arr = np.asarray(times_arr)
+            future_offsets = np.arange(context_length, context_length + future_days)
+            future_idx = all_starts[:, None] + future_offsets[None, :]   # [N, future_days]
+            future_idx = np.clip(future_idx, 0, len(times_arr) - 1)
+            future_dates = times_arr[future_idx]                          # [N, future_days]
+            excluded_arr = np.fromiter(excluded_market_dates, dtype=times_arr.dtype)
+            extreme_mask = np.any(np.isin(future_dates, excluded_arr), axis=1)
+            valid &= ~extreme_mask
 
     if not np.any(valid):
         return None, None, None, None, None, None
@@ -1315,6 +1330,43 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
 
     return input_seqs, targets, returns_arr, keys, available_days, daily_returns_list
 
+def load_excluded_market_dates():
+    """
+    从 market_index.json 加载极端行情日期集合
+
+    涨跌比（上涨家数/下跌家数）超过 EXTREME_UP_DOWN_RATIO 的日期视为极端行情日。
+    未来窗口落在这些日期的样本标签由市场 beta 驱动，不属于主力运作信号，应剔除。
+
+    Returns:
+        set[int] 或 None: 极端日期集合（yyyymmdd），未启用或文件不存在时返回 None
+    """
+    if not DataConfig.EXCLUDE_EXTREME_MARKET:
+        return None
+
+    path = DataConfig.MARKET_BREADTH_PATH
+    if not os.path.exists(path):
+        print(f"  ⚠ 市场宽度数据不存在({path})，跳过极端行情过滤")
+        print(f"    请先运行: python src/market_index.py")
+        return None
+
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    threshold = DataConfig.EXTREME_UP_DOWN_RATIO
+    excluded = set()
+    for d in data:
+        up, down = d['up_count'], d['down_count']
+        ratio = up / down if down > 0 else float('inf')
+        if ratio >= threshold:
+            excluded.add(d['yyyymmdd'])
+
+    if excluded:
+        sorted_dates = sorted(excluded)
+        print(f"  极端行情过滤: {len(excluded)} 个交易日(涨跌比≥{threshold})")
+        print(f"    首个: {sorted_dates[0]}, 末个: {sorted_dates[-1]}")
+
+    return excluded
+
 def fit_feature_normalizer(output_path=None):
     """
     在训练集上拟合特征归一化器并保存到文件
@@ -1384,13 +1436,17 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None):
     filter_last_day = DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP
     label_day1_use_open = DataConfig.LABEL_DAY1_USE_OPEN
 
+    # 加载极端行情日期，过滤 beta 驱动的噪声标签
+    excluded_market_dates = load_excluded_market_dates()
+
     for stock_idx, stock_info in enumerate(train_stock_info):
         result = _vectorized_process_stock(
             stock_info, stock_idx,
             context_length, future_days, required_length,
             ma_window, limit_threshold, filter_last_day,
             label_day1_use_open,
-            generate_label, calculate_returns
+            generate_label, calculate_returns,
+            excluded_market_dates=excluded_market_dates,
         )
         inputs, targets, returns_arr, keys, _, _ = result
 

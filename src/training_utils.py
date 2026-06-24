@@ -570,6 +570,9 @@ def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_perc
     return {
         'threshold': threshold,
         'daily_stats': daily_stats,
+        # daily_stats 的第 i 项对应 unique_days[i]（按升序排列的预测日 day_index）
+        # 供 run.py 将每个交易日映射回日历日期、并按 --begin 过滤
+        'day_indices': unique_days.tolist(),
         'cumulative_return': cumulative_return,
         'valid_days': len(daily_returns),
         'avg_realistic_return': avg_realistic_return,

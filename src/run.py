@@ -11,7 +11,8 @@ EquiNet 模型推理与选股脚本
 - 最近几天展示：包含临时样本（available_days < 3），仅用于展示，不参与阈值计算
 '''
 
-import os, sys, torch, numpy as np, glob, re
+import os, sys, torch, numpy as np, glob, re, json, argparse
+from collections import defaultdict
 from datetime import datetime
 import matplotlib.pyplot as plt
 
@@ -20,6 +21,11 @@ from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
                   create_recent_days_dataset, normalize_and_validate_context_window)
 from training_utils import evaluate_model, DynamicWeightedBCE, _get_amp_context
+
+
+# 每日统计 JSON 与可视化输出目录（项目根 /out_run，已被 .gitignore 的 out*/ 覆盖）
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_RUN_DIR = os.path.join(_PROJECT_ROOT, 'out_run')
 
 
 # ==================== 工具函数 ====================
@@ -257,6 +263,142 @@ def score_all_stocks(model, stock_list, device, feature_normalizer=None):
     return results, skipped
 
 
+# ==================== 每日统计：日期映射 / 导出 ====================
+
+def build_day_to_date_map(test_stock_info, start_date=None):
+    """
+    构建 day_index -> 交易日历日期(int YYYYMMDD) 的映射。
+
+    关键：split_point 必须与 create_fixed_evaluation_dataset 完全一致，否则日期会错位。
+        - start_date 给定时(--begin 口径)：split_point = max(1, begin_idx - CONTEXT_LENGTH + 1)，
+          使首个预测日落在 begin 当天
+        - 否则(默认测试集口径)：split_point = test_split_point
+
+    推导：
+        eval_day_index = start_idx + CONTEXT_LENGTH - split_point
+        上下文最后一天（预测日）的绝对索引 = start_idx + CONTEXT_LENGTH - 1
+            = day_index + split_point - 1
+        该日日期 = stock_info['times'][day_index + split_point - 1]
+
+    所有股票共享同一交易日历，理论上同一 day_index 对应同一日期；
+    但停牌/数据缺失会让个别股票错位，故对每个 day_index 采用"多数投票"
+    取出现次数最多的日期，保证鲁棒。
+    """
+    context_length = DataConfig.CONTEXT_LENGTH
+    votes = defaultdict(lambda: defaultdict(int))  # day_index -> {date: 票数}
+
+    for stock_info in test_stock_info:
+        times = stock_info.get('times')
+        if times is None:
+            continue
+        times = np.asarray(times)
+        if len(times) == 0:
+            continue
+
+        if start_date is not None:
+            # 与 create_fixed_evaluation_dataset 完全一致：首个预测日落在 begin 当天
+            mask = np.where(times >= start_date)[0]
+            if len(mask) == 0:
+                continue
+            begin_idx = int(mask[0])
+            sp = max(1, begin_idx - context_length + 1)
+        else:
+            sp = int(stock_info.get('test_split_point', 0))
+
+        first_abs = sp + context_length - 1          # 最早的预测日绝对索引
+        if first_abs < 0 or first_abs >= len(times):
+            continue
+        abs_indices = np.arange(first_abs, len(times))
+        day_indices = (abs_indices - sp + 1).astype(np.int64)
+        dates = times[abs_indices].astype(np.int64)
+        for di, dt in zip(day_indices.tolist(), dates.tolist()):
+            votes[di][dt] += 1
+
+    # 多数投票；票数并列时取日期较小者（更早的交易日），保证结果确定、不依赖股票遍历顺序
+    return {di: max(counter.items(), key=lambda x: (x[1], -x[0]))[0]
+            for di, counter in votes.items()}
+
+
+def _format_date(yyyymmdd):
+    """20260602 -> '2026-06-02'；无法解析时原样返回字符串。"""
+    try:
+        s = str(int(yyyymmdd))
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    except (ValueError, TypeError):
+        return str(yyyymmdd)
+
+
+def _json_default(o):
+    """json.dump 的 default 钩子：把 numpy 标量/数组转成原生 Python 类型，
+    避免 'Object of type float32 is not JSON serializable'（meta 里的
+    avg_realistic_return / cumulative_return 等可能是 np.float32/float64）。"""
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+
+def build_daily_kept(realistic_stats, day_to_date):
+    """
+    将 realistic_stats 的每日统计对齐到日历日期，产出展示/导出用列表。
+
+    - 区间已在 create_fixed_evaluation_dataset(start_date=...) 处确定（--begin 时为
+      [begin, 最新]，默认为测试集区间），此处不再做日期过滤；
+    - 丢弃 count==0（无股票过阈值）的日子——这些日子没有真实交易，
+      不应计入"赚钱效应"收益序列；
+    - 返回 [(date_int, count, return), ...]，按 day_index 升序（即日期升序）。
+    """
+    daily_stats = realistic_stats['daily_stats']
+    day_indices = realistic_stats.get('day_indices')
+    if day_indices is None:
+        day_indices = list(range(len(daily_stats)))
+
+    kept = []
+    for (count, ret), di in zip(daily_stats, day_indices):
+        if count <= 0:
+            continue
+        date = day_to_date.get(int(di))
+        if date is None:
+            continue
+        kept.append((int(date), int(count), float(ret)))
+    return kept
+
+
+def write_daily_json(kept, meta, out_dir=OUT_RUN_DIR):
+    """
+    将过滤后的每日统计写入 out_run/ 下的 JSON。
+
+    JSON 结构（自设计）：
+        {
+          "meta": { 模型名、起止日期、阈值、平均/累计收益、生成时间, ... },
+          "daily": [ {"date": "2026-01-06", "yyyymmdd": 20260106,
+                      "return_pct": 0.9, "count": 4}, ... ]
+        }
+    每条 daily 记录即"每日统计"中的第二位数（当日收益率%），并附带年月日。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    daily = [
+        {
+            "date": _format_date(d),
+            "yyyymmdd": d,
+            "return_pct": round(float(r) * 100, 4),
+            "count": int(c),
+        }
+        for (d, c, r) in kept
+    ]
+    payload = {"meta": meta, "daily": daily}
+
+    fname = f"daily_stats_{meta.get('generated_tag', 'run')}.json"
+    path = os.path.join(out_dir, fname)
+    with open(path, 'w', encoding='utf-8') as f:
+        # default=_json_default 兜底 meta 中可能残留的 numpy 标量
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
+    return path
+
+
 # ==================== 界面函数 ====================
 
 def print_banner():
@@ -387,19 +529,25 @@ def select_model(models):
             print(f"  ✗ 无效输入，请输入数字")
 
 
-def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
+def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
+                   begin_date=None):
     """
     执行模型评估（与 train.py 中对模型A的评估完全一致）
     返回评估统计字典
 
     Args:
         feature_normalizer: 可选的特征归一化器实例
+        begin_date: 可选，每日统计的起始测评日期(int YYYYMMDD)。
+                    仅展示/导出 预测日 >= begin_date 的交易日，不影响阈值计算。
     """
     print(f"正在创建评估数据集...")
+    if begin_date is not None:
+        print(f"- 评估区间: --begin {_format_date(begin_date)} ~ 最新（忽略训练/验证/测试集划分）")
 
+    # --begin 给定时，评估区间变为 [begin, 最新]；否则为默认测试集区间
     eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = \
-        create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
-    
+        create_fixed_evaluation_dataset(test_stock_info, feature_normalizer, start_date=begin_date)
+
     print(f"- 评估样本数: {len(eval_inputs)}")
     print(f"正在评估模型...")
 
@@ -432,7 +580,15 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
         enable_portfolio_simulation=True
     )
     test_loss = stats['test_loss']
-    
+
+    # ========== 每日统计：对齐日历日期（供展示与 out_run/ JSON 导出）==========
+    # split_point 口径必须与上面 create_fixed_evaluation_dataset 一致（start_date=begin_date）
+    day_to_date = build_day_to_date_map(test_stock_info, start_date=begin_date)
+    daily_kept = []  # [(date, count, return), ...] 有效交易日(count>0)
+    if stats.get('realistic_stats') is not None:
+        daily_kept = build_daily_kept(stats['realistic_stats'], day_to_date)
+    stats['daily_kept'] = daily_kept  # 供 main() 写入 out_run/ JSON
+
     # 打印评估结果（与 train.py 格式一致）
     print()
     print(f"┌── 评估结果 ──────────────────────────────────┐")
@@ -458,12 +614,25 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
     # 实战收益率
     if stats['realistic_stats'] is not None:
         rs = stats['realistic_stats']
-        daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in rs['daily_stats']])
+        ds = rs['daily_stats']
         mode_str = f"每日Top{DataConfig.TOP_N_PER_DAY}" if rs.get('mode') == 'top_n_per_day' else \
                    f"全局阈值,每日上限{DataConfig.MAX_SELECT_PER_DAY},最大持仓{DataConfig.MAX_HOLDINGS}" if DataConfig.MAX_SELECT_PER_DAY > 0 else \
                    "全局阈值,不限数量"
         print(f"│  【实战收益率({mode_str})】")
-        print(f"│  每日统计: {{{daily_stats_str}}}")
+        if daily_kept:
+            print(f"│  交易区间: {_format_date(daily_kept[0][0])} ~ {_format_date(daily_kept[-1][0])}"
+                  f"（{len(daily_kept)}个有效交易日）")
+        if begin_date is not None:
+            print(f"│  --begin 起始测评日期: {_format_date(begin_date)}（全区间回测，不分训练/验证/测试集）")
+        # 内联展示：区间短则全量；区间长(--begin 多年)则只显示首尾，完整数据见 out_run/ JSON
+        if len(ds) <= 60:
+            daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in ds])
+            print(f"│  每日统计: {{{daily_stats_str}}}")
+        else:
+            head = ', '.join([f'({c},{r*100:.1f}%)' for c, r in ds[:8]])
+            tail = ', '.join([f'({c},{r*100:.1f}%)' for c, r in ds[-4:]])
+            print(f"│  每日统计: {{{head}, ... 共{len(ds)}天 ..., {tail}}}")
+            print(f"│            （区间较长，完整逐日数据见 out_run/ JSON）")
         print(f"│  平均实战收益率: {rs['avg_realistic_return']*100:.1f}%")
         print(f"│")
     
@@ -480,11 +649,21 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None):
             dt = ps['daily_trades']
             print(f"│")
             print(f"│  *** 逐日交易明细（共{len(dt)}天） ***")
-            for d in dt:
+            # 区间短则全量；区间长(--begin 多年)则只显示首10+末5，避免刷屏
+            if len(dt) <= 40:
+                show_idx = list(range(len(dt)))
+            else:
+                show_idx = list(range(10)) + list(range(len(dt) - 5, len(dt)))
+            last_shown = -1
+            for i in show_idx:
+                if last_shown >= 0 and i > last_shown + 1:
+                    print(f"│  ... （省略 {i - last_shown - 1} 天） ...")
+                d = dt[i]
                 cash_pct = d['cash_ratio'] * 100
                 pv = d['portfolio_value']
-                print(f"│  Day{d['day']:>3}: 买{d['buys']} 卖{d['open_sells']+d['close_sells']} "
+                print(f"│  Day{d['day']:>4}: 买{d['buys']} 卖{d['open_sells']+d['close_sells']} "
                       f"资金={pv:.4f} (现金{cash_pct:.0f}%)")
+                last_shown = i
             print(f"│")
     
     print(f"└───────────────────────────────────────────────┘")
@@ -796,8 +975,23 @@ def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4,
 # ==================== 主函数 ====================
 
 def main():
+    # ===== 命令行参数 =====
+    parser = argparse.ArgumentParser(description='EquiNet 模型推理与选股')
+    parser.add_argument('--begin', type=str, default=None, metavar='YYYYMMDD',
+                        help='每日统计的起始测评日期(如 20260301)：仅展示并导出 该日及之后的'
+                             '交易日，不影响选股阈值计算。')
+    args = parser.parse_args()
+
+    begin_date = None
+    if args.begin:
+        raw = re.sub(r'\D', '', args.begin)  # 容错：容忍 2026-03-01 / 2026/03/01 等写法
+        if len(raw) != 8:
+            print(f"  ✗ --begin 需要 8 位日期 YYYYMMDD，收到: {args.begin}")
+            sys.exit(1)
+        begin_date = int(raw)
+
     print_banner()
-    
+
     # 获取设备
     device = DeviceConfig.get_device()
     if device.type == "cuda":
@@ -856,8 +1050,35 @@ def main():
     train_stock_info, val_stock_info, test_stock_info = load_and_preprocess_data()
 
     # 运行评估
-    stats = run_evaluation(model, test_stock_info, device, feature_normalizer)
+    stats = run_evaluation(model, test_stock_info, device, feature_normalizer,
+                           begin_date=begin_date)
     threshold = stats['top_threshold']
+
+    # 导出每日统计 JSON 到 out_run/（功能2）
+    daily_kept = stats.get('daily_kept') or []
+    if daily_kept and stats.get('realistic_stats') is not None:
+        rs = stats['realistic_stats']
+        now = datetime.now()
+        meta = {
+            'model': selected_file,
+            'mode': rs.get('mode'),
+            'threshold': float(threshold),
+            'max_select_per_day': DataConfig.MAX_SELECT_PER_DAY,
+            'top_n_per_day': DataConfig.TOP_N_PER_DAY,
+            'begin_date': _format_date(begin_date) if begin_date else None,
+            'start_date': _format_date(daily_kept[0][0]),
+            'end_date': _format_date(daily_kept[-1][0]),
+            'total_days': len(daily_kept),
+            'avg_return_pct': round(rs['avg_realistic_return'] * 100, 4),
+            'cumulative_return_pct': round(rs['cumulative_return'] * 100, 4),
+            'generated_at': now.strftime('%Y-%m-%d %H:%M:%S'),
+            'generated_tag': now.strftime('%Y%m%d_%H%M%S'),
+        }
+        json_path = write_daily_json(daily_kept, meta)
+        print(f"\n  📄 每日统计已导出: {json_path}")
+        print(f"     可视化: python src/visualize_daily.py \"{json_path}\"")
+    else:
+        print(f"\n  （无可导出的每日统计数据）")
 
     visualize_classification(
         preds=stats['all_preds'],

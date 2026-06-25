@@ -23,10 +23,15 @@ EquiNet/
 │   ├── select.py              # 股票筛选（全量池 → 训练池）
 │   └── features.py            # 衍生特征计算
 ├── src/
-│   ├── train.py               # 主训练脚本
-│   ├── run.py                 # 推理/选股脚本
-│   ├── training_utils.py      # 训练工具模块
 │   ├── config.py              # 统一配置文件
+│   ├── data.py                # 数据加载 / 样本生成 / 特征归一化 / 极端行情过滤
+│   ├── model.py               # 模型架构（Post-Norm Transformer）
+│   ├── train.py               # 主训练脚本
+│   ├── training_utils.py      # 训练 / 评估工具模块
+│   ├── run.py                 # 推理 / 选股 / 全区间回测脚本
+│   ├── pretrain_embedding.py  # Embedding 预训练（SIGReg 几何正则）
+│   ├── embedding_evaluator.py # Embedding 质量评估
+│   ├── market_index.py        # 市场宽度计算（极端行情过滤的数据源）
 │   └── ...                    # 其他模块
 ├── data_maintenance.py        # 数据维护工具入口
 ├── LICENSE                    # Apache-2.0许可证
@@ -74,14 +79,49 @@ python data_maintenance.py
 ```bash
 # 首次使用（从零开始）
 python data_maintenance.py       # 选项1: 全量更新 → 选项2: 筛选 → 选项4: 计算特征
+python src/market_index.py       # 生成 out/market_index.json（极端行情过滤的数据源）
 
 # 日常维护
 python data_maintenance.py       # 选项1: 增量更新 → 选项3: 检查质量
+python src/market_index.py       # 行情更新后重新生成市场宽度数据
 
 # 训练 & 推理
 python src/train.py
 python src/run.py
 ```
+
+## 极端行情过滤
+
+市场普涨/普跌日的标签由 beta 驱动而非个股主力运作，混入训练会稀释信号。项目据此剔除噪声标签：
+
+1. 先用 `market_index.py` 统计每个交易日的全市场涨跌家数，输出 `out/market_index.json`：
+   ```bash
+   python src/market_index.py                 # 默认数据库
+   python src/market_index.py --start 20200101 --end 20261231
+   python src/market_index.py --open          # 生成后浏览器打开市场指数看板
+   ```
+2. 训练时 `data.py` 读取该文件，将未来窗口落在「涨跌比 ≥ 阈值」日期的样本整体剔除（既不作正样本也不作负样本）。
+
+阈值与开关在 `config.py` 中配置：`EXCLUDE_EXTREME_MARKET`（总开关）、`EXTREME_UP_DOWN_RATIO`（涨跌比阈值，默认 50.0）。**未生成 `market_index.json` 时自动跳过过滤并打印提示，不影响训练**。
+
+## 推理与全区间回测
+
+```bash
+python src/run.py                             # 默认：测试集区间评估 + 选股
+python src/run.py --begin 20230101            # 全区间回测：从 2023-01-01 评估到最新
+python src/run.py --begin 2023-03-01          # 容错：2023-03-01 / 2023/03/01 等写法均可
+```
+
+`--begin` 指定后评估区间变为 `[begin, 最新]`，忽略训练/验证/测试集划分——模型用 begin 之前的历史做上下文，首个预测日恰好落在 begin 当天（无数据泄漏）。区间过长时终端只显示首尾，完整逐日统计导出到 `out_run/daily_stats_<时间戳>.json`。
+
+### 每日统计可视化
+
+```bash
+python src/visualize_daily.py                 # 自动取 out_run/ 下最新的 daily_stats_*.json
+python src/visualize_daily.py out_run/xxx.json --open   # 指定文件并浏览器打开
+```
+
+读取每日统计 JSON 生成 HTML 看板，直观展示回测期间每个交易日的选股数量与收益率。
 
 ## 模型文件名格式说明示例
 
@@ -118,7 +158,11 @@ ep29 - 第29轮
    conda env create -f environment.yaml && conda activate equinet
    ```
 2. **数据获取**（详见上方「数据管理」）
-3. **训练 & 选股**
+3. **生成市场宽度数据**（供极端行情过滤；不生成也可训练，会自动跳过）
+   ```bash
+   python src/market_index.py
+   ```
+4. **训练 & 选股**
    ```bash
    python src/train.py
    python src/run.py
@@ -145,7 +189,8 @@ python src/visualize_attention.py
 
 ## 项目修改LOG
 
-- 2026.6:重构embedding预训练脚本;对齐 Qwen3.5 主流训练实践;重构数据维护工具
+- 2026.6.24:新增极端行情过滤（剔除市场普涨普跌日的噪声标签）与市场宽度工具；评估集支持 `--begin` 全区间回测；新增每日统计导出与 HTML 看板
+- 2026.6:重构 MultiHeadAttention 为手写实现（LLaMA2 风格 per-head Q/K RMSNorm）；全栈对齐 Qwen3.5 使用 Zero-Centered RMSNorm；data.py 样本生成收敛至向量化批处理；重构 FFN-Embedding 结构与 embedding 预训练脚本；重构数据维护工具
 - 2026.6.3:修正SIGReg的使用实现
 - 2026.5:新增信号流诊断和注意力机制诊断脚本;修复SwiGLU的非主流实现;修复embedding预训脚本的warmup学习率错位;重构训练参数初始化策略;新增交互式注意力可视化工具;新增MC dropout推理机制
 - 2026.5.29:模型采用Post-Norm架构

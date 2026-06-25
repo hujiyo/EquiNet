@@ -110,7 +110,7 @@ class EmbeddingModule(nn.Module):
         """
         Args:
             x: 粗处理后的数据 [batch, seq_len, 15]
-               范围：OHLC [-0.1, 0.1], VWAP [-0.1, 0.1], Amount 相对MA变化率, Exchange 相对MA变化率
+               范围：open_rel/close_rel/vwap [-0.1, 0.1], high_rel/low_rel 日内振幅（不clip）, Amount 相对MA变化率, Exchange 相对MA变化率
 
         Returns:
             embedded: [batch, seq_len, d_model]
@@ -200,7 +200,7 @@ class EmbeddingModuleAnalyzer:
             'desc': '长下影线'
         },
         'high_ex_limit': {
-            'values': [0.02, 0.10, 0.01, 0.10, -0.02, 0.90, 0.15, 0.04, 0.03, 0.02, 0.01, 0.008, 0.004, -0.01, -0.01],
+            'values': [0.02, 0.10, 0.0, 0.10, -0.02, 0.90, 0.15, 0.04, 0.03, 0.02, 0.01, 0.008, 0.004, -0.01, -0.01],
             'desc': '高换手涨停'
         }
     }

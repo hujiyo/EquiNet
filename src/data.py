@@ -57,8 +57,14 @@ class FeatureNormalizer:
         self.random_state = random_state
 
         # 特征组定义：(名称, 列切片)
+        # OHLC 拆成 4 个单列组：open/close 相对昨收（对称、小幅），
+        # high（单边≥0，日内冲高）、low（单边≤0，日内下探）分布差异巨大，
+        # 各自独立拟合分位数映射，避免互相污染。
         self._feature_groups = [
-            ('ohlc',    slice(0, 4)),
+            ('open',    slice(0, 1)),
+            ('high',    slice(1, 2)),
+            ('low',     slice(2, 3)),
+            ('close',   slice(3, 4)),
             ('vwap',    slice(4, 5)),
             ('amount',  slice(5, 6)),
             ('exchange',slice(6, 7)),
@@ -910,8 +916,8 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
 
     数据处理分两阶段：
         - 粗处理：CSV → 归一化格式
-            - OHLC: 日环比变化率，clip [-0.1, 0.1]
-            - VWAP: 日环比变化率，clip [-0.1, 0.1]（价格类特征）
+            - OHLC: open_rel/close_rel 相对前日收盘价（clip [-0.1,0.1]）；high_rel/low_rel 相对当日 open 的日内振幅（不 clip，恒 high≥0/low≤0）
+            - VWAP: 相对当日收盘价偏离，clip [-0.1, 0.1]（价格类特征）
             - Amount: (amount_i - MA_N) / MA_N，MA_N 为过去 N 日均量，无 clip
             - Exchange: (exchange_i - MA_N) / MA_N，MA_N 为过去 N 日均换手率，无 clip
         - 细处理：归一化 → 标准化数据（均值≈0，方差≈1）
@@ -927,7 +933,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
 
     Returns:
         input_seq: [context_length, 15] 归一化后的输入序列，或 None（如果验证失败）
-            - 粗处理后：OHLC/VWAP: [-0.1, 0.1], Volume: 相对N日均值变化率, Exchange: 相对N日均值变化率
+            - 粗处理后：open_rel/close_rel/vwap: [-0.1, 0.1], high_rel/low_rel: 日内振幅无 clip, Volume: 相对N日均值变化率, Exchange: 相对N日均值变化率
             - 细处理后：均值≈0，方差≈1
 
     验证项：
@@ -992,10 +998,26 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
 
     input_seq = np.empty((context_length, 15), dtype=np.float32)
 
-    # OHLC: 日环比变化率
-    input_seq[0, :4] = (input_seq_raw[0, :4] - prev_close) / prev_close
+    # OHLC 编码：
+    #   open_rel(列0) / close_rel(列3): 相对前一日收盘价的位置，反映隔夜跳空与当日涨跌
+    #   high_rel(列1) / low_rel(列2): 相对当日 open 的日内振幅，反映上/下影线强度
+    #     high ≥ open → high_rel 恒 ≥ 0；low ≤ open → low_rel 恒 ≤ 0
+    # 这样 candlestick 形态（实体/影线）不再淹没在"相对昨收偏离"里，横盘日也不再四列同时≈0。
+    opens = input_seq_raw[:, 0]
+
+    # open_rel / close_rel：idx0 相对 prev_close，idx1+ 相对前日收盘价
+    input_seq[0, 0] = (input_seq_raw[0, 0] - prev_close) / prev_close
+    input_seq[0, 3] = (input_seq_raw[0, 3] - prev_close) / prev_close
     if context_length > 1:
-        input_seq[1:, :4] = (input_seq_raw[1:, :4] - closes[:-1, np.newaxis]) / closes[:-1, np.newaxis]
+        prev_closes = closes[:-1]
+        safe_pc = np.where(prev_closes != 0, prev_closes, 1.0)
+        input_seq[1:, 0] = (input_seq_raw[1:, 0] - prev_closes) / safe_pc
+        input_seq[1:, 3] = (input_seq_raw[1:, 3] - prev_closes) / safe_pc
+
+    # high_rel / low_rel：相对当日 open，所有行统一公式（不 clip，保留极端日影线信号）
+    safe_opens = np.where(opens != 0, opens, 1.0)
+    input_seq[:, 1] = (input_seq_raw[:, 1] - opens) / safe_opens
+    input_seq[:, 2] = (input_seq_raw[:, 2] - opens) / safe_opens
 
     # VWAP: 相对当日收盘价的偏离（捕捉盘中均价与收盘价的关系）
     # > 0: 均价高于收盘 → 盘中强势但尾盘回落（抛压）
@@ -1005,7 +1027,11 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     N = DataConfig.MA_WINDOW
     exchanges = input_seq_raw[:, 6]
 
-    np.clip(input_seq[:, :5], -0.1, 0.1, out=input_seq[:, :5])
+    # 只 clip 价格相对偏离类：open_rel(列0)/close_rel(列3)/vwap(列4) 仍在 ±0.1（涨跌停尺度）
+    # high_rel(列1)/low_rel(列2) 为日内振幅，极端日会远超 ±0.1，保留原值交由 normalizer 压缩
+    np.clip(input_seq[:, 0], -0.1, 0.1, out=input_seq[:, 0])
+    np.clip(input_seq[:, 3], -0.1, 0.1, out=input_seq[:, 3])
+    np.clip(input_seq[:, 4], -0.1, 0.1, out=input_seq[:, 4])
 
     abs_indices = start_idx + np.arange(context_length)
 
@@ -1196,20 +1222,34 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
     input_seqs = np.empty((Nv, C, 15), dtype=np.float32)
 
     closes_w = raw_w[:, :, 3]
+    opens_w = raw_w[:, :, 0]
     prev_close = prev_d[:, 3:4]
     safe_prev_close = np.where(prev_close != 0, prev_close, 1.0)
-    input_seqs[:, 0, :4] = (raw_w[:, 0, :4] - prev_close) / safe_prev_close
+
+    # OHLC 编码：
+    #   open_rel(列0)/close_rel(列3): 相对前一日收盘价
+    #   high_rel(列1)/low_rel(列2): 相对当日 open（恒 ≥0 / 恒 ≤0）
+    input_seqs[:, 0, 0] = (raw_w[:, 0, 0] - prev_close[:, 0]) / safe_prev_close[:, 0]
+    input_seqs[:, 0, 3] = (raw_w[:, 0, 3] - prev_close[:, 0]) / safe_prev_close[:, 0]
 
     if C > 1:
         closes_prev = closes_w[:, :-1]
-        safe_cp = np.where(closes_prev != 0, closes_prev, 1.0)[:, :, np.newaxis]
-        input_seqs[:, 1:, :4] = (raw_w[:, 1:, :4] - closes_prev[:, :, np.newaxis]) / safe_cp
+        safe_cp = np.where(closes_prev != 0, closes_prev, 1.0)
+        input_seqs[:, 1:, 0] = (raw_w[:, 1:, 0] - closes_prev) / safe_cp
+        input_seqs[:, 1:, 3] = (raw_w[:, 1:, 3] - closes_prev) / safe_cp
+
+    safe_opens = np.where(opens_w != 0, opens_w, 1.0)
+    input_seqs[:, :, 1] = (raw_w[:, :, 1] - opens_w) / safe_opens
+    input_seqs[:, :, 2] = (raw_w[:, :, 2] - opens_w) / safe_opens
 
     vwaps_w = raw_w[:, :, 4]
     safe_closes_w = np.where(closes_w != 0, closes_w, 1.0)
     input_seqs[:, :, 4] = (vwaps_w - closes_w) / safe_closes_w
 
-    np.clip(input_seqs[:, :, :5], -0.1, 0.1, out=input_seqs[:, :, :5])
+    # 只 clip 价格相对偏离类：open_rel(列0)/close_rel(列3)/vwap(列4) ±0.1；high/low 日内振幅不 clip
+    np.clip(input_seqs[:, :, 0], -0.1, 0.1, out=input_seqs[:, :, 0])
+    np.clip(input_seqs[:, :, 3], -0.1, 0.1, out=input_seqs[:, :, 3])
+    np.clip(input_seqs[:, :, 4], -0.1, 0.1, out=input_seqs[:, :, 4])
 
     abs_idx = vs[:, None] + offsets[None, :]
 

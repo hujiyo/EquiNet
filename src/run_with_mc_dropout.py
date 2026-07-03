@@ -84,7 +84,7 @@ def mc_dropout_evaluate(model, eval_inputs, eval_targets, eval_cumulative_return
                         device, model_name="MC-Dropout模型",
                         eval_day_indices=None, eval_daily_returns=None,
                         criterion=None, enable_portfolio_simulation=False,
-                        num_samples=MC_SAMPLES):
+                        num_samples=MC_SAMPLES, tradeable_mask=None):
     """
     使用 MC Dropout 预测后，复用 evaluate_model 的指标计算逻辑。
 
@@ -108,6 +108,7 @@ def mc_dropout_evaluate(model, eval_inputs, eval_targets, eval_cumulative_return
     all_preds = mc_dropout_predict(model, eval_inputs, device, num_samples=num_samples)
 
     # ===== 计算测试损失（单次前向传播即可，用 eval 模式） =====
+    # 注意：损失在全量样本上计算（不应用开盘涨停过滤），与 evaluate_model 行为一致。
     from sklearn.metrics import roc_auc_score
     from training_utils import calculate_realistic_return, calculate_portfolio_simulation
 
@@ -134,6 +135,19 @@ def mc_dropout_evaluate(model, eval_inputs, eval_targets, eval_cumulative_return
     # ===== 统计计算（与 evaluate_model 完全一致） =====
     all_targets = np.array(eval_targets)
     all_returns = np.array(eval_cumulative_returns)
+
+    # 过滤：排除T+1开盘价接近涨停的不可交易样本
+    # 仅作用于统计指标（AUC/收益），不影响上方已算完的 test_loss（全量）。
+    filtered_count = 0
+    if tradeable_mask is not None and not np.all(tradeable_mask):
+        filtered_count = int(np.sum(~tradeable_mask))
+        all_preds = all_preds[tradeable_mask]
+        all_targets = all_targets[tradeable_mask]
+        all_returns = all_returns[tradeable_mask]
+        if eval_day_indices is not None:
+            eval_day_indices = [d for d, m in zip(eval_day_indices, tradeable_mask) if m]
+        if eval_daily_returns is not None:
+            eval_daily_returns = [r for r, m in zip(eval_daily_returns, tradeable_mask) if m]
 
     try:
         auc = roc_auc_score(all_targets, all_preds)
@@ -188,7 +202,7 @@ def mc_dropout_evaluate(model, eval_inputs, eval_targets, eval_cumulative_return
         'low_conf_count': int(np.sum(low_conf)),
         'pred_mean': float(np.mean(all_preds)),
         'pred_std': float(np.std(all_preds)),
-        'filtered_count': 0,
+        'filtered_count': filtered_count,
         'dispersion_std': float(np.std(all_preds)),
         'dispersion_range': float(np.max(all_preds) - np.min(all_preds)),
         'dispersion_iqr': float(np.percentile(all_preds, 75) - np.percentile(all_preds, 25)),
@@ -224,7 +238,7 @@ def run_mc_dropout_evaluation(model, test_stock_info, device, feature_normalizer
     """
     print(f"正在创建评估数据集...")
 
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = \
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns, eval_tradeable_mask = \
         create_fixed_evaluation_dataset(test_stock_info, feature_normalizer)
 
     print(f"- 评估样本数: {len(eval_inputs)}")
@@ -258,7 +272,8 @@ def run_mc_dropout_evaluation(model, test_stock_info, device, feature_normalizer
         eval_day_indices=eval_day_indices,
         eval_daily_returns=eval_daily_returns,
         criterion=eval_criterion,
-        enable_portfolio_simulation=True
+        enable_portfolio_simulation=True,
+        tradeable_mask=eval_tradeable_mask
     )
     test_loss = stats['test_loss']
 

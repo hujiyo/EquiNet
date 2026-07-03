@@ -81,19 +81,19 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
     has_val = len(val_stock_info) > 0
     if has_val:
         print("创建验证集评估数据集...")
-        eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(
+        eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns, eval_tradeable_mask = create_fixed_evaluation_dataset(
             val_stock_info, feature_normalizer,
             start_key='val_split_point', end_key='test_split_point'
         )
         print(f"  验证集样本数: {len(eval_inputs)}")
     else:
         print("⚠ 无验证集数据，使用测试集进行模型选择（不推荐）")
-        eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = create_fixed_evaluation_dataset(
+        eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns, eval_tradeable_mask = create_fixed_evaluation_dataset(
             test_stock_info, feature_normalizer
         )
 
     # 创建测试集评估数据集（训练结束后仅评估一次）
-    test_eval_inputs, test_eval_targets, test_eval_cumulative_returns, test_eval_day_indices, test_eval_daily_returns = create_fixed_evaluation_dataset(
+    test_eval_inputs, test_eval_targets, test_eval_cumulative_returns, test_eval_day_indices, test_eval_daily_returns, test_eval_tradeable_mask = create_fixed_evaluation_dataset(
         test_stock_info, feature_normalizer
     )
 
@@ -280,7 +280,8 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             device,
             eval_day_indices=eval_day_indices,
             eval_daily_returns=eval_daily_returns,
-            criterion=eval_criterion
+            criterion=eval_criterion,
+            tradeable_mask=eval_tradeable_mask
         )
 
         # 计算训练集平均损失
@@ -418,7 +419,8 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
                 device,
                 eval_day_indices=test_eval_day_indices,
                 eval_daily_returns=test_eval_daily_returns,
-                criterion=test_eval_criterion
+                criterion=test_eval_criterion,
+                tradeable_mask=test_eval_tradeable_mask
             )
             print(f"\n  [测试集] 模型(loss): "
                   f"Loss: {test_stats_loss['test_loss']:.4f}, "
@@ -441,7 +443,8 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
                 device,
                 eval_day_indices=test_eval_day_indices,
                 eval_daily_returns=test_eval_daily_returns,
-                criterion=test_eval_criterion
+                criterion=test_eval_criterion,
+                tradeable_mask=test_eval_tradeable_mask
             )
             print(f"\n  [测试集] 模型(realistic): "
                   f"Loss: {test_stats_realistic['test_loss']:.4f}, "

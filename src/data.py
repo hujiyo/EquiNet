@@ -133,7 +133,7 @@ class FeatureNormalizer:
             stride = max(1, available // max(1, remaining))
 
             # 向量化处理：只做粗归一化，不需要标签、收益和未来数据
-            inputs, _, _, _, _, _ = _vectorized_process_stock(
+            inputs, _, _, _, _, _, _ = _vectorized_process_stock(
                 stock, stock_idx,
                 context_length,
                 DataConfig.FUTURE_DAYS,
@@ -739,6 +739,7 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
     eval_cumulative_returns = []
     eval_day_indices = []
     eval_daily_returns = []
+    eval_tradeable_masks = []
 
     for stock_idx, stock_info in enumerate(test_stock_info):
         data_length = len(stock_info['data'])
@@ -770,7 +771,7 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
         if start_max < start_min:
             continue
 
-        inputs, targets, returns_arr, keys, _, daily_rets = _vectorized_process_stock(
+        inputs, targets, returns_arr, keys, _, daily_rets, tradeable_mask = _vectorized_process_stock(
             stock_info, stock_idx,
             context_length, future_days, required_length,
             ma_window, limit_threshold, filter_last_day,
@@ -794,14 +795,18 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
         # daily_returns：从向量化批处理中收集逐样本的逐日收益
         eval_daily_returns.extend(daily_rets)
 
+        # tradeable_mask：开盘涨停过滤（评估阶段排除不可交易样本）
+        eval_tradeable_masks.append(tradeable_mask)
+
     if len(eval_inputs) == 0:
         raise ValueError("固定评估集为空：test_stock_info中没有可用样本")
 
     eval_inputs_array = np.concatenate(eval_inputs, axis=0)
     eval_targets_array = np.concatenate(eval_targets, axis=0)
     eval_returns_array = np.concatenate(eval_cumulative_returns, axis=0)
+    eval_tradeable_mask_array = np.concatenate(eval_tradeable_masks, axis=0)
     # 释放分块列表（其总大小与拼接后的 array 相当），降低大评估集(--begin 多年)峰值内存
-    del eval_inputs, eval_targets, eval_cumulative_returns
+    del eval_inputs, eval_targets, eval_cumulative_returns, eval_tradeable_masks
 
     # 批量细处理：分块归一化（大评估集如 --begin 多年回测时避免内存爆炸）
     if feature_normalizer is not None:
@@ -819,12 +824,13 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
             eval_inputs_array = eval_inputs_array[finite_mask]
             eval_targets_array = eval_targets_array[finite_mask]
             eval_returns_array = eval_returns_array[finite_mask]
+            eval_tradeable_mask_array = eval_tradeable_mask_array[finite_mask]
             eval_day_indices = [d for d, m in zip(eval_day_indices, finite_mask) if m]
             eval_daily_returns = [r for r, m in zip(eval_daily_returns, finite_mask) if m]
 
     return (eval_inputs_array, eval_targets_array,
             eval_returns_array, np.asarray(eval_day_indices),
-            eval_daily_returns)
+            eval_daily_returns, eval_tradeable_mask_array)
 
 def create_recent_days_dataset(test_stock_info, feature_normalizer=None, max_days=15):
     """
@@ -860,7 +866,7 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None, max_day
 
         # require_full_future=False: 允许不完整的未来数据（最近几天可能还没走完）
         # compute_labels=False: 不需要标签（仅用于推理展示）
-        inputs, _, returns_arr, keys, avail, _ = _vectorized_process_stock(
+        inputs, _, returns_arr, keys, avail, _, tradeable_mask = _vectorized_process_stock(
             stock_info, stock_idx,
             context_length, future_days,
             min(required_length, data_length - start_min),
@@ -877,6 +883,15 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None, max_day
 
         if inputs is None:
             continue
+
+        # 过滤：排除T+1开盘价接近涨停的不可交易样本
+        # 近期选股路径始终过滤（与评估阶段一致），不受 FILTER_LIMIT_UP_OPEN 控制。
+        if not np.all(tradeable_mask):
+            keep = tradeable_mask
+            inputs = inputs[keep]
+            returns_arr = returns_arr[keep]
+            avail = avail[keep]
+            keys = [k for k, m in zip(keys, keep) if m]
 
         # 批量细处理
         if feature_normalizer is not None:
@@ -1144,7 +1159,7 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
 
     max_valid_start = T - required_length
     if max_valid_start < range_min:
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     all_starts = np.arange(range_min, min(range_max, max_valid_start) + 1)
 
@@ -1155,7 +1170,7 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
 
     N = len(all_starts)
     if N == 0:
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     C = context_length
     offsets = np.arange(C, dtype=np.intp)
@@ -1212,7 +1227,7 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
             valid &= ~extreme_mask
 
     if not np.any(valid):
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     vs = all_starts[valid]
     raw_w = raw_windows[valid]
@@ -1291,7 +1306,7 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
     nan_rows = np.any(~np.isfinite(input_seqs), axis=(1, 2))
     good = ~nan_rows
     if not np.any(good):
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     input_seqs = input_seqs[good]
     vs = vs[good]
@@ -1301,7 +1316,7 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
     # 不需要标签和收益时，跳过未来数据验证（如归一化器训练数据收集）
     if not compute_labels and not compute_returns:
         keys = [(stock_idx, int(s)) for s in vs]
-        return input_seqs, np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32), keys, np.empty(0, dtype=np.int32), []
+        return input_seqs, np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32), keys, np.empty(0, dtype=np.int32), [], np.empty(0, dtype=bool)
 
     future_offsets = np.arange(future_days, dtype=np.intp)
     future_idx = (vs[:, None] + C) + future_offsets[None, :]
@@ -1334,15 +1349,20 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
         Nv = len(vs)
 
     if Nv == 0:
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     f_closes = future_data[:, :, 3]
     context_last_close = stock_data[vs + C - 1, 3]
+    safe_ctx_close = np.where(context_last_close != 0, context_last_close, 1.0)
+
+    # 过滤：T+1开盘价接近涨停价时标记为不可交易（评估阶段排除）
+    t1_open = future_data[:, 0, 0]
+    open_gap = (t1_open - context_last_close) / safe_ctx_close
+    tradeable_mask = open_gap < limit_threshold
 
     # 计算每日涨跌幅，不可用的天填 0
     day1_valid = available_days >= 1
     safe_f_open0 = np.where(future_data[:, 0, 0] != 0, future_data[:, 0, 0], 1.0)
-    safe_ctx_close = np.where(context_last_close != 0, context_last_close, 1.0)
 
     day1_change = np.where(
         day1_valid,
@@ -1401,7 +1421,7 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
 
     keys = [(stock_idx, int(s)) for s in vs]
 
-    return input_seqs, targets, returns_arr, keys, available_days, daily_returns_list
+    return input_seqs, targets, returns_arr, keys, available_days, daily_returns_list, tradeable_mask
 
 def load_excluded_market_dates():
     """
@@ -1491,6 +1511,9 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None):
         pos_indices: [M] int 正样本在 all_inputs 中的索引
         neg_indices: [K] int 负样本在 all_inputs 中的索引
         sample_key_to_pool_idx: dict  (stock_idx, start_idx) -> pool_index 映射
+
+    过滤：受 DataConfig.FILTER_LIMIT_UP_OPEN 控制，开启时排除 T+1 开盘涨停的
+    不可交易样本（评估阶段在 create_fixed_evaluation_dataset 中始终过滤，不受此开关控制）。
     """
     import time
     t0 = time.time()
@@ -1508,6 +1531,7 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None):
     limit_threshold = DataConfig.LIMIT_THRESHOLD
     filter_last_day = DataConfig.FILTER_CONTEXT_LAST_DAY_LIMIT_UP
     label_day1_use_open = DataConfig.LABEL_DAY1_USE_OPEN
+    filter_limit_up_open = DataConfig.FILTER_LIMIT_UP_OPEN
 
     # 加载极端行情日期，过滤 beta 驱动的噪声标签
     excluded_market_dates = load_excluded_market_dates()
@@ -1521,10 +1545,18 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None):
             generate_label, calculate_returns,
             excluded_market_dates=excluded_market_dates,
         )
-        inputs, targets, returns_arr, keys, _, _ = result
+        inputs, targets, returns_arr, keys, _, _, tradeable_mask = result
 
         if inputs is None:
             continue
+
+        # 过滤（可选）：排除T+1开盘涨停的不可交易样本
+        # 仅训练阶段受 FILTER_LIMIT_UP_OPEN 控制；评估阶段始终过滤（在 create_fixed_evaluation_dataset 中）
+        if filter_limit_up_open and tradeable_mask is not None and not np.all(tradeable_mask):
+            inputs = inputs[tradeable_mask]
+            targets = targets[tradeable_mask]
+            returns_arr = returns_arr[tradeable_mask]
+            keys = [k for k, m in zip(keys, tradeable_mask) if m]
 
         base_idx = total_samples
         total_samples += len(inputs)

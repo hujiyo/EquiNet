@@ -354,7 +354,7 @@ class PairwiseWeightedBCE(DynamicWeightedBCE):
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
                    device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None,
-                   criterion=None, enable_portfolio_simulation=False):
+                   criterion=None, enable_portfolio_simulation=False, tradeable_mask=None):
     """
     模型评估函数
     涨停样本已在向量化批处理中过滤，无需再次过滤
@@ -370,7 +370,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         low_conf_count：低置信(<0.2)样本数
         pred_mean：预测均值
         pred_std：预测标准差
-        filtered_count：被过滤的涨停样本数（始终为0，因已在生成阶段过滤）
+        filtered_count：被过滤的涨停样本数
         realistic_stats：实战收益率统计（如果提供了eval_day_indices）
         test_loss：测试集损失（如果提供了criterion）
     """
@@ -413,6 +413,18 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     all_preds = np.concatenate(all_preds)
     all_targets = np.array(eval_targets)
     all_returns = np.array(eval_cumulative_returns)
+
+    # 过滤：排除T+1开盘价接近涨停的不可交易样本
+    filtered_count = 0
+    if tradeable_mask is not None and not np.all(tradeable_mask):
+        filtered_count = int(np.sum(~tradeable_mask))
+        all_preds = all_preds[tradeable_mask]
+        all_targets = all_targets[tradeable_mask]
+        all_returns = all_returns[tradeable_mask]
+        if eval_day_indices is not None:
+            eval_day_indices = [d for d, m in zip(eval_day_indices, tradeable_mask) if m]
+        if eval_daily_returns is not None:
+            eval_daily_returns = [r for r, m in zip(eval_daily_returns, tradeable_mask) if m]
 
     try:
         auc = roc_auc_score(all_targets, all_preds)
@@ -470,7 +482,7 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         'low_conf_count': np.sum(low_conf),
         'pred_mean': np.mean(all_preds),
         'pred_std': np.std(all_preds),
-        'filtered_count': 0,
+        'filtered_count': filtered_count,
         'dispersion_std': float(np.std(all_preds)),
         'dispersion_range': float(np.max(all_preds) - np.min(all_preds)),
         'dispersion_iqr': float(np.percentile(all_preds, 75) - np.percentile(all_preds, 25)),

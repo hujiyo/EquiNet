@@ -545,7 +545,7 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
         print(f"- 评估区间: --begin {_format_date(begin_date)} ~ 最新（忽略训练/验证/测试集划分）")
 
     # --begin 给定时，评估区间变为 [begin, 最新]；否则为默认测试集区间
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = \
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns, eval_tradeable_mask = \
         create_fixed_evaluation_dataset(test_stock_info, feature_normalizer, start_date=begin_date)
 
     print(f"- 评估样本数: {len(eval_inputs)}")
@@ -577,7 +577,8 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
         eval_day_indices=eval_day_indices,
         eval_daily_returns=eval_daily_returns,
         criterion=eval_criterion,
-        enable_portfolio_simulation=True
+        enable_portfolio_simulation=True,
+        tradeable_mask=eval_tradeable_mask
     )
     test_loss = stats['test_loss']
 

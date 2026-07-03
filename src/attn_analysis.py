@@ -72,7 +72,7 @@ def _create_eval_criterion(eval_targets):
     return criterion
 
 
-def _compute_auc_and_loss(model, eval_inputs, eval_targets, device, criterion=None, batch_size=DataConfig.EVAL_BATCH_SIZE):
+def _compute_auc_and_loss(model, eval_inputs, eval_targets, device, criterion=None, batch_size=DataConfig.EVAL_BATCH_SIZE, tradeable_mask=None):
     model.eval()
     all_preds = []
     total_loss = 0.0
@@ -100,6 +100,12 @@ def _compute_auc_and_loss(model, eval_inputs, eval_targets, device, criterion=No
 
     all_preds = np.concatenate(all_preds)
     all_targets = np.array(eval_targets)
+
+    # 过滤：排除T+1开盘价接近涨停的不可交易样本
+    if tradeable_mask is not None and not np.all(tradeable_mask):
+        all_preds = all_preds[tradeable_mask]
+        all_targets = all_targets[tradeable_mask]
+
     try:
         auc = roc_auc_score(all_targets, all_preds)
     except ValueError:
@@ -298,7 +304,7 @@ def main():
     print(f"\n正在加载数据集...")
     train_stock_info, val_stock_info, test_stock_info = load_and_preprocess_data()
 
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns = \
+    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns, eval_tradeable_mask = \
         create_fixed_evaluation_dataset(val_stock_info, feature_normalizer)
     print(f"  验证集样本数: {len(eval_inputs)}")
 
@@ -306,7 +312,7 @@ def main():
     eval_criterion = _create_eval_criterion(eval_targets)
 
     print(f"\n正在计算 Baseline...")
-    baseline_auc, baseline_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion)
+    baseline_auc, baseline_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion, tradeable_mask=eval_tradeable_mask)
     print(f"  Baseline AUC = {baseline_auc:.6f}  Loss = {baseline_loss:.6f}")
 
     transformer_results = []
@@ -322,7 +328,7 @@ def main():
             model.load_state_dict(copy.deepcopy(original_state_dict))
             _mask_mha_head(model.layers[layer_idx].attn, head_idx, head_dim)
 
-            masked_auc, masked_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion)
+            masked_auc, masked_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion, tradeable_mask=eval_tradeable_mask)
             auc_change = masked_auc - baseline_auc
             auc_change_pct = (auc_change / baseline_auc) * 100 if baseline_auc > 0 else 0
             loss_change = masked_loss - baseline_loss
@@ -364,7 +370,7 @@ def main():
         model.load_state_dict(copy.deepcopy(original_state_dict))
         _mask_mha_head(model.attention_pooling.cross_attn, head_idx, head_dim)
 
-        masked_auc, masked_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion)
+        masked_auc, masked_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion, tradeable_mask=eval_tradeable_mask)
         auc_change = masked_auc - baseline_auc
         auc_change_pct = (auc_change / baseline_auc) * 100 if baseline_auc > 0 else 0
         loss_change = masked_loss - baseline_loss
@@ -413,7 +419,7 @@ def main():
         model.load_state_dict(copy.deepcopy(original_state_dict))
         _mask_layer_all_heads(model.layers[layer_idx], nhead, head_dim)
 
-        masked_auc, _ = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion)
+        masked_auc, _ = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion, tradeable_mask=eval_tradeable_mask)
         auc_change = masked_auc - baseline_auc
         auc_change_pct = (auc_change / baseline_auc) * 100 if baseline_auc > 0 else 0
 
@@ -443,7 +449,7 @@ def main():
 
     model.load_state_dict(copy.deepcopy(original_state_dict))
     _mask_position_encoding(model)
-    masked_auc, masked_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion)
+    masked_auc, masked_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion, tradeable_mask=eval_tradeable_mask)
     auc_change = masked_auc - baseline_auc
     auc_change_pct = (auc_change / baseline_auc) * 100 if baseline_auc > 0 else 0
     loss_change = masked_loss - baseline_loss
@@ -465,7 +471,7 @@ def main():
     with torch.no_grad():
         orig_weight = model.pos_encoding.pe.weight.data.clone()
         model.pos_encoding.pe.weight.data = orig_weight[perm]
-    masked_auc, masked_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion)
+    masked_auc, masked_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion, tradeable_mask=eval_tradeable_mask)
     auc_change = masked_auc - baseline_auc
     auc_change_pct = (auc_change / baseline_auc) * 100 if baseline_auc > 0 else 0
     loss_change = masked_loss - baseline_loss

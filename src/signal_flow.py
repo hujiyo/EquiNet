@@ -194,7 +194,7 @@ def main():
 
     print("加载数据集...")
     train_stock_info, val_stock_info, test_stock_info = load_and_preprocess_data()
-    eval_inputs, eval_targets, _, _, _ = create_fixed_evaluation_dataset(
+    eval_inputs, eval_targets, _, _, _, _ = create_fixed_evaluation_dataset(
         val_stock_info, feature_normalizer
     )
     print(f"验证集: {len(eval_inputs)} 样本")

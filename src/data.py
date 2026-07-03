@@ -57,20 +57,27 @@ class FeatureNormalizer:
         self.random_state = random_state
 
         # 特征组定义：(名称, 列切片)
-        # OHLC 拆成 4 个单列组：open/close 相对昨收（对称、小幅），
-        # high（单边≥0，日内冲高）、low（单边≤0，日内下探）分布差异巨大，
-        # 各自独立拟合分位数映射，避免互相污染。
+        # 每个维度各自独立拟合分位数映射，互不污染：
+        # open/close 相对昨收（对称、小幅）、high（单边≥0）、low（单边≤0）
+        # m5/m10/m20 偏离度、dif/dea/macd_hist/macd_hist_diff、bb_upper/bb_lower
+        # 分布形态各不相同，分别建模最安全。
         self._feature_groups = [
-            ('open',    slice(0, 1)),
-            ('high',    slice(1, 2)),
-            ('low',     slice(2, 3)),
-            ('close',   slice(3, 4)),
-            ('vwap',    slice(4, 5)),
-            ('amount',  slice(5, 6)),
-            ('exchange',slice(6, 7)),
-            ('ma',      slice(7, 10)),
-            ('macd',    slice(10, 13)),
-            ('bb',      slice(13, 15)),
+            ('open',          slice(0, 1)),
+            ('high',          slice(1, 2)),
+            ('low',           slice(2, 3)),
+            ('close',         slice(3, 4)),
+            ('vwap',          slice(4, 5)),
+            ('amount',        slice(5, 6)),
+            ('exchange',      slice(6, 7)),
+            ('m5',            slice(7, 8)),
+            ('m10',           slice(8, 9)),
+            ('m20',           slice(9, 10)),
+            ('dif',           slice(10, 11)),
+            ('dea',           slice(11, 12)),
+            ('macd_hist',     slice(12, 13)),
+            ('macd_hist_diff',slice(13, 14)),
+            ('bb_upper',      slice(14, 15)),
+            ('bb_lower',      slice(15, 16)),
         ]
 
         # 为每个特征组创建独立的 pipeline
@@ -218,10 +225,10 @@ class FeatureNormalizer:
         对单个样本应用归一化
 
         Args:
-            input_seq: [context_length, 15] 原始输入序列
+            input_seq: [context_length, 16] 原始输入序列
 
         Returns:
-            normalized_seq: [context_length, 15] 归一化后的序列
+            normalized_seq: [context_length, 16] 归一化后的序列
         """
         if not self.is_fitted:
             raise RuntimeError("归一化器未拟合！请先调用 fit() 方法")
@@ -244,11 +251,11 @@ class FeatureNormalizer:
         内部 np.interp 会再分配等大数组），按 chunk_size 分块处理，峰值内存仅与单块大小相关。
 
         Args:
-            input_seqs: [batch_size, context_length, 15] 原始输入序列
+            input_seqs: [batch_size, context_length, 16] 原始输入序列
             chunk_size: 每块处理的样本数（默认 10万，单块峰值内存约数百MB）
 
         Returns:
-            [batch_size, context_length, 15] 归一化后的序列
+            [batch_size, context_length, 16] 归一化后的序列
         """
         if not self.is_fitted:
             raise RuntimeError("归一化器未拟合！请先调用 fit() 方法")
@@ -342,7 +349,7 @@ def process_single_file(args):
 
     Args:
         stock_code: 股票代码
-        data: 预加载的行情数据 numpy 数组 (N, 15)
+        data: 预加载的行情数据 numpy 数组 (N, 16)
         times: 预加载的日期数组 (N,)
         train_start_date: 训练集起始日期 (YYYYMMDD)
         train_end_date: 训练集截止日期 (YYYYMMDD)
@@ -441,7 +448,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
     conn = sqlite3.connect(db_path)
     query = """SELECT sd.stock_code, sd.date, sd.open, sd.high, sd.low, sd.close,
                       sd.vwap, sd.volume, sd.exchange, sd.m5, sd.m10, sd.m20,
-                      sd.dif, sd.dea, sd.macd_hist, sd.bb_upper, sd.bb_lower
+                      sd.dif, sd.dea, sd.macd_hist, sd.macd_hist_diff, sd.bb_upper, sd.bb_lower
                FROM stock_daily sd
                JOIN stock_pool sp ON sd.stock_code = sp.stock_code
                WHERE sp.pool_type='selected' AND sp.is_active=1
@@ -449,7 +456,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
     df = pd.read_sql_query(query, conn)
     conn.close()
 
-    cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange', 'm5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'bb_upper', 'bb_lower']
+    cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange', 'm5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'macd_hist_diff', 'bb_upper', 'bb_lower']
     stock_codes = []
     stock_data_arrays = []
     stock_times_arrays = []
@@ -938,7 +945,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         - 细处理：归一化 → 标准化数据（均值≈0，方差≈1）
 
     Args:
-        stock_data: 股票原始数据 [N, 15]
+        stock_data: 股票原始数据 [N, 16]
         start_idx: 上下文窗口起始索引（需要 >= 1，因为需要前一天作为基准）
         context_length: 上下文窗口长度
         check_limit_up: 是否检查涨停（默认 True）
@@ -947,7 +954,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         apply_fine_normalization: 是否应用细处理（默认 True）。设为 False 时只执行粗处理。
 
     Returns:
-        input_seq: [context_length, 15] 归一化后的输入序列，或 None（如果验证失败）
+            input_seq: [context_length, 16] 归一化后的输入序列，或 None（如果验证失败）
             - 粗处理后：open_rel/close_rel/vwap: [-0.1, 0.1], high_rel/low_rel: 日内振幅无 clip, Volume: 相对N日均值变化率, Exchange: 相对N日均值变化率
             - 细处理后：均值≈0，方差≈1
 
@@ -1011,7 +1018,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         if last_day_return >= DataConfig.LIMIT_THRESHOLD:
             return None
 
-    input_seq = np.empty((context_length, 15), dtype=np.float32)
+    input_seq = np.empty((context_length, 16), dtype=np.float32)
 
     # OHLC 编码：
     #   open_rel(列0) / close_rel(列3): 相对前一日收盘价的位置，反映隔夜跳空与当日涨跌
@@ -1085,8 +1092,11 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     # MACD特征（已在数据库中预计算为 (value)/close 比值）
     input_seq[:, 10:13] = input_seq_raw[:, 10:13]
 
+    # MACD柱状图变化量（已在数据库中预计算为 macd_hist[t]-macd_hist[t-1]）
+    input_seq[:, 13] = input_seq_raw[:, 13]
+
     # BB特征（已在数据库中预计算）
-    input_seq[:, 13:15] = input_seq_raw[:, 13:15]
+    input_seq[:, 14:16] = input_seq_raw[:, 14:16]
 
     # ========== 细处理阶段（可选）==========
     # 应用高级特征归一化，将粗处理结果转换为均值≈0、方差≈1的标准化数据
@@ -1234,7 +1244,7 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
     prev_d = prev_days[valid]
     Nv = len(vs)
 
-    input_seqs = np.empty((Nv, C, 15), dtype=np.float32)
+    input_seqs = np.empty((Nv, C, 16), dtype=np.float32)
 
     closes_w = raw_w[:, :, 3]
     opens_w = raw_w[:, :, 0]
@@ -1300,8 +1310,11 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
     # MACD特征（已在数据库中预计算）
     input_seqs[:, :, 10:13] = raw_w[:, :, 10:13]
 
+    # MACD柱状图变化量（已在数据库中预计算）
+    input_seqs[:, :, 13] = raw_w[:, :, 13]
+
     # BB特征（已在数据库中预计算）
-    input_seqs[:, :, 13:15] = raw_w[:, :, 13:15]
+    input_seqs[:, :, 14:16] = raw_w[:, :, 14:16]
 
     nan_rows = np.any(~np.isfinite(input_seqs), axis=(1, 2))
     good = ~nan_rows
@@ -1505,7 +1518,7 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None):
     使用向量化批处理替代逐样本 Python 循环，每只股票的所有窗口一次性处理。
 
     Returns:
-        all_inputs: [N, context_length, 15] float32 归一化后的输入
+        all_inputs: [N, context_length, 16] float32 归一化后的输入
         all_targets: [N] float32 标签 (0/1)
         all_returns: [N] float32 累计收益率
         pos_indices: [M] int 正样本在 all_inputs 中的索引

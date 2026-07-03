@@ -27,7 +27,7 @@ class DatabaseManager:
     # 行情列：upsert 时允许覆盖
     MARKET_COLS = ('open', 'high', 'low', 'close', 'amount', 'volume', 'exchange', 'vwap')
     # 特征列：upsert 时保留原值，仅由 update_features() 修改
-    FEATURE_COLS = ('m5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'bb_upper', 'bb_lower')
+    FEATURE_COLS = ('m5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'macd_hist_diff', 'bb_upper', 'bb_lower')
 
     SCHEMA_SQL = """
     CREATE TABLE IF NOT EXISTS stock_daily (
@@ -44,10 +44,11 @@ class DatabaseManager:
         m5          REAL,
         m10         REAL,
         m20         REAL,
-        dif         REAL,
-        dea         REAL,
-        macd_hist   REAL,
-        bb_upper    REAL,
+        dif          REAL,
+        dea          REAL,
+        macd_hist    REAL,
+        macd_hist_diff REAL,
+        bb_upper     REAL,
         bb_lower    REAL,
         updated_at  TEXT    DEFAULT (datetime('now')),
         PRIMARY KEY (stock_code, date)
@@ -81,7 +82,7 @@ class DatabaseManager:
 
     _STOCK_DAILY_COLUMNS = ('date', 'open', 'high', 'low', 'close', 'amount', 'volume',
                             'exchange', 'vwap', 'm5', 'm10', 'm20', 'dif', 'dea',
-                            'macd_hist', 'bb_upper', 'bb_lower')
+                            'macd_hist', 'macd_hist_diff', 'bb_upper', 'bb_lower')
 
     def __init__(self, db_path=None):
         if db_path is None:
@@ -106,9 +107,9 @@ class DatabaseManager:
             ('version', '1')
         )
 
-        # 增量迁移：添加 MACD 特征列
+        # 增量迁移：添加 MACD / BB 特征列
         existing_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(stock_daily)")}
-        for col in ('dif', 'dea', 'macd_hist', 'bb_upper', 'bb_lower'):
+        for col in ('dif', 'dea', 'macd_hist', 'macd_hist_diff', 'bb_upper', 'bb_lower'):
             if col not in existing_cols:
                 self._conn.execute(f"ALTER TABLE stock_daily ADD COLUMN {col} REAL")
 
@@ -188,12 +189,12 @@ class DatabaseManager:
 
     def update_features(self, stock_code: str, feature_records: List[tuple], auto_commit: bool = True):
         """更新指定股票的衍生特征。
-        feature_records: [(date, m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower), ...]"""
+        feature_records: [(date, m5, m10, m20, dif, dea, macd_hist, macd_hist_diff, bb_upper, bb_lower), ...]"""
         self._conn.executemany(
-            "UPDATE stock_daily SET m5=?, m10=?, m20=?, dif=?, dea=?, macd_hist=?, bb_upper=?, bb_lower=? "
+            "UPDATE stock_daily SET m5=?, m10=?, m20=?, dif=?, dea=?, macd_hist=?, macd_hist_diff=?, bb_upper=?, bb_lower=? "
             "WHERE stock_code=? AND date=?",
-            [(m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower, stock_code, date)
-             for date, m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower in feature_records]
+            [(m5, m10, m20, dif, dea, macd_hist, macd_hist_diff, bb_upper, bb_lower, stock_code, date)
+             for date, m5, m10, m20, dif, dea, macd_hist, macd_hist_diff, bb_upper, bb_lower in feature_records]
         )
         if auto_commit:
             self._conn.commit()
@@ -332,12 +333,12 @@ class DatabaseManager:
         return pd.read_sql_query(query, self._conn, params=stock_codes)
 
     def get_stocks_missing_features(self, pool_type='selected') -> List[str]:
-        """获取指定池中缺少特征（m5/m10/m20 或 MACD）的股票"""
+        """获取指定池中缺少特征（m5/m10/m20 或 MACD 或 BB）的股票"""
         cursor = self._conn.execute(
             "SELECT sp.stock_code FROM stock_pool sp "
             "JOIN stock_daily sd ON sp.stock_code = sd.stock_code "
             "WHERE sp.pool_type=? AND sp.is_active=1 "
-            "AND (sd.m5 IS NULL OR sd.dif IS NULL OR sd.bb_upper IS NULL) "
+            "AND (sd.m5 IS NULL OR sd.dif IS NULL OR sd.macd_hist_diff IS NULL OR sd.bb_upper IS NULL) "
             "GROUP BY sp.stock_code",
             (pool_type,)
         )
@@ -480,7 +481,7 @@ class DatabaseManager:
         cursor = self._conn.execute(
             "SELECT COUNT(DISTINCT sd.stock_code) FROM stock_daily sd "
             "JOIN stock_pool sp ON sd.stock_code = sp.stock_code "
-            "WHERE sp.pool_type='selected' AND sp.is_active=1 AND (sd.m5 IS NULL OR sd.dif IS NULL OR sd.bb_upper IS NULL)"
+            "WHERE sp.pool_type='selected' AND sp.is_active=1 AND (sd.m5 IS NULL OR sd.dif IS NULL OR sd.macd_hist_diff IS NULL OR sd.bb_upper IS NULL)"
         )
         stats['stocks_missing_features'] = cursor.fetchone()[0]
 

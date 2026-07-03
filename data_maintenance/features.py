@@ -8,6 +8,7 @@
 - dif:       (EMA12 - EMA26) / close       （MACD快线偏离度）
 - dea:       EMA9(DIF) / close             （MACD信号线偏离度）
 - macd_hist: 2 * (DIF - DEA) / close       （MACD柱状图偏离度）
+- macd_hist_diff: macd_hist[t] - macd_hist[t-1]  （MACD柱状图变化量，>0=动量转多，<0=动量转空）
 - bb_upper:  (close - UPPER) / close       （收盘价相对布林上轨偏离）
 - bb_lower:  (LOWER - close) / close       （布林下轨相对收盘价偏离）
 """
@@ -107,10 +108,11 @@ def compute_macd_features(closes: np.ndarray) -> tuple:
         closes: 收盘价数组（时间正序）
 
     Returns:
-        (dif, dea, macd_hist) 三个数组，均为 np.float32
-        - dif:       (EMA12 - EMA26) / close
-        - dea:       EMA9(DIF) / close
-        - macd_hist: 2 * (DIF - DEA) / close
+        (dif, dea, macd_hist, macd_hist_diff) 四个数组，均为 np.float32
+        - dif:           (EMA12 - EMA26) / close
+        - dea:           EMA9(DIF) / close
+        - macd_hist:     2 * (DIF - DEA) / close
+        - macd_hist_diff: macd_hist[t] - macd_hist[t-1]（首日为0）
     """
     ema_fast = compute_ema(closes, MACD_FAST)
     ema_slow = compute_ema(closes, MACD_SLOW)
@@ -125,7 +127,11 @@ def compute_macd_features(closes: np.ndarray) -> tuple:
     dea = (dea_raw / safe_closes).astype(np.float32)
     macd_hist = (macd_hist_raw / safe_closes).astype(np.float32)
 
-    return dif, dea, macd_hist
+    macd_hist_diff = np.empty_like(macd_hist)
+    macd_hist_diff[0] = 0.0
+    macd_hist_diff[1:] = macd_hist[1:] - macd_hist[:-1]
+
+    return dif, dea, macd_hist, macd_hist_diff
 
 
 def compute_bb_features(closes: np.ndarray) -> tuple:
@@ -192,7 +198,7 @@ def compute_features_for_stock(db: DatabaseManager, stock_code: str, auto_commit
     m10 = compute_ma_features(closes, 10).astype(np.float32)
     m20 = compute_ma_features(closes, 20).astype(np.float32)
 
-    dif, dea, macd_hist = compute_macd_features(closes)
+    dif, dea, macd_hist, macd_hist_diff = compute_macd_features(closes)
 
     bb_upper, bb_lower = compute_bb_features(closes)
 
@@ -204,6 +210,7 @@ def compute_features_for_stock(db: DatabaseManager, stock_code: str, auto_commit
         dif.tolist(),
         dea.tolist(),
         macd_hist.tolist(),
+        macd_hist_diff.tolist(),
         bb_upper.tolist(),
         bb_lower.tolist()
     ))

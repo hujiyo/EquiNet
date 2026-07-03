@@ -6,8 +6,8 @@ EquiNet Embedding层训练脚本
 
 1. SIGReg 几何正则 (Balestriero & LeCun, 2025)：约束嵌入分布趋向各向同性高斯
    通过 Cramér-Wold + Epps-Pulley 检验，数学上保证无维度/子空间/聚类坍塌
-2. MLP 解码器重建损失：确保嵌入向量足以恢复原始15维特征
-   非线性解码器允许 embedding 自由学习特征融合，而不仅限于线性可编码的表示
+2. MLP 解码器重建损失：确保嵌入向量足以恢复原始16维特征
+    非线性解码器允许 embedding 自由学习特征融合，而不仅限于线性可编码的表示
 
 用法：
   python src/pretrain_embedding.py                        # 使用默认参数
@@ -41,11 +41,11 @@ class KLineEmbedding(nn.Module):
     """
     单日K线嵌入模块（结构与 StockTransformer 的 FFN-Embedding 完全一致）
 
-    MLP(15→128→256→GELU→128)
+    MLP(input_dim→128→256→GELU→128)
     网络足够浅（3层），无需残差连接，纯 MLP 即可充分学习非线性特征交互。
     """
 
-    def __init__(self, input_dim=15, d_model=128, expand_ratio=2):
+    def __init__(self, input_dim=ModelConfig.INPUT_DIM, d_model=128, expand_ratio=2):
         super().__init__()
         hidden_dim = d_model * expand_ratio
         self.embed_proj = nn.Linear(input_dim, d_model, bias=False)
@@ -67,7 +67,7 @@ class KLineEmbedding(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [batch, 15] 归一化K线特征
+            x: [batch, input_dim] 归一化K线特征
         Returns:
             z: [batch, d_model] 嵌入向量（保留方向+幅度）
         """
@@ -91,12 +91,12 @@ class PretrainModel(nn.Module):
     解码器在预训练完成后丢弃，只保留 embedding 权重。
     """
 
-    def __init__(self, input_dim=15, d_model=128, expand_ratio=2):
+    def __init__(self, input_dim=ModelConfig.INPUT_DIM, d_model=128, expand_ratio=2):
         super().__init__()
         self.embedding = KLineEmbedding(input_dim, d_model, expand_ratio)
         self.input_dim = input_dim
 
-        # MLP解码器: 128→256→GELU→128→15（逐步压缩，避免大跨度降维）
+        # MLP解码器: 128→256→GELU→128→input_dim（逐步压缩，避免大跨度降维）
         hidden_dim = d_model * expand_ratio
         self.decoder = nn.Sequential(
             nn.Linear(d_model, hidden_dim, bias=False),
@@ -108,10 +108,10 @@ class PretrainModel(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [batch, 15]
+            x: [batch, input_dim]
         Returns:
             z: [batch, d_model] 嵌入向量 S（用于 SIGReg）
-            recon: [batch, 15] 重建的原始输入 Y
+            recon: [batch, input_dim] 重建的原始输入 Y
         """
         z = self.embedding(x)
         recon = self.decoder(z)
@@ -132,7 +132,7 @@ def collect_kline_data(train_stock_info, feature_normalizer=None):
         feature_normalizer: 特征归一化器
 
     Returns:
-        kline_data: [M, 15] numpy array (完整池)
+        kline_data: [M, input_dim] numpy array (完整池)
     """
     print("\n[数据收集] 提取逐日K线向量...")
 
@@ -161,6 +161,7 @@ def collect_kline_data(train_stock_info, feature_normalizer=None):
                                'VWAP', 'Volume', 'Exchange',
                                'MA5', 'MA10', 'MA20',
                                'DIF', 'DEA', 'MACD_Hist',
+                               'MACD_Hist_Diff',
                                'BB_Upper', 'BB_Lower']):
         col = kline_data[:, i]
         print(f"    {name:>8s}: [{col.min():.4f}, {col.max():.4f}]  "
@@ -282,7 +283,7 @@ def measure_embedding_std(checkpoint_path, kline_pool, device, n_probe=10000):
 
     Args:
         checkpoint_path: .pth 权重文件路径
-        kline_pool: [M, 15] 真实归一化K线池（numpy）
+        kline_pool: [M, input_dim] 真实归一化K线池（numpy）
         device: 计算设备
         n_probe: 探测样本数（默认 10000）
 

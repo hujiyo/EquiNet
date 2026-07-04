@@ -16,7 +16,7 @@ from data import (
     create_fixed_evaluation_dataset,
     FeatureNormalizer,
 )
-from training_utils import DynamicWeightedBCE
+from training_utils import DynamicWeightedBCE, BalancedBCE
 from run import list_available_models, select_model, load_model
 
 
@@ -69,8 +69,11 @@ def _create_eval_criterion(eval_targets):
         else:
             neg_w = 0.1
         criterion.weight_0_0.fill_(neg_w)
+    elif LossConfig.LOSS_TYPE.lower() == 'balanced_bce':
+        criterion = BalancedBCE(reduction='mean')
+        criterion.update_weights(np.array(eval_targets))
     else:
-        criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        raise ValueError(f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE} (支持: dynamic_bce / pairwise_bce / balanced_bce)")
     return criterion
 
 

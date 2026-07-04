@@ -16,7 +16,7 @@ import os, sys, torch, numpy as np
 from config import (DataConfig, DeviceConfig, LossConfig)
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset, FeatureNormalizer,
                   create_recent_days_dataset)
-from training_utils import DynamicWeightedBCE, _get_amp_context
+from training_utils import DynamicWeightedBCE, BalancedBCE, _get_amp_context
 from run import (list_available_models, load_model,
                  visualize_classification, print_banner, print_section, print_section_end,
                  select_model, print_recent_days_chart)
@@ -262,9 +262,11 @@ def run_mc_dropout_evaluation(model, test_stock_info, device, feature_normalizer
         else:
             test_neg_weight = 0.1
         eval_criterion.weight_0_0.fill_(test_neg_weight)
+    elif LossConfig.LOSS_TYPE.lower() == 'balanced_bce':
+        eval_criterion = BalancedBCE(reduction='mean')
+        eval_criterion.update_weights(np.array(eval_targets))
     else:
-        import torch.nn as nn
-        eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        raise ValueError(f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE} (支持: dynamic_bce / pairwise_bce / balanced_bce)")
 
     stats = mc_dropout_evaluate(
         model, eval_inputs, eval_targets, eval_cumulative_returns,

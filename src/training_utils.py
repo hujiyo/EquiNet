@@ -248,6 +248,46 @@ class DynamicWeightedBCE(nn.Module):
             return loss
 
 
+class BalancedBCE(nn.Module):
+    """
+    平衡二元交叉熵：正负样本各占一半损失贡献
+    w_pos = (a+b) / (2a),  w_neg = (a+b) / (2b)
+    使得 weighted_loss 的总量纲与标准 BCE 一致（均值≈1）
+    """
+    def __init__(self, reduction='mean'):
+        super(BalancedBCE, self).__init__()
+        self.reduction = reduction
+        self.register_buffer('pos_weight', torch.tensor(1.0))
+        self.register_buffer('neg_weight', torch.tensor(1.0))
+
+    def update_weights(self, targets):
+        if isinstance(targets, torch.Tensor):
+            targets = targets.float().cpu().numpy()
+        pos_count = np.sum(targets >= 0.5)
+        neg_count = np.sum(targets < 0.5)
+        total = pos_count + neg_count
+        if pos_count > 0 and neg_count > 0:
+            self.pos_weight.fill_(total / (2.0 * pos_count))
+            self.neg_weight.fill_(total / (2.0 * neg_count))
+        else:
+            self.pos_weight.fill_(1.0)
+            self.neg_weight.fill_(1.0)
+
+    def forward(self, inputs, targets):
+        if inputs.dim() == 2 and inputs.size(1) == 1:
+            inputs = inputs.squeeze(-1)
+        inputs_fp32 = inputs.float()
+        targets_fp32 = targets.float()
+        loss = F.binary_cross_entropy_with_logits(inputs_fp32, targets_fp32, reduction='none')
+        pw = self.pos_weight.to(dtype=loss.dtype, device=loss.device)
+        nw = self.neg_weight.to(dtype=loss.dtype, device=loss.device)
+        weights = torch.where(targets_fp32 >= 0.5, pw, nw)
+        loss = loss * weights
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
 
 class PairwiseWeightedBCE(DynamicWeightedBCE):
     """

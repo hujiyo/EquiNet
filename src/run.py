@@ -20,7 +20,7 @@ from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
                   create_recent_days_dataset, normalize_and_validate_context_window)
-from training_utils import evaluate_model, DynamicWeightedBCE, _get_amp_context
+from training_utils import evaluate_model, DynamicWeightedBCE, BalancedBCE, _get_amp_context
 
 
 # 每日统计 JSON 与可视化输出目录（项目根 /out_run，已被 .gitignore 的 out*/ 覆盖）
@@ -566,9 +566,11 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
         else:
             test_neg_weight = 0.1
         eval_criterion.weight_0_0.fill_(test_neg_weight)
+    elif LossConfig.LOSS_TYPE.lower() == 'balanced_bce':
+        eval_criterion = BalancedBCE(reduction='mean')
+        eval_criterion.update_weights(np.array(eval_targets))
     else:
-        import torch.nn as nn
-        eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        raise ValueError(f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE} (支持: dynamic_bce / pairwise_bce / balanced_bce)")
 
     # 评估模型（同时计算测试损失，避免冗余前向传播）
     stats = evaluate_model(

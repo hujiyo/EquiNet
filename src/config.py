@@ -240,7 +240,7 @@ class TrainingConfig:
 # ==================== 损失函数配置 ====================
 class LossConfig:
     """损失函数相关配置"""
-    # 'dynamic_bce':批权重动态平衡 | 'pairwise_bce':BCE+Pairwise排序 | 'standard_bce':标准二元交叉熵
+    # 'dynamic_bce':批权重动态平衡 | 'pairwise_bce':BCE+Pairwise排序 | 'balanced_bce':正负各半损失量纲不变
     LOSS_TYPE = 'dynamic_bce'
 
     POS_WEIGHT = 4.0  # DynamicWeightedBCE 的正样本权重

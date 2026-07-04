@@ -2,7 +2,7 @@
 EquiNet 模型训练脚本
 
 训练策略：
-- 使用 DynamicWeightedBCE / PairwiseWeightedBCE 损失函数
+- 使用 DynamicWeightedBCE / PairwiseWeightedBCE / BalancedBCE 损失函数
 - 两阶段学习率调度：Warmup + Cosine Annealing
 - 训练时在验证集上评估，按验证集 loss 和实战收益率选择最佳模型
 - 训练结束后用最佳模型在测试集上做最终评估
@@ -33,6 +33,7 @@ from training_utils import (
     save_model_with_metadata,
     DynamicWeightedBCE,
     PairwiseWeightedBCE,
+    BalancedBCE,
     EarlyStopping,
     print_dispersion_sparkline,
     create_optimizer_from_config_for_params,
@@ -128,10 +129,12 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
         eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+    elif LossConfig.LOSS_TYPE.lower() == 'balanced_bce':
+        print("损失函数: BalancedBCE (正负各占一半损失，量纲与标准BCE一致)")
+        criterion = BalancedBCE(reduction='mean')
+        eval_criterion = BalancedBCE(reduction='mean')
     else:
-        print("损失函数: 简单BCE (BCEWithLogitsLoss)")
-        criterion = nn.BCEWithLogitsLoss(reduction='mean')
-        eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        raise ValueError(f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE} (支持: dynamic_bce / pairwise_bce / balanced_bce)")
 
     # 设置验证集评估损失权重（BCE类损失共享此逻辑）
     if isinstance(eval_criterion, DynamicWeightedBCE):
@@ -147,6 +150,13 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         eval_criterion.weight_0_0.fill_(val_neg_weight)
         eval_set_name = "验证集" if has_val else "测试集"
         print(f"{eval_set_name}权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={val_neg_weight:.4f} (正负比例={val_pos_count}:{val_neg_count})")
+    elif isinstance(eval_criterion, BalancedBCE):
+        eval_targets_arr = np.array(eval_targets)
+        eval_criterion.update_weights(eval_targets_arr)
+        pos_count = np.sum(eval_targets_arr >= 0.5)
+        neg_count = np.sum(eval_targets_arr < 0.5)
+        eval_set_name = "验证集" if has_val else "测试集"
+        print(f"{eval_set_name}BalancedBCE权重: 正样本={eval_criterion.pos_weight.item():.4f}, 负样本={eval_criterion.neg_weight.item():.4f} (正{pos_count}:负{neg_count})")
 
     # 按loss保存的最佳模型（条件：预热结束后, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
     best_loss = float('inf')
@@ -408,8 +418,11 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             else:
                 t_neg_w = 0.1
             test_eval_criterion.weight_0_0.fill_(t_neg_w)
+        elif isinstance(eval_criterion, BalancedBCE):
+            test_eval_criterion = BalancedBCE(reduction='mean')
+            test_eval_criterion.update_weights(np.array(test_eval_targets))
         else:
-            test_eval_criterion = nn.BCEWithLogitsLoss(reduction='mean')
+            raise ValueError(f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE}")
 
         # 评估按loss选出的最佳模型
         if best_model_by_loss is not None:

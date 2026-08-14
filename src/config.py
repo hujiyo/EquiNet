@@ -153,14 +153,13 @@ class EmbeddingConfig:
     DEDUP_PRECISION = 1                 # batch内去重精度（小数位数），值越小去重越激进
     BATCH_DEDUP_OVERSAMPLE = 2.0        # batch内去重过采样倍数（先多采再去重，保证多样性）
 
-    # SIGReg 几何正则 (Balestriero & LeCun, 2025)
-    # 约束嵌入分布趋向各向同性高斯 N(0, target_std²)
-    # 损失公式: loss = λ·SIGReg + (1-λ)·Recon  (凸组合)
-    SIGREG_WEIGHT = 0.98                # λ, SIGReg 权重 (自适应归一化下逐步调高至Recon刚退化)
-    SIGREG_NUM_SLICES = 256             # 随机投影方向数 (官方最小示例: 256)
-    SIGREG_T_MAX = 3                    # Epps-Pulley 积分上限
-    SIGREG_N_POINTS = 17                # Epps-Pulley 积分节点数（奇数）
-    TARGET_STD = 0.2                    # 目标标准差（缩放后 SIGReg 检验 N(0,1)）
+    # 与 Recon MSE 同量级、batch size 不变（论文 3.2 似乎说明）。
+    VISREG_WEIGHT = 0.6                # λ, 正则项权重
+    VISREG_NUM_SLICES = 256             # 随机投影方向数 K (论文建议 K>C·D, 此处 D=128, K/D=2)
+    VISREG_W_SCALE = 1.0                # 尺度项权重 (逐维 std→1, VICReg 方差项)
+    VISREG_W_SHAPE = 1.0                # 形状项权重 (SWD 对齐高斯分位数, 低质量数据建议调大)
+    VISREG_W_CENTER = 1.0               # 中心化项权重 (批均值→0)
+    TARGET_STD = 0.2                    # 目标标准差（缩放后 VISReg 尺度项 target std依旧=1）
 
     # 输出
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out', 'embedding_pretrain')

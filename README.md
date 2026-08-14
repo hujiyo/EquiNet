@@ -4,12 +4,6 @@
 
  - EquiNet基于历史数据进行统计建模，对未来3天是否具有短期上涨趋势进行打分
 
-## 主要特性
-
-- **架构主流**：BERT拥有一定的时序建模能力
-- **训练监控**：每轮训练计算并显示各种评估指标
-- **参数配置**：自定义模型配置以适应不同需求
-
 ## 目录结构
 
 ```
@@ -17,21 +11,13 @@ EquiNet/
 ├── out/                       # 模型权重输出
 ├── data_maintenance/          # 数据维护工具包
 │   ├── equinet.db             # SQLite 数据库
-│   ├── database.py            # SQLite 数据库管理
-│   ├── update.py              # 数据更新（Baostock / AKShare）
-│   ├── check.py               # 数据质量检查与修复
-│   ├── select.py              # 股票筛选（全量池 → 训练池）
-│   └── features.py            # 衍生特征计算
+│   └── ...                    # 其他模块
 ├── src/
 │   ├── config.py              # 统一配置文件
-│   ├── data.py                # 数据加载 / 样本生成 / 特征归一化 / 极端行情过滤
 │   ├── model.py               # 模型架构（Post-Norm Transformer）
 │   ├── train.py               # 主训练脚本
-│   ├── training_utils.py      # 训练 / 评估工具模块
 │   ├── run.py                 # 推理 / 选股 / 全区间回测脚本
-│   ├── pretrain_embedding.py  # Embedding 预训练（SIGReg 几何正则）
-│   ├── embedding_evaluator.py # Embedding 质量评估
-│   ├── market_index.py        # 市场宽度计算（极端行情过滤的数据源）
+│   ├── pretrain_embedding.py  # Embedding 预训练（VISReg 几何正则）
 │   └── ...                    # 其他模块
 ├── data_maintenance.py        # 数据维护工具入口
 ├── LICENSE                    # Apache-2.0许可证
@@ -189,6 +175,7 @@ python src/visualize_attention.py
 
 ## 项目修改LOG
 
+- 2026.7.16:将Embedding预训练的几何正则从SIGReg更新为VISReg
 - 2026.6.24:新增极端行情过滤（剔除市场普涨普跌日的噪声标签）与市场宽度工具；评估集支持 `--begin` 全区间回测；新增每日统计导出与 HTML 看板
 - 2026.6:重构 MultiHeadAttention 为手写实现（LLaMA2 风格 per-head Q/K RMSNorm）；全栈对齐 Qwen3.5 使用 Zero-Centered RMSNorm；data.py 样本生成收敛至向量化批处理；重构 FFN-Embedding 结构与 embedding 预训练脚本；重构数据维护工具
 - 2026.6.3:修正SIGReg的使用实现

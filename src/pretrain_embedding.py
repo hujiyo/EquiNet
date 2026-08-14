@@ -1,11 +1,11 @@
 """
 EquiNet Embedding层训练脚本
 
-通过 SIGReg 几何正则 + 重建约束，预训练 FFN-Embedding 层，
+通过 VISReg 几何正则 + 重建约束，预训练 FFN-Embedding 层，
 使其成为一个固定的、具有几何保证的K线特征提取器：
 
-1. SIGReg 几何正则 (Balestriero & LeCun, 2025)：约束嵌入分布趋向各向同性高斯
-   通过 Cramér-Wold + Epps-Pulley 检验，数学上保证无维度/子空间/聚类坍塌
+1. VISReg 几何正则 (Wu, Balestriero & Levine, 2026; arXiv:2606.02572)：
+   约束嵌入分布趋向各向同性高斯 N(0, target_std²)
 2. MLP 解码器重建损失：确保嵌入向量足以恢复原始16维特征
     非线性解码器允许 embedding 自由学习特征融合，而不仅限于线性可编码的表示
 
@@ -32,7 +32,7 @@ from config import (DataConfig, EmbeddingConfig, DeviceConfig,ModelConfig,
 from data import (load_and_preprocess_data, FeatureNormalizer,
                   precompute_training_pool)
 from training_utils import _get_amp_context
-from sigreg import SIGRegLoss
+from visreg import VISRegLoss
 
 
 # ==================== 模型定义 ====================
@@ -56,7 +56,7 @@ class KLineEmbedding(nn.Module):
         )
         # 初始化（非逐层调参，从架构推导）
         # MLP分支增益=1（σ1·σ2·0.588·√(d·h) = 1），输出std = embed_proj输出std
-        # 合计std≈0.141（接近SIGReg目标std=0.2，训练中SIGReg会微调至精确目标）
+        # 合计std≈0.141（接近VISReg目标std=0.2，训练中VISReg会微调至精确目标）
         nn.init.normal_(self.embed_proj.weight,
                         std=0.2 / (math.sqrt(2) * math.sqrt(input_dim)))
         nn.init.normal_(self.embed_mlp[0].weight,
@@ -82,7 +82,7 @@ class PretrainModel(nn.Module):
 
     X → Embedding → S → MLP → Y
                       ↑           ↑
-                  SIGReg(S)   MSE(Y, X)
+                  VISReg(S)   MSE(Y, X)
 
     非线性解码器允许 embedding 自由学习特征融合表示，
     不强制要求信息线性可编码。
@@ -110,7 +110,7 @@ class PretrainModel(nn.Module):
         Args:
             x: [batch, input_dim]
         Returns:
-            z: [batch, d_model] 嵌入向量 S（用于 SIGReg）
+            z: [batch, d_model] 嵌入向量 S（用于 VISReg）
             recon: [batch, input_dim] 重建的原始输入 Y
         """
         z = self.embedding(x)
@@ -260,7 +260,7 @@ def save_pretrained_embedding(embedding, path, metrics=None, decoder=None):
             'epochs': EmbeddingConfig.EPOCHS,
             'batch_size': EmbeddingConfig.BATCH_SIZE,
             'learning_rate': EmbeddingConfig.LEARNING_RATE,
-            'sigreg_weight': EmbeddingConfig.SIGREG_WEIGHT,
+            'visreg_weight': EmbeddingConfig.VISREG_WEIGHT,
         },
     }
     if metrics:
@@ -279,7 +279,7 @@ def measure_embedding_std(checkpoint_path, kline_pool, device, n_probe=10000):
     测量已保存的 embedding 权重在真实归一化K线上的输出std
 
     从磁盘加载权重（save/load round-trip 验证），用真实K线池抽样探测，
-    反映 embedding 在真实数据分布上是否达成 SIGReg 的 TARGET_STD 目标。
+    反映 embedding 在真实数据分布上是否达成 VISReg 的 TARGET_STD 目标。
 
     Args:
         checkpoint_path: .pth 权重文件路径
@@ -377,21 +377,18 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
         eta_min=EmbeddingConfig.COSINE_ETA_MIN
     )
 
-    # 损失权重 (凸组合: λ·SIGReg + (1-λ)·Recon)
-    sigreg_weight = EmbeddingConfig.SIGREG_WEIGHT
+    # 损失权重 (论文式9/7): loss = (1-λ)·L_pred + λ·L_reg
+    # L_reg = w_scale·L_scale + w_shape·L_shape + w_center·L_center
+    # 三分量均为均值形式、天然 O(1)，与 Recon MSE 同量级，无需 SIGReg 时代的 EMA 归一化。
+    visreg_weight = EmbeddingConfig.VISREG_WEIGHT
     target_std = EmbeddingConfig.TARGET_STD
 
-    # 自适应归一化: EMA 跟踪各损失量级，归一化至 O(1) 后再做凸组合
-    sigreg_ema = None
-    recon_ema = None
-    ema_momentum = 0.9
-
-    # SIGReg 几何正则
-    sigreg_loss_fn = SIGRegLoss(
-        d_model=ModelConfig.D_MODEL,
-        num_slices=EmbeddingConfig.SIGREG_NUM_SLICES,
-        t_max=EmbeddingConfig.SIGREG_T_MAX,
-        n_points=EmbeddingConfig.SIGREG_N_POINTS,
+    # VISReg 几何正则：尺度/形状(SWD)/中心化 三项解耦
+    visreg_loss_fn = VISRegLoss(
+        num_slices=EmbeddingConfig.VISREG_NUM_SLICES,
+        w_scale=EmbeddingConfig.VISREG_W_SCALE,
+        w_shape=EmbeddingConfig.VISREG_W_SHAPE,
+        w_center=EmbeddingConfig.VISREG_W_CENTER,
     ).to(device)
 
     # 5. 训练循环
@@ -400,7 +397,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
     print(f"开始 Embedding 预训练")
     print(f"  轮数={epochs}  batch={batch_size}  lr={lr}")
     print(f"  精度={amp_str}  设备={device}")
-    print(f"  损失公式: {sigreg_weight:.0%}·(SIGReg/ema) + {1 - sigreg_weight:.0%}·(Recon/ema)")
+    print(f"  损失公式: {visreg_weight:.2f}·VISReg + {1 - visreg_weight:.2f}·Recon  (论文原版)")
     print(f"{'='*60}")
 
     output_dir = EmbeddingConfig.OUTPUT_DIR
@@ -410,9 +407,9 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
-        epoch_sigreg_w = 0.0  # SIGReg 加权贡献 (λ·sigreg/ema)
-        epoch_recon_w = 0.0   # Recon 加权贡献 ((1-λ)·recon/ema)
-        epoch_sigreg_raw = 0.0  # SIGReg 原始值
+        epoch_visreg_w = 0.0  # λ·VISReg 加权贡献
+        epoch_recon_w = 0.0   # (1-λ)·Recon 加权贡献
+        epoch_visreg_raw = 0.0  # VISReg 原始值
         epoch_recon_raw = 0.0   # Recon 原始值
         epoch_dedup_total = 0   # batch内去重去掉的条数
         n_batches = 0
@@ -441,67 +438,57 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
             with amp_ctx:
                 z, recon = model(batch)
 
-                # SIGReg: 缩放到 N(0,1) 目标，EP 检验各向同性高斯
-                loss_sigreg = sigreg_loss_fn(z / target_std)
+                # VISReg: 缩放到目标 std，尺度项 target std=1，形状项 SWD 对齐高斯
+                loss_visreg = visreg_loss_fn(z / target_std)
 
                 # 重建损失
                 loss_recon = F.mse_loss(recon, batch)
 
-                # 首次迭代用原始值初始化 EMA
-                if sigreg_ema is None:
-                    sigreg_ema = loss_sigreg.item()
-                    recon_ema = loss_recon.item()
-
-                # 自适应归一化凸组合 (归一化后各 ≈O(1)，λ 真实反映占比)
-                loss = (sigreg_weight * (loss_sigreg / sigreg_ema)
-                        + (1 - sigreg_weight) * (loss_recon / recon_ema))
+                # 论文原版加权: (1-λ)·Recon + λ·VISReg
+                loss = (1 - visreg_weight) * loss_recon + visreg_weight * loss_visreg
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(),TrainingConfig.GRADIENT_CLIP_NORM)
             optimizer.step()
 
             # 统计
-            raw_sigreg = loss_sigreg.item()
+            raw_visreg = loss_visreg.item()
             raw_recon = loss_recon.item()
-            sigreg_w = sigreg_weight * raw_sigreg / sigreg_ema
-            recon_w = (1 - sigreg_weight) * raw_recon / recon_ema
-            epoch_loss += sigreg_w + recon_w
-            epoch_sigreg_w += sigreg_w
+            visreg_w = visreg_weight * raw_visreg
+            recon_w = (1 - visreg_weight) * raw_recon
+            epoch_loss += visreg_w + recon_w
+            epoch_visreg_w += visreg_w
             epoch_recon_w += recon_w
-            epoch_sigreg_raw += raw_sigreg
+            epoch_visreg_raw += raw_visreg
             epoch_recon_raw += raw_recon
             n_batches += 1
-
-            # 更新归一化基准
-            sigreg_ema = ema_momentum * sigreg_ema + (1 - ema_momentum) * raw_sigreg
-            recon_ema = ema_momentum * recon_ema + (1 - ema_momentum) * raw_recon
 
         scheduler.step()
         elapsed = time.time() - t0
 
         avg_loss = epoch_loss / n_batches
-        avg_sigreg_w = epoch_sigreg_w / n_batches
+        avg_visreg_w = epoch_visreg_w / n_batches
         avg_recon_w = epoch_recon_w / n_batches
-        avg_sigreg_raw = epoch_sigreg_raw / n_batches
+        avg_visreg_raw = epoch_visreg_raw / n_batches
         avg_recon_raw = epoch_recon_raw / n_batches
         current_lr = scheduler.get_lr()
 
-        # 打印日志
+        # 打印日志 （原始值用于观察两项量级是否接近，验证 O(1) 假设）
         avg_dedup = epoch_dedup_total / max(1, n_batches)
         print(f"  Epoch {epoch:3d}/{epochs}  "
-              f"Loss={avg_loss:.4f} ({avg_sigreg_w:.4f}·SIGReg + {avg_recon_w:.4f}·Recon)  "
-              f"SIGReg={avg_sigreg_raw:.4f}  Recon={avg_recon_raw:.4f}  "
+              f"Loss={avg_loss:.4f} ({avg_visreg_w:.4f}·VISReg + {avg_recon_w:.4f}·Recon)  "
+              f"VISReg={avg_visreg_raw:.4f}  Recon={avg_recon_raw:.4f}  "
               f"LR={current_lr:.6f}  "
               f"Dedup={avg_dedup:.0f}/batch  "
               f"Time={elapsed:.1f}s")
 
     # 训练结束后保存最后一轮模型到磁盘
-    # （不按 loss 挑选：各轮 loss 经自适应归一化均稳定在 1 附近，
-    #   最低 loss 不可靠，直接保留最后一轮的权重）
+    # （不按 loss 挑选：预训练接近纯约束收敛，各轮 loss 差异小，
+    #   直接保留最后一轮收敛后的权重）
     last_metrics = {
         'epoch': epochs,
         'loss': avg_loss,
-        'sigreg_weighted': avg_sigreg_w,
+        'visreg_weighted': avg_visreg_w,
         'recon_weighted': avg_recon_w,
     }
     best_path = os.path.join(output_dir, 'best_embedding.pth')
@@ -530,8 +517,8 @@ def main():
                         help=f'批大小 (默认 {EmbeddingConfig.BATCH_SIZE})')
     parser.add_argument('--lr', type=float, default=None,
                         help=f'学习率 (默认 {EmbeddingConfig.LEARNING_RATE})')
-    parser.add_argument('--sigreg-weight', type=float, default=None,
-                        help=f'SIGReg损失权重λ (默认 {EmbeddingConfig.SIGREG_WEIGHT})')
+    parser.add_argument('--visreg-weight', type=float, default=None,
+                        help=f'VISReg损失权重λ (默认 {EmbeddingConfig.VISREG_WEIGHT})')
     parser.add_argument('--output-dir', type=str, default=None,
                         help=f'输出目录')
     parser.add_argument('--test', action='store_true',
@@ -546,8 +533,8 @@ def main():
         EmbeddingConfig.EPOCHS = args.epochs
     if args.batch_size:
         EmbeddingConfig.BATCH_SIZE = args.batch_size
-    if args.sigreg_weight is not None:
-        EmbeddingConfig.SIGREG_WEIGHT = args.sigreg_weight
+    if args.visreg_weight is not None:
+        EmbeddingConfig.VISREG_WEIGHT = args.visreg_weight
     if args.output_dir:
         EmbeddingConfig.OUTPUT_DIR = args.output_dir
 

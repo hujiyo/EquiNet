@@ -27,10 +27,11 @@ class PositionalEncoding(nn.Module):
     def __init__(self, d_model, seq_len=DataConfig.CONTEXT_LENGTH):
         super(PositionalEncoding, self).__init__()
         self.pe = nn.Embedding(seq_len, d_model)
-        # gain推导: 使position embedding输出std匹配FFN-Embedding输出std≈0.25
+        # gain推导: 使position embedding输出std匹配FFN-Embedding输出std
+        # (预训练VISReg目标 EmbeddingConfig.TARGET_STD=0.2, 见 pretrain_embedding.py)
         # xavier_uniform_输出std = gain × √(2/(45+128)) = gain × 0.10752
-        # 令其=0.25 → gain = 0.25/0.10752 ≈ 2.32
-        nn.init.xavier_uniform_(self.pe.weight, gain=2.32)
+        # 令其=0.2 → gain = 0.2/0.10752 ≈ 1.86
+        nn.init.xavier_uniform_(self.pe.weight, gain=1.86)
 
     def forward(self, x):
         seq_len = x.size(1)

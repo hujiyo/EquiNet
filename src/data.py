@@ -1511,19 +1511,24 @@ def fit_feature_normalizer(output_path=None):
 
     return normalizer
 
-def precompute_training_pool(train_stock_info, feature_normalizer=None):
+def precompute_training_pool(train_stock_info, feature_normalizer=None, max_pool_size=None):
     """
     预计算所有合法训练样本，一次性完成验证+粗归一化+标签+收益率+细归一化
 
     使用向量化批处理替代逐样本 Python 循环，每只股票的所有窗口一次性处理。
 
     Returns:
-        all_inputs: [N, context_length, 16] float32 归一化后的输入
-        all_targets: [N] float32 标签 (0/1)
-        all_returns: [N] float32 累计收益率
-        pos_indices: [M] int 正样本在 all_inputs 中的索引
-        neg_indices: [K] int 负样本在 all_inputs 中的索引
-        sample_key_to_pool_idx: dict  (stock_idx, start_idx) -> pool_index 映射
+        正常模式 (max_pool_size=None):
+            all_inputs: [N, context_length, 16] float32 归一化后的输入
+            all_targets: [N] float32 标签 (0/1)
+            all_returns: [N] float32 累计收益率
+            pos_indices: [M] int 正样本在 all_inputs 中的索引
+            neg_indices: [K] int 负样本在 all_inputs 中的索引
+            sample_key_to_pool_idx: dict  (stock_idx, start_idx) -> pool_index 映射
+        采样模式 (max_pool_size is not None):
+            all_inputs: [M, 16] float32 归一化后的 K 线（展平采样，无时间维度）
+            all_targets / all_returns / pos_indices / neg_indices: None
+            sample_key_to_pool_idx: {} (空 dict，展平后不再对应)
 
     过滤：受 DataConfig.FILTER_LIMIT_UP_OPEN 控制，开启时排除 T+1 开盘涨停的
     不可交易样本（评估阶段在 create_fixed_evaluation_dataset 中始终过滤，不受此开关控制）。
@@ -1573,6 +1578,10 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None):
 
         base_idx = total_samples
         total_samples += len(inputs)
+
+        # 采样模式：逐股票归一化（采样后展平为2D，无法用3D的transform_batch归一化）
+        if max_pool_size is not None and feature_normalizer is not None:
+            inputs = feature_normalizer.transform_batch(inputs)
         all_inputs.append(inputs)
         all_targets.append(targets)
         all_returns.append(returns_arr)
@@ -1582,24 +1591,62 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None):
     if len(all_inputs) == 0:
         raise ValueError("预计算结果为空：没有有效的训练样本")
 
-    all_inputs = np.concatenate(all_inputs, axis=0)
-    all_targets = np.concatenate(all_targets, axis=0)
-    all_returns = np.concatenate(all_returns, axis=0)
+    if max_pool_size is not None:
+        # 采样模式：逐股票展平采样，避免拼接完整数组导致双倍内存峰值
+        # list 中分散数组(~10GB) + 连续数组(~10GB) = 峰值~20GB 会 OOM；
+        # 逐股票采样后释放原数组，只拼接采样部分(~6GB)，峰值~10GB
+        total_klines = sum(arr.shape[0] * arr.shape[1] for arr in all_inputs)
+        if total_klines > max_pool_size:
+            sampled_chunks = []
+            remaining = max_pool_size
+            for i in range(len(all_inputs)):
+                arr = all_inputs[i]  # [N_i, 45, 16] 已归一化
+                n = arr.shape[0] * arr.shape[1]  # N_i * 45
+                k = int(n * max_pool_size / total_klines)  # floor: 保证 sum(k_i) <= max_pool_size，避免 round 累加超限导致尾部股票 k=0 被跳过
+                k = min(k, remaining, n)
+                flat = arr.reshape(-1, arr.shape[-1])  # [N_i*45, 16]
+                if k < n:
+                    idx = np.random.choice(n, k, replace=False)
+                    sampled_chunks.append(flat[idx])
+                else:
+                    sampled_chunks.append(flat.copy())
+                all_inputs[i] = None  # 释放原数组
+                remaining -= k
+            all_inputs = np.concatenate(sampled_chunks, axis=0)  # [max_pool_size, 16]
+            print(f"  K线级预采样: {total_klines:,} → {len(all_inputs):,} 条")
+        else:
+            all_inputs = np.concatenate(all_inputs, axis=0)
+            all_inputs = all_inputs.reshape(-1, all_inputs.shape[-1])
+        # 展平采样后 targets/returns 不再对应，置 None
+        all_targets = None
+        all_returns = None
+        pos_indices = None
+        neg_indices = None
+        sample_key_to_pool_idx = {}
+    else:
+        # 正常模式：拼接3D → 归一化 → 返回
+        all_inputs = np.concatenate(all_inputs, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+        all_returns = np.concatenate(all_returns, axis=0)
 
-    if feature_normalizer is not None:
-        chunk_size = 100_000
-        for start in range(0, len(all_inputs), chunk_size):
-            end = min(start + chunk_size, len(all_inputs))
-            all_inputs[start:end] = feature_normalizer.transform_batch(all_inputs[start:end])
+        if feature_normalizer is not None:
+            chunk_size = 100_000
+            for start in range(0, len(all_inputs), chunk_size):
+                end = min(start + chunk_size, len(all_inputs))
+                all_inputs[start:end] = feature_normalizer.transform_batch(all_inputs[start:end])
 
-    pos_indices = np.where(all_targets >= 0.5)[0]
-    neg_indices = np.where(all_targets < 0.5)[0]
+        pos_indices = np.where(all_targets >= 0.5)[0]
+        neg_indices = np.where(all_targets < 0.5)[0]
 
     elapsed = time.time() - t0
     mem_mb = all_inputs.nbytes / 1024 / 1024
-    print(f"  预计算完成: {len(all_inputs)} 个有效样本 "
-          f"(正样本 {len(pos_indices)}, 负样本 {len(neg_indices)})，"
-          f"耗时 {elapsed:.1f}s，占用 {mem_mb:.0f}MB")
+    if max_pool_size is not None:
+        print(f"  预计算完成: {len(all_inputs):,} 条K线 (采样模式)，"
+              f"耗时 {elapsed:.1f}s，占用 {mem_mb:.0f}MB")
+    else:
+        print(f"  预计算完成: {len(all_inputs)} 个有效样本 "
+              f"(正样本 {len(pos_indices)}, 负样本 {len(neg_indices)})，"
+              f"耗时 {elapsed:.1f}s，占用 {mem_mb:.0f}MB")
 
     return all_inputs, all_targets, all_returns, pos_indices, neg_indices, sample_key_to_pool_idx
 

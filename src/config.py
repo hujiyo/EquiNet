@@ -161,6 +161,15 @@ class EmbeddingConfig:
     VISREG_W_CENTER = 1.0               # 中心化项权重 (批均值→0)
     TARGET_STD = 0.2                    # 目标标准差（缩放后 VISReg 尺度项 target std依旧=1）
 
+    # 衍生特征解码：线性解码器额外解码 N 个"16维的跨域非线性函数"，
+    # 强迫 embedding 编码维度间关系（特征融合），而非逐维独立存储。
+    # 详见 pretrain_embedding.py:compute_derived_features
+    N_DERIVED_FEATURES = 11             # 衍生特征数量
+    DERIVED_EPS = 1e-6                  # 衍生特征除法防零 epsilon
+    DERIVED_WEIGHT = 1.0                # 衍生重建损失权重 (剪尾标准化后等权=1.0，可调防辅助任务主导)
+    DERIVED_WINSORIZE_PCT = (1.0, 99.0) # 衍生特征剪尾分位数：剔除极少数极端行情样本
+                                        # 对损失的支配（"极端值霸凌"），(0,100)=不剪尾
+
     # 输出
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out', 'embedding_pretrain')
     BEST_EMBEDDING_PATH = os.path.join(OUTPUT_DIR, 'best_embedding.pth')

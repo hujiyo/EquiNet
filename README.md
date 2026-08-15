@@ -175,6 +175,7 @@ python src/visualize_attention.py
 
 ## 项目修改LOG
 
+- 2026.8.15:embedding预训练解码器改为线性探针并新增11维衍生特征掩码MSE损失项（形态域在未归一化相对空间统一参考系计算,免掩码100%有效）；新增衍生特征线性探针对照工具probe_derived.py验证跨维结构是否编码进embedding
 - 2026.7.16:将Embedding预训练的几何正则从SIGReg更新为VISReg
 - 2026.6.24:新增极端行情过滤（剔除市场普涨普跌日的噪声标签）与市场宽度工具；评估集支持 `--begin` 全区间回测；新增每日统计导出与 HTML 看板
 - 2026.6:重构 MultiHeadAttention 为手写实现（LLaMA2 风格 per-head Q/K RMSNorm）；全栈对齐 Qwen3.5 使用 Zero-Centered RMSNorm；data.py 样本生成收敛至向量化批处理；重构 FFN-Embedding 结构与 embedding 预训练脚本；重构数据维护工具
@@ -183,7 +184,7 @@ python src/visualize_attention.py
 - 2026.5.29:模型采用Post-Norm架构
 - 2026.5.22:新增MACD和布林带衍生特征
 - 2026.5.13:重构Embedding预训练流程，替换原约束为SIGReg几何正则
-- 2026.5:数据存储从CSV文件迁移至SQLite数据库;新增Embedding层预训练机制;彻底移除克隆模型训练策略+多教师模型纠偏机制;新增Embedding预训练模块;重构数据分割与训练流程，加入验证集支持
+- 2026.5:数据存储从CSV文件迁移至SQLite数据库;新增Embedding层预训练机制;彻底移除克隆模型训练策略+多教师模型纠偏机制;重构数据分割与训练流程，加入验证集支持
 - 2026.5.5:添加日内均价特征(vwap);修复volume数据源错误
 - 2026.4:将transformer的FFN子层替换为SwiGLU子层;移除DFT微调训练脚本及相关文档引用;将量能和换手率归一化方式从固定范围改为基于N日均值的相对变化率;添加Top K%精度指标并更新相关输出;添加PairwiseWeightedBCE损失函数支持排序学习（可选）;添加均线偏离度特征(m5,m10,m20)
 - 2026.4.20谷雨:EquiNet v2归档，v3 start ~，方向:架构优化

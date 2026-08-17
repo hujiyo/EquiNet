@@ -170,6 +170,21 @@ class EmbeddingConfig:
     DERIVED_WINSORIZE_PCT = (1.0, 99.0) # 衍生特征剪尾分位数：剔除极少数极端行情样本
                                         # 对损失的支配（"极端值霸凌"），(0,100)=不剪尾
 
+    # 掩码对比学习（几何轴，SCARF式）：InfoNCE 施加在 projector 输出 g(z) 上，
+    # 正对=同一条K线的两个不同掩码视图，负对=batch内其他K线。
+    # 重建/VISReg 只保证"每条K线的信息可读出"，不管样本间相似度结构——
+    # 而下游 attention 消费的恰恰是 z 的点积相似度。对比损失塑造该几何，
+    # projector（SimCLR/DINOv2 路线）吸收"收紧"压力，z 保住 O/D 线性可读性；
+    # 训练后 projector 丢弃，下游仍用 z。
+    CONTRASTIVE_ENABLED = True           # 总开关，False=退回纯线性探针模式
+    CONTRASTIVE_WEIGHT = 0.2             # w_c：InfoNCE 权重（冷启动值≈ln(2B)≈8.5 远大于
+                                        # O(1) 的另两项，0.2 使三者加权贡献同数量级）；
+                                        # 剩余权重按 (1-w_c) 分配给 VISReg(λ)/Recon(1-λ)，
+                                        # λ=VISREG_WEIGHT 相对语义不变，w_c=0 时公式退回旧版
+    CONTRASTIVE_TAU = 0.2                # 温度：控制负对推开力度（数千负样本常规 0.1~0.2）
+    MASK_K_MIN = 2                       # 每视图最少掩码特征数（16维的 12.5%）
+    MASK_K_MAX = 5                       # 每视图最多掩码特征数（16维的 31%，SCARF 主流区间）
+
     # 输出
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out', 'embedding_pretrain')
     BEST_EMBEDDING_PATH = os.path.join(OUTPUT_DIR, 'best_embedding.pth')

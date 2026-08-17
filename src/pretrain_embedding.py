@@ -12,6 +12,13 @@ EquiNet Embedding层训练脚本
    线性解码器算不了任何非线性运算，跨维结构必须由 embedding 内部预先算好
    并编码成可线性读出的方向。此时重建损失 = 线性探针误差，
    O=/D= 日志直接衡量 embedding 中可线性读出的原始/衍生信息量。
+3. 掩码对比损失（几何轴，SCARF式）：同一条K线的两个不同掩码视图经
+   projector 投影后互为正对、batch内其他K线为负对（InfoNCE）。
+   1/2 管的是"每条K线编码了什么信息"，3 管的是"样本之间怎么排布"——
+   下游 attention 消费的是 z 的点积相似度，该几何必须显式训练。
+   对比施加在 projector 输出上（SimCLR/DINOv2 路线）：projector 吸收
+   "收紧"压力，z 保住 O/D 线性可读性的同时继承光滑相似度结构；
+   projector 训练后丢弃。CONTRASTIVE_ENABLED=False 可退回纯探针模式。
 
 用法：
   python src/pretrain_embedding.py                        # 使用默认参数
@@ -278,6 +285,71 @@ def build_derived_targets(kline_data, feature_normalizer, chunk_size=4_000_000):
     return derived_data, derived_mask
 
 
+# ==================== 掩码对比学习（几何轴） ====================
+def make_masked_view(x, k_min, k_max):
+    """
+    SCARF式特征掩码视图：每行随机掩 k∈[k_min, k_max] 个特征，
+    被掩位置的值替换为 batch 内随机样本的同列值（分布内重采样）。
+
+    为什么重采样而非置零：置零=均值插补（归一化后均值0），"被掩"痕迹
+    可被模型轻易识破，视图退化为轻度噪声，对比任务过简单；
+    重采样值在分布内合理，模型必须依赖跨维相关性才能区分真值与伪装
+    ——这正是要 embedding 学的东西。两视图掩码独立采样，被掩子集不同，
+    InfoNCE 拉近两视图 = 强迫从剩余特征推断被掩特征（度量形式的掩码预测）。
+
+    batch 内去重（training loop, precision=1）保证无重复K线，
+    否则相同样本互为负对会强迫同输入映射到远点，毒化几何。
+
+    Args:
+        x: [B, D] tensor（device 上）
+    Returns:
+        [B, D] 掩码+重采样后的视图
+    """
+    B, D = x.shape
+    # 每行独立的随机 k
+    k = torch.randint(k_min, k_max + 1, (B,), device=x.device)
+    # 每行恰好 k 个 True：阈值取该行第 k 大的随机值（升序 sort 用 D-k 索引），
+    # r >= 第k大 → 恰好 k 个位置入选（随机子集，等价于均匀抽 k 列）
+    r = torch.rand(B, D, device=x.device)
+    thresh = r.sort(dim=1).values.gather(1, (D - k).unsqueeze(1))
+    mask = r >= thresh
+    # 被掩位置的替换值来自 batch 内同列随机样本（分布内重采样）。
+    # 用 roll(1) 而非 randperm：roll 严格无固定点（randperm 有 1/B 概率
+    # 抽到自己→整行替换成原值、该样本视图失效）；batch 本身经 DataLoader
+    # shuffle，前驱行即均匀随机样本，统计上等价
+    resample = torch.roll(x, shifts=1, dims=0)
+    return torch.where(mask, resample, x)
+
+
+def info_nce_loss(p1, p2, tau):
+    """
+    对称 NT-Xent InfoNCE：p1/p2 为同 batch 两个视图的 L2 归一化投影 [B, d]。
+
+    正对 = 同一样本的两个视图 (i ↔ i+B)，负对 = 2B-2 个其他样本。
+    logits 必须在 fp32 计算（τ=0.2 除法后 bf16 精度不足）。
+
+    同时返回 Wang & Isola (ICML 2020) 几何度量用于监控：
+    - alignment: 正对欧氏距离²（越小说明正对拉得越近）
+    - uniformity: log E[exp(-2·dist²)]（越小说明样本在超球面上铺得越均匀）
+    两者同时下降 = 几何在改善（只降一个可能是坍塌前兆）。
+
+    Returns:
+        (loss, alignment, uniformity) 后两者为 python float
+    """
+    B = p1.shape[0]
+    z = torch.cat([p1, p2], dim=0)                      # [2B, d]
+    sim = (z @ z.t()) / tau
+    sim.fill_diagonal_(float('-inf'))                   # 排除自身
+    targets = torch.arange(2 * B, device=z.device)
+    targets = (targets + B) % (2 * B)                   # i ↔ i+B 互为正对
+    loss = F.cross_entropy(sim, targets)
+    with torch.no_grad():
+        alignment = (p1 - p2).pow(2).sum(dim=1).mean()
+        pd = torch.pdist(z, p=2).pow(2)
+        uniformity = torch.log(pd.mul(-2).exp().mean() + 1e-12)
+    return loss, alignment.item(), uniformity.item()
+
+
 # ==================== 模型定义 ====================
 
 class KLineEmbedding(nn.Module):
@@ -321,11 +393,14 @@ class KLineEmbedding(nn.Module):
 
 class PretrainModel(nn.Module):
     """
-    Embedding层训练模型 = KLineEmbedding + 线性解码器
+    Embedding层训练模型 = KLineEmbedding + 线性解码器 + 对比 projector
 
-    X → Embedding → S → Linear → Y
-                      ↑              ↑
-                  VISReg(S)   MSE(Y, [X, derived(X)])
+    X ──────────→ Embedding → S ─┬─ Linear → Y
+                                 ├─ VISReg(S)
+                                 └─→ (丢弃)
+    X 掩码视图1 ┐
+               ├→ Embedding → S → projector g(S) → L2归一化 ─┐
+    X 掩码视图2 ┘                                              ┴─ InfoNCE
 
     解码器刻意退化为单层线性映射（线性探针）：
     - 非线性解码器（如旧版 MLP 128→256→GELU→128）自己就能近似乘积/绝对值/
@@ -339,7 +414,11 @@ class PretrainModel(nn.Module):
       不需要事后单独跑探针实验验证机制是否成立。
     - 下游 Transformer（6层 FFN 128→512→128）的解码能力远超线性读出器，
       只要线性层能读出的信息，backbone 一定能提取。
-    解码器在预训练完成后丢弃，只保留 embedding 权重。
+
+    projector（对比分支，SimCLR/DINOv2 路线）：InfoNCE 不直接作用在 S 上
+    （会把"对区分样本身份无贡献"的方差压掉，冲掉 O/D 线性可读结构），
+    而是作用在 g(S) 上——projector 吸收几何收紧压力，S 继承温和的部分。
+    decoder 与 projector 均在预训练完成后丢弃，只保留 embedding 权重。
     """
 
     def __init__(self, input_dim=ModelConfig.INPUT_DIM, d_model=128,
@@ -351,6 +430,18 @@ class PretrainModel(nn.Module):
 
         out_dim = input_dim + n_derived
         self.decoder = nn.Linear(d_model, out_dim, bias=True)
+
+        # 对比 projector: 128→256→GELU→128（与 embed_mlp 同构，初始化同推导）
+        # MLP分支增益=1（σ1·σ2·0.588·√(d·h) = 1），输出 L2 归一化后进入 InfoNCE
+        hidden_dim = d_model * expand_ratio
+        self.projector = nn.Sequential(
+            nn.Linear(d_model, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_dim, d_model, bias=False),
+        )
+        nn.init.normal_(self.projector[0].weight, std=1.0 / math.sqrt(d_model))
+        nn.init.normal_(self.projector[2].weight,
+                        std=1.0 / (0.588 * math.sqrt(hidden_dim)))
 
     def forward(self, x):
         """
@@ -645,6 +736,16 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
     input_dim = ModelConfig.INPUT_DIM                # 原始16维，recon前 input_dim 列为原始重建
     n_derived = EmbeddingConfig.N_DERIVED_FEATURES
 
+    # 掩码对比（几何轴）：w_c=InfoNCE 权重，剩余 (1-w_c) 按 λ 分配给 VISReg/Recon，
+    # w_c=0 或 CONTRASTIVE_ENABLED=False 时公式严格退回旧版 (1-λ)·Recon + λ·VISReg
+    use_contrastive = EmbeddingConfig.CONTRASTIVE_ENABLED
+    w_c = EmbeddingConfig.CONTRASTIVE_WEIGHT if use_contrastive else 0.0
+    w_v = (1.0 - w_c) * visreg_weight
+    w_r = (1.0 - w_c) * (1.0 - visreg_weight)
+    ncl_tau = EmbeddingConfig.CONTRASTIVE_TAU
+    mask_k_min = EmbeddingConfig.MASK_K_MIN
+    mask_k_max = EmbeddingConfig.MASK_K_MAX
+
     # VISReg 几何正则：尺度/形状(SWD)/中心化 三项解耦
     visreg_loss_fn = VISRegLoss(
         num_slices=EmbeddingConfig.VISREG_NUM_SLICES,
@@ -659,7 +760,11 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
     print(f"开始 Embedding 预训练")
     print(f"  轮数={epochs}  batch={batch_size}  lr={lr}")
     print(f"  精度={amp_str}  设备={device}")
-    print(f"  损失公式: {visreg_weight:.2f}·VISReg + {1 - visreg_weight:.2f}·Recon  (论文原版)")
+    if use_contrastive:
+        print(f"  损失公式: {w_v:.2f}·VISReg + {w_r:.2f}·Recon + {w_c:.2f}·InfoNCE"
+              f"(掩码对比, τ={ncl_tau}, k∈[{mask_k_min},{mask_k_max}], projector头)")
+    else:
+        print(f"  损失公式: {visreg_weight:.2f}·VISReg + {1 - visreg_weight:.2f}·Recon  (论文原版)")
     print(f"  解码器=线性探针, Recon=原始16维 + {derived_weight:.2f}·{n_derived}衍生(掩码MSE)")
     print(f"{'='*60}")
 
@@ -676,6 +781,10 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
         epoch_recon_raw = 0.0   # Recon 原始值(原始重建+衍生重建之和)
         epoch_recon_orig_raw = 0.0    # 原始16维重建原始值
         epoch_recon_derived_raw = 0.0 # 衍生重建原始值(掩码后逐特征均值)
+        epoch_ncl_raw = 0.0      # InfoNCE 原始值
+        epoch_ncl_w = 0.0        # w_c·InfoNCE 加权贡献
+        epoch_align = 0.0        # alignment: 正对距离²（越低越好）
+        epoch_uniform = 0.0      # uniformity: 超球面均匀度（越低越好）
         epoch_dedup_total = 0   # batch内去重去掉的条数
         n_batches = 0
 
@@ -711,6 +820,12 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
                 deduped_mask[:batch_size], dtype=torch.float32).to(device)
 
             optimizer.zero_grad()
+            # 掩码视图（几何轴）：两视图独立采样不同掩码子集，
+            # 前向走 AMP（小 MLP 开销可忽略），InfoNCE 的 logits 在 AMP 外算 fp32
+            if use_contrastive:
+                v1 = make_masked_view(batch_x, mask_k_min, mask_k_max)
+                v2 = make_masked_view(batch_x, mask_k_min, mask_k_max)
+
             with amp_ctx:
                 z, recon = model(batch_x)
 
@@ -732,8 +847,18 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
                 loss_recon_derived = (num / den).mean()
                 loss_recon = loss_recon_orig + derived_weight * loss_recon_derived
 
-                # 论文原版加权: (1-λ)·Recon + λ·VISReg
-                loss = (1 - visreg_weight) * loss_recon + visreg_weight * loss_visreg
+                # 对比分支前向在 AMP 内（小 MLP），投影输出转 fp32 后归一化
+                if use_contrastive:
+                    p1 = model.projector(model.embedding(v1))
+                    p2 = model.projector(model.embedding(v2))
+                # 加权合成（InfoNCE 的 fp32 计算放 AMP 外，避免 bf16 logits 精度不足）
+                loss = w_v * loss_visreg + w_r * loss_recon
+
+            if use_contrastive:
+                p1 = F.normalize(p1.float(), dim=1)
+                p2 = F.normalize(p2.float(), dim=1)
+                loss_ncl, align_val, uniform_val = info_nce_loss(p1, p2, ncl_tau)
+                loss = loss + w_c * loss_ncl
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(),TrainingConfig.GRADIENT_CLIP_NORM)
@@ -742,8 +867,8 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
             # 统计
             raw_visreg = loss_visreg.item()
             raw_recon = loss_recon.item()
-            visreg_w = visreg_weight * raw_visreg
-            recon_w = (1 - visreg_weight) * raw_recon
+            visreg_w = w_v * raw_visreg
+            recon_w = w_r * raw_recon
             epoch_loss += visreg_w + recon_w
             epoch_visreg_w += visreg_w
             epoch_recon_w += recon_w
@@ -751,6 +876,13 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
             epoch_recon_raw += raw_recon
             epoch_recon_orig_raw += loss_recon_orig.item()
             epoch_recon_derived_raw += loss_recon_derived.item()
+            if use_contrastive:
+                ncl_w = w_c * loss_ncl.item()
+                epoch_loss += ncl_w
+                epoch_ncl_w += ncl_w
+                epoch_ncl_raw += loss_ncl.item()
+                epoch_align += align_val
+                epoch_uniform += uniform_val
             n_batches += 1
 
         scheduler.step()
@@ -766,12 +898,20 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
         current_lr = scheduler.get_lr()
 
         # 打印日志 （O=/D= 分别为原始16维/衍生重建原始值，D= 即线性探针误差，
-        # 直接衡量 embedding 中可线性读出的跨维结构量，观察衍生目标是否被学到）
+        # 直接衡量 embedding 中可线性读出的跨维结构量，观察衍生目标是否被学到；
+        # NCL=InfoNCE 原始值，A/U=alignment/uniformity 几何度量，两者同降=几何改善）
         avg_dedup = epoch_dedup_total / max(1, n_batches)
+        weighted_str = f"{avg_visreg_w:.4f}·VISReg + {avg_recon_w:.4f}·Recon"
+        ncl_str = ""
+        if use_contrastive:
+            weighted_str += f" + {epoch_ncl_w / n_batches:.4f}·NCL"
+            ncl_str = (f"NCL={epoch_ncl_raw / n_batches:.4f} "
+                       f"(A={epoch_align / n_batches:.3f}/U={epoch_uniform / n_batches:.3f})  ")
         print(f"  Epoch {epoch:3d}/{epochs}  "
-              f"Loss={avg_loss:.4f} ({avg_visreg_w:.4f}·VISReg + {avg_recon_w:.4f}·Recon)  "
+              f"Loss={avg_loss:.4f} ({weighted_str})  "
               f"VISReg={avg_visreg_raw:.4f}  Recon={avg_recon_raw:.4f} "
               f"(O={avg_recon_orig:.4f}/D={avg_recon_derived:.4f})  "
+              f"{ncl_str}"
               f"LR={current_lr:.6f}  "
               f"Dedup={avg_dedup:.0f}/batch  "
               f"Time={elapsed:.1f}s")
@@ -785,6 +925,13 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None,
         'visreg_weighted': avg_visreg_w,
         'recon_weighted': avg_recon_w,
     }
+    if use_contrastive:
+        last_metrics.update({
+            'contrastive_weighted': epoch_ncl_w / n_batches,
+            'contrastive_raw': epoch_ncl_raw / n_batches,
+            'alignment': epoch_align / n_batches,
+            'uniformity': epoch_uniform / n_batches,
+        })
     best_path = os.path.join(output_dir, 'best_embedding.pth')
     save_pretrained_embedding(model.embedding, best_path,
                               metrics=last_metrics, decoder=model.decoder)
@@ -813,6 +960,10 @@ def main():
                         help=f'学习率 (默认 {EmbeddingConfig.LEARNING_RATE})')
     parser.add_argument('--visreg-weight', type=float, default=None,
                         help=f'VISReg损失权重λ (默认 {EmbeddingConfig.VISREG_WEIGHT})')
+    parser.add_argument('--contrastive-weight', type=float, default=None,
+                        help=f'InfoNCE掩码对比权重w_c (默认 {EmbeddingConfig.CONTRASTIVE_WEIGHT})')
+    parser.add_argument('--no-contrastive', action='store_true',
+                        help='关闭掩码对比学习，退回纯线性探针模式')
     parser.add_argument('--output-dir', type=str, default=None,
                         help=f'输出目录')
     parser.add_argument('--test', action='store_true',
@@ -829,6 +980,10 @@ def main():
         EmbeddingConfig.BATCH_SIZE = args.batch_size
     if args.visreg_weight is not None:
         EmbeddingConfig.VISREG_WEIGHT = args.visreg_weight
+    if args.no_contrastive:
+        EmbeddingConfig.CONTRASTIVE_ENABLED = False
+    if args.contrastive_weight is not None:
+        EmbeddingConfig.CONTRASTIVE_WEIGHT = args.contrastive_weight
     if args.output_dir:
         EmbeddingConfig.OUTPUT_DIR = args.output_dir
 

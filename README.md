@@ -175,7 +175,8 @@ python src/visualize_attention.py
 
 ## 项目修改LOG
 
-- 2026.8.15:embedding预训练解码器改为线性探针并新增11维衍生特征掩码MSE损失项（形态域在未归一化相对空间统一参考系计算,免掩码100%有效）；新增衍生特征线性探针对照工具probe_derived.py验证跨维结构是否编码进embedding
+- 2026.8.16:embedding预训练新增掩码对比学习损失(SCARF式)
+- 2026.8.15:embedding预训练解码器改为线性decoder并新增11维衍生特征掩码MSE损失项；新增衍生特征线性探针对照工具probe_derived.py验证跨维结构是否编码进Embedding内
 - 2026.7.16:将Embedding预训练的几何正则从SIGReg更新为VISReg
 - 2026.6.24:新增极端行情过滤（剔除市场普涨普跌日的噪声标签）与市场宽度工具；评估集支持 `--begin` 全区间回测；新增每日统计导出与 HTML 看板
 - 2026.6:重构 MultiHeadAttention 为手写实现（LLaMA2 风格 per-head Q/K RMSNorm）；全栈对齐 Qwen3.5 使用 Zero-Centered RMSNorm；data.py 样本生成收敛至向量化批处理；重构 FFN-Embedding 结构与 embedding 预训练脚本；重构数据维护工具

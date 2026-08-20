@@ -185,6 +185,24 @@ class EmbeddingConfig:
     MASK_K_MIN = 2                       # 每视图最少掩码特征数（16维的 12.5%）
     MASK_K_MAX = 5                       # 每视图最多掩码特征数（16维的 31%，SCARF 主流区间）
 
+    # 分类头（粗粒度类别监督，Kronos 分层监督的"粗"端；头定义见
+    # pretrain_embedding.py:CLS_HEAD_SPEC）：
+    # 符号类衍生目标本质是类别 {-1,0,1}，被 MSE 当连续数训时存在
+    # "猜0.7也算对"的盲区，模型没有动力让同类K线在 embedding 空间靠拢；
+    # 交叉熵没有"差不多"，必须选边，逼 embedding 出现可线性读出的
+    # 类别可分结构（同类聚拢/异类分开）——下游 attention 消费点积
+    # 相似度，此几何直接可用。
+    # 注意与 VISReg 相克：可分性在 z 分布上产生多峰，高斯形状项拉单峰，
+    # 权重别开大（默认 0.1：4头平均CE≈0.5~0.7，加权贡献≈0.05~0.07，
+    # 与另三项 O(1) 量级相当但偏轻）。
+    CLS_ENABLED = True                   # 分类头总开关，False=退回纯回归监督
+    CLS_WEIGHT = 0.1                     # 分类总权重（各头 CE 等权平均后 × 该权重）
+    # "平"类区间：|v| ≤ ε 判平（ε 为每个头独立的分位数阈值，见
+    # pretrain_embedding.py:compute_cls_stats）。不用"恰好=0"（连续分布
+    # 上测度为零、平类退化）；用区间保证三类都非空。
+    CLS_FLAT_PCT = 15.0                  # 每个头 |v| 最小的百分之几判"平"
+                                         # （在 pre_sampled 池上预计算，确定性）
+
     # 输出
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out', 'embedding_pretrain')
     BEST_EMBEDDING_PATH = os.path.join(OUTPUT_DIR, 'best_embedding.pth')

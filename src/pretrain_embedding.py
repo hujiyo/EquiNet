@@ -19,16 +19,29 @@ EquiNet Embedding层训练脚本
    对比施加在 projector 输出上（SimCLR/DINOv2 路线）：projector 吸收
    "收紧"压力，z 保住 O/D 线性可读性的同时继承光滑相似度结构；
    projector 训练后丢弃。CONTRASTIVE_ENABLED=False 可退回纯探针模式。
-4. 分类头（粗粒度类别监督，Kronos 分层监督的"粗"端）：符号类衍生目标
+   类感知混合（SUPCON_ENABLED, α=SUPCON_ALPHA）：对比项 =
+   (1-α)·InfoNCE + α·SupCon。InfoNCE 把同类样本当负对推远，与 CLS
+   的同类聚拢在类别方向上互相抵消；SupCon（Khosla et al., NeurIPS 2020）
+   把同类（粗头 direction 标签）移入正对集，且损失由 batch 内全部成对
+   点积构成——梯度触及 z 的每个方向（CE 只塑形头权重张成的 ≤8 个方向），
+   即直接训练下游 attention 消费的核矩阵。α 别开大（抹平类内细粒度）。
+4. 分类头（类别监督，Kronos 粗细分层监督的判别式移植）：符号类衍生目标
    本质是类别 {-1,0,1}，被 MSE 当连续数训时存在"猜 0.7 也算对"的盲区，
    模型没有动力让同类K线在 embedding 空间靠拢；交叉熵没有"差不多"，
    必须选边站，逼 embedding 出现可线性读出的类别可分结构
    （同类聚拢/异类分开）——下游 attention 消费点积相似度，此几何直接可用。
-   三类=跌/平/涨，"平"为 |v|≤ε 的区间（ε 由池上分位数预计算，CLS_FLAT_PCT），
-   非"恰好=0"（连续分布上测度为零、平类会退化）。
+   粗头（CLS_ENABLED）：三类=跌/平/涨，"平"为 |v|≤ε 的区间
+   （ε 由池上分位数预计算，CLS_FLAT_PCT），非"恰好=0"（连续分布上
+   测度为零、平类会退化）。
+   细头（CLS_FINE_ENABLED）：同一判别值等频分 CLS_FINE_BUCKETS 桶——
+   粗头只有"分得开"的压力、类内几何是平的（涨0.5%与涨9.8%同为"涨"），
+   细头在桶粒度继续聚拢，给类内几何加分辨率。
    头为单层线性（与线性解码器同哲学：非线性头会把分类压力吞掉），
-   标签由归一化输入即时计算（与符号族衍生特征同定义、符号严格一致、无噪声），
-   训练后与 decoder/projector 一起丢弃。CLS_ENABLED=False 可退回纯回归。
+   标签由归一化输入即时计算（与符号族衍生特征同定义、平带外符号一致、
+   无噪声），训练后与 decoder/projector 一起丢弃。
+   CKA 监控（CKA_LOG_ENABLED）：逐 epoch 计算 CKA(z, 4粗头标签核)
+   （Kornblith et al. 2019）——z 的成对相似度结构与标签核的中心化相关，
+   几何轴指标（与 probe B/C 的信息轴正交）：高=类别几何饱和，低=有空间。
 
 用法：
   python src/pretrain_embedding.py
@@ -239,7 +252,7 @@ DERIVED_FEATURE_NAMES = [
 ]
 
 
-# ==================== 分类头（粗粒度类别监督） ====================
+# ==================== 分类头（类别监督：粗头+细头） ====================
 
 CLS_HEAD_SPEC = {
     # name: n_classes —— 符号类衍生目标的分类版本（Kronos 分层监督的"粗"端）。
@@ -289,53 +302,94 @@ def _cls_values(x):
     yield 'vwap_side', x[:, 3] - x[:, 4]
 
 
-def compute_cls_stats(pool, pct):
-    """
-    在池上预计算每个分类头的"平"阈值 ε 与三类占比（numpy，零 torch 开销）
+def fine_head_name(name):
+    """细头名：direction -> direction_f5（桶数取自 CLS_FINE_BUCKETS）"""
+    return f"{name}_f{EmbeddingConfig.CLS_FINE_BUCKETS}"
 
-    ε = |v| 的 pct 分位数：|v| ≤ ε 判"平"，保证三类都非空；
-    逐头独立 → 不引入人工量纲（各 v 的量级差异大：
-    direction≈O(0.1~1) 而 vol_price_align=sign(close-open)·amount 可达 O(几)）。
+
+def build_cls_head_spec():
+    """
+    构建参与 CE 损失的完整头规格（粗+细），成员由 EmbeddingConfig 决定。
+
+    Returns:
+        dict[head_name -> n_classes]；空 dict = 分类监督整体关闭
+    """
+    heads = {}
+    if EmbeddingConfig.CLS_ENABLED:
+        heads.update(CLS_HEAD_SPEC)
+    if EmbeddingConfig.CLS_FINE_ENABLED:
+        heads.update({fine_head_name(n): EmbeddingConfig.CLS_FINE_BUCKETS
+                      for n in CLS_HEAD_SPEC})
+    return heads
+
+
+def _bucket_shares(v, boundaries):
+    """按 bucketize 口径统计各类占比（numpy 侧与 torch.bucketize 严格同口径）"""
+    labels = np.searchsorted(boundaries, v, side='left')
+    counts = np.bincount(labels, minlength=len(boundaries) + 1)
+    return tuple(counts / len(v))
+
+
+def compute_cls_stats(pool, coarse, fine):
+    """
+    在池上预计算每个分类头的桶边界与类别占比（numpy，零 torch 开销）
+
+    统一边界表示：每头一个升序边界数组 b（长度 n_classes-1），
+    标签 = bucketize(v, b)（numpy 侧 searchsorted side='left' 与
+    torch.bucketize 默认 right=False 严格一致）：
+    - 粗头（3类）：b = [-ε, +ε]，ε = |v| 的 CLS_FLAT_PCT 分位数（平带）；
+      逐头独立 → 不引入人工量纲（各 v 量级差异大）
+    - 细头（n桶）：b = v 的等频分位数 i/n·100（i=1..n-1），天然类平衡
+
+    逐头惰性（_cls_values 生成器），40M 池上任一时刻只物化一个头的数组
+    （峰值 ~400MB 而非 4 头齐物化的 ~1.1GB，本项目 OOM 纪律）。
     池用实际参与训练的 pre_sampled 子集，与 batch 分布一致、确定性。
 
     Args:
         pool: [M, input_dim] 归一化K线池（numpy）
-        pct: 平类占比（百分数，如 20.0）
+        coarse: 是否计算粗头边界（SupCon/CKA 消费粗头标签，
+                即使粗头 CE 关闭也可能需要，由调用方决定）
+        fine: 是否计算细头边界
     Returns:
-        dict[name -> (eps, (跌占比, 平占比, 涨占比))]
+        dict[head_name -> (boundaries: np.ndarray[n_classes-1] float32 升序,
+                           shares: 各类占比 tuple，顺序=标签值升序)]
     """
     out = {}
     for name, v in _cls_values(pool):
-        abs_v = np.abs(v)  # 复用：分位数与平类计数共用一份 |v|（省一次全量拷贝）
-        eps = float(np.percentile(abs_v, pct))
-        n_flat = int((abs_v <= eps).sum())
-        n_neg = int((v < -eps).sum())
-        n_pos = int((v > eps).sum())
-        total = n_flat + n_neg + n_pos
-        out[name] = (eps, (n_neg / total, n_flat / total, n_pos / total))
+        if coarse and name in CLS_HEAD_SPEC:
+            eps = float(np.percentile(np.abs(v), EmbeddingConfig.CLS_FLAT_PCT))
+            b = np.array([-eps, eps], dtype=np.float32)
+            out[name] = (b, _bucket_shares(v, b))
+        if fine:
+            b = np.quantile(v, np.arange(1, EmbeddingConfig.CLS_FINE_BUCKETS)
+                            / EmbeddingConfig.CLS_FINE_BUCKETS).astype(np.float32)
+            out[fine_head_name(name)] = (b, _bucket_shares(v, b))
     return out
 
 
-def compute_cls_targets(x, cls_eps):
+def compute_cls_targets(x, cls_boundaries):
     """
-    从归一化K线即时计算分类标签 {0:跌, 1:平, 2:涨}
+    从归一化K线即时计算分类标签（bucketize，粗/细头统一入口）
 
-    平类判据为区间 |v| ≤ ε（ε 来自池上分位数 compute_cls_stats），
-    与"恰好=0"的 sign 不同：三类非空，模型无法偷懒只学二分类。
-    全 torch 算子，batch 内一步得出，无 numpy 往返。
+    全 torch 算子，batch 内一步得出，无 numpy 往返；
+    边界为池上预计算的升序 tensor（compute_cls_stats 输出转 torch 后传入）。
+    粗头三类语义 {0:跌, 1:平, 2:涨}——平类判据为区间 |v|≤ε 而非"恰好=0"
+    （连续分布上测度为零、平类退化），模型无法偷懒只学二分类；
+    细头 n 桶按判别值大小升序编号。
 
     Args:
         x: [B, input_dim] 归一化K线（与训练 batch 相同）
-        cls_eps: dict[name -> ε 阈值]（compute_cls_stats 输出）
+        cls_boundaries: dict[head_name -> 边界 tensor(升序, x.device)]
     Returns:
-        dict[name -> [B] torch.long, 值域 {0,1,2}]
+        dict[head_name -> [B] torch.long, 值域 {0..n_classes-1}]
     """
-    neg, flat, pos = (torch.tensor(i, device=x.device) for i in (0, 1, 2))
     targets = {}
     for name, v in _cls_values(x):
-        eps = cls_eps[name]
-        targets[name] = torch.where(
-            v > eps, pos, torch.where(v < -eps, neg, flat))
+        if name in cls_boundaries:                      # 粗头
+            targets[name] = torch.bucketize(v, cls_boundaries[name])
+        fine = fine_head_name(name)                     # 细头
+        if fine in cls_boundaries:
+            targets[fine] = torch.bucketize(v, cls_boundaries[fine])
     return targets
 
 
@@ -469,6 +523,82 @@ def info_nce_loss(p1, p2, tau):
     return loss, alignment.item(), uniformity.item()
 
 
+def supcon_loss(p, y, tau):
+    """
+    类感知对比损失 SupCon（Khosla et al., NeurIPS 2020，"out" 形式）
+
+    与 InfoNCE 的区别只在正对集扩大：
+        InfoNCE: 正对 = {同一样本的另一视图}    负对 = 其余全部（含同类！）
+        SupCon:  正对 = {另一视图} ∪ {同类样本} 负对 = {异类样本}
+    InfoNCE 把同类样本当负对推远，与 CLS 的同类聚拢在类别方向上互相抵消；
+    SupCon 把同类移入正对修正之。且损失由 batch 内全部成对点积构成，
+    梯度触及 z 的每个方向（CE 只塑形头权重张成的 ≤8 个方向）——
+    直接训练下游 attention 消费的核矩阵：同类→核值高，异类→核值低。
+
+    正对集至少含同一样本的另一视图（两视图标签恒同）→ 无空集风险。
+    fp32 计算（同 InfoNCE，τ 除法后 bf16 精度不足）。
+
+    Args:
+        p: [2B, d] L2 归一化投影（两视图拼接，fp32）
+        y: [2B] 类标签（torch.long）
+        tau: 温度（与 InfoNCE 共用）
+    Returns:
+        标量损失
+    """
+    n = p.size(0)
+    sim = (p @ p.t()) / tau                              # [2B, 2B]
+    mask_self = torch.eye(n, dtype=torch.bool, device=p.device)
+    mask_pos = (y[:, None] == y[None, :]) & ~mask_self   # 同类且非自身
+    # 每行对 a≠i 做 log-softmax（自身位置 -inf 排除出分母）
+    sim = sim.masked_fill(mask_self, float('-inf'))
+    log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+    # 自身位置 log_prob=-inf，置 0 防止与 mask_pos 相乘产生 nan
+    log_prob = log_prob.masked_fill(mask_self, 0.0)
+    mean_log_prob_pos = (mask_pos * log_prob).sum(1) / mask_pos.sum(1)
+    return -mean_log_prob_pos.mean()
+
+
+def label_kernel_from_targets(cls_targets, names):
+    """
+    多头同类比例软核：L_ij = mean_h 1[y_h(i)==y_h(j)] ∈ [0,1]
+
+    L_ij=1 表示所有头同类，=0 表示所有头异类；各头示性核均为 PSD
+    （类指示向量外积之和），均值仍 PSD，可作 CKA 的目标核。
+
+    Args:
+        cls_targets: dict[head_name -> [B] long]（compute_cls_targets 输出）
+        names: 参与核构建的头名列表（如 CLS_HEAD_SPEC 的 4 个粗头）
+    Returns:
+        [B, B] float tensor（对称）
+    """
+    y = torch.stack([cls_targets[n] for n in names], dim=1)       # [B, H]
+    return (y[:, None, :] == y[None, :, :]).float().mean(dim=2)  # [B, B]
+
+
+def compute_label_cka(z, label_kernel):
+    """
+    线性 CKA（Kornblith et al., ICML 2019）：z 的 Gram 与标签核的中心化相关
+
+    K = z_c z_cᵀ（z 列中心化 ⇒ 等价于核的双中心化 HXH），
+    L_c = H L H（标签核显式双中心化），
+    CKA = ⟨K, L_c⟩_F / (‖K‖_F·‖L_c‖_F) ∈ [-1, 1]。
+
+    衡量"z 里挨得近的样本对，标签上是否也同类"——成对几何轴指标，
+    与 probe B/C（单样本线性读出，信息轴）正交。纯监控，调用方需 no_grad。
+
+    Args:
+        z: [B, d] fp32（建议 detach 后传入）
+        label_kernel: [B, B] 对称标签核（label_kernel_from_targets 输出）
+    Returns:
+        python float
+    """
+    zc = z - z.mean(dim=0, keepdim=True)
+    k = zc @ zc.t()
+    lc = (label_kernel - label_kernel.mean(dim=0, keepdim=True)
+          - label_kernel.mean(dim=1, keepdim=True) + label_kernel.mean())
+    return ((k * lc).sum() / (k.norm() * lc.norm() + 1e-12)).item()
+
+
 # ==================== 模型定义 ====================
 
 class KLineEmbedding(nn.Module):
@@ -535,16 +665,18 @@ class PretrainModel(nn.Module):
     - 下游 Transformer（6层 FFN 128→512→128）的解码能力远超线性读出器，
       只要线性层能读出的信息，backbone 一定能提取。
 
-    分类头（粗粒度类别监督，Kronos 分层监督的"粗"端）：
+    分类头（类别监督，粗3类+细5桶两档粒度）：
     - 符号类衍生目标本质是类别 {-1,0,1}，被 MSE 当连续数训时"猜 0.7 也算对"，
       模型没有动力让同类K线在 embedding 空间靠拢；
     - 交叉熵没有"差不多"，必须选边站，逼 embedding 出现可线性读出的
       类别可分结构（同类聚拢/异类分开）——下游 attention 消费点积相似度，
       此几何直接可用；
+    - 细头（等频分桶）在桶粒度继续聚拢，补粗头类内几何的分辨率盲区
+      （涨0.5%与涨9.8%粗标签同为"涨"）；
     - 头必须单层线性（同解码器哲学：MLP 头自己就把类别算出来了，
       压力被吞掉）；标签由归一化输入即时计算（compute_cls_targets），无噪声；
     - 注意与 VISReg 相克：可分性在 z 分布上产生多峰，高斯形状项拉单峰，
-      CLS_WEIGHT 别开大；训练后丢弃，与 decoder/projector 相同。
+      CLS_WEIGHT/CLS_FINE_WEIGHT 别开大；训练后丢弃，与 decoder/projector 相同。
 
     projector（对比分支，SimCLR/DINOv2 路线）：InfoNCE 不直接作用在 S 上
     （会把"对区分样本身份无贡献"的方差压掉，冲掉 O/D 线性可读结构），
@@ -858,16 +990,32 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
     print(f"  batch 内去重: precision={precision}, "
           f"oversample={oversample}x → DataLoader batch={loader_batch_size}")
 
-    # 分类头（粗粒度类别监督）开关与权重：须在模型构造之前定义。
-    # w_cls 独立于 (1-w_c) 预算（置零即退回纯回归监督）。
-    use_cls = EmbeddingConfig.CLS_ENABLED and len(CLS_HEAD_SPEC) > 0
-    w_cls = EmbeddingConfig.CLS_WEIGHT if use_cls else 0.0
-    # "平"类阈值：池上分位数预计算（确定性、与 batch 分布一致）
-    cls_eps = None
+    # ---- 分类头（粗+细）/ SupCon / CKA 开关与预计算（须在模型构造前定义） ----
+    # 粗头(3类平带) + 细头(等频分桶)；SupCon/CKA 消费粗头标签，
+    # 故 CLS_ENABLED=False 时粗头边界仍需计算（need_coarse）。
+    # w_cls/w_fine 独立于 (1-w_c) 预算（置零即退回纯回归监督）。
+    use_cls_coarse = EmbeddingConfig.CLS_ENABLED
+    use_cls_fine = EmbeddingConfig.CLS_FINE_ENABLED
+    use_supcon = (EmbeddingConfig.SUPCON_ENABLED
+                  and EmbeddingConfig.CONTRASTIVE_ENABLED)
+    use_cka = EmbeddingConfig.CKA_LOG_ENABLED
+    need_coarse = use_cls_coarse or use_supcon or use_cka
+    w_cls = EmbeddingConfig.CLS_WEIGHT if use_cls_coarse else 0.0
+    w_fine = EmbeddingConfig.CLS_FINE_WEIGHT if use_cls_fine else 0.0
+    supcon_alpha = EmbeddingConfig.SUPCON_ALPHA if use_supcon else 0.0
+
+    # 头规格（模型侧：只含参与 CE 损失的头；SupCon/CKA 不需要头只要标签）
+    cls_heads_spec = build_cls_head_spec()
+    use_cls = len(cls_heads_spec) > 0
+
+    # 桶边界：池上分位数预计算（确定性、与 batch 分布一致），转 torch 上 device
     cls_stats = None
-    if use_cls:
-        cls_stats = compute_cls_stats(pre_sampled, EmbeddingConfig.CLS_FLAT_PCT)
-        cls_eps = {name: eps for name, (eps, _) in cls_stats.items()}
+    cls_boundaries = None
+    if need_coarse or use_cls_fine:
+        cls_stats = compute_cls_stats(pre_sampled,
+                                      coarse=need_coarse, fine=use_cls_fine)
+        cls_boundaries = {head: torch.tensor(b, dtype=torch.float32, device=device)
+                          for head, (b, _) in cls_stats.items()}
 
     # 3. 创建模型
     n_derived = EmbeddingConfig.N_DERIVED_FEATURES
@@ -875,7 +1023,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         input_dim=ModelConfig.INPUT_DIM,
         d_model=ModelConfig.D_MODEL,
         n_derived=n_derived,
-        cls_heads=CLS_HEAD_SPEC if use_cls else None,
+        cls_heads=cls_heads_spec if use_cls else None,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -928,22 +1076,41 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
     print(f"  轮数={epochs}  batch={batch_size}  lr={lr}")
     print(f"  精度={amp_str}  设备={device}")
     if use_contrastive:
-        formula = (f"{w_v:.2f}·VISReg + {w_r:.2f}·Recon + {w_c:.2f}·InfoNCE"
-                   f"(掩码对比, τ={ncl_tau}, k∈[{mask_k_min},{mask_k_max}], projector头)")
+        formula = (f"{w_v:.2f}·VISReg + {w_r:.2f}·Recon + "
+                   f"{w_c:.2f}·({1 - supcon_alpha:.1f}·InfoNCE"
+                   + (f" + {supcon_alpha:.1f}·SupCon" if use_supcon else "")
+                   + f")(掩码对比, τ={ncl_tau}, k∈[{mask_k_min},{mask_k_max}], projector头)")
     else:
         formula = (f"{visreg_weight:.2f}·VISReg + {1 - visreg_weight:.2f}·Recon  (论文原版)")
-    if use_cls:
+    if use_cls_coarse:
         formula += f" + {w_cls:.2f}·CLS({','.join(CLS_SHORT_NAMES.values())})"
+    if use_cls_fine:
+        formula += (f" + {w_fine:.2f}·FINE(f{EmbeddingConfig.CLS_FINE_BUCKETS})")
     print(f"  损失公式: {formula}")
     print(f"  解码器=线性探针, Recon=原始16维 + {derived_weight:.2f}·{n_derived}衍生(掩码MSE)")
-    if use_cls:
-        print(f"  分类头=线性探针(粗粒度, 跌/平/涨):")
+    if use_cls_coarse:
+        print(f"  分类头(粗,3类 跌/平/涨)=线性探针:")
         for name in CLS_HEAD_SPEC:
-            eps, shares = cls_stats[name]
-            print(f"    {name:>16s}: ε={eps:.4f}  "
+            b, shares = cls_stats[name]
+            print(f"    {name:>16s}: ε={-b[0]:.4f}  "
                   f"池上占比 跌{shares[0]*100:.0f}%/平{shares[1]*100:.0f}%/涨{shares[2]*100:.0f}%")
+    if use_cls_fine:
+        nb = EmbeddingConfig.CLS_FINE_BUCKETS
+        print(f"  分类头(细,{nb}桶 等频)=线性探针:")
+        for name in CLS_HEAD_SPEC:
+            b, shares = cls_stats[fine_head_name(name)]
+            b_str = ' '.join(f"{x:+.3f}" for x in b)
+            s_str = '/'.join(f"{s*100:.0f}%" for s in shares)
+            print(f"    {name:>16s}: 边界[{b_str}]  池上占比 {s_str}")
+    if use_supcon:
+        print(f"  SupCon(类感知对比): α={supcon_alpha} "
+              f"((1-α)·InfoNCE + α·SupCon), 正对=direction粗头同类, τ={ncl_tau}")
+    if use_cka:
+        print(f"  CKA监控: CKA(z, 4粗头标签核) 逐epoch日志"
+              f" (几何轴指标, 与probe B/C信息轴正交)")
+    if use_cls_coarse or use_cls_fine:
         print(f"  注: 分类可分性在 z 分布上产生多峰, 与 VISReg 高斯形状项相克, "
-              f"w_cls={w_cls} 不宜开大; 标签由归一化输入即时计算, 无噪声")
+              f"权重别开大; 标签由归一化输入即时计算, 无噪声")
     print(f"{'='*60}")
 
     output_dir = EmbeddingConfig.OUTPUT_DIR
@@ -963,10 +1130,15 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         epoch_ncl_w = 0.0        # w_c·InfoNCE 加权贡献
         epoch_align = 0.0        # alignment: 正对距离²（越低越好）
         epoch_uniform = 0.0      # uniformity: 超球面均匀度（越低越好）
-        epoch_cls_raw = 0.0      # CLS 原始值（各头 CE 平均）
-        epoch_cls_w = 0.0        # w_cls·CLS 加权贡献
-        epoch_cls_head_raw = [0.0] * len(CLS_HEAD_SPEC)  # 逐头 CE
-        epoch_cls_head_acc = [0.0] * len(CLS_HEAD_SPEC)  # 逐头准确率
+        epoch_cls_raw = 0.0      # 粗头 CE 平均（原始值）
+        epoch_cls_w = 0.0        # w_cls·粗头CE 加权贡献
+        epoch_cls_fine_raw = 0.0 # 细头 CE 平均（原始值）
+        epoch_cls_fine_w = 0.0   # w_fine·细头CE 加权贡献
+        epoch_cls_head_raw = {}  # 逐头 CE（粗+细，按头名）
+        epoch_cls_head_acc = {}  # 逐头准确率（粗+细，按头名）
+        epoch_sup_raw = 0.0      # SupCon 原始值
+        epoch_sup_w = 0.0        # w_c·α·SupCon 加权贡献
+        epoch_cka = 0.0          # CKA(z, 标签核)（batch 级平均）
         epoch_dedup_total = 0   # batch内去重去掉的条数
         n_batches = 0
 
@@ -1000,6 +1172,11 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
                 deduped_derived[:batch_size], dtype=torch.float32).to(device)
             batch_m = torch.tensor(
                 deduped_mask[:batch_size], dtype=torch.float32).to(device)
+
+            # 分类标签：由归一化输入即时计算（CE/SupCon/CKA 三方消费，
+            # 与 batch 天然对齐、零存储），先于任何前向算好
+            cls_targets = (compute_cls_targets(batch_x, cls_boundaries)
+                           if cls_boundaries is not None else None)
 
             optimizer.zero_grad()
             # 掩码视图（几何轴）：两视图独立采样不同掩码子集，
@@ -1040,20 +1217,38 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
                 p1 = F.normalize(p1.float(), dim=1)
                 p2 = F.normalize(p2.float(), dim=1)
                 loss_ncl, align_val, uniform_val = info_nce_loss(p1, p2, ncl_tau)
-                loss = loss + w_c * loss_ncl
+                loss_contrast = loss_ncl
+                if use_supcon:
+                    # 类感知混合：direction 粗头同类样本移入正对集
+                    # （标签已在 batch 开头算好；两视图标签恒同，拼接顺序对应）
+                    sup_y = torch.cat([cls_targets['direction'],
+                                       cls_targets['direction']], dim=0)
+                    loss_sup = supcon_loss(torch.cat([p1, p2], dim=0),
+                                           sup_y, ncl_tau)
+                    loss_contrast = ((1.0 - supcon_alpha) * loss_ncl
+                                     + supcon_alpha * loss_sup)
+                loss = loss + w_c * loss_contrast
 
-            # 分类头（粗粒度监督）：fp32 计算（CE 在 bf16 下精度不足，同 InfoNCE）。
-            # 标签由归一化输入即时计算（compute_cls_targets），与 batch 天然对齐；
-            # 梯度经线性头回流 embedding，逼 z 出现可线性读出的类别可分结构
+            # 分类头（粗+细）：fp32 计算（CE 在 bf16 下精度不足，同 InfoNCE）。
+            # 标签已由 compute_cls_targets 预算好；梯度经线性头回流 embedding，
+            # 逼 z 出现可线性读出的类别可分结构
             if use_cls:
                 cls_logits = model.cls_forward(z.float())
-                cls_targets = compute_cls_targets(batch_x, cls_eps)
                 cls_losses = {
                     name: F.cross_entropy(cls_logits[name], cls_targets[name])
-                    for name in CLS_HEAD_SPEC
+                    for name in cls_heads_spec
                 }
-                loss_cls = torch.stack(list(cls_losses.values())).mean()
-                loss = loss + w_cls * loss_cls
+                # 粗/细分组（键在 CLS_HEAD_SPEC 中=粗头，其余=细头），各自等权平均
+                coarse_l = [cls_losses[n] for n in cls_heads_spec
+                            if n in CLS_HEAD_SPEC]
+                fine_l = [cls_losses[n] for n in cls_heads_spec
+                          if n not in CLS_HEAD_SPEC]
+                loss_cls = torch.stack(coarse_l).mean() if coarse_l else None
+                loss_cls_fine = torch.stack(fine_l).mean() if fine_l else None
+                if loss_cls is not None:
+                    loss = loss + w_cls * loss_cls
+                if loss_cls_fine is not None:
+                    loss = loss + w_fine * loss_cls_fine
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(),TrainingConfig.GRADIENT_CLIP_NORM)
@@ -1072,21 +1267,41 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
             epoch_recon_orig_raw += loss_recon_orig.item()
             epoch_recon_derived_raw += loss_recon_derived.item()
             if use_contrastive:
-                ncl_w = w_c * loss_ncl.item()
+                # SupCon 开启时 InfoNCE 的有效权重是 w_c·(1-α)
+                ncl_w = w_c * (1.0 - supcon_alpha) * loss_ncl.item()
                 epoch_loss += ncl_w
                 epoch_ncl_w += ncl_w
                 epoch_ncl_raw += loss_ncl.item()
                 epoch_align += align_val
                 epoch_uniform += uniform_val
+            if use_supcon:
+                sup_w = w_c * supcon_alpha * loss_sup.item()
+                epoch_loss += sup_w
+                epoch_sup_w += sup_w
+                epoch_sup_raw += loss_sup.item()
             if use_cls:
-                cls_w = w_cls * loss_cls.item()
-                epoch_loss += cls_w
-                epoch_cls_w += cls_w
-                epoch_cls_raw += loss_cls.item()
-                for i, name in enumerate(CLS_HEAD_SPEC):
-                    epoch_cls_head_raw[i] += cls_losses[name].item()
+                if loss_cls is not None:
+                    cls_w = w_cls * loss_cls.item()
+                    epoch_loss += cls_w
+                    epoch_cls_w += cls_w
+                    epoch_cls_raw += loss_cls.item()
+                if loss_cls_fine is not None:
+                    fine_w = w_fine * loss_cls_fine.item()
+                    epoch_loss += fine_w
+                    epoch_cls_fine_w += fine_w
+                    epoch_cls_fine_raw += loss_cls_fine.item()
+                for name in cls_heads_spec:
+                    epoch_cls_head_raw[name] = (epoch_cls_head_raw.get(name, 0.0)
+                                                + cls_losses[name].item())
                     acc = (cls_logits[name].argmax(dim=1) == cls_targets[name])
-                    epoch_cls_head_acc[i] += acc.float().mean().item()
+                    epoch_cls_head_acc[name] = (epoch_cls_head_acc.get(name, 0.0)
+                                                + acc.float().mean().item())
+            if use_cka:
+                # 纯监控：z 已反传完毕，detach+no_grad 零额外图开销
+                with torch.no_grad():
+                    k_l = label_kernel_from_targets(cls_targets,
+                                                    list(CLS_HEAD_SPEC))
+                    epoch_cka += compute_label_cka(z.detach().float(), k_l)
             n_batches += 1
 
         scheduler.step()
@@ -1104,8 +1319,12 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         # 打印日志 （O=/D= 分别为原始16维/衍生重建原始值，D= 即线性探针误差，
         # 直接衡量 embedding 中可线性读出的跨维结构量，观察衍生目标是否被学到；
         # NCL=InfoNCE 原始值，A/U=alignment/uniformity 几何度量，两者同降=几何改善；
-        # CLS=各头 CE 平均，逐头格式 CE/Acc——CE 从初始 ln(3)≈1.1 下降 + Acc 上升
-        # = 类别可分结构正在被嵌入；Acc 受 label 噪声/可分离度上限约束，无需追满）
+        # SUP=SupCon 原始值，下降=全空间同类聚拢/异类分开在推进；
+        # CLS/FINE=粗/细头 CE 平均，逐头格式 CE/Acc——CLS 从 ln(3)≈1.1、
+        # FINE 从 ln(5)≈1.61 下降 + Acc 上升 = 类别可分结构正在被嵌入
+        # （Acc 受 label 噪声/可分离度上限约束，无需追满）；
+        # CKA=z 与标签核的中心化相关（几何轴），上升=类别成对几何与标签
+        # 一致性提高——VISReg 单峰压力会限制其上限，看趋势不看绝对值）
         avg_dedup = epoch_dedup_total / max(1, n_batches)
         weighted_str = f"{avg_visreg_w:.4f}·VISReg + {avg_recon_w:.4f}·Recon"
         ncl_str = ""
@@ -1113,22 +1332,45 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
             weighted_str += f" + {epoch_ncl_w / n_batches:.4f}·NCL"
             ncl_str = (f"NCL={epoch_ncl_raw / n_batches:.4f} "
                        f"(A={epoch_align / n_batches:.3f}/U={epoch_uniform / n_batches:.3f})  ")
+        sup_str = ""
+        if use_supcon:
+            weighted_str += f" + {epoch_sup_w / n_batches:.4f}·SUP"
+            sup_str = f"SUP={epoch_sup_raw / n_batches:.4f}  "
         cls_str = ""
-        if use_cls:
+        if use_cls_coarse:
             weighted_str += f" + {epoch_cls_w / n_batches:.4f}·CLS"
             cls_parts = []
-            for i, name in enumerate(CLS_HEAD_SPEC):
-                ce = epoch_cls_head_raw[i] / n_batches
-                acc = epoch_cls_head_acc[i] / n_batches
+            for name in CLS_HEAD_SPEC:
+                ce = epoch_cls_head_raw[name] / n_batches
+                acc = epoch_cls_head_acc[name] / n_batches
                 cls_parts.append(f"{CLS_SHORT_NAMES[name]}={ce:.3f}/{acc*100:.0f}%")
             cls_str = (f"CLS={epoch_cls_raw / n_batches:.4f} "
                        f"({' '.join(cls_parts)})  ")
+        fine_str = ""
+        if use_cls_fine:
+            weighted_str += f" + {epoch_cls_fine_w / n_batches:.4f}·FINE"
+            nb = EmbeddingConfig.CLS_FINE_BUCKETS
+            fine_parts = []
+            for name in CLS_HEAD_SPEC:
+                head = fine_head_name(name)
+                ce = epoch_cls_head_raw[head] / n_batches
+                acc = epoch_cls_head_acc[head] / n_batches
+                fine_parts.append(
+                    f"{CLS_SHORT_NAMES[name]}{nb}={ce:.3f}/{acc*100:.0f}%")
+            fine_str = (f"FINE={epoch_cls_fine_raw / n_batches:.4f} "
+                        f"({' '.join(fine_parts)})  ")
+        cka_str = ""
+        if use_cka:
+            cka_str = f"CKA={epoch_cka / n_batches:.4f}  "
         print(f"  Epoch {epoch:3d}/{epochs}  "
               f"Loss={avg_loss:.4f} ({weighted_str})  "
               f"VISReg={avg_visreg_raw:.4f}  Recon={avg_recon_raw:.4f} "
               f"(O={avg_recon_orig:.4f}/D={avg_recon_derived:.4f})  "
               f"{ncl_str}"
+              f"{sup_str}"
               f"{cls_str}"
+              f"{fine_str}"
+              f"{cka_str}"
               f"LR={current_lr:.6f}  "
               f"Dedup={avg_dedup:.0f}/batch  "
               f"Time={elapsed:.1f}s")
@@ -1149,14 +1391,26 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
             'alignment': epoch_align / n_batches,
             'uniformity': epoch_uniform / n_batches,
         })
-    if use_cls:
+    if use_cls_coarse:
         last_metrics.update({
             'cls_weighted': epoch_cls_w / n_batches,
             'cls_raw': epoch_cls_raw / n_batches,
         })
-        for i, name in enumerate(CLS_HEAD_SPEC):
-            last_metrics[f'cls_ce_{name}'] = epoch_cls_head_raw[i] / n_batches
-            last_metrics[f'cls_acc_{name}'] = epoch_cls_head_acc[i] / n_batches
+    if use_cls_fine:
+        last_metrics.update({
+            'cls_fine_weighted': epoch_cls_fine_w / n_batches,
+            'cls_fine_raw': epoch_cls_fine_raw / n_batches,
+        })
+    for name in cls_heads_spec:
+        last_metrics[f'cls_ce_{name}'] = epoch_cls_head_raw[name] / n_batches
+        last_metrics[f'cls_acc_{name}'] = epoch_cls_head_acc[name] / n_batches
+    if use_supcon:
+        last_metrics.update({
+            'supcon_weighted': epoch_sup_w / n_batches,
+            'supcon_raw': epoch_sup_raw / n_batches,
+        })
+    if use_cka:
+        last_metrics['cka'] = epoch_cka / n_batches
     best_path = os.path.join(output_dir, 'best_embedding.pth')
     save_pretrained_embedding(model.embedding, best_path,
                               metrics=last_metrics, decoder=model.decoder)

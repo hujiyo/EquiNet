@@ -195,13 +195,45 @@ class EmbeddingConfig:
     # 注意与 VISReg 相克：可分性在 z 分布上产生多峰，高斯形状项拉单峰，
     # 权重别开大（默认 0.1：4头平均CE≈0.5~0.7，加权贡献≈0.05~0.07，
     # 与另三项 O(1) 量级相当但偏轻）。
-    CLS_ENABLED = True                   # 分类头总开关，False=退回纯回归监督
-    CLS_WEIGHT = 0.1                     # 分类总权重（各头 CE 等权平均后 × 该权重）
+    CLS_ENABLED = True                   # 粗头总开关，False=退回纯回归监督
+    CLS_WEIGHT = 0.1                     # 粗头分类权重（4头 CE 等权平均后 × 该权重）
     # "平"类区间：|v| ≤ ε 判平（ε 为每个头独立的分位数阈值，见
     # pretrain_embedding.py:compute_cls_stats）。不用"恰好=0"（连续分布
     # 上测度为零、平类退化）；用区间保证三类都非空。
     CLS_FLAT_PCT = 15.0                  # 每个头 |v| 最小的百分之几判"平"
                                          # （在 pre_sampled 池上预计算，确定性）
+
+    # ---- 多粒度细头（粗头之上的分辨率层） ----
+    # 3 类粗头只有"分得开"的压力，类内几何是平的（涨0.5%与涨9.8%标签同为
+    # "涨"，CE 施加完全相同的拉力）；细头把同一判别值等频分桶，在桶粒度上
+    # 继续施加同类聚拢压力，给类内几何加分辨率（Kronos 粗细token思想的
+    # 判别式移植）。等频分桶天然类平衡；训练后期仍有梯度（3类头 Acc 平台
+    # 化后细头继续供压）。注意 CE 不保证"相邻桶更近"（桶被当无序类别），
+    # 相邻结构只是 v 连续性的副作用，要严格有序需 CORAL 类损失（未采用）。
+    CLS_FINE_ENABLED = True              # 细头开关
+    CLS_FINE_BUCKETS = 5                 # 桶数（4个判别值统一；大涨/小涨/平/小跌/大跌）
+    CLS_FINE_WEIGHT = 0.1                # 细头 CE 权重（ln5≈1.61 起步 vs 粗头 ln3≈1.1，
+                                         # 同乘 0.1 后量级相当）
+
+    # ---- 类感知对比（SupCon, Khosla et al., NeurIPS 2020） ----
+    # InfoNCE 的正对只有"同一样本两视图"，同类样本全在负对集里被推远，
+    # 与 CLS 的同类聚拢在类别方向上互相抵消；SupCon 把同类（粗头
+    # direction 标签）移入正对集，修正该抵消。且 CE 只塑形头权重张成的
+    # ≤8 个方向（4头×3类的有效秩），SupCon 损失由 batch 内全部成对点积
+    # 构成，梯度触及 z 的每个方向——直接训练下游 attention 消费的核矩阵。
+    # 依赖 CONTRASTIVE_ENABLED（无视图无 projector 输出）。
+    SUPCON_ENABLED = True                # 类感知对比开关
+    SUPCON_ALPHA = 0.3                   # 混合系数 α：对比项 = (1-α)·InfoNCE + α·SupCon
+                                         # α 别开大：同类拉太近会抹平类内细粒度
+                                         # （与细头目标相克）并压 uniformity
+
+    # ---- CKA 几何监控（Kornblith et al., ICML 2019） ----
+    # 逐 epoch 计算 CKA(z, 4粗头标签核)：z 的 Gram 矩阵与"同类比例"标签核
+    # 的中心化相关——衡量类别成对几何与标签的一致性（"z 里挨得近的样本对
+    # 是否同类"）。probe B/C 测信息轴（单样本线性读出），CKA 测几何轴
+    # （样本对相对位置），两者正交。用于决策而非仅监控：
+    # 高=类别几何已饱和（SupCon 无油水），低=有空间（SupCon 该上的证据）。
+    CKA_LOG_ENABLED = True               # CKA 逐 epoch 日志开关
 
     # 输出
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out', 'embedding_pretrain')

@@ -12,19 +12,24 @@ EquiNet Embedding层训练脚本
    线性解码器算不了任何非线性运算，跨维结构必须由 embedding 内部预先算好
    并编码成可线性读出的方向。此时重建损失 = 线性探针误差，
    O=/D= 日志直接衡量 embedding 中可线性读出的原始/衍生信息量。
-3. 掩码对比损失（几何轴，SCARF式）：同一条K线的两个不同掩码视图经
-   projector 投影后互为正对、batch内其他K线为负对（InfoNCE）。
+3. 类感知对比损失（几何轴主损失，SupCon；Khosla et al., NeurIPS 2020）：
+   正对 = 粗头 vol_price_align 同类（量价同向/背离/中性，编码
+   direction×量交互），负对 = 异类，施加在 projector 输出 g(z) 上。
    1/2 管的是"每条K线编码了什么信息"，3 管的是"样本之间怎么排布"——
    下游 attention 消费的是 z 的点积相似度，该几何必须显式训练。
-   对比施加在 projector 输出上（SimCLR/DINOv2 路线）：projector 吸收
-   "收紧"压力，z 保住 O/D 线性可读性的同时继承光滑相似度结构；
-   projector 训练后丢弃。CONTRASTIVE_ENABLED=False 可退回纯探针模式。
-   类感知混合（SUPCON_ENABLED, α=SUPCON_ALPHA）：对比项 =
-   (1-α)·InfoNCE + α·SupCon。InfoNCE 把同类样本当负对推远，与 CLS
-   的同类聚拢在类别方向上互相抵消；SupCon（Khosla et al., NeurIPS 2020）
-   把同类（粗头 direction 标签）移入正对集，且损失由 batch 内全部成对
-   点积构成——梯度触及 z 的每个方向（CE 只塑形头权重张成的 ≤8 个方向），
-   即直接训练下游 attention 消费的核矩阵。α 别开大（抹平类内细粒度）。
+   损失由 batch 内全部成对点积构成，梯度触及 z 的每个方向（CE 只塑形
+   头权重张成的 ≤8 个方向）；正对掩码=标签核=CKA 目标核——SupCon 把
+   CKA 要测的"类别成对几何一致性"直接变成损失在优化。
+   无掩码无视图，干净 x 的投影直接进 SupCon。掩码视图 InfoNCE
+   （SCARF式）已删除：其前提"被掩列可从剩余列恢复"对本特征表示
+   不成立——技术列依赖历史（不在当日输入）、逐列分位数归一化破坏
+   跨列代数关系，掩技术列 → 模型学会忽略它们（不变性捷径，
+   alignment→0 任务空转）；掩源列 → 语义真空（伪方向/伪量价视图，
+   全列掩码下 ~39% 视图伪 direction）。SCARF 是无标签时代的拐杖，
+   有确定性标签时直接用标签教几何。
+   projector 吸收"收紧"压力，z 保住 O/D 线性可读性；z 不坍缩由
+   VISReg（各向同性高斯散度）+ Recon（细粒度信息）保证。projector
+   训练后丢弃。SUPCON_ENABLED=False 可退回纯探针模式。
 4. 分类头（类别监督，Kronos 粗细分层监督的判别式移植）：符号类衍生目标
    本质是类别 {-1,0,1}，被 MSE 当连续数训时存在"猜 0.7 也算对"的盲区，
    模型没有动力让同类K线在 embedding 空间靠拢；交叉熵没有"差不多"，
@@ -448,105 +453,33 @@ def build_derived_targets(kline_data, feature_normalizer, chunk_size=4_000_000):
     return derived_data, derived_mask
 
 
-# ==================== 掩码对比学习（几何轴） ====================
-def make_masked_view(x, k_min, k_max):
-    """
-    SCARF式特征掩码视图：每行随机掩 k∈[k_min, k_max] 个特征，
-    被掩位置的值替换为 batch 内随机样本的同列值（分布内重采样）。
-
-    为什么重采样而非置零：置零=均值插补（归一化后均值0），"被掩"痕迹
-    可被模型轻易识破，视图退化为轻度噪声，对比任务过简单；
-    重采样值在分布内合理，模型必须依赖跨维相关性才能区分真值与伪装
-    ——这正是要 embedding 学的东西。两视图掩码独立采样，被掩子集不同，
-    InfoNCE 拉近两视图 = 强迫从剩余特征推断被掩特征（度量形式的掩码预测）。
-
-    batch 内去重（training loop, precision=1）保证无重复K线，
-    否则相同样本互为负对会强迫同输入映射到远点，毒化几何。
-
-    Args:
-        x: [B, D] tensor（device 上）
-    Returns:
-        [B, D] 掩码+重采样后的视图
-    """
-    B, D = x.shape
-    # 每行独立的随机 k
-    k = torch.randint(k_min, k_max + 1, (B,), device=x.device)
-    # 每行恰好 k 个 True：阈值取该行第 k 大的随机值（升序 sort 用 D-k 索引），
-    # r >= 第k大 → 恰好 k 个位置入选（随机子集，等价于均匀抽 k 列）
-    r = torch.rand(B, D, device=x.device)
-    thresh = r.sort(dim=1).values.gather(1, (D - k).unsqueeze(1))
-    mask = r >= thresh
-    # 被掩位置的替换值来自 batch 内同列随机样本（分布内重采样）。
-    # 用 roll(1) 而非 randperm：roll 严格无固定点（randperm 有 1/B 概率
-    # 抽到自己→整行替换成原值、该样本视图失效）；batch 本身经 DataLoader
-    # shuffle，前驱行即均匀随机样本，统计上等价
-    resample = torch.roll(x, shifts=1, dims=0)
-    return torch.where(mask, resample, x)
-
-
-def info_nce_loss(p1, p2, tau):
-    """
-    对称 NT-Xent InfoNCE：p1/p2 为同 batch 两个视图的 L2 归一化投影 [B, d]。
-
-    正对 = 同一样本的两个视图 (i ↔ i+B)，负对 = 2B-2 个其他样本。
-    logits 必须在 fp32 计算（τ=0.2 除法后 bf16 精度不足）。
-
-    同时返回 Wang & Isola (ICML 2020) 几何度量用于监控：
-    - alignment: 正对欧氏距离²（越小说明正对拉得越近）
-    - uniformity: log E[exp(-2·dist²)]（越小说明样本在超球面上铺得越均匀）
-    两者同时下降 = 几何在改善（只降一个可能是坍塌前兆）。
-
-    Returns:
-        (loss, alignment, uniformity) 后两者为 python float
-    """
-    B = p1.shape[0]
-    z = torch.cat([p1, p2], dim=0)                      # [2B, d]
-    sim = (z @ z.t()) / tau
-    sim.fill_diagonal_(float('-inf'))                   # 排除自身
-    targets = torch.arange(2 * B, device=z.device)
-    targets = (targets + B) % (2 * B)                   # i ↔ i+B 互为正对
-    loss = F.cross_entropy(sim, targets)
-    with torch.no_grad():
-        alignment = (p1 - p2).pow(2).sum(dim=1).mean()
-        # uniformity 复用已算好的 sim，不用 torch.pdist：
-        # 输入已 L2 归一化 ⇒ d² = 2 - 2·dot = 2 - 2τ·sim
-        # ⇒ exp(-2d²) = exp(-4 + 4τ·sim)，逐对等价（数值验证 diff=0）
-        # pdist 的 CUDA kernel 对 N 个向量需逐对算 N(N-1)/2 个距离
-        # （B=512 时 ~50 万对），实测 ~300ms/batch（曾占整个 epoch
-        # 耗时的 ~90%，纯监控指标不值得）；对角 exp(-inf)=0 自动剔除，
-        # 除以 N(N-1) 与 pdist 的 i<j 无序对均值严格一致
-        # （对称矩阵，有序对均值相同）
-        N = z.shape[0]
-        s = sim.mul(4 * tau).exp_().sum()
-        uniformity = torch.log(
-            s / (N * (N - 1)) * math.exp(-4.0) + 1e-12)
-    return loss, alignment.item(), uniformity.item()
+# ==================== 类感知对比学习（几何轴） ====================
 
 
 def supcon_loss(p, y, tau):
     """
     类感知对比损失 SupCon（Khosla et al., NeurIPS 2020，"out" 形式）
 
-    与 InfoNCE 的区别只在正对集扩大：
-        InfoNCE: 正对 = {同一样本的另一视图}    负对 = 其余全部（含同类！）
-        SupCon:  正对 = {另一视图} ∪ {同类样本} 负对 = {异类样本}
-    InfoNCE 把同类样本当负对推远，与 CLS 的同类聚拢在类别方向上互相抵消；
-    SupCon 把同类移入正对修正之。且损失由 batch 内全部成对点积构成，
+    正对 = {同类样本}，负对 = {异类样本}：
+        正对集 = 标签核 = CKA 目标核——SupCon 把 CKA 要测的"类别成对
+    几何一致性"直接变成损失在优化；损失由 batch 内全部成对点积构成，
     梯度触及 z 的每个方向（CE 只塑形头权重张成的 ≤8 个方向）——
     直接训练下游 attention 消费的核矩阵：同类→核值高，异类→核值低。
 
-    正对集至少含同一样本的另一视图（两视图标签恒同）→ 无空集风险。
-    fp32 计算（同 InfoNCE，τ 除法后 bf16 精度不足）。
+    batch 内去重（training loop, precision=1）保证无重复K线，
+    否则相同样本互为正对会退化为恒等任务（无监督信号）。
+
+    fp32 计算（τ 除法后 bf16 精度不足）。
 
     Args:
-        p: [2B, d] L2 归一化投影（两视图拼接，fp32）
-        y: [2B] 类标签（torch.long）
-        tau: 温度（与 InfoNCE 共用）
+        p: [B, d] L2 归一化投影（fp32）
+        y: [B] 类标签（torch.long）
+        tau: 温度
     Returns:
         标量损失
     """
     n = p.size(0)
-    sim = (p @ p.t()) / tau                              # [2B, 2B]
+    sim = (p @ p.t()) / tau                              # [B, B]
     mask_self = torch.eye(n, dtype=torch.bool, device=p.device)
     mask_pos = (y[:, None] == y[None, :]) & ~mask_self   # 同类且非自身
     # 每行对 a≠i 做 log-softmax（自身位置 -inf 排除出分母）
@@ -556,6 +489,36 @@ def supcon_loss(p, y, tau):
     log_prob = log_prob.masked_fill(mask_self, 0.0)
     mean_log_prob_pos = (mask_pos * log_prob).sum(1) / mask_pos.sum(1)
     return -mean_log_prob_pos.mean()
+
+
+def p_geometry_stats(p, y):
+    """
+    类感知对比的几何监控（Wang & Isola uniformity + 同类/异类分离度）
+
+    - uniformity: log E_{i≠j}[exp(-2‖p_i−p_j‖²)]，p 已 L2 归一化 ⇒
+      ‖·‖²=2−2·dot ⇒ exp(-2d²)=exp(4·dot−4)（不用 torch.pdist：
+      CUDA kernel 逐对算 N(N-1)/2 个距离，实测 ~300ms/batch，
+      纯监控指标不值得；对角 exp(-inf)=0 自动剔除，除以 N(N-1)
+      与无序对均值严格一致）
+    - sim_same / sim_diff: 同类/异类平均余弦——两者之差就是 SupCon
+      正在优化的"类别几何分离度"的直接读数
+
+    纯监控，调用方需 no_grad + detach。
+
+    Args:
+        p: [B, d] L2 归一化投影（fp32）
+        y: [B] 类标签（torch.long）
+    Returns:
+        (uniformity, sim_same, sim_diff) python float 三元组
+    """
+    n = p.size(0)
+    sim = p @ p.t()
+    mask_self = torch.eye(n, dtype=torch.bool, device=p.device)
+    s = (sim.mul(4.0) - 4.0).masked_fill(mask_self, float('-inf')).exp().sum()
+    uniformity = torch.log(s / (n * (n - 1)) + 1e-12)
+    same = (y[:, None] == y[None, :]) & ~mask_self
+    diff = ~same & ~mask_self
+    return (uniformity.item(), sim[same].mean().item(), sim[diff].mean().item())
 
 
 def label_kernel_from_targets(cls_targets, names):
@@ -645,12 +608,9 @@ class PretrainModel(nn.Module):
     Embedding层训练模型 = KLineEmbedding + 线性解码器 + 对比 projector + 分类头
 
     X ──────────→ Embedding → S ─┬─ Linear → Y            (线性重建探针)
-                                 ├─ Linear×4 → 类别 (分类头, 粗粒度, 训练后丢弃)
+                                 ├─ Linear×4 → 类别 (分类头, 粗+细, 训练后丢弃)
                                  ├─ VISReg(S)
-                                 └─→ (丢弃)
-    X 掩码视图1 ┐
-               ├→ Embedding → S → projector g(S) → L2归一化 ─┐
-    X 掩码视图2 ┘                                              ┴─ InfoNCE
+                                 └─ projector g(S) → L2归一化 → SupCon(vpa标签)
 
     解码器刻意退化为单层线性映射（线性探针）：
     - 非线性解码器（如旧版 MLP 128→256→GELU→128）自己就能近似乘积/绝对值/
@@ -678,8 +638,8 @@ class PretrainModel(nn.Module):
     - 注意与 VISReg 相克：可分性在 z 分布上产生多峰，高斯形状项拉单峰，
       CLS_WEIGHT/CLS_FINE_WEIGHT 别开大；训练后丢弃，与 decoder/projector 相同。
 
-    projector（对比分支，SimCLR/DINOv2 路线）：InfoNCE 不直接作用在 S 上
-    （会把"对区分样本身份无贡献"的方差压掉，冲掉 O/D 线性可读结构），
+    projector（对比分支，SimCLR/DINOv2 路线）：SupCon 不直接作用在 S 上
+    （对比的收紧压力会把"对类别无贡献"的方差压掉，冲掉 O/D 线性可读结构），
     而是作用在 g(S) 上——projector 吸收几何收紧压力，S 继承温和的部分。
     decoder、projector 与分类头均在预训练完成后丢弃，只保留 embedding 权重。
     """
@@ -707,7 +667,7 @@ class PretrainModel(nn.Module):
                 nn.init.zeros_(head.bias)
 
         # 对比 projector: 128→256→GELU→128（与 embed_mlp 同构，初始化同推导）
-        # MLP分支增益=1（σ1·σ2·0.588·√(d·h) = 1），输出 L2 归一化后进入 InfoNCE
+        # MLP分支增益=1（σ1·σ2·0.588·√(d·h) = 1），输出 L2 归一化后进入 SupCon
         hidden_dim = d_model * expand_ratio
         self.projector = nn.Sequential(
             nn.Linear(d_model, hidden_dim, bias=False),
@@ -996,13 +956,11 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
     # w_cls/w_fine 独立于 (1-w_c) 预算（置零即退回纯回归监督）。
     use_cls_coarse = EmbeddingConfig.CLS_ENABLED
     use_cls_fine = EmbeddingConfig.CLS_FINE_ENABLED
-    use_supcon = (EmbeddingConfig.SUPCON_ENABLED
-                  and EmbeddingConfig.CONTRASTIVE_ENABLED)
+    use_supcon = EmbeddingConfig.SUPCON_ENABLED
     use_cka = EmbeddingConfig.CKA_LOG_ENABLED
     need_coarse = use_cls_coarse or use_supcon or use_cka
     w_cls = EmbeddingConfig.CLS_WEIGHT if use_cls_coarse else 0.0
     w_fine = EmbeddingConfig.CLS_FINE_WEIGHT if use_cls_fine else 0.0
-    supcon_alpha = EmbeddingConfig.SUPCON_ALPHA if use_supcon else 0.0
 
     # 头规格（模型侧：只含参与 CE 损失的头；SupCon/CKA 不需要头只要标签）
     cls_heads_spec = build_cls_head_spec()
@@ -1051,15 +1009,13 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
     input_dim = ModelConfig.INPUT_DIM                # 原始16维，recon前 input_dim 列为原始重建
     n_derived = EmbeddingConfig.N_DERIVED_FEATURES
 
-    # 掩码对比（几何轴）：w_c=InfoNCE 权重，剩余 (1-w_c) 按 λ 分配给 VISReg/Recon，
-    # w_c=0 或 CONTRASTIVE_ENABLED=False 时公式严格退回旧版 (1-λ)·Recon + λ·VISReg
-    use_contrastive = EmbeddingConfig.CONTRASTIVE_ENABLED
-    w_c = EmbeddingConfig.CONTRASTIVE_WEIGHT if use_contrastive else 0.0
+    # 类感知对比（几何轴主损失）：w_c=SupCon 权重，剩余 (1-w_c) 按 λ 分配给
+    # VISReg/Recon；w_c=0 或 SUPCON_ENABLED=False 时公式严格退回旧版
+    # (1-λ)·Recon + λ·VISReg（use_supcon 在上方分类头块定义）
+    w_c = EmbeddingConfig.SUPCON_WEIGHT if use_supcon else 0.0
     w_v = (1.0 - w_c) * visreg_weight
     w_r = (1.0 - w_c) * (1.0 - visreg_weight)
-    ncl_tau = EmbeddingConfig.CONTRASTIVE_TAU
-    mask_k_min = EmbeddingConfig.MASK_K_MIN
-    mask_k_max = EmbeddingConfig.MASK_K_MAX
+    supcon_tau = EmbeddingConfig.SUPCON_TAU
 
     # VISReg 几何正则：尺度/形状(SWD)/中心化 三项解耦
     visreg_loss_fn = VISRegLoss(
@@ -1075,11 +1031,10 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
     print(f"开始 Embedding 预训练")
     print(f"  轮数={epochs}  batch={batch_size}  lr={lr}")
     print(f"  精度={amp_str}  设备={device}")
-    if use_contrastive:
+    if use_supcon:
         formula = (f"{w_v:.2f}·VISReg + {w_r:.2f}·Recon + "
-                   f"{w_c:.2f}·({1 - supcon_alpha:.1f}·InfoNCE"
-                   + (f" + {supcon_alpha:.1f}·SupCon" if use_supcon else "")
-                   + f")(掩码对比, τ={ncl_tau}, k∈[{mask_k_min},{mask_k_max}], projector头)")
+                   f"{w_c:.2f}·SupCon(类感知, vpa标签, τ={supcon_tau}, "
+                   f"projector头)")
     else:
         formula = (f"{visreg_weight:.2f}·VISReg + {1 - visreg_weight:.2f}·Recon  (论文原版)")
     if use_cls_coarse:
@@ -1103,8 +1058,11 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
             s_str = '/'.join(f"{s*100:.0f}%" for s in shares)
             print(f"    {name:>16s}: 边界[{b_str}]  池上占比 {s_str}")
     if use_supcon:
-        print(f"  SupCon(类感知对比): α={supcon_alpha} "
-              f"((1-α)·InfoNCE + α·SupCon), 正对=direction粗头同类, τ={ncl_tau}")
+        print(f"  SupCon(类感知, 几何轴主损失): 正对=vol_price_align粗头同类"
+              f"(量价同向/背离/中性), 负对=异类, τ={supcon_tau}; "
+              f"无掩码无视图——掩码预测通道对本特征表示不成立"
+              f"(技术列依赖历史+归一化破坏代数关系→不可恢复), "
+              f"有确定性标签直接教几何")
     if use_cka:
         print(f"  CKA监控: CKA(z, 4粗头标签核) 逐epoch日志"
               f" (几何轴指标, 与probe B/C信息轴正交)")
@@ -1126,10 +1084,6 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         epoch_recon_raw = 0.0   # Recon 原始值(原始重建+衍生重建之和)
         epoch_recon_orig_raw = 0.0    # 原始16维重建原始值
         epoch_recon_derived_raw = 0.0 # 衍生重建原始值(掩码后逐特征均值)
-        epoch_ncl_raw = 0.0      # InfoNCE 原始值
-        epoch_ncl_w = 0.0        # w_c·InfoNCE 加权贡献
-        epoch_align = 0.0        # alignment: 正对距离²（越低越好）
-        epoch_uniform = 0.0      # uniformity: 超球面均匀度（越低越好）
         epoch_cls_raw = 0.0      # 粗头 CE 平均（原始值）
         epoch_cls_w = 0.0        # w_cls·粗头CE 加权贡献
         epoch_cls_fine_raw = 0.0 # 细头 CE 平均（原始值）
@@ -1137,7 +1091,10 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         epoch_cls_head_raw = {}  # 逐头 CE（粗+细，按头名）
         epoch_cls_head_acc = {}  # 逐头准确率（粗+细，按头名）
         epoch_sup_raw = 0.0      # SupCon 原始值
-        epoch_sup_w = 0.0        # w_c·α·SupCon 加权贡献
+        epoch_sup_w = 0.0        # w_c·SupCon 加权贡献
+        epoch_uniform_p = 0.0    # p 上 uniformity（B样本口径，越低越均匀）
+        epoch_sim_same = 0.0     # p 上同类平均余弦（越高越好）
+        epoch_sim_diff = 0.0     # p 上异类平均余弦（越低越好）
         epoch_cka = 0.0          # CKA(z, 标签核)（batch 级平均）
         epoch_dedup_total = 0   # batch内去重去掉的条数
         n_batches = 0
@@ -1179,12 +1136,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
                            if cls_boundaries is not None else None)
 
             optimizer.zero_grad()
-            # 掩码视图（几何轴）：两视图独立采样不同掩码子集，
-            # 前向走 AMP（小 MLP 开销可忽略），InfoNCE 的 logits 在 AMP 外算 fp32
-            if use_contrastive:
-                v1 = make_masked_view(batch_x, mask_k_min, mask_k_max)
-                v2 = make_masked_view(batch_x, mask_k_min, mask_k_max)
-
+            # 前向走 AMP（小 MLP 开销可忽略），对比 logits 在 AMP 外算 fp32
             with amp_ctx:
                 z, recon = model(batch_x)
 
@@ -1206,30 +1158,29 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
                 loss_recon_derived = (num / den).mean()
                 loss_recon = loss_recon_orig + derived_weight * loss_recon_derived
 
-                # 对比分支前向在 AMP 内（小 MLP），投影输出转 fp32 后归一化
-                if use_contrastive:
-                    p1 = model.projector(model.embedding(v1))
-                    p2 = model.projector(model.embedding(v2))
-                # 加权合成（InfoNCE 的 fp32 计算放 AMP 外，避免 bf16 logits 精度不足）
+                # 对比分支前向在 AMP 内（小 MLP），复用主前向的 z
+                # （省两次 embedding 前向，梯度也更直接）
+                if use_supcon:
+                    p_clean = model.projector(z)
+                # 加权合成（对比项的 fp32 计算放 AMP 外，避免 bf16 logits 精度不足）
                 loss = w_v * loss_visreg + w_r * loss_recon
 
-            if use_contrastive:
-                p1 = F.normalize(p1.float(), dim=1)
-                p2 = F.normalize(p2.float(), dim=1)
-                loss_ncl, align_val, uniform_val = info_nce_loss(p1, p2, ncl_tau)
-                loss_contrast = loss_ncl
-                if use_supcon:
-                    # 类感知混合：direction 粗头同类样本移入正对集
-                    # （标签已在 batch 开头算好；两视图标签恒同，拼接顺序对应）
-                    sup_y = torch.cat([cls_targets['direction'],
-                                       cls_targets['direction']], dim=0)
-                    loss_sup = supcon_loss(torch.cat([p1, p2], dim=0),
-                                           sup_y, ncl_tau)
-                    loss_contrast = ((1.0 - supcon_alpha) * loss_ncl
-                                     + supcon_alpha * loss_sup)
-                loss = loss + w_c * loss_contrast
+            # 类感知对比（几何轴主损失）：干净 x 的投影 + vpa 标签。
+            # vpa 符号 = sign(c−o)·sign(amount) 编码量价交互
+            # （同向：涨+放量/跌+缩量；背离：涨+缩量/跌+放量；中性），
+            # 正对掩码=标签核=CKA 目标核。无视图身份游戏，
+            # "几乎相同的两条K线被拉近"是 feature：下游要语义相似度
+            # 而非身份识别
+            if use_supcon:
+                p_n = F.normalize(p_clean.float(), dim=1)
+                vpa_y = cls_targets['vol_price_align']
+                loss_sup = supcon_loss(p_n, vpa_y, supcon_tau)
+                loss = loss + w_c * loss_sup
+                # 纯监控：U + 同类/异类平均余弦（类别几何分离度）
+                with torch.no_grad():
+                    uni_p, sim_same, sim_diff = p_geometry_stats(p_n, vpa_y)
 
-            # 分类头（粗+细）：fp32 计算（CE 在 bf16 下精度不足，同 InfoNCE）。
+            # 分类头（粗+细）：fp32 计算（CE 在 bf16 下精度不足，同 SupCon）。
             # 标签已由 compute_cls_targets 预算好；梯度经线性头回流 embedding，
             # 逼 z 出现可线性读出的类别可分结构
             if use_cls:
@@ -1266,19 +1217,14 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
             epoch_recon_raw += raw_recon
             epoch_recon_orig_raw += loss_recon_orig.item()
             epoch_recon_derived_raw += loss_recon_derived.item()
-            if use_contrastive:
-                # SupCon 开启时 InfoNCE 的有效权重是 w_c·(1-α)
-                ncl_w = w_c * (1.0 - supcon_alpha) * loss_ncl.item()
-                epoch_loss += ncl_w
-                epoch_ncl_w += ncl_w
-                epoch_ncl_raw += loss_ncl.item()
-                epoch_align += align_val
-                epoch_uniform += uniform_val
             if use_supcon:
-                sup_w = w_c * supcon_alpha * loss_sup.item()
+                sup_w = w_c * loss_sup.item()
                 epoch_loss += sup_w
                 epoch_sup_w += sup_w
                 epoch_sup_raw += loss_sup.item()
+                epoch_uniform_p += uni_p
+                epoch_sim_same += sim_same
+                epoch_sim_diff += sim_diff
             if use_cls:
                 if loss_cls is not None:
                     cls_w = w_cls * loss_cls.item()
@@ -1318,8 +1264,9 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
 
         # 打印日志 （O=/D= 分别为原始16维/衍生重建原始值，D= 即线性探针误差，
         # 直接衡量 embedding 中可线性读出的跨维结构量，观察衍生目标是否被学到；
-        # NCL=InfoNCE 原始值，A/U=alignment/uniformity 几何度量，两者同降=几何改善；
-        # SUP=SupCon 原始值，下降=全空间同类聚拢/异类分开在推进；
+        # SUP=SupCon 原始值（下降=同类聚拢/异类分开在推进，地板≈ln(同类数)），
+        # U=p 上 uniformity（防坍塌监控，B 样本口径），
+        # 同/异=同类/异类平均余弦（两者差=类别几何分离度，SupCon 优化的量）；
         # CLS/FINE=粗/细头 CE 平均，逐头格式 CE/Acc——CLS 从 ln(3)≈1.1、
         # FINE 从 ln(5)≈1.61 下降 + Acc 上升 = 类别可分结构正在被嵌入
         # （Acc 受 label 噪声/可分离度上限约束，无需追满）；
@@ -1327,15 +1274,13 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         # 一致性提高——VISReg 单峰压力会限制其上限，看趋势不看绝对值）
         avg_dedup = epoch_dedup_total / max(1, n_batches)
         weighted_str = f"{avg_visreg_w:.4f}·VISReg + {avg_recon_w:.4f}·Recon"
-        ncl_str = ""
-        if use_contrastive:
-            weighted_str += f" + {epoch_ncl_w / n_batches:.4f}·NCL"
-            ncl_str = (f"NCL={epoch_ncl_raw / n_batches:.4f} "
-                       f"(A={epoch_align / n_batches:.3f}/U={epoch_uniform / n_batches:.3f})  ")
         sup_str = ""
         if use_supcon:
             weighted_str += f" + {epoch_sup_w / n_batches:.4f}·SUP"
-            sup_str = f"SUP={epoch_sup_raw / n_batches:.4f}  "
+            sup_str = (f"SUP={epoch_sup_raw / n_batches:.4f} "
+                       f"(U={epoch_uniform_p / n_batches:.3f}/"
+                       f"同={epoch_sim_same / n_batches:.3f}/"
+                       f"异={epoch_sim_diff / n_batches:.3f})  ")
         cls_str = ""
         if use_cls_coarse:
             weighted_str += f" + {epoch_cls_w / n_batches:.4f}·CLS"
@@ -1366,7 +1311,6 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
               f"Loss={avg_loss:.4f} ({weighted_str})  "
               f"VISReg={avg_visreg_raw:.4f}  Recon={avg_recon_raw:.4f} "
               f"(O={avg_recon_orig:.4f}/D={avg_recon_derived:.4f})  "
-              f"{ncl_str}"
               f"{sup_str}"
               f"{cls_str}"
               f"{fine_str}"
@@ -1384,13 +1328,6 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         'visreg_weighted': avg_visreg_w,
         'recon_weighted': avg_recon_w,
     }
-    if use_contrastive:
-        last_metrics.update({
-            'contrastive_weighted': epoch_ncl_w / n_batches,
-            'contrastive_raw': epoch_ncl_raw / n_batches,
-            'alignment': epoch_align / n_batches,
-            'uniformity': epoch_uniform / n_batches,
-        })
     if use_cls_coarse:
         last_metrics.update({
             'cls_weighted': epoch_cls_w / n_batches,
@@ -1408,6 +1345,9 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         last_metrics.update({
             'supcon_weighted': epoch_sup_w / n_batches,
             'supcon_raw': epoch_sup_raw / n_batches,
+            'uniformity_p': epoch_uniform_p / n_batches,
+            'sim_same': epoch_sim_same / n_batches,
+            'sim_diff': epoch_sim_diff / n_batches,
         })
     if use_cka:
         last_metrics['cka'] = epoch_cka / n_batches

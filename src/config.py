@@ -170,20 +170,29 @@ class EmbeddingConfig:
     DERIVED_WINSORIZE_PCT = (1.0, 99.0) # 衍生特征剪尾分位数：剔除极少数极端行情样本
                                         # 对损失的支配（"极端值霸凌"），(0,100)=不剪尾
 
-    # 掩码对比学习（几何轴，SCARF式）：InfoNCE 施加在 projector 输出 g(z) 上，
-    # 正对=同一条K线的两个不同掩码视图，负对=batch内其他K线。
+    # 类感知对比学习（几何轴主损失，SupCon；Khosla et al., NeurIPS 2020）：
+    # 正对 = 粗头 vol_price_align 同类（量价同向/背离/中性，编码
+    # direction×量交互——避免"放量涨"和"缩量涨"被拉近），负对 = 异类，
+    # 施加在 projector 输出 g(z) 上（SimCLR/DINOv2 路线：projector 吸收
+    # "收紧"压力，z 保住 O/D 线性可读性，训练后丢弃）。
     # 重建/VISReg 只保证"每条K线的信息可读出"，不管样本间相似度结构——
-    # 而下游 attention 消费的恰恰是 z 的点积相似度。对比损失塑造该几何，
-    # projector（SimCLR/DINOv2 路线）吸收"收紧"压力，z 保住 O/D 线性可读性；
-    # 训练后 projector 丢弃，下游仍用 z。
-    CONTRASTIVE_ENABLED = True           # 总开关，False=退回纯线性探针模式
-    CONTRASTIVE_WEIGHT = 0.2             # w_c：InfoNCE 权重（冷启动值≈ln(2B)≈8.5 远大于
-                                        # O(1) 的另两项，0.2 使三者加权贡献同数量级）；
+    # 而下游 attention 消费的恰恰是 z 的点积相似度，该几何必须显式训练。
+    # SupCon 损失由 batch 内全部成对点积构成，梯度触及 z 的每个方向
+    # （CE 只塑形头权重张成的 ≤8 个方向）——直接训练下游 attention
+    # 消费的核矩阵；正对掩码=标签核=CKA 目标核。
+    # z 不坍缩由 VISReg（各向同性高斯散度）+ Recon（细粒度信息）保证。
+    # 历史注记：掩码视图 InfoNCE（SCARF式，含源列保护白名单）已删除——
+    # 其前提"被掩列可从剩余列恢复"对本特征表示不成立（技术列依赖历史
+    # 不在当日输入、逐列分位数归一化破坏跨列代数关系）：掩技术列 →
+    # 模型学会忽略它们（alignment→0 任务空转）；掩源列 → 语义真空
+    # （全列掩码下 ~39% 视图伪 direction）。SCARF 是无标签时代的拐杖，
+    # 有确定性标签时直接用标签教几何。
+    SUPCON_ENABLED = True               # 总开关，False=退回纯线性探针模式
+    SUPCON_WEIGHT = 0.2                 # w_c：SupCon 权重（冷启动≈ln(同类数)~7.6，
+                                        # 与另两项 O(1) 相比 0.2 使加权贡献同数量级）；
                                         # 剩余权重按 (1-w_c) 分配给 VISReg(λ)/Recon(1-λ)，
                                         # λ=VISREG_WEIGHT 相对语义不变，w_c=0 时公式退回旧版
-    CONTRASTIVE_TAU = 0.2                # 温度：控制负对推开力度（数千负样本常规 0.1~0.2）
-    MASK_K_MIN = 2                       # 每视图最少掩码特征数（16维的 12.5%）
-    MASK_K_MAX = 5                       # 每视图最多掩码特征数（16维的 31%，SCARF 主流区间）
+    SUPCON_TAU = 0.2                    # 温度：控制异类推开力度（数千负样本常规 0.1~0.2）
 
     # 分类头（粗粒度类别监督，Kronos 分层监督的"粗"端；头定义见
     # pretrain_embedding.py:CLS_HEAD_SPEC）：
@@ -214,18 +223,6 @@ class EmbeddingConfig:
     CLS_FINE_BUCKETS = 5                 # 桶数（4个判别值统一；大涨/小涨/平/小跌/大跌）
     CLS_FINE_WEIGHT = 0.1                # 细头 CE 权重（ln5≈1.61 起步 vs 粗头 ln3≈1.1，
                                          # 同乘 0.1 后量级相当）
-
-    # ---- 类感知对比（SupCon, Khosla et al., NeurIPS 2020） ----
-    # InfoNCE 的正对只有"同一样本两视图"，同类样本全在负对集里被推远，
-    # 与 CLS 的同类聚拢在类别方向上互相抵消；SupCon 把同类（粗头
-    # direction 标签）移入正对集，修正该抵消。且 CE 只塑形头权重张成的
-    # ≤8 个方向（4头×3类的有效秩），SupCon 损失由 batch 内全部成对点积
-    # 构成，梯度触及 z 的每个方向——直接训练下游 attention 消费的核矩阵。
-    # 依赖 CONTRASTIVE_ENABLED（无视图无 projector 输出）。
-    SUPCON_ENABLED = True                # 类感知对比开关
-    SUPCON_ALPHA = 0.3                   # 混合系数 α：对比项 = (1-α)·InfoNCE + α·SupCon
-                                         # α 别开大：同类拉太近会抹平类内细粒度
-                                         # （与细头目标相克）并压 uniformity
 
     # ---- CKA 几何监控（Kornblith et al., ICML 2019） ----
     # 逐 epoch 计算 CKA(z, 4粗头标签核)：z 的 Gram 矩阵与"同类比例"标签核

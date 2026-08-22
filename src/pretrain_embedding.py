@@ -12,21 +12,23 @@ EquiNet Embedding层训练脚本
    线性解码器算不了任何非线性运算，跨维结构必须由 embedding 内部预先算好
    并编码成可线性读出的方向。此时重建损失 = 线性探针误差，
    O=/D= 日志直接衡量 embedding 中可线性读出的原始/衍生信息量。
-3. 类感知对比损失（几何轴主损失，SupCon；Khosla et al., NeurIPS 2020）：
-   正对 = 粗头 vol_price_align 同类（量价同向/背离/中性，编码
-   direction×量交互），负对 = 异类，施加在 projector 输出 g(z) 上。
+3. 核加权类感知对比损失（几何轴主损失，SupCon；Khosla et al.,
+   NeurIPS 2020）：正对权重 = 多头一致度核 K_ij（全粗+细分头中标签
+   一致的比例 ∈ {0, 1/H, ..., 1}），施加在 projector 输出 g(z) 上。
    1/2 管的是"每条K线编码了什么信息"，3 管的是"样本之间怎么排布"——
    下游 attention 消费的是 z 的点积相似度，该几何必须显式训练。
-   损失由 batch 内全部成对点积构成，梯度触及 z 的每个方向（CE 只塑形
-   头权重张成的 ≤8 个方向）；正对掩码=标签核=CKA 目标核——SupCon 把
-   CKA 要测的"类别成对几何一致性"直接变成损失在优化。
-   无掩码无视图，干净 x 的投影直接进 SupCon。掩码视图 InfoNCE
-   （SCARF式）已删除：其前提"被掩列可从剩余列恢复"对本特征表示
-   不成立——技术列依赖历史（不在当日输入）、逐列分位数归一化破坏
-   跨列代数关系，掩技术列 → 模型学会忽略它们（不变性捷径，
-   alignment→0 任务空转）；掩源列 → 语义真空（伪方向/伪量价视图，
-   全列掩码下 ~39% 视图伪 direction）。SCARF 是无标签时代的拐杖，
-   有确定性标签时直接用标签教几何。
+   锚点设计：单标签（如仅 vpa 3类）锚点贫乏——同类聚拢无终点（簇内
+   坍缩）、与锚点弱相关的语义被挤出几何（vws 退化实测）；多头一致度核
+   把锚点增殖为头组合胞元（~百级），全头一致全力度聚拢、部分一致分级
+   聚拢、全不一致斥远——样本按丰富语义在空间中分级"沉淀"，
+   拉力与语义一致度成正比。正对核=CKA 目标核（同一数学对象），
+   损失由 batch 内全部成对点积构成，梯度触及 z 的每个方向。
+   掩码视图 InfoNCE（SCARF式）已删除：其前提"被掩列可从剩余列恢复"
+   对本特征表示不成立——技术列依赖历史（不在当日输入）、逐列分位数
+   归一化破坏跨列代数关系，掩技术列 → 模型学会忽略它们（不变性捷径，
+   alignment→0 任务空转）；掩源列 → 语义真空（伪方向视图，全列掩码下
+   ~39% 视图伪 direction）。SCARF 是无标签时代的拐杖，有确定性标签时
+   直接用标签教几何。
    projector 吸收"收紧"压力，z 保住 O/D 线性可读性；z 不坍缩由
    VISReg（各向同性高斯散度）+ Recon（细粒度信息）保证。projector
    训练后丢弃。SUPCON_ENABLED=False 可退回纯探针模式。
@@ -456,24 +458,30 @@ def build_derived_targets(kline_data, feature_normalizer, chunk_size=4_000_000):
 # ==================== 类感知对比学习（几何轴） ====================
 
 
-def supcon_loss(p, y, tau):
+def supcon_loss(p, k_pos, tau):
     """
-    类感知对比损失 SupCon（Khosla et al., NeurIPS 2020，"out" 形式）
+    核加权类感知对比损失（SupCon "out" 形式；Khosla et al., NeurIPS 2020）
 
-    正对 = {同类样本}，负对 = {异类样本}：
-        正对集 = 标签核 = CKA 目标核——SupCon 把 CKA 要测的"类别成对
-    几何一致性"直接变成损失在优化；损失由 batch 内全部成对点积构成，
-    梯度触及 z 的每个方向（CE 只塑形头权重张成的 ≤8 个方向）——
-    直接训练下游 attention 消费的核矩阵：同类→核值高，异类→核值低。
+    正对权重 = 多头一致度核 k_pos_ij ∈ [0,1]（label_kernel_from_targets）：
+    全头一致 → 全力度聚拢，部分一致 → 分级聚拢，全不一致 → 斥远。
+    锚点从单标签 3 簇增殖为头组合胞元（~百级）——样本按丰富语义在空间中
+    分级"沉淀"，拉力与语义一致度成正比（soft nearest neighbor 的对比版）。
+    正对核 = CKA 目标核：SupCon 把 CKA 要测的"语义成对几何一致性"直接
+    变成损失在优化；损失由 batch 内全部成对点积构成，梯度触及 z 的
+    每个方向（CE 只塑形头权重张成的 ≤8 个方向）。
+
+    单锚点（如仅 vpa 硬标签）的反面教训：同类聚拢无终点（同=0.968 簇内
+    坍缩）、与锚点弱相关的语义（vws）被挤出几何——锚点贫乏是病根，
+    聚拢本身不是。核密度较高（任意两样本大概率至少共享一头一致）属预期，
+    分级权重保持相对拉力结构；若过软可阈值化（K≥0.5 才计正对）。
 
     batch 内去重（training loop, precision=1）保证无重复K线，
     否则相同样本互为正对会退化为恒等任务（无监督信号）。
-
     fp32 计算（τ 除法后 bf16 精度不足）。
 
     Args:
         p: [B, d] L2 归一化投影（fp32）
-        y: [B] 类标签（torch.long）
+        k_pos: [B, B] 一致度核（对称，对角线任意值——内部强制排除自身）
         tau: 温度
     Returns:
         标量损失
@@ -481,58 +489,77 @@ def supcon_loss(p, y, tau):
     n = p.size(0)
     sim = (p @ p.t()) / tau                              # [B, B]
     mask_self = torch.eye(n, dtype=torch.bool, device=p.device)
-    mask_pos = (y[:, None] == y[None, :]) & ~mask_self   # 同类且非自身
     # 每行对 a≠i 做 log-softmax（自身位置 -inf 排除出分母）
     sim = sim.masked_fill(mask_self, float('-inf'))
     log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
-    # 自身位置 log_prob=-inf，置 0 防止与 mask_pos 相乘产生 nan
+    # 自身位置 log_prob=-inf，置 0 防止与权重相乘产生 nan
     log_prob = log_prob.masked_fill(mask_self, 0.0)
-    mean_log_prob_pos = (mask_pos * log_prob).sum(1) / mask_pos.sum(1)
+    # 核权重（排除自身）；与任何样本都无一致头的行（实践中概率≈0，
+    # 8 头×2560 样本下不存在）安全跳过，避免 0/0 噪声放大
+    w = k_pos.float().masked_fill(mask_self, 0.0)
+    w_sum = w.sum(1)
+    valid = w_sum > 1e-6
+    mean_log_prob_pos = (w * log_prob).sum(1)[valid] / w_sum[valid]
     return -mean_log_prob_pos.mean()
 
 
-def p_geometry_stats(p, y):
+def p_geometry_stats(p, k_pos):
     """
-    类感知对比的几何监控（Wang & Isola uniformity + 同类/异类分离度）
+    类感知对比的几何监控（uniformity + 锚点分离度 + 核相关）
 
     - uniformity: log E_{i≠j}[exp(-2‖p_i−p_j‖²)]，p 已 L2 归一化 ⇒
       ‖·‖²=2−2·dot ⇒ exp(-2d²)=exp(4·dot−4)（不用 torch.pdist：
       CUDA kernel 逐对算 N(N-1)/2 个距离，实测 ~300ms/batch，
       纯监控指标不值得；对角 exp(-inf)=0 自动剔除，除以 N(N-1)
       与无序对均值严格一致）
-    - sim_same / sim_diff: 同类/异类平均余弦——两者之差就是 SupCon
-      正在优化的"类别几何分离度"的直接读数
+    - sim_k1 / sim_k0: 全头一致(K=1)/全头不一致(K=0)样本对的平均余弦
+      ——两者之差是"锚点胞元"分离度的直接读数
+    - corr: 非对角 sim 与 K 的 Pearson 相关——p 几何与语义核的整体
+      一致性（"沉淀"是否发生的总指标，CKA 在 p 空间的线性版）
 
     纯监控，调用方需 no_grad + detach。
 
     Args:
         p: [B, d] L2 归一化投影（fp32）
-        y: [B] 类标签（torch.long）
+        k_pos: [B, B] 一致度核（对称）
     Returns:
-        (uniformity, sim_same, sim_diff) python float 三元组
+        (uniformity, sim_k1, sim_k0, corr) python float 四元组
     """
     n = p.size(0)
     sim = p @ p.t()
     mask_self = torch.eye(n, dtype=torch.bool, device=p.device)
+    off = ~mask_self
     s = (sim.mul(4.0) - 4.0).masked_fill(mask_self, float('-inf')).exp().sum()
     uniformity = torch.log(s / (n * (n - 1)) + 1e-12)
-    same = (y[:, None] == y[None, :]) & ~mask_self
-    diff = ~same & ~mask_self
-    return (uniformity.item(), sim[same].mean().item(), sim[diff].mean().item())
+    k1 = off & (k_pos > 1.0 - 1e-6)
+    k0 = off & (k_pos < 1e-6)
+    sim_k1 = sim[k1].mean().item() if k1.any() else 0.0
+    sim_k0 = sim[k0].mean().item() if k0.any() else 0.0
+    # Pearson = 中心化向量的余弦（norm 形式避免 std/n 除法）
+    v_s = sim[off]
+    v_k = k_pos[off].float()
+    v_s = v_s - v_s.mean()
+    v_k = v_k - v_k.mean()
+    corr = ((v_s * v_k).sum() / (v_s.norm() * v_k.norm() + 1e-12)).item()
+    return (uniformity.item(), sim_k1, sim_k0, corr)
 
 
 def label_kernel_from_targets(cls_targets, names):
     """
-    多头同类比例软核：L_ij = mean_h 1[y_h(i)==y_h(j)] ∈ [0,1]
+    多头一致度核：L_ij = mean_h 1[y_h(i)==y_h(j)] ∈ {0, 1/H, ..., 1}
 
+    双用途：SupCon 的正对权重核（锚点=头组合胞元，分级聚拢/斥远）
+    与 CKA 的目标核（同一数学对象，SupCon 直接优化 CKA 要测的东西）。
     L_ij=1 表示所有头同类，=0 表示所有头异类；各头示性核均为 PSD
     （类指示向量外积之和），均值仍 PSD，可作 CKA 的目标核。
+    头集合（粗+细）由调用方传入——细头参与使核更细粒度
+    （同一 v 上粗/细两级一致度平均，等效逐数量分级权重）。
 
     Args:
         cls_targets: dict[head_name -> [B] long]（compute_cls_targets 输出）
-        names: 参与核构建的头名列表（如 CLS_HEAD_SPEC 的 4 个粗头）
+        names: 参与核构建的头名列表（训练中=cls_heads_spec 全部头）
     Returns:
-        [B, B] float tensor（对称）
+        [B, B] float tensor（对称，对角线=1）
     """
     y = torch.stack([cls_targets[n] for n in names], dim=1)       # [B, H]
     return (y[:, None, :] == y[None, :, :]).float().mean(dim=2)  # [B, B]
@@ -608,9 +635,9 @@ class PretrainModel(nn.Module):
     Embedding层训练模型 = KLineEmbedding + 线性解码器 + 对比 projector + 分类头
 
     X ──────────→ Embedding → S ─┬─ Linear → Y            (线性重建探针)
-                                 ├─ Linear×4 → 类别 (分类头, 粗+细, 训练后丢弃)
+                                 ├─ Linear×8 → 类别 (分类头, 粗+细, 训练后丢弃)
                                  ├─ VISReg(S)
-                                 └─ projector g(S) → L2归一化 → SupCon(vpa标签)
+                                 └─ projector g(S) → L2归一化 → SupCon(多头一致度核)
 
     解码器刻意退化为单层线性映射（线性探针）：
     - 非线性解码器（如旧版 MLP 128→256→GELU→128）自己就能近似乘积/绝对值/
@@ -1033,8 +1060,8 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
     print(f"  精度={amp_str}  设备={device}")
     if use_supcon:
         formula = (f"{w_v:.2f}·VISReg + {w_r:.2f}·Recon + "
-                   f"{w_c:.2f}·SupCon(类感知, vpa标签, τ={supcon_tau}, "
-                   f"projector头)")
+                   f"{w_c:.2f}·SupCon(核加权, {len(cls_heads_spec)}头一致度核, "
+                   f"τ={supcon_tau}, projector头)")
     else:
         formula = (f"{visreg_weight:.2f}·VISReg + {1 - visreg_weight:.2f}·Recon  (论文原版)")
     if use_cls_coarse:
@@ -1058,14 +1085,13 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
             s_str = '/'.join(f"{s*100:.0f}%" for s in shares)
             print(f"    {name:>16s}: 边界[{b_str}]  池上占比 {s_str}")
     if use_supcon:
-        print(f"  SupCon(类感知, 几何轴主损失): 正对=vol_price_align粗头同类"
-              f"(量价同向/背离/中性), 负对=异类, τ={supcon_tau}; "
-              f"无掩码无视图——掩码预测通道对本特征表示不成立"
-              f"(技术列依赖历史+归一化破坏代数关系→不可恢复), "
-              f"有确定性标签直接教几何")
+        print(f"  SupCon(核加权, 几何轴主损失): 正对权重=全{len(cls_heads_spec)}头"
+              f"(粗+细)标签一致度 K∈{{0,1/{len(cls_heads_spec)},...,1}}, "
+              f"τ={supcon_tau}; 锚点从单标签3簇增殖为头组合胞元(~百级), "
+              f"样本按语义一致度分级沉淀; 正对核=CKA目标核")
     if use_cka:
-        print(f"  CKA监控: CKA(z, 4粗头标签核) 逐epoch日志"
-              f" (几何轴指标, 与probe B/C信息轴正交)")
+        print(f"  CKA监控: CKA(z, 全头一致度核) 逐epoch日志"
+              f" (几何轴指标, 与probe B/C信息轴正交; 与SupCon正对核同一对象)")
     if use_cls_coarse or use_cls_fine:
         print(f"  注: 分类可分性在 z 分布上产生多峰, 与 VISReg 高斯形状项相克, "
               f"权重别开大; 标签由归一化输入即时计算, 无噪声")
@@ -1093,8 +1119,9 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         epoch_sup_raw = 0.0      # SupCon 原始值
         epoch_sup_w = 0.0        # w_c·SupCon 加权贡献
         epoch_uniform_p = 0.0    # p 上 uniformity（B样本口径，越低越均匀）
-        epoch_sim_same = 0.0     # p 上同类平均余弦（越高越好）
-        epoch_sim_diff = 0.0     # p 上异类平均余弦（越低越好）
+        epoch_sim_k1 = 0.0       # p 上全头一致(K=1)对平均余弦（越高越好）
+        epoch_sim_k0 = 0.0       # p 上全头不一致(K=0)对平均余弦（越低越好）
+        epoch_sim_corr = 0.0     # p 上 sim~K Pearson 相关（沉淀总指标）
         epoch_cka = 0.0          # CKA(z, 标签核)（batch 级平均）
         epoch_dedup_total = 0   # batch内去重去掉的条数
         n_batches = 0
@@ -1165,20 +1192,22 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
                 # 加权合成（对比项的 fp32 计算放 AMP 外，避免 bf16 logits 精度不足）
                 loss = w_v * loss_visreg + w_r * loss_recon
 
-            # 类感知对比（几何轴主损失）：干净 x 的投影 + vpa 标签。
-            # vpa 符号 = sign(c−o)·sign(amount) 编码量价交互
-            # （同向：涨+放量/跌+缩量；背离：涨+缩量/跌+放量；中性），
-            # 正对掩码=标签核=CKA 目标核。无视图身份游戏，
+            # 类感知对比（几何轴主损失）：干净 x 的投影 + 多头一致度核。
+            # K_ij = 各头标签一致比例——锚点从单标签 3 簇增殖为头组合
+            # 胞元（~百级），正对权重=语义一致度：全头一致全力度聚拢、
+            # 部分一致分级聚拢、全不一致斥远，样本按丰富语义分级"沉淀"。
+            # 正对核=CKA 目标核（同一 K 两处共用）。无视图身份游戏，
             # "几乎相同的两条K线被拉近"是 feature：下游要语义相似度
             # 而非身份识别
             if use_supcon:
                 p_n = F.normalize(p_clean.float(), dim=1)
-                vpa_y = cls_targets['vol_price_align']
-                loss_sup = supcon_loss(p_n, vpa_y, supcon_tau)
+                k_sem = label_kernel_from_targets(cls_targets,
+                                                  list(cls_heads_spec))
+                loss_sup = supcon_loss(p_n, k_sem, supcon_tau)
                 loss = loss + w_c * loss_sup
-                # 纯监控：U + 同类/异类平均余弦（类别几何分离度）
+                # 纯监控：U + K=1/K=0 对相似度 + sim~K 相关
                 with torch.no_grad():
-                    uni_p, sim_same, sim_diff = p_geometry_stats(p_n, vpa_y)
+                    uni_p, sim_k1, sim_k0, sim_corr = p_geometry_stats(p_n, k_sem)
 
             # 分类头（粗+细）：fp32 计算（CE 在 bf16 下精度不足，同 SupCon）。
             # 标签已由 compute_cls_targets 预算好；梯度经线性头回流 embedding，
@@ -1223,8 +1252,9 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
                 epoch_sup_w += sup_w
                 epoch_sup_raw += loss_sup.item()
                 epoch_uniform_p += uni_p
-                epoch_sim_same += sim_same
-                epoch_sim_diff += sim_diff
+                epoch_sim_k1 += sim_k1
+                epoch_sim_k0 += sim_k0
+                epoch_sim_corr += sim_corr
             if use_cls:
                 if loss_cls is not None:
                     cls_w = w_cls * loss_cls.item()
@@ -1243,10 +1273,12 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
                     epoch_cls_head_acc[name] = (epoch_cls_head_acc.get(name, 0.0)
                                                 + acc.float().mean().item())
             if use_cka:
-                # 纯监控：z 已反传完毕，detach+no_grad 零额外图开销
+                # 纯监控：z 已反传完毕，detach+no_grad 零额外图开销。
+                # 目标核与 SupCon 正对核共用（use_supcon 时直接复用 k_sem）
                 with torch.no_grad():
-                    k_l = label_kernel_from_targets(cls_targets,
-                                                    list(CLS_HEAD_SPEC))
+                    k_l = (k_sem if use_supcon else
+                           label_kernel_from_targets(cls_targets,
+                                                     list(cls_heads_spec)))
                     epoch_cka += compute_label_cka(z.detach().float(), k_l)
             n_batches += 1
 
@@ -1264,14 +1296,18 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
 
         # 打印日志 （O=/D= 分别为原始16维/衍生重建原始值，D= 即线性探针误差，
         # 直接衡量 embedding 中可线性读出的跨维结构量，观察衍生目标是否被学到；
-        # SUP=SupCon 原始值（下降=同类聚拢/异类分开在推进，地板≈ln(同类数)），
+        # SUP=核加权 SupCon 原始值（下降=按语义一致度分级沉淀在推进；
+        # 核密度高故地板随核分布变化，看趋势不看绝对值），
         # U=p 上 uniformity（防坍塌监控，B 样本口径），
-        # 同/异=同类/异类平均余弦（两者差=类别几何分离度，SupCon 优化的量）；
+        # K1/K0=全头一致/全头不一致样本对的平均余弦（两者差=锚点胞元分离度），
+        # r=非对角 sim 与一致度核 K 的 Pearson 相关（沉淀总指标，
+        # r 升 = p 几何整体向语义核对齐）；
         # CLS/FINE=粗/细头 CE 平均，逐头格式 CE/Acc——CLS 从 ln(3)≈1.1、
         # FINE 从 ln(5)≈1.61 下降 + Acc 上升 = 类别可分结构正在被嵌入
         # （Acc 受 label 噪声/可分离度上限约束，无需追满）；
-        # CKA=z 与标签核的中心化相关（几何轴），上升=类别成对几何与标签
-        # 一致性提高——VISReg 单峰压力会限制其上限，看趋势不看绝对值）
+        # CKA=z 与标签核的中心化相关（几何轴，与 SupCon 正对核同一对象），
+        # 上升=类别成对几何与标签一致性提高——VISReg 单峰压力会限制其
+        # 上限，看趋势不看绝对值）
         avg_dedup = epoch_dedup_total / max(1, n_batches)
         weighted_str = f"{avg_visreg_w:.4f}·VISReg + {avg_recon_w:.4f}·Recon"
         sup_str = ""
@@ -1279,8 +1315,9 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
             weighted_str += f" + {epoch_sup_w / n_batches:.4f}·SUP"
             sup_str = (f"SUP={epoch_sup_raw / n_batches:.4f} "
                        f"(U={epoch_uniform_p / n_batches:.3f}/"
-                       f"同={epoch_sim_same / n_batches:.3f}/"
-                       f"异={epoch_sim_diff / n_batches:.3f})  ")
+                       f"K1={epoch_sim_k1 / n_batches:.3f}/"
+                       f"K0={epoch_sim_k0 / n_batches:.3f}/"
+                       f"r={epoch_sim_corr / n_batches:.3f})  ")
         cls_str = ""
         if use_cls_coarse:
             weighted_str += f" + {epoch_cls_w / n_batches:.4f}·CLS"
@@ -1346,8 +1383,9 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
             'supcon_weighted': epoch_sup_w / n_batches,
             'supcon_raw': epoch_sup_raw / n_batches,
             'uniformity_p': epoch_uniform_p / n_batches,
-            'sim_same': epoch_sim_same / n_batches,
-            'sim_diff': epoch_sim_diff / n_batches,
+            'sim_k1': epoch_sim_k1 / n_batches,
+            'sim_k0': epoch_sim_k0 / n_batches,
+            'sim_kernel_corr': epoch_sim_corr / n_batches,
         })
     if use_cka:
         last_metrics['cka'] = epoch_cka / n_batches

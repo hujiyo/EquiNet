@@ -37,16 +37,20 @@ EquiNet Embedding层训练脚本
    模型没有动力让同类K线在 embedding 空间靠拢；交叉熵没有"差不多"，
    必须选边站，逼 embedding 出现可线性读出的类别可分结构
    （同类聚拢/异类分开）——下游 attention 消费点积相似度，此几何直接可用。
-   粗头（CLS_ENABLED）：三类=跌/平/涨，"平"为 |v|≤ε 的区间
-   （ε 由池上分位数预计算，CLS_FLAT_PCT），非"恰好=0"（连续分布上
-   测度为零、平类会退化）。
-   细头（CLS_FINE_ENABLED）：同一判别值等频分 CLS_FINE_BUCKETS 桶——
-   粗头只有"分得开"的压力、类内几何是平的（涨0.5%与涨9.8%同为"涨"），
-   细头在桶粒度继续聚拢，给类内几何加分辨率。
+   粗头（CLS_ENABLED）：四族 dir/vpa/drv/vws 各三类=负/中性/正，"中性"
+   为 |v|≤ε 的区间（ε 由池上分位数预计算，CLS_FLAT_PCT），非"恰好=0"
+   （连续分布上测度为零、平类会退化）。drv=macd_drive 取 MACD柱差分
+   本身：hd>0 多头边际加强（红柱变长/绿柱变短）、hd<0 空头边际加强——
+   替换原 momentum_accel 乘积锚点（sign(h)·sign(hd) 销毁多空方向，
+   把多头加强和空头加强混进同类，与交易语义相悖）。
+   细头（CLS_FINE_ENABLED）：仅 dir/vpa 两族，同一判别值等频分
+   CLS_FINE_BUCKETS 桶——粗头只有"分得开"的压力、类内几何是平的
+   （涨0.5%与涨9.8%同为"涨"），细头在桶粒度继续聚拢，给类内几何加
+   分辨率；vws 细版与 dir/vpa 强相关属冗余不设。
    头为单层线性（与线性解码器同哲学：非线性头会把分类压力吞掉），
    标签由归一化输入即时计算（与符号族衍生特征同定义、平带外符号一致、
    无噪声），训练后与 decoder/projector 一起丢弃。
-   CKA 监控（CKA_LOG_ENABLED）：逐 epoch 计算 CKA(z, 4粗头标签核)
+   CKA 监控（CKA_LOG_ENABLED）：逐 epoch 计算 CKA(z, 全头一致度核)
    （Kornblith et al. 2019）——z 的成对相似度结构与标签核的中心化相关，
    几何轴指标（与 probe B/C 的信息轴正交）：高=类别几何饱和，低=有空间。
 
@@ -58,6 +62,7 @@ EquiNet Embedding层训练脚本
 import os
 import sys
 import math
+import re
 import argparse
 import time
 import numpy as np
@@ -276,16 +281,29 @@ CLS_HEAD_SPEC = {
     # 与训练 batch 天然对齐 → 零存储、零数据管线改动。
     # 三类 = 跌/平/涨，其中"平"不是"恰好=0"而是 |v|≤ε 的区间
     # （ε 由 compute_cls_stats 在池上按分位数预计算，见 CLS_FLAT_PCT）。
+    # macd_drive 的语义（替换原 momentum_accel 分类锚点）：交易语义中多空
+    # 攻守由柱体变化方向决定——红柱变长(h>0,hd>0)与绿柱变短(h<0,hd>0)同为
+    # 多头边际加强（hd>0），红柱变短与绿柱变长同为空头边际加强（hd<0）；
+    # 原乘积 sign(h)·sign(hd) 恰好销毁该方向信息（把多头加强和空头加强各
+    # 拆一半混进"同向"类）。macd_drive 直接取 hd 本身：v>ε 多头边际加强 /
+    # |v|≤ε 盘整 / v<−ε 空头边际加强。momentum_accel（动能加速）仍保留在
+    # MSE 衍生重建 11 维中——作为回归目标语义无碍，仅不再作分类锚点。
     'direction':       3,   # v = close-open                 收/开相对强弱
     'vol_price_align': 3,   # v = sign(close-open)·amount    量价配合
-    'momentum_accel':  3,   # v = macd_h·macd_hd           MACD柱同向/反向
+    'macd_drive':      3,   # v = macd_hd                    多头/空头 边际加强
     'vwap_side':       3,   # v = close-vwap                 收在均价上/下
 }
 
 CLS_SHORT_NAMES = {
     'direction': 'dir', 'vol_price_align': 'vpa',
-    'momentum_accel': 'mom', 'vwap_side': 'vws',
+    'macd_drive': 'drv', 'vwap_side': 'vws',
 }
+
+# 有细头（等频分桶）的基头：仅方向/量价两族。细头的价值在类内幅度分辨率
+# （大涨vs小涨、放量程度分级）；vws 与 dir/vpa 强相关（细版冗余，run3 中
+# 退化最重），macd_drive 为新锚点先粗粒度验证。结构性事实写死于代码
+# （git 管理），不做运行时配置。
+FINE_HEAD_BASES = ('direction', 'vol_price_align')
 
 
 def _cls_values(x):
@@ -305,7 +323,7 @@ def _cls_values(x):
     sign = torch.sign if torch.is_tensor(x) else np.sign
     yield 'direction', x[:, 3] - x[:, 0]
     yield 'vol_price_align', sign(x[:, 3] - x[:, 0]) * x[:, 5]
-    yield 'momentum_accel', x[:, 12] * x[:, 13]
+    yield 'macd_drive', x[:, 13]
     yield 'vwap_side', x[:, 3] - x[:, 4]
 
 
@@ -326,7 +344,7 @@ def build_cls_head_spec():
         heads.update(CLS_HEAD_SPEC)
     if EmbeddingConfig.CLS_FINE_ENABLED:
         heads.update({fine_head_name(n): EmbeddingConfig.CLS_FINE_BUCKETS
-                      for n in CLS_HEAD_SPEC})
+                      for n in CLS_HEAD_SPEC if n in FINE_HEAD_BASES})
     return heads
 
 
@@ -367,7 +385,7 @@ def compute_cls_stats(pool, coarse, fine):
             eps = float(np.percentile(np.abs(v), EmbeddingConfig.CLS_FLAT_PCT))
             b = np.array([-eps, eps], dtype=np.float32)
             out[name] = (b, _bucket_shares(v, b))
-        if fine:
+        if fine and name in FINE_HEAD_BASES:
             b = np.quantile(v, np.arange(1, EmbeddingConfig.CLS_FINE_BUCKETS)
                             / EmbeddingConfig.CLS_FINE_BUCKETS).astype(np.float32)
             out[fine_head_name(name)] = (b, _bucket_shares(v, b))
@@ -635,7 +653,7 @@ class PretrainModel(nn.Module):
     Embedding层训练模型 = KLineEmbedding + 线性解码器 + 对比 projector + 分类头
 
     X ──────────→ Embedding → S ─┬─ Linear → Y            (线性重建探针)
-                                 ├─ Linear×8 → 类别 (分类头, 粗+细, 训练后丢弃)
+                                 ├─ Linear×6 → 类别 (分类头, dir/vpa粗+细 + drv/vws粗, 训练后丢弃)
                                  ├─ VISReg(S)
                                  └─ projector g(S) → L2归一化 → SupCon(多头一致度核)
 
@@ -853,12 +871,14 @@ class WarmupCosineScheduler:
 
 # ==================== 保存函数 ====================
 
-def save_pretrained_embedding(embedding, path, metrics=None, decoder=None):
+def save_pretrained_embedding(embedding, path, metrics=None, decoder=None, tag=None):
     """
     保存预训练 embedding 权重（及可选解码器）
 
     格式与 StockTransformer 的 embed_proj / embed_mlp 直接兼容。
     传入 decoder 时同时保存解码器权重，供重建可视化等用途。
+    checkpoint['config'] 落盘全部损失权重与实验臂标签——任何 .pth
+    均可独立追溯其训练配方，多臂对比产物不混淆。
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -874,6 +894,17 @@ def save_pretrained_embedding(embedding, path, metrics=None, decoder=None):
             'batch_size': EmbeddingConfig.BATCH_SIZE,
             'learning_rate': EmbeddingConfig.LEARNING_RATE,
             'visreg_weight': EmbeddingConfig.VISREG_WEIGHT,
+            # 损失权重全量快照（实验臂自描述）
+            'visreg_w_scale': EmbeddingConfig.VISREG_W_SCALE,
+            'visreg_w_shape': EmbeddingConfig.VISREG_W_SHAPE,
+            'visreg_w_center': EmbeddingConfig.VISREG_W_CENTER,
+            'target_std': EmbeddingConfig.TARGET_STD,
+            'derived_weight': EmbeddingConfig.DERIVED_WEIGHT,
+            'supcon_weight': EmbeddingConfig.SUPCON_WEIGHT,
+            'supcon_tau': EmbeddingConfig.SUPCON_TAU,
+            'cls_weight': EmbeddingConfig.CLS_WEIGHT,
+            'cls_fine_weight': EmbeddingConfig.CLS_FINE_WEIGHT,
+            'tag': tag,
         },
     }
     if metrics:
@@ -932,9 +963,12 @@ def measure_embedding_std(checkpoint_path, kline_pool, device, n_probe=10000):
 
 # ==================== 主训练函数 ====================
 
-def pretrain(train_stock_info, feature_normalizer=None, device=None):
+def pretrain(train_stock_info, feature_normalizer=None, device=None, tag=None):
     """
     Embedding层训练-主函数（超参统一走 EmbeddingConfig，CLI 不再提供覆盖入口）
+
+    tag: 实验臂标签（非 None 时产物存为 best_embedding_<tag>.pth，
+         并写入 checkpoint['config']['tag']；None=常规产物）
     """
     epochs = EmbeddingConfig.EPOCHS
     batch_size = EmbeddingConfig.BATCH_SIZE
@@ -1078,16 +1112,17 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
                   f"池上占比 跌{shares[0]*100:.0f}%/平{shares[1]*100:.0f}%/涨{shares[2]*100:.0f}%")
     if use_cls_fine:
         nb = EmbeddingConfig.CLS_FINE_BUCKETS
-        print(f"  分类头(细,{nb}桶 等频)=线性探针:")
-        for name in CLS_HEAD_SPEC:
+        print(f"  分类头(细,{nb}桶 等频, 仅{'+'.join(FINE_HEAD_BASES)})=线性探针:")
+        for name in FINE_HEAD_BASES:
             b, shares = cls_stats[fine_head_name(name)]
             b_str = ' '.join(f"{x:+.3f}" for x in b)
             s_str = '/'.join(f"{s*100:.0f}%" for s in shares)
             print(f"    {name:>16s}: 边界[{b_str}]  池上占比 {s_str}")
     if use_supcon:
         print(f"  SupCon(核加权, 几何轴主损失): 正对权重=全{len(cls_heads_spec)}头"
-              f"(粗+细)标签一致度 K∈{{0,1/{len(cls_heads_spec)},...,1}}, "
-              f"τ={supcon_tau}; 锚点从单标签3簇增殖为头组合胞元(~百级), "
+              f"(dir/vpa各粗+细, drv/vws粗)标签一致度 "
+              f"K∈{{0,1/{len(cls_heads_spec)},...,1}}, "
+              f"τ={supcon_tau}; 锚点从单标签3簇增殖为头组合胞元(~十级), "
               f"样本按语义一致度分级沉淀; 正对核=CKA目标核")
     if use_cka:
         print(f"  CKA监控: CKA(z, 全头一致度核) 逐epoch日志"
@@ -1118,10 +1153,13 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         epoch_cls_head_acc = {}  # 逐头准确率（粗+细，按头名）
         epoch_sup_raw = 0.0      # SupCon 原始值
         epoch_sup_w = 0.0        # w_c·SupCon 加权贡献
-        epoch_uniform_p = 0.0    # p 上 uniformity（B样本口径，越低越均匀）
-        epoch_sim_k1 = 0.0       # p 上全头一致(K=1)对平均余弦（越高越好）
-        epoch_sim_k0 = 0.0       # p 上全头不一致(K=0)对平均余弦（越低越好）
-        epoch_sim_corr = 0.0     # p 上 sim~K Pearson 相关（沉淀总指标）
+        epoch_sup_hfloor = 0.0   # SUP 理论下界(核行熵均值): softmax 完美匹配正对核时的损失值
+        # 语义几何指标一律只在 z 本体测（下游消费 z 而非 g(z)；p 是训练后丢弃的
+        # 脚手架，其绝对几何无消费者——p 空间 U/K1/K0/r 已移除，历史教训：
+        # p 的全局收缩是设计内现象（VISReg 反压拦截在 z 端），看 p 只会误报）
+        epoch_sim_k1_z = 0.0     # z 上全头一致(K=1)对平均余弦
+        epoch_sim_k0_z = 0.0     # z 上全头不一致(K=0)对平均余弦
+        epoch_sim_corr_z = 0.0   # z 上 sim~K Pearson 相关
         epoch_cka = 0.0          # CKA(z, 标签核)（batch 级平均）
         epoch_dedup_total = 0   # batch内去重去掉的条数
         n_batches = 0
@@ -1205,9 +1243,19 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
                                                   list(cls_heads_spec))
                 loss_sup = supcon_loss(p_n, k_sem, supcon_tau)
                 loss = loss + w_c * loss_sup
-                # 纯监控：U + K=1/K=0 对相似度 + sim~K 相关
+                # 纯监控：语义几何只在 z 本体测（下游消费 z；p 是丢弃的脚手架，
+                # 其全局收缩是设计内现象——VISReg 反压把它拦截在 g 内部，
+                # 历史 p 空间 U/K1/K0/r 指标已移除以免误读）
                 with torch.no_grad():
-                    uni_p, sim_k1, sim_k0, sim_corr = p_geometry_stats(p_n, k_sem)
+                    z_n = F.normalize(z.detach().float(), dim=1)
+                    _, sim_k1_z, sim_k0_z, sim_corr_z = p_geometry_stats(z_n, k_sem)
+                    # SUP 理论下界 Hf：若 softmax 完美匹配归一化正对核 q̃∝K，
+                    # 损失恰为核行熵的平均——核越稠密下界越高（稠密核下 ~5-7）。
+                    # SUP 绝对值无信息，有效读数 = SUP − Hf（超下界余量）
+                    k_off = k_sem.float().clone()
+                    k_off.fill_diagonal_(0.0)
+                    q_row = k_off / k_off.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                    h_floor = -(q_row * torch.log(q_row.clamp_min(1e-12))).sum(dim=1).mean()
 
             # 分类头（粗+细）：fp32 计算（CE 在 bf16 下精度不足，同 SupCon）。
             # 标签已由 compute_cls_targets 预算好；梯度经线性头回流 embedding，
@@ -1251,10 +1299,10 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
                 epoch_loss += sup_w
                 epoch_sup_w += sup_w
                 epoch_sup_raw += loss_sup.item()
-                epoch_uniform_p += uni_p
-                epoch_sim_k1 += sim_k1
-                epoch_sim_k0 += sim_k0
-                epoch_sim_corr += sim_corr
+                epoch_sim_k1_z += sim_k1_z
+                epoch_sim_k0_z += sim_k0_z
+                epoch_sim_corr_z += sim_corr_z
+                epoch_sup_hfloor += h_floor.item()
             if use_cls:
                 if loss_cls is not None:
                     cls_w = w_cls * loss_cls.item()
@@ -1296,12 +1344,13 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
 
         # 打印日志 （O=/D= 分别为原始16维/衍生重建原始值，D= 即线性探针误差，
         # 直接衡量 embedding 中可线性读出的跨维结构量，观察衍生目标是否被学到；
-        # SUP=核加权 SupCon 原始值（下降=按语义一致度分级沉淀在推进；
-        # 核密度高故地板随核分布变化，看趋势不看绝对值），
-        # U=p 上 uniformity（防坍塌监控，B 样本口径），
-        # K1/K0=全头一致/全头不一致样本对的平均余弦（两者差=锚点胞元分离度），
-        # r=非对角 sim 与一致度核 K 的 Pearson 相关（沉淀总指标，
-        # r 升 = p 几何整体向语义核对齐）；
+        # SUP=核加权 SupCon 原始值（对 B≈2560 候选的平均负对数概率，
+        # 绝对值无信息——完美匹配时损失也只降到核行熵）；
+        # Hf=SUP 理论下界(核行熵均值)，SUPexc=SUP−Hf 才是有效读数：
+        # 越接近 0 = 通道越接近其目标允许的极限；
+        # zK1/zK0/zr=语义几何指标，只在 z 本体测（L2 归一化后与语义核比）——
+        # 下游消费 z 而非 g(z)，p 是训练后丢弃的脚手架，其全局收缩是设计内
+        # 现象（VISReg 反压拦截在 g 内部），p 空间 U/K1/K0/r 指标已移除；
         # CLS/FINE=粗/细头 CE 平均，逐头格式 CE/Acc——CLS 从 ln(3)≈1.1、
         # FINE 从 ln(5)≈1.61 下降 + Acc 上升 = 类别可分结构正在被嵌入
         # （Acc 受 label 噪声/可分离度上限约束，无需追满）；
@@ -1314,10 +1363,11 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         if use_supcon:
             weighted_str += f" + {epoch_sup_w / n_batches:.4f}·SUP"
             sup_str = (f"SUP={epoch_sup_raw / n_batches:.4f} "
-                       f"(U={epoch_uniform_p / n_batches:.3f}/"
-                       f"K1={epoch_sim_k1 / n_batches:.3f}/"
-                       f"K0={epoch_sim_k0 / n_batches:.3f}/"
-                       f"r={epoch_sim_corr / n_batches:.3f})  ")
+                       f"(zK1={epoch_sim_k1_z / n_batches:.3f}/"
+                       f"zK0={epoch_sim_k0_z / n_batches:.3f}/"
+                       f"zr={epoch_sim_corr_z / n_batches:.3f}/"
+                       f"Hf={epoch_sup_hfloor / n_batches:.3f})  "
+                       f"SUPexc={epoch_sup_raw / n_batches - epoch_sup_hfloor / n_batches:.3f}  ")
         cls_str = ""
         if use_cls_coarse:
             weighted_str += f" + {epoch_cls_w / n_batches:.4f}·CLS"
@@ -1333,7 +1383,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
             weighted_str += f" + {epoch_cls_fine_w / n_batches:.4f}·FINE"
             nb = EmbeddingConfig.CLS_FINE_BUCKETS
             fine_parts = []
-            for name in CLS_HEAD_SPEC:
+            for name in FINE_HEAD_BASES:
                 head = fine_head_name(name)
                 ce = epoch_cls_head_raw[head] / n_batches
                 acc = epoch_cls_head_acc[head] / n_batches
@@ -1382,16 +1432,18 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None):
         last_metrics.update({
             'supcon_weighted': epoch_sup_w / n_batches,
             'supcon_raw': epoch_sup_raw / n_batches,
-            'uniformity_p': epoch_uniform_p / n_batches,
-            'sim_k1': epoch_sim_k1 / n_batches,
-            'sim_k0': epoch_sim_k0 / n_batches,
-            'sim_kernel_corr': epoch_sim_corr / n_batches,
+            'sim_k1_z': epoch_sim_k1_z / n_batches,
+            'sim_k0_z': epoch_sim_k0_z / n_batches,
+            'sim_kernel_corr_z': epoch_sim_corr_z / n_batches,
+            'supcon_h_floor': epoch_sup_hfloor / n_batches,
         })
     if use_cka:
         last_metrics['cka'] = epoch_cka / n_batches
-    best_path = os.path.join(output_dir, 'best_embedding.pth')
+    ckpt_name = f'best_embedding{("_" + tag) if tag else ""}.pth'
+    best_path = os.path.join(output_dir, ckpt_name)
     save_pretrained_embedding(model.embedding, best_path,
-                              metrics=last_metrics, decoder=model.decoder)
+                              metrics=last_metrics, decoder=model.decoder,
+                              tag=tag)
 
     # 测量保存文件的输出std（pre_sampled 为池的随机子集，分布等价）
     measure_embedding_std(best_path, pre_sampled, device)
@@ -1413,6 +1465,9 @@ def main():
                         help='只测试已保存 embedding 权重的输出std，不训练')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help=f'--test 模式加载的权重文件 (默认 <output-dir>/best_embedding.pth)')
+    parser.add_argument('--tag', type=str, default=None,
+                        help='实验臂标签: 产物存为 best_embedding_<tag>.pth 并写入'
+                             ' checkpoint（多臂对比时区分产物，不影响 train.py 默认加载路径）')
 
     args = parser.parse_args()
 
@@ -1440,11 +1495,15 @@ def main():
         return
 
     # 预训练
+    if args.tag is not None and not re.fullmatch(r'[\w\-]+', args.tag):
+        parser.error(f"--tag 仅允许字母/数字/下划线/连字符: {args.tag!r}")
+
     print("\n[步骤3] 开始 Embedding 预训练...")
     pretrain(
         train_stock_info=train_stock_info,
         feature_normalizer=feature_normalizer,
         device=device,
+        tag=args.tag,
     )
 
 

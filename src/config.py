@@ -157,7 +157,14 @@ class EmbeddingConfig:
     VISREG_WEIGHT = 0.6                # λ, 正则项权重
     VISREG_NUM_SLICES = 256             # 随机投影方向数 K (论文建议 K>C·D, 此处 D=128, K/D=2)
     VISREG_W_SCALE = 1.0                # 尺度项权重 (逐维 std→1, VICReg 方差项)
-    VISREG_W_SHAPE = 1.0                # 形状项权重 (SWD 对齐高斯分位数, 低质量数据建议调大)
+    VISREG_W_SHAPE = 0.6                # 形状项权重 (SWD 对齐高斯分位数)。
+                                        # 0.6 由单变量实验臂 shape06 定版：削弱"单峰高斯"
+                                        # 反压后，语义沉淀在 z 本体的晚期衰退消失——
+                                        # ep50→100 的 CKA/zK1/zr 由同步下滑转为稳定，
+                                        # 终值 zK1 0.355→0.389 / zr 0.532→0.568 /
+                                        # CKA 0.535→0.569，D= 0.084→0.080 同步小幅改善；
+                                        # 尺度(std=TARGET_STD)与中心化契约由独立条款保护不受影响。
+                                        # 对照: w_shape=1.0 基线与 dw16/lam45 臂数据见 git 历史
     VISREG_W_CENTER = 1.0               # 中心化项权重 (批均值→0)
     TARGET_STD = 0.2                    # 目标标准差（缩放后 VISReg 尺度项 target std依旧=1）
 
@@ -220,8 +227,9 @@ class EmbeddingConfig:
     # 判别式移植）。等频分桶天然类平衡；训练后期仍有梯度（3类头 Acc 平台
     # 化后细头继续供压）。注意 CE 不保证"相邻桶更近"（桶被当无序类别），
     # 相邻结构只是 v 连续性的副作用，要严格有序需 CORAL 类损失（未采用）。
-    CLS_FINE_ENABLED = True              # 细头开关
-    CLS_FINE_BUCKETS = 5                 # 桶数（4个判别值统一；大涨/小涨/平/小跌/大跌）
+    CLS_FINE_ENABLED = True              # 细头开关（仅 direction/vol_price_align 两族）
+    CLS_FINE_BUCKETS = 5                 # 桶数（大涨/小涨/平/小跌/大跌；vws 细版与
+                                         # dir/vpa 强相关属冗余不设，drv 新锚点先粗验证）
     CLS_FINE_WEIGHT = 0.1                # 细头 CE 权重（ln5≈1.61 起步 vs 粗头 ln3≈1.1，
                                          # 同乘 0.1 后量级相当）
 

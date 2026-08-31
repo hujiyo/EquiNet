@@ -6,7 +6,7 @@ EquiNet Embedding层训练脚本
 
 1. VISReg 几何正则 (Wu, Balestriero & Levine, 2026; arXiv:2606.02572)：
    约束嵌入分布趋向各向同性高斯 N(0, target_std²)
-2. 线性解码器重建损失：确保嵌入向量足以恢复原始16维 + 11个衍生特征
+2. 线性解码器重建损失：确保嵌入向量足以恢复原始19维 + 11个衍生特征
    刻意不用非线性解码器——非线性层自己就能完成乘积/绝对值/除法等跨维运算，
    会把"逼融合"的压力吞掉，embedding 逐维线性拷贝也能过关；
    线性解码器算不了任何非线性运算，跨维结构必须由 embedding 内部预先算好
@@ -80,40 +80,43 @@ from training_utils import _get_amp_context
 from visreg import VISRegLoss
 
 # ==================== 衍生特征 ====================
-def compute_derived_features(x, eps=None, chunk_size=4_000_000, rel_ohlc=None):
+def compute_derived_features(x, eps=None, chunk_size=4_000_000, coarse=None):
     """
-    从归一化16维特征计算11个衍生特征 [N, 11] + 语义掩码 [N, 11]
+    从归一化19维特征计算11个衍生特征 [N, 11] + 语义掩码 [N, 11]
 
     设计原则：全部为"跨维度非线性函数"——
-    单维度信息 decoder 用线性层就能从原始16维算出，逼不出 embedding 融合；
+    单维度信息 decoder 用线性层就能从原始19维算出，逼不出 embedding 融合；
     只有跨维度的非线性关系（abs/sign/乘积/除法）才能强迫 embedding
     在128维里编码"维度间关系"，而非逐维独立存储。
 
     输入 x 为 QuantileTransformer 细处理后的特征（各维均值0方差1），
     embedding 也只见过这个分布。衍生目标分两个空间计算：
-    - 归一化空间（符号族/breakthrough/均线/布林）：与 embedding 输入同分布，直接可推；
-    - 未归一化相对空间（body_ratio/upper_shadow/lower_shadow 及 span_turnover 的
-      振幅项，经 rel_ohlc 逆变换）：物理语义纯净，embedding 需自行学会分位数逆映射
-      后才能推出，任务更硬。
+    - 归一化空间（符号族/breakthrough/均线/布林）：与输入同分布，直接可推；
+    - 粗处理空间（body_ratio/upper_shadow/lower_shadow + 物理振幅，经 coarse
+      逆变换）：教科书 K线解剖量，embedding 需自行学会分位数逆映射后才能
+      推出，任务更硬。
 
-    rel_ohlc: [N, 4] 未归一化（粗处理后、分位数变换前）的相对特征
-              [open_rel, high_rel, low_rel, close_rel]（由 feature_normalizer
-              逆变换得到）。注意这不是原始价格：
-              - open_rel/close_rel = (O或C - 昨收)/昨收，参考系=昨收(列0/3被clip±0.1)
-              - high_rel/low_rel   = (H或L - 当日开盘)/开盘，参考系=当日开盘
-              K线形态特征计算前必须先统一参考系（除以 1+open_rel 换算到开盘系），
-              否则跳空日影线为负、body_ratio 有 ±10% 畸变（见 _compute_derived_block）。
-              统一后 K线序关系(high≥max(open,close)≥...≥low)在该空间严格成立，
-              100%有效无需掩码。None 时退化为归一化空间计算+掩码剔除
-              （归一化空间 ~65% 样本影线为负，纯为分位数变换伪影）。
+    coarse: None 或 (w_up, w_dn, high_raw, low_raw)——列16/17/1/2 逆变换回
+      粗处理空间的原始量（构建见 build_derived_targets）：
+        - w_up/w_dn: [N] 上/下影线占比 ∈[0,1]
+        - high_raw/low_raw: [N] 距开盘运动总量 (高−开)/开、(低−开)/开，两者之差
+          即物理振幅 (H−L)/O ≥ 0（high/low 列保留后振幅可精确重建）
+      提供时：
+        - K线形态域走占比口径：upper_shadow=w_up、lower_shadow=w_dn、
+          body_ratio=1−w_up−w_dn（K线解剖恒等式：三段占满全幅），三者天然
+          ∈[0,1]、无归一化伪影，掩码恒有效
+        - 量价关系域恢复物理振幅：span_turnover = (high_raw−low_raw)×exchange
+      None 时两域退化为归一化空间近似+掩码剔除（仅函数完整性保留，
+      kline-shape-v1 下 build_derived_targets 恒提供 coarse）。
 
     大数据集分块计算：衍生特征+掩码+中间临时变量峰值约 20·N·4 bytes，
     1.6亿条需~12GB 会 OOM；分块后每块峰值仅 ~20·chunk·4 bytes (chunk=4M→~320MB)。
 
-    16维索引:
-      0:open_rel 1:high_rel(≥0) 2:low_rel(≤0) 3:close_rel 4:vwap_rel
+    19维索引:
+      0:open_rel 1:high_rel 2:low_rel 3:close_rel 4:vwap_rel
       5:amount 6:exchange 7:m5 8:m10 9:m20 10:dif 11:dea
       12:macd_hist 13:macd_hist_diff 14:bb_upper 15:bb_lower
+      16:wick_up(∈[0,1]) 17:wick_dn(∈[0,1]) 18:body_ratio(∈[0,1])
     """
     if eps is None:
         eps = EmbeddingConfig.DERIVED_EPS
@@ -124,8 +127,10 @@ def compute_derived_features(x, eps=None, chunk_size=4_000_000, rel_ohlc=None):
         mask_chunks = []
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
-            ohlc_block = rel_ohlc[start:end] if rel_ohlc is not None else None
-            d, m = _compute_derived_block(x[start:end], eps, ohlc_block)
+            coarse_block = None
+            if coarse is not None:
+                coarse_block = tuple(c[start:end] for c in coarse)
+            d, m = _compute_derived_block(x[start:end], eps, coarse_block)
             derived_chunks.append(d)
             mask_chunks.append(m)
         # 两个 concat 必须分开并显式释放 chunks：若写进同一 return 顺序求值，
@@ -135,10 +140,10 @@ def compute_derived_features(x, eps=None, chunk_size=4_000_000, rel_ohlc=None):
         masks = np.concatenate(mask_chunks, axis=0)
         del mask_chunks
         return derived, masks
-    return _compute_derived_block(x, eps, rel_ohlc)
+    return _compute_derived_block(x, eps, coarse)
 
 
-def _compute_derived_block(x, eps, rel_ohlc=None):
+def _compute_derived_block(x, eps, coarse=None):
     """单块衍生特征计算（compute_derived_features 的分块内核）"""
     open_r, high_r, low_r, close_r = x[:, 0], x[:, 1], x[:, 2], x[:, 3]
     vwap = x[:, 4]
@@ -160,31 +165,24 @@ def _compute_derived_block(x, eps, rel_ohlc=None):
     momentum_accel = np.sign(macd_h) * np.sign(macd_hd)  # 柱体与变化相对各自分布中心: 同向+1/反向-1
     vwap_side = np.sign(close_r - vwap)                  # 收盘列 vs 均价列 相对强弱
 
-    # 归一化空间的 body/span（用于 breakthrough；span 仅退化路径使用）
+    # 归一化空间的 body（用于 breakthrough）；span_norm 仅 coarse 缺失时兜底
     body_norm = np.abs(close_r - open_r)
     span_norm = high_r - low_r
 
-    # ---- B. K线形态域（依赖跨维序关系 high≥max(open,close)≥min(open,close)≥low）----
-    if rel_ohlc is not None:
-        # 未归一化相对空间计算：物理约束完好，100%有效无需掩码。
-        # 注意逆变换得到的是混合参考系的相对特征，必须先统一到当日开盘系：
-        #   o=(O-昨收)/昨收, c=(C-昨收)/昨收 （昨收系, 被clip±0.1）
-        #   h=(H-O)/O,      l=(L-O)/O      （开盘系, 恒 h≥0≥l）
-        # 换算：开盘系下 (C-O)/O = (c-o)/(1+o)（1+o=O/昨收∈[0.9,1.1]）。
-        # 若直接用 o/c 与 h/l 相减（昨收系混开盘系），跳空高开日 upper_shadow<0、
-        # 跳空低开日 lower_shadow<0，伪影未消除只是换了样本；body_ratio 还带
-        # ±10% 的 O/昨收 畸变。统一参考系后序关系严格恢复：
-        #   span=(H-L)/O≥0, |C-O|≤H-L → body_ratio∈[0,1], 影线恒≥0。
-        o, h, l, c = rel_ohlc[:, 0], rel_ohlc[:, 1], rel_ohlc[:, 2], rel_ohlc[:, 3]
-        safe_scale = 1.0 + o                              # = O/昨收 ∈ [0.9, 1.1]
-        body_open = (c - o) / safe_scale                  # (C-O)/O 开盘系实体(带符号)
-        span_open = h - l                                 # (H-L)/O ≥ 0
-        body_ratio = np.clip(np.abs(body_open) / (span_open + eps), 0.0, 1.0)
-        upper_shadow = h - np.maximum(0.0, body_open)     # (H-max(O,C))/O ≥ 0
-        lower_shadow = np.minimum(0.0, body_open) - l     # (min(O,C)-L)/O ≥ 0
+    # ---- B. K线形态域（占比口径）----
+    if coarse is not None:
+        # 占比口径：w_up/w_dn 由归一化列逆变换而来的教科书影线占比 ∈[0,1]，
+        # K线解剖恒等式 上影+实体+下影 = 全幅 ⇒ 实体占比 = 1−w_up−w_dn。
+        # 三者天然有界、无归一化伪影，掩码恒有效。
+        w_up, w_dn, _, _ = coarse
+        upper_shadow = np.clip(w_up, 0.0, 1.0)
+        lower_shadow = np.clip(w_dn, 0.0, 1.0)
+        body_ratio = np.clip(1.0 - upper_shadow - lower_shadow, 0.0, 1.0)
         mask_body, mask_upper, mask_lower = ones, ones, ones
     else:
-        # 退化：归一化空间计算 + 掩码剔除伪影
+        # 无占比信息时的退化：归一化空间近似 + 掩码剔除伪影
+        # （kline-shape-v1 下 build_derived_targets 恒提供 coarse，
+        #   此分支仅为函数完整性保留）
         body_ratio = np.clip(body_norm / (span_norm + eps), 0.0, 1.0)
         upper_shadow = high_r - np.maximum(open_r, close_r)
         lower_shadow = np.minimum(open_r, close_r) - low_r
@@ -194,12 +192,17 @@ def _compute_derived_block(x, eps, rel_ohlc=None):
 
     # ---- C. 量价关系域 ----
     breakthrough = body_norm * amount                    # 实体×量: 突破强度 (归一化空间)
-    if rel_ohlc is not None:
-        # 物理振幅 (H-L)/O 恒≥0；归一化空间 high_r-low_r 在小振幅日可为负
-        # （逐列变换不保跨列序，伪影，见 mask 注释），故振幅项不用归一化空间
-        span_turnover = span_open * exchange             # 振幅×换手: 波动×资金参与
+    if coarse is not None:
+        # 物理振幅 (H−L)/O 精确重建：high/low 列保留后，
+        # high_raw−low_raw = (高−开)/开 − (低−开)/开 = (高−低)/开 ≥ 0，
+        # 不再需要归一化空间近似。
+        _, _, high_raw, low_raw = coarse
+        span_turnover = (high_raw - low_raw) * exchange  # 物理振幅×换手: 波动×资金参与
     else:
-        span_turnover = span_norm * exchange             # 退化: 归一化空间(含符号伪影, 剪尾+z-score缓解)
+        # 无 coarse 时退化：归一化空间 |span|×exchange（函数完整性保留）。
+        # abs() 消除逐列变换的符号伪影，但 rank 变换不保跨列差的绝对序，
+        # 保序性受损，仅作软指标。
+        span_turnover = np.abs(span_norm) * exchange     # |振幅|×换手
 
     # ---- D. 均线域 (绝对值线性化，不用平方：平方使极端离散日主导损失) ----
     ma_spread = np.abs(m5 - m10) + np.abs(m10 - m20)     # 均线离散度
@@ -231,7 +234,7 @@ def _standardize_derived(derived, masks, winsorize_pct=None):
     平方类目标有重尾（极端行情日误差平方后主导整个 loss），
     绝对值线性化后仍可能有产品类重尾（两个归一化因子的积），
     统一按分位数剪尾后再 z-score：剪掉的是极少数极端行情样本，
-    其余样本的分布和量级与原始16维（已归一化，方差1）对齐，等权 MSE 才成立。
+    其余样本的分布和量级与原始19维（已归一化，方差1）对齐，等权 MSE 才成立。
 
     统计量（分位数/均值/标准差）只在掩码有效样本上计算；
     掩码样本标准化后置 0（损失端会被掩码剔除，0 仅为占位）。
@@ -309,7 +312,7 @@ FINE_HEAD_BASES = ('direction', 'vol_price_align')
 def _cls_values(x):
     """
     各分类头的原始判别值 v：分类标签 = sign(v)（±ε 平带），四个头的共性入口。
-    归一化空间、与 compute_derived_features 符号族同列索引（16维索引见该函数）；
+    归一化空间、与 compute_derived_features 符号族同列索引（19维索引见该函数）；
     平带外 sign(v) 与该族衍生特征符号严格一致（见 CLS_HEAD_SPEC 注释）。
     numpy 与 torch 张量均可（切片+算术+sign 均为两者共有算子）。
 
@@ -420,38 +423,58 @@ def compute_cls_targets(x, cls_boundaries):
 
 def build_derived_targets(kline_data, feature_normalizer, chunk_size=4_000_000):
     """
-    从归一化K线构建衍生训练目标：OHLC 逆变换 + 衍生特征 + 剪尾 z-score
+    从归一化K线构建衍生训练目标：影线占比逆变换 + 衍生特征 + 剪尾 z-score
 
     只对实际参与训练/探测的子集调用，而非全池：
     衍生目标与掩码按行独立计算，子集统计（分位数/均值/标准差）与全池
-    在百万级样本下已收敛等价，但内存从 全池×(16+11+11) 列 降到 子集×27 列，
+    在百万级样本下已收敛等价，但内存从 全池×(19+11+11) 列 降到 子集×30 列，
     避免大池上衍生数组的双倍 concat 峰值 OOM。
 
     Returns:
         derived_data: [M, n_derived] float32 剪尾+z-score 后的衍生目标
         derived_mask: [M, n_derived] uint8 语义掩码 (1=有效, 0=归一化伪影样本)
     """
-    # 逆变换 open/high/low/close 到未归一化相对空间（粗处理后的 open_rel 等，
-    # 非原始价格，参考系混合见 compute_derived_features 的 rel_ohlc 说明），
-    # 用于计算依赖 K线序关系的形态特征(body_ratio/影线)与物理振幅 span：
-    # 逐维分位数变换不保跨维序关系(high≥max(open,close)≥...≥low)，
-    # 归一化空间中 ~65% 样本影线为负(伪影)；逆变换后统一参考系计算，物理约束完好
+    # 逆变换 wick_up/wick_dn 回粗处理占比空间（[0,1] 教科书影线占比），
+    # 供 K线形态域使用；实体占比由
+    # 恒等式 1−w_up−w_dn 直接得到（上影+实体+下影恒等全幅）。
+    # 同时逆变换 high/low 回「距开盘运动总量」原始量 (高−开)/开、(低−开)/开，
+    # 两者之差即物理振幅 (H−L)/O——high/low 列保留后振幅可精确重建，
+    # span_turnover 不再需要归一化空间近似。
     if feature_normalizer is not None:
-        rel_ohlc = np.empty((len(kline_data), 4), dtype=np.float32)
+        # 列号取 slice.start（与 _feature_groups 的真实列定义对齐），
+        # 不用分组序号——后者仅在"每 group 恰为单列 slice 且按列序排列"
+        # 时才碰巧等价，属隐式脆弱耦合
+        group_slice = dict(feature_normalizer._feature_groups)
+        ups, dns, highs, lows = [], [], [], []
         for start in range(0, len(kline_data), chunk_size):
             end = min(start + chunk_size, len(kline_data))
-            for col, name in enumerate(['open', 'high', 'low', 'close']):
-                rel_ohlc[start:end, col] = feature_normalizer.pipelines[name].inverse_transform(
-                    kline_data[start:end, col:col+1]).flatten()
-        print(f"  OHLC 逆变换完成 ({len(kline_data):,} 条, 未归一化相对空间计算形态/振幅)")
+            block = kline_data[start:end]
+            for name, bucket in (('wick_up', ups), ('wick_dn', dns),
+                                 ('high', highs), ('low', lows)):
+                c = group_slice[name].start
+                bucket.append(feature_normalizer.pipelines[name]
+                              .inverse_transform(block[:, c:c + 1]).flatten())
+        coarse = (
+            np.concatenate(ups).astype(np.float32),
+            np.concatenate(dns).astype(np.float32),
+            np.concatenate(highs).astype(np.float32),
+            np.concatenate(lows).astype(np.float32),
+        )
+        # 振幅范围用 min(high)−max(low) / max(high)−min(low) 表达，
+        # 避免物化整条 (high−low) 临时数组（大池下省 ~N×4B 峰值）
+        amp_lo = float(np.min(coarse[2]) - np.max(coarse[3]))
+        amp_hi = float(np.max(coarse[2]) - np.min(coarse[3]))
+        print(f"  K线形态域逆变换完成 ({len(kline_data):,} 条, "
+              f"w_up∈[{coarse[0].min():.3f},{coarse[0].max():.3f}], "
+              f"w_dn∈[{coarse[1].min():.3f},{coarse[1].max():.3f}], "
+              f"振幅 (H−L)/O∈[{amp_lo:.3f},{amp_hi:.3f}])")
     else:
-        rel_ohlc = None
+        coarse = None
 
     derived_data, derived_mask = compute_derived_features(
-        kline_data, rel_ohlc=rel_ohlc, chunk_size=chunk_size)
+        kline_data, coarse=coarse, chunk_size=chunk_size)
     print(f"  衍生特征: {derived_data.shape[1]}维 "
-          f"(跨域非线性; 形态/振幅域在未归一化相对空间100%有效, "
-          f"无 rel_ohlc 时退化为归一化空间+掩码剔除, 见 compute_derived_features)")
+          f"(跨域非线性; 形态域走占比口径无伪影)")
 
     # 剪尾 + z-score 标准化：
     # - 剪尾 (分位数 clip) 防"极端值霸凌"：极少数极端行情日(涨停放巨量等)误差平方后
@@ -459,7 +482,7 @@ def build_derived_targets(kline_data, feature_normalizer, chunk_size=4_000_000):
     # - z-score 防"量级失衡"：各衍生特征量级差异大
     #   (direction∈{-1,0,1} vs breakthrough=body*amount 可能>10)，
     #   直接拼接做等权 MSE 会让大量级特征主导损失、小量级特征被忽略；
-    #   标准化后所有衍生特征方差=1，与原始16维(已归一化、方差1)量级一致，等权 MSE 才合理
+    #   标准化后所有衍生特征方差=1，与原始19维(已归一化、方差1)量级一致，等权 MSE 才合理
     derived_data = _standardize_derived(derived_data, derived_mask)
     print(f"  衍生特征已剪尾+z-score 标准化 (μ→0, σ→1, 掩码样本剔除后置0)")
     print(f"  衍生特征分布 (有效样本):")
@@ -729,7 +752,7 @@ class PretrainModel(nn.Module):
             x: [batch, input_dim]
         Returns:
             z: [batch, d_model] 嵌入向量 S（用于 VISReg）
-            recon: [batch, input_dim + n_derived] 重建=[原始16维, 衍生特征]
+            recon: [batch, input_dim + n_derived] 重建=[原始19维, 衍生特征]
         """
         z = self.embedding(x)
         recon = self.decoder(z)
@@ -774,8 +797,8 @@ def collect_kline_data(train_stock_info, feature_normalizer=None, pool_cap=None)
                      else EmbeddingConfig.MAX_SAMPLES * EmbeddingConfig.EPOCHS * 5)
 
     # 传入 max_pool_size：precompute_training_pool 逐股票采样，
-    # 避免拼接完整 [N,45,16] 数组(~10GB)+新数组(~10GB)=峰值~20GB OOM；
-    # 采样后直接返回 [M,16] 2D数组，全在内存中完成，不写磁盘
+    # 避免拼接完整 [N,45,19] 数组(~10GB)+新数组(~10GB)=峰值~20GB OOM；
+    # 采样后直接返回 [M,19] 2D数组，全在内存中完成，不写磁盘
     kline_data, _, _, _, _, _ = precompute_training_pool(
         train_stock_info, feature_normalizer, max_pool_size=max_pool_size
     )
@@ -1067,7 +1090,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None, tag=None):
     visreg_weight = EmbeddingConfig.VISREG_WEIGHT
     target_std = EmbeddingConfig.TARGET_STD
     derived_weight = EmbeddingConfig.DERIVED_WEIGHT  # 衍生重建权重(标准化后等权=1.0)
-    input_dim = ModelConfig.INPUT_DIM                # 原始16维，recon前 input_dim 列为原始重建
+    input_dim = ModelConfig.INPUT_DIM                # 原始19维，recon前 input_dim 列为原始重建
     n_derived = EmbeddingConfig.N_DERIVED_FEATURES
 
     # 类感知对比（几何轴主损失）：w_c=SupCon 权重，剩余 (1-w_c) 按 λ 分配给
@@ -1103,7 +1126,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None, tag=None):
     if use_cls_fine:
         formula += (f" + {w_fine:.2f}·FINE(f{EmbeddingConfig.CLS_FINE_BUCKETS})")
     print(f"  损失公式: {formula}")
-    print(f"  解码器=线性探针, Recon=原始16维 + {derived_weight:.2f}·{n_derived}衍生(掩码MSE)")
+    print(f"  解码器=线性探针, Recon=原始19维 + {derived_weight:.2f}·{n_derived}衍生(掩码MSE)")
     if use_cls_coarse:
         print(f"  分类头(粗,3类 跌/平/涨)=线性探针:")
         for name in CLS_HEAD_SPEC:
@@ -1143,7 +1166,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None, tag=None):
         epoch_recon_w = 0.0   # (1-λ)·Recon 加权贡献
         epoch_visreg_raw = 0.0  # VISReg 原始值
         epoch_recon_raw = 0.0   # Recon 原始值(原始重建+衍生重建之和)
-        epoch_recon_orig_raw = 0.0    # 原始16维重建原始值
+        epoch_recon_orig_raw = 0.0    # 原始19维重建原始值
         epoch_recon_derived_raw = 0.0 # 衍生重建原始值(掩码后逐特征均值)
         epoch_cls_raw = 0.0      # 粗头 CE 平均（原始值）
         epoch_cls_w = 0.0        # w_cls·粗头CE 加权贡献
@@ -1212,7 +1235,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None, tag=None):
                 # 衍生项逼 embedding 编码跨维度关系，而非逐维独立存储；
                 # 解码器是线性层，衍生目标(非线性函数)无法由解码器自行计算，
                 # 结构必须由 embedding 内部算好 → 重建损失即线性探针误差
-                # 衍生目标已剪尾+z-score 标准化，与原始16维量级一致，等权合理；
+                # 衍生目标已剪尾+z-score 标准化，与原始19维量级一致，等权合理；
                 # derived_weight 可调，防止辅助任务(衍生)主导主任务(原始重建)
                 loss_recon_orig = F.mse_loss(recon[:, :input_dim], batch_x)
                 # 掩码 MSE：仅有效样本参与，逐特征归一(每个衍生目标等权)，
@@ -1342,7 +1365,7 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None, tag=None):
         avg_recon_derived = epoch_recon_derived_raw / n_batches
         current_lr = scheduler.get_lr()
 
-        # 打印日志 （O=/D= 分别为原始16维/衍生重建原始值，D= 即线性探针误差，
+        # 打印日志 （O=/D= 分别为原始19维/衍生重建原始值，D= 即线性探针误差，
         # 直接衡量 embedding 中可线性读出的跨维结构量，观察衍生目标是否被学到；
         # SUP=核加权 SupCon 原始值（对 B≈2560 候选的平均负对数概率，
         # 绝对值无信息——完美匹配时损失也只降到核行熵）；

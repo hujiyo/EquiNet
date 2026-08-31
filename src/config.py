@@ -113,7 +113,7 @@ class DataConfig:
 class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
-    INPUT_DIM = 16                   # 输入特征维度数（OHLC[open/close相对昨收,high/low相对当日open] + vwap + volume + exchange + m5 + m10 + m20 + dif + dea + macd_hist + macd_hist_diff + bb_upper + bb_lower）
+    INPUT_DIM = 19                   # 输入特征维度数（16 原始列 + wick_up/wick_dn/body_ratio 三列 K线形态占比）
     D_MODEL = 128                    # 模型维度（Transformer 内部维度）
     FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数
@@ -168,7 +168,7 @@ class EmbeddingConfig:
     VISREG_W_CENTER = 1.0               # 中心化项权重 (批均值→0)
     TARGET_STD = 0.2                    # 目标标准差（缩放后 VISReg 尺度项 target std依旧=1）
 
-    # 衍生特征解码：线性解码器额外解码 N 个"16维的跨域非线性函数"，
+    # 衍生特征解码：线性解码器额外解码 N 个"19维的跨域非线性函数"，
     # 强迫 embedding 编码维度间关系（特征融合），而非逐维独立存储。
     # 详见 pretrain_embedding.py:compute_derived_features
     N_DERIVED_FEATURES = 11             # 衍生特征数量

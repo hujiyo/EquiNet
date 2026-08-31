@@ -1,1117 +1,740 @@
 """
-Embedding模块评估脚本
+Embedding 训后诊断脚本（v2 完全重写，2026-08）
 
-核心思路：评估Embedding层是否成功编码了6个输入维度之间的交互关系
+定位
+====
+embedding 预训练完成后的**离线深度诊断**。只回答训练期指标覆盖不了的
+问题——与训练日志的分工（避免重复造轮子）：
 
-评估对象：粗处理后的数据 → 细处理(FeatureNormalizer) → Embedding层 → d_model维输出
+    训练期已覆盖（本脚本不再重复）：
+      - 信息可解码度        → 线性探针 D=（衍生重建误差）
+      - 输出分布健康度      → TARGET_STD 契约 + measure_embedding_std
+      - 语义几何是否沉淀    → SupCon 核 + CKA / zK1 / zK0 / zr
+    本脚本独有（训练期看不到的离线问题）：
+      [1] 方向对比          —— 符号翻转 vs 同幅平移的响应比，
+          检验输入维的"方向"是否被放大编码
+      [2] 跨维交互残差矩阵   —— 维度对之间的非线性二阶响应：
+          embedding 是否只做逐维加性映射，还是真的编码了
+          "量价配合""影线形态"这类跨维结构
+      [3] 连续性扫值         —— 沿每个输入维扫值时输出轨迹是否平滑、
+          在语义边界（=该列历史中位水平）处是否有曲率峰
+      [4] 特征消融           —— 把某一维替换为中性值后的输出位移，
+          单维重要性排序（与预训练分类头的压力来源相互印证）
 
-评估维度：
-1. 跨维度交互分析：检测维度对之间的非线性交互效应（最核心）
-2. 方向对比敏感性：符号翻转 vs 同向平移的输出差异比
-3. 语义模式分析：原型K线模式的embedding距离关系
-4. 高维连续性：沿关键维度扫值，检测平滑性和边界曲率
-5. 信息保留度：从embedding能否重建原始输入特征
-6. 饱和度分析：输出分布健康检查
-7. 特征消融：单维度遮盖的重要性排序
+设计三原则（旧版死于违反它们）
+==============================
+P1 一切基准量从测试池实测校准：中性点=池中位数、扰动幅度=各列 IQR×
+   固定比例、扫值区间=[q02,q98]，启动时打印校准表供人工核查。禁止
+   手调绝对值——2026-06/07 两轮特征工程改动后，旧版手写的
+   NEUTRAL_VALUES / DELTA_MAP / SEMANTIC_PATTERNS 全部失真且不报错，
+   这是旧版被判不可信的直接原因。
+P2 扰动在细处理空间进行（=embedding 真实输入空间）。细处理是逐列
+   QuantileTransformer→StandardScaler（见 data.py FeatureNormalizer），
+   输出近似标准正态：扰动幅度跨列可比、不会被子列尾部饱和吞掉。
+   注意：z=0 在该空间表示"该列处于历史中位水平"，对相对涨跌/变化率
+   列即"相对基准不变"，语义边界与粗空间的 0 对应。
+P3 特征名运行时取自 FeatureNormalizer._feature_groups 并校验维度，
+   不维护抄写副本。特征增删改名时本脚本自动跟随或显式报错。
+
+输入合法性（继承并强化旧版的严格校验）
+======================================
+- 全模型 checkpoint：state_dict 与当前架构严格匹配（缺键/多键/shape
+  不符一律报错），不接受静默 partial load；
+- 预训练 checkpoint：按 input_dim/d_model/expand_ratio 元数据重建
+  KLineEmbedding，与当前配置不符直接报错而不是产出垃圾结果。
+
+解读纪律
+========
+本脚本输出的是"观察"，不是"判卷"。阈值（强/中/弱）是启发式参考线；
+数值含义依赖校准表和当前特征口径，请结合训练期指标一起读。
 """
 
-import torch
-import torch.nn as nn
-import numpy as np
-from scipy.spatial.distance import cosine
-import matplotlib.pyplot as plt
+import argparse
+import os
+from datetime import datetime
+
 import matplotlib
 matplotlib.use('Agg')
-plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
+import matplotlib.pyplot as plt
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans',
+                                   'Arial Unicode MS', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
-import os
-import warnings
-warnings.filterwarnings('ignore')
-from datetime import datetime
-import argparse
+import numpy as np
+import torch
+import torch.nn as nn
 
+from config import DataConfig, EmbeddingConfig, ModelConfig, PROJECT_ROOT
+from data import (FeatureNormalizer, load_and_preprocess_data,
+                  normalize_and_validate_context_window)
 from model import create_model
-from data import load_and_preprocess_data, FeatureNormalizer
-from config import DataConfig, ModelConfig, PROJECT_ROOT
+from pretrain_embedding import KLineEmbedding
 
+
+# ==================== 可调参数 ====================
+
+DEFAULT_SAMPLES = 64     # 参与分析的单日样本数（从测试集窗口抽取）
+DEFAULT_STEPS = 25       # 连续性扫值的步数
+SHIFT_IQR_FRAC = 0.5     # 方向对比/交互分析的扰动幅度 = 各列 IQR × 此系数
+SWEEP_QLO = 0.02         # 扫值下界分位数
+SWEEP_QHI = 0.98         # 扫值上界分位数
+TOP_K_INTERACT = 8       # 打印的最强交互对数量
+RATIO_STRONG = 3.0       # 方向对比"强"参考线（启发式，非硬标准）
+RATIO_MODERATE = 1.5     # 方向对比"中"参考线
+EDGE_MASS_WARN_PCT = 2.0  # 粗空间端点焊死比例≥此值 → 判为边界平台列
+
+# 语义上预期存在跨维配合的特征对（仅用于在交互矩阵里高亮对照，
+# 不参与任何阈值判定——哪些交互"应该"强属于业务判断，脚本不越权）
+KEY_PAIR_NAMES = [('close', 'amount'), ('close', 'vwap'),
+                  ('open', 'close'), ('wick_up', 'wick_dn')]
+
+
+# ==================== 权重加载 ====================
 
 def _validate_state_dict_match(current_state, loaded_state, source_path):
     """严格校验 loaded_state 与 current_state 完全匹配，不一致直接报错"""
     missing_keys = set(current_state.keys()) - set(loaded_state.keys())
     extra_keys = set(loaded_state.keys()) - set(current_state.keys())
     shape_mismatches = []
-
     for key in current_state:
         if key in loaded_state and current_state[key].shape != loaded_state[key].shape:
             shape_mismatches.append(
-                f"  {key}: checkpoint {list(loaded_state[key].shape)} vs 模型 {list(current_state[key].shape)}")
-
-    if missing_keys or shape_mismatches or extra_keys:
-        parts = [f"模型权重与 checkpoint 不匹配: {source_path}"]
+                f"  {key}: checkpoint {list(loaded_state[key].shape)} "
+                f"vs 模型 {list(current_state[key].shape)}")
+    if missing_keys or extra_keys or shape_mismatches:
+        parts = [f"权重与 checkpoint 不匹配: {source_path}"]
         if missing_keys:
-            parts.append(f"  缺少的权重 ({len(missing_keys)}): {sorted(missing_keys)}")
+            parts.append(f"  缺少 ({len(missing_keys)}): {sorted(missing_keys)[:8]} ...")
         if extra_keys:
-            parts.append(f"  多余的权重 ({len(extra_keys)}): {sorted(extra_keys)}")
+            parts.append(f"  多余 ({len(extra_keys)}): {sorted(extra_keys)[:8]} ...")
         if shape_mismatches:
             parts.append(f"  shape 不一致 ({len(shape_mismatches)}):")
             parts.extend(shape_mismatches)
         raise ValueError('\n'.join(parts))
 
 
-class FFNEmbeddingWrapper(nn.Module):
-    """
-    FFN-Embedding wrapper：将 embed_proj + embed_mlp 封装为单一模块
+class FFNEmbedding(nn.Module):
+    """StockTransformer 的 embedding 前段：embed_proj → embed_mlp"""
 
-    对应 StockTransformer 中的:
-        x = self.embed_proj(x)
-        x = self.embed_mlp(x)
-    """
     def __init__(self, embed_proj, embed_mlp):
         super().__init__()
         self.embed_proj = embed_proj
         self.embed_mlp = embed_mlp
 
     def forward(self, x):
-        x = self.embed_proj(x)
-        x = self.embed_mlp(x)
-        return x
+        return self.embed_mlp(self.embed_proj(x))
 
 
-class EmbeddingModule(nn.Module):
+def _embed_numpy(embed_fn, x_np, device):
     """
-    统一的 Embedding 模块
+    统一前向入口：numpy → 强制 float32 → forward → numpy
 
-    将细处理和 Embedding 层封装为一个整体：
-    - 细处理：FeatureNormalizer（训练时学到的变换）
-    - Embedding 层：nn.Linear / nn.Sequential / FFNEmbeddingWrapper
-
-    注意：粗处理（OHLE变换）在数据加载阶段完成，
-    本模块接收粗处理后的数据作为输入。
+    为什么强制 float32：校准量来自 np.percentile（恒返回 float64），
+    任何参与运算的数组都会被提升为 double，而模型权重是 float32，
+    混合输入会直接 RuntimeError（double != float）。所有 embed_fn
+    调用必须经过这里，禁止各分析函数自建 tensor。
     """
-
-    def __init__(self, embedding_layer, feature_normalizer):
-        super().__init__()
-        self.embedding_layer = embedding_layer
-        self.feature_normalizer = feature_normalizer
-
-    def _get_device(self):
-        """获取embedding层所在的设备，兼容多种embedding结构"""
-        if isinstance(self.embedding_layer, FFNEmbeddingWrapper):
-            return self.embedding_layer.embed_proj.weight.device
-        elif isinstance(self.embedding_layer, nn.Sequential):
-            for module in self.embedding_layer:
-                if hasattr(module, 'weight'):
-                    return module.weight.device
-        elif hasattr(self.embedding_layer, 'weight'):
-            return self.embedding_layer.weight.device
-        return torch.device('cpu')
-
-    def forward(self, x):
-        """
-        Args:
-            x: 粗处理后的数据 [batch, seq_len, input_dim]
-               范围：open_rel/close_rel/vwap [-0.1, 0.1], high_rel/low_rel 日内振幅（不clip）, Amount 相对MA变化率, Exchange 相对MA变化率
-
-        Returns:
-            embedded: [batch, seq_len, d_model]
-        """
-        if self.feature_normalizer is not None:
-            x_np = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else x
-            device = self._get_device()
-            if x_np.ndim == 3:
-                batch_size, seq_len, n_features = x_np.shape
-                x_normalized = np.empty_like(x_np, dtype=np.float32)
-                for b in range(batch_size):
-                    x_normalized[b] = self.feature_normalizer.transform(x_np[b])
-                x = torch.tensor(x_normalized, dtype=torch.float32, device=device)
-            else:
-                x_normalized = self.feature_normalizer.transform(x_np)
-                x = torch.tensor(x_normalized, dtype=torch.float32, device=device)
-
-        return self.embedding_layer(x)
-
-    def transform_numpy(self, x_np):
-        """
-        对 numpy 数组应用细处理（不包含 Embedding 层）
-        """
-        if self.feature_normalizer is None:
-            return x_np
-
-        if x_np.ndim == 3:
-            batch_size, seq_len, n_features = x_np.shape
-            x_normalized = np.empty_like(x_np, dtype=np.float32)
-            for b in range(batch_size):
-                x_normalized[b] = self.feature_normalizer.transform(x_np[b])
-            return x_normalized
-        else:
-            return self.feature_normalizer.transform(x_np)
-
-
-class EmbeddingModuleAnalyzer:
-    """Embedding模块分析器 - 评估维度间交互编码质量"""
-
-    FEATURE_NAMES = ['Open', 'High', 'Low', 'Close', 'VWAP', 'Amount', 'Exchange',
-                     'MA5', 'MA10', 'MA20', 'DIF', 'DEA', 'MACD_Hist', 'MACD_Hist_Diff', 'BB_Upper', 'BB_Lower']
-
-    NEUTRAL_VALUES = [0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-
-    DELTA_MAP = {0: 0.03, 1: 0.03, 2: 0.03, 3: 0.03, 4: 0.03, 5: 0.05, 6: 0.02,
-                 7: 0.015, 8: 0.01, 9: 0.01, 10: 0.01, 11: 0.01, 12: 0.01, 13: 0.005, 14: 0.01, 15: 0.01}
-
-    KEY_PAIRS = [(0, 3), (1, 2), (3, 4), (3, 5)]
-    KEY_PAIR_NAMES = ['Open-Close', 'High-Low', 'Close-VWAP', 'Close-Amount']
-
-    # 原型交易日模式（coarse-normalized空间, 16维: OHLC + VWAP + Amount + Exchange + MA5 + MA10 + MA20 + DIF + DEA + MACD_Hist + MACD_Hist_Diff + BB_Upper + BB_Lower）
-    SEMANTIC_PATTERNS = {
-        'bullish_large': {
-            'values': [0.01, 0.05, -0.01, 0.04, -0.01, 0.70, 0.05, 0.02, 0.015, 0.01, 0.005, 0.003, 0.004, 0.002, -0.01, -0.01],
-            'desc': '大阳线'
-        },
-        'bearish_large': {
-            'values': [-0.01, 0.01, -0.05, -0.04, 0.01, 0.70, 0.05, -0.02, -0.015, -0.01, -0.005, -0.003, -0.004, -0.002, -0.01, -0.01],
-            'desc': '大阴线'
-        },
-        'doji': {
-            'values': [0.0, 0.01, -0.01, 0.001, 0.0, 0.50, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            'desc': '十字星'
-        },
-        'high_vol_bull': {
-            'values': [0.01, 0.04, -0.005, 0.03, -0.01, 0.85, 0.08, 0.02, 0.015, 0.01, 0.005, 0.003, 0.004, 0.002, -0.005, -0.005],
-            'desc': '放量上涨'
-        },
-        'low_vol_bull': {
-            'values': [0.01, 0.04, -0.005, 0.03, -0.005, 0.35, 0.01, 0.015, 0.01, 0.005, 0.002, 0.001, 0.002, 0.001, 0.0, 0.0],
-            'desc': '缩量上涨'
-        },
-        'divergence_bull': {
-            'values': [0.005, 0.03, -0.005, 0.02, -0.005, 0.60, 0.04, 0.01, 0.005, 0.0, 0.001, 0.0, 0.002, 0.001, -0.005, -0.005],
-            'desc': '逆势上涨'
-        },
-        'following_bull': {
-            'values': [0.01, 0.02, -0.005, 0.015, 0.0, 0.50, 0.03, 0.01, 0.005, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            'desc': '跟风上涨'
-        },
-        'upper_shadow': {
-            'values': [0.0, 0.06, -0.005, 0.005, 0.01, 0.60, 0.04, 0.005, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, -0.01],
-            'desc': '长上影线'
-        },
-        'lower_shadow': {
-            'values': [0.0, 0.005, -0.06, 0.005, -0.01, 0.60, 0.04, -0.005, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.01, 0.01],
-            'desc': '长下影线'
-        },
-        'high_ex_limit': {
-            'values': [0.02, 0.10, 0.0, 0.10, -0.02, 0.90, 0.15, 0.04, 0.03, 0.02, 0.01, 0.008, 0.004, 0.003, -0.01, -0.01],
-            'desc': '高换手涨停'
-        }
-    }
-
-    # 语义对立的模式对（embedding应该距离远）
-    EXPECTED_OPPOSITE_PAIRS = [
-        ('bullish_large', 'bearish_large'),
-        ('high_vol_bull', 'low_vol_bull'),
-        ('upper_shadow', 'lower_shadow'),
-        ('divergence_bull', 'following_bull'),
-    ]
-
-    # 语义相似的模式对（embedding应该距离近）
-    EXPECTED_SIMILAR_PAIRS = [
-        ('bullish_large', 'high_vol_bull'),
-        ('doji', 'upper_shadow'),
-        ('low_vol_bull', 'following_bull'),
-    ]
-
-    def __init__(self, model_path=None, device=None):
-        self.model_path = model_path
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = None
-        self.embedding_module = None
-        self.feature_normalizer = None
-
-    def load_model(self, model_path=None, feature_normalizer=None):
-        """加载模型并创建 EmbeddingModule"""
-        self.feature_normalizer = feature_normalizer
-
-        if model_path:
-            self.model_path = model_path
-        if self.model_path and os.path.exists(self.model_path):
-            checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
-            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                # 带元数据的完整模型 checkpoint
-                if 'model_arch' not in checkpoint:
-                    raise ValueError(f"checkpoint 缺少必需的 'model_arch' 元数据: {self.model_path}")
-                model_arch = checkpoint['model_arch']
-                self.model = create_model(model_arch=model_arch).to(self.device)
-
-                current_state = self.model.state_dict()
-                loaded_state = checkpoint['state_dict']
-
-                # 严格匹配：shape 不一致或 key 缺失直接报错
-                _validate_state_dict_match(current_state, loaded_state, self.model_path)
-
-                self.model.load_state_dict(loaded_state)
-                print(f"加载训练好的模型: {self.model_path}")
-            elif isinstance(checkpoint, dict) and 'embed_proj_weight' in checkpoint:
-                # 预训练 Embedding 格式（来自 pretrain_embedding.py）
-                self.model = create_model().to(self.device)
-
-                key_map = {
-                    'embed_proj_weight': 'embed_proj.weight',
-                    'embed_mlp_0_weight': 'embed_mlp.0.weight',
-                    'embed_mlp_2_weight': 'embed_mlp.2.weight',
-                }
-
-                # 严格匹配：所有 key 必须存在且 shape 一致
-                for src_key, dst_key in key_map.items():
-                    if src_key not in checkpoint:
-                        raise ValueError(f"预训练 Embedding 缺少必需的权重 '{src_key}': {self.model_path}")
-                    if dst_key not in self.model.state_dict():
-                        raise ValueError(f"模型缺少对应的目标权重 '{dst_key}'，架构不兼容")
-                    if checkpoint[src_key].shape != self.model.state_dict()[dst_key].shape:
-                        raise ValueError(
-                            f"权重 '{src_key}' shape 不匹配: "
-                            f"checkpoint {checkpoint[src_key].shape} vs 模型 {self.model.state_dict()[dst_key].shape}")
-
-                state = self.model.state_dict()
-                for src_key, dst_key in key_map.items():
-                    state[dst_key] = checkpoint[src_key]
-                self.model.load_state_dict(state)
-                print(f"加载预训练Embedding: {self.model_path}")
-            else:
-                raise ValueError(f"无法识别的 checkpoint 格式: {self.model_path}")
-        else:
-            self.model = create_model().to(self.device)
-            print("使用随机初始化模型")
-        self.model.eval()
-
-        if hasattr(self.model, 'embed_proj') and hasattr(self.model, 'embed_mlp'):
-            embedding_layer = FFNEmbeddingWrapper(self.model.embed_proj, self.model.embed_mlp)
-            print("检测到FFN-Embedding结构（embed_proj + embed_mlp）")
-        elif hasattr(self.model, 'embedding'):
-            embedding_layer = self.model.embedding
-            print("检测到传统Embedding结构（单一embedding层）")
-        else:
-            raise AttributeError("模型不包含可识别的embedding层")
-
-        self.embedding_module = EmbeddingModule(embedding_layer, self.feature_normalizer)
-
-        return self.model
-
-    # ==================== 辅助方法 ====================
-
-    def _embed_batch(self, x_np):
-        """统一的batch embedding：numpy → tensor → forward → numpy"""
-        with torch.no_grad():
-            x_tensor = torch.tensor(np.ascontiguousarray(x_np, dtype=np.float32),
-                                    device=self.device)
-            output = self.embedding_module(x_tensor)
-            return output.cpu().numpy()
-
-    # ==================== 分析方法 ====================
-
-    def analyze_cross_dimensional_interactions(self, sample_inputs, n_samples=100):
-        """
-        跨维度交互分析（最核心）
-
-        检测维度对之间的非线性交互效应：
-        线性映射：f(x+δi+δj) - f(x) = [f(x+δi)-f(x)] + [f(x+δj)-f(x)]
-        非线性交互：residual = f(x+δi+δj) - f(x+δi) - f(x+δj) + f(x)
-        交互强度 = ||residual||
-
-        如果embedding捕获了维度间交互（如量价关系），residual应该显著非零。
-        """
-        print("\n[跨维度交互分析]")
-        print("  评估对象: Embedding模块（细处理 + Embedding层）")
-        print("  核心问题: 维度间是否存在非线性交互效应？")
-
-        sample_inputs = np.array(sample_inputs[:n_samples])
-        n_dims = sample_inputs.shape[-1]
-        interaction_sum = np.zeros((n_dims, n_dims))
-
-        for sample_idx in range(len(sample_inputs)):
-            x = sample_inputs[sample_idx:sample_idx+1]  # [1, seq_len, n_dims]
-
-            f_base = self._embed_batch(x).flatten()
-
-            # 单维度扰动的embedding
-            f_single = {}
-            for i in range(n_dims):
-                x_i = x.copy()
-                x_i[:, :, i] += self.DELTA_MAP[i]
-                f_single[i] = self._embed_batch(x_i).flatten()
-
-            # 双维度扰动 → 交互残差
-            for i in range(n_dims):
-                for j in range(i + 1, n_dims):
-                    x_ij = x.copy()
-                    x_ij[:, :, i] += self.DELTA_MAP[i]
-                    x_ij[:, :, j] += self.DELTA_MAP[j]
-                    f_ij = self._embed_batch(x_ij).flatten()
-
-                    # 交互残差 = 实际联合效应 - 各自效应之和
-                    residual = f_ij - f_single[i] - f_single[j] + f_base
-                    strength = np.linalg.norm(residual)
-
-                    interaction_sum[i, j] += strength
-                    interaction_sum[j, i] += strength
-
-        interaction_matrix = interaction_sum / len(sample_inputs)
-
-        # 关键维度对评分
-        key_pair_scores = {}
-        for pair, name in zip(self.KEY_PAIRS, self.KEY_PAIR_NAMES):
-            key_pair_scores[name] = float(interaction_matrix[pair[0], pair[1]])
-
-        # 最强交互 top 5
-        strongest = []
-        for i in range(n_dims):
-            for j in range(i + 1, n_dims):
-                strongest.append((i, j, interaction_matrix[i, j]))
-        strongest.sort(key=lambda x: x[2], reverse=True)
-
-        mean_abs = float(np.mean(interaction_matrix[interaction_matrix > 0]))
-
-        print(f"  平均交互强度: {mean_abs:.6f}")
-        print(f"  关键维度对交互强度:")
-        for name, score in key_pair_scores.items():
-            print(f"    {name}: {score:.6f}")
-        print(f"  最强交互 Top 5:")
-        for rank, (i, j, s) in enumerate(strongest[:5], 1):
-            print(f"    {rank}. {self.FEATURE_NAMES[i]}-{self.FEATURE_NAMES[j]}: {s:.6f}")
-
-        return {
-            'interaction_matrix': interaction_matrix,
-            'key_pair_scores': key_pair_scores,
-            'strongest_interactions': strongest,
-            'mean_abs_interaction': mean_abs
-        }
-
-    def analyze_directional_contrast(self, sample_inputs, n_samples=100, delta=0.03):
-        """
-        方向对比敏感性分析
-
-        对比两种扰动方式的embedding变化：
-        - 同向平移：x[j] += δ（保持方向不变，小幅移动）
-        - 符号翻转：x[j] = -x[j]（方向完全反转）
-
-        如果embedding对"方向"敏感，翻转应该产生比平移大得多的变化。
-        对比率 = 翻转变化量 / 平移变化量，越大说明方向敏感性越强。
-        """
-        print("\n[方向对比敏感性分析]")
-        print("  核心问题: 符号翻转是否比同向平移产生更大的embedding变化？")
-
-        sample_inputs = np.array(sample_inputs[:n_samples])
-        n_dims = sample_inputs.shape[-1]
-        flip_mag = np.zeros(n_dims)
-        shift_mag = np.zeros(n_dims)
-
-        for sample_idx in range(len(sample_inputs)):
-            x = sample_inputs[sample_idx:sample_idx+1]
-            f_base = self._embed_batch(x).flatten()
-
-            for j in range(n_dims):
-                # 同向平移（正向和负向各一次，取平均）
-                x_pos = x.copy()
-                x_pos[:, :, j] += delta
-                f_pos = self._embed_batch(x_pos).flatten()
-
-                x_neg = x.copy()
-                x_neg[:, :, j] -= delta
-                f_neg = self._embed_batch(x_neg).flatten()
-
-                shift = 0.5 * (np.linalg.norm(f_pos - f_base) + np.linalg.norm(f_neg - f_base))
-                shift_mag[j] += shift
-
-                # 符号翻转
-                x_flip = x.copy()
-                if j in (5, 6):  # Amount/Exchange: [0,1]范围，翻转=1-x
-                    x_flip[:, :, j] = 1.0 - x_flip[:, :, j]
-                else:
-                    x_flip[:, :, j] = -x_flip[:, :, j]
-
-                f_flip = self._embed_batch(x_flip).flatten()
-                flip_mag[j] += np.linalg.norm(f_flip - f_base)
-
-        flip_mag /= len(sample_inputs)
-        shift_mag /= len(sample_inputs)
-        contrast_ratios = flip_mag / (shift_mag + 1e-8)
-
-        print(f"  对比率 (翻转变化 / 平移变化):")
-        for j, name in enumerate(self.FEATURE_NAMES):
-            ratio = contrast_ratios[j]
-            tag = "强" if ratio > 3.0 else ("中" if ratio > 1.5 else "弱")
-            print(f"    {name:8s}: 对比={ratio:.2f}  "
-                  f"翻转={flip_mag[j]:.4f}  平移={shift_mag[j]:.4f}  ({tag})")
-
-        return {
-            'contrast_ratios': contrast_ratios,
-            'flip_magnitudes': flip_mag,
-            'shift_magnitudes': shift_mag
-        }
-
-    def analyze_semantic_patterns(self):
-        """
-        语义模式分析
-
-        构造原型交易日（大阳线、大阴线、放量上涨、缩量上涨等），
-        检测embedding是否将语义对立的模式映射到远处，将相似的模式映射到近处。
-
-        一致性分数 = 对立模式平均距离 / 相似模式平均距离
-        理想值 >> 1.0
-        """
-        print("\n[语义模式分析]")
-        print("  核心问题: 语义对立的模式是否映射到embedding空间的对立面？")
-
-        pattern_names = list(self.SEMANTIC_PATTERNS.keys())
-        pattern_descs = [self.SEMANTIC_PATTERNS[n]['desc'] for n in pattern_names]
-        n_patterns = len(pattern_names)
-
-        # 构造单时间步输入并获取embedding
-        embeddings = {}
-        for name, pattern in self.SEMANTIC_PATTERNS.items():
-            x = np.array(pattern['values'], dtype=np.float32).reshape(1, 1, -1)
-            emb = self._embed_batch(x).flatten()
-            embeddings[name] = emb
-
-        # 两两cosine距离矩阵
-        dist_matrix = np.zeros((n_patterns, n_patterns))
-        for i in range(n_patterns):
-            for j in range(i + 1, n_patterns):
-                cos_dist = cosine(embeddings[pattern_names[i]], embeddings[pattern_names[j]])
-                dist_matrix[i, j] = cos_dist
-                dist_matrix[j, i] = cos_dist
-
-        # 对立模式对距离
-        opp_dists = []
-        print(f"\n  对立模式对距离（应较远）:")
-        for n1, n2 in self.EXPECTED_OPPOSITE_PAIRS:
-            d1 = self.SEMANTIC_PATTERNS[n1]['desc']
-            d2 = self.SEMANTIC_PATTERNS[n2]['desc']
-            i, j = pattern_names.index(n1), pattern_names.index(n2)
-            dist = dist_matrix[i, j]
-            opp_dists.append(dist)
-            print(f"    {d1} vs {d2}: {dist:.4f}")
-
-        # 相似模式对距离
-        sim_dists = []
-        print(f"  相似模式对距离（应较近）:")
-        for n1, n2 in self.EXPECTED_SIMILAR_PAIRS:
-            d1 = self.SEMANTIC_PATTERNS[n1]['desc']
-            d2 = self.SEMANTIC_PATTERNS[n2]['desc']
-            i, j = pattern_names.index(n1), pattern_names.index(n2)
-            dist = dist_matrix[i, j]
-            sim_dists.append(dist)
-            print(f"    {d1} vs {d2}: {dist:.4f}")
-
-        mean_opp = np.mean(opp_dists) if opp_dists else 0
-        mean_sim = np.mean(sim_dists) if sim_dists else 1e-8
-        consistency = mean_opp / (mean_sim + 1e-8)
-
-        tag = "STRONG" if consistency > 2.0 else ("MODERATE" if consistency > 1.0 else "WEAK")
-        print(f"\n  语义一致性分数: {consistency:.2f} ({tag})")
-        print(f"    对立对平均距离: {mean_opp:.4f}, 相似对平均距离: {mean_sim:.4f}")
-
-        return {
-            'pattern_names': pattern_names,
-            'pattern_descs': pattern_descs,
-            'embeddings': embeddings,
-            'distance_matrix': dist_matrix,
-            'opposite_pair_distances': opp_dists,
-            'similar_pair_distances': sim_dists,
-            'consistency_score': float(consistency)
-        }
-
-    def analyze_continuity(self, sample_inputs, n_steps=25):
-        """
-        高维连续性分析
-
-        沿关键维度（Close, Amount）扫值，检测：
-        1. embedding是否平滑（速度连续，无突变）
-        2. 在关键边界处（如Close=0）是否有曲率尖峰
-
-        好的embedding：全局平滑 + 边界处高曲率
-        """
-        print("\n[高维连续性分析]")
-        print("  核心问题: embedding是否全局平滑但在决策边界处有高曲率？")
-
-        base_sample = sample_inputs[0:1]  # [1, seq_len, n_dims]
-
-        sweep_configs = {
-            'Close': (3, np.linspace(-0.05, 0.05, n_steps)),
-            'VWAP': (4, np.linspace(-0.05, 0.05, n_steps)),
-            'Amount': (5, np.linspace(0.3, 0.7, n_steps)),
-        }
-
-        profiles = {}
-        for dim_name, (dim_idx, sweep_values) in sweep_configs.items():
-            embeddings = []
-            for v in sweep_values:
-                x = base_sample.copy()
-                x[:, :, dim_idx] = v
-                emb = self._embed_batch(x).flatten()
-                embeddings.append(emb)
-            embeddings = np.array(embeddings)
-
-            # 速度 = 相邻embedding的距离
-            velocities = np.linalg.norm(np.diff(embeddings, axis=0), axis=1)
-
-            # 曲率 = 二阶差分的范数
-            curvatures = np.linalg.norm(
-                embeddings[2:] - 2 * embeddings[1:-1] + embeddings[:-2], axis=1
-            )
-
-            # Close维度的零点曲率
-            curv_at_zero = None
-            if dim_idx == 3:  # Close
-                zero_idx = np.argmin(np.abs(sweep_values))
-                if 1 <= zero_idx <= len(curvatures):
-                    curv_at_zero = float(curvatures[zero_idx - 1])
-
-            avg_curv = float(np.mean(curvatures)) if len(curvatures) > 0 else 0
-            max_curv = float(np.max(curvatures)) if len(curvatures) > 0 else 0
-            max_curv_idx = int(np.argmax(curvatures)) if len(curvatures) > 0 else 0
-            max_curv_value = float(sweep_values[min(max_curv_idx + 1, len(sweep_values) - 1)])
-
-            profiles[dim_name] = {
-                'dim_idx': dim_idx,
-                'sweep_values': sweep_values,
-                'velocities': velocities,
-                'curvatures': curvatures,
-                'max_curvature': max_curv,
-                'max_curvature_at': max_curv_value,
-                'avg_curvature': avg_curv,
-                'curvature_at_zero': curv_at_zero
-            }
-
-            print(f"\n  {dim_name}维度 ({sweep_values[0]:.3f} → {sweep_values[-1]:.3f}):")
-            print(f"    最大曲率: {max_curv:.6f} (在 {dim_name}={max_curv_value:.3f} 处)")
-            print(f"    平均曲率: {avg_curv:.6f}")
-            if curv_at_zero is not None:
-                ratio = curv_at_zero / (avg_curv + 1e-8)
-                print(f"    零点曲率: {curv_at_zero:.6f} (是平均值的 {ratio:.1f} 倍)")
-
-        smoothness = float(np.mean([p['avg_curvature'] for p in profiles.values()]))
-
-        return {
-            'profiles': profiles,
-            'smoothness_score': smoothness
-        }
-
-    def analyze_information_preservation(self, sample_inputs, n_samples=200):
-        """
-        信息保留度分析
-
-        用Ridge回归测试：从128维embedding能否重建原始8维输入？
-        如果某个特征的R²很低，说明该维度的信息在embedding中丢失了。
-        """
-        print("\n[信息保留度分析]")
-        print("  核心问题: 从embedding能否重建原始输入特征？")
-
-        from sklearn.linear_model import RidgeCV
-        from sklearn.model_selection import cross_val_score
-
-        sample_inputs = np.array(sample_inputs[:n_samples])
-
-        # 获取embedding
-        embeddings = self._embed_batch(sample_inputs)  # [n, seq_len, d_model]
-
-        # 使用最后时间步
-        X_emb = embeddings[:, -1, :]  # [n, d_model]
-
-        # 目标：细处理后的输入（embedding层的直接输入）
-        y_features = self.embedding_module.transform_numpy(sample_inputs)[:, -1, :]  # [n, n_dims]
-
-        r2_values = np.zeros(y_features.shape[1])
-        for j in range(y_features.shape[1]):
-            ridge = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0])
-            scores = cross_val_score(ridge, X_emb, y_features[:, j], cv=5, scoring='r2')
-            r2_values[j] = float(np.mean(scores))
-
-        r2_per_feature = {name: float(r2_values[j]) for j, name in enumerate(self.FEATURE_NAMES)}
-        mean_r2 = float(np.mean(r2_values))
-
-        print(f"  各特征重建R² (Ridge回归, 5折CV):")
-        for name, r2 in r2_per_feature.items():
-            tag = "GOOD" if r2 > 0.8 else ("MODERATE" if r2 > 0.5 else "POOR")
-            print(f"    {name:8s}: R²={r2:.4f} ({tag})")
-        print(f"  平均R²: {mean_r2:.4f}")
-
-        worst_idx = int(np.argmin(r2_values))
-        best_idx = int(np.argmax(r2_values))
-
-        return {
-            'r2_per_feature': r2_per_feature,
-            'r2_values': r2_values,
-            'mean_r2': mean_r2,
-            'worst_feature': (self.FEATURE_NAMES[worst_idx], float(r2_values[worst_idx])),
-            'best_feature': (self.FEATURE_NAMES[best_idx], float(r2_values[best_idx]))
-        }
-
-    def analyze_saturation(self, sample_inputs, n_samples=100):
-        """饱和度分析: 输出分布健康检查"""
-        print("\n[饱和度分析]")
-
-        sample_inputs = np.array(sample_inputs[:n_samples])
-
-        with torch.no_grad():
-            x_tensor = torch.tensor(sample_inputs, dtype=torch.float32, device=self.device)
-            hidden = self.embedding_module(x_tensor)
-
-            hidden_flat = hidden.cpu().numpy().flatten()
-            saturation_ratio = float(np.mean(np.abs(hidden_flat) > 3))
-            dead_ratio = float(np.mean(np.abs(hidden_flat) < 0.01))
-
-        print(f"  Embedding模块输出:")
-        print(f"    均值: {np.mean(hidden_flat):.4f}")
-        print(f"    标准差: {np.std(hidden_flat):.4f}")
-        print(f"    范围: [{np.min(hidden_flat):.4f}, {np.max(hidden_flat):.4f}]")
-        print(f"    饱和比例(|x|>3): {saturation_ratio*100:.2f}%")
-        print(f"    死神经元比例(|x|<0.01): {dead_ratio*100:.2f}%")
-
-        return {
-            'hidden_mean': float(np.mean(hidden_flat)),
-            'hidden_std': float(np.std(hidden_flat)),
-            'hidden_min': float(np.min(hidden_flat)),
-            'hidden_max': float(np.max(hidden_flat)),
-            'saturation_ratio': saturation_ratio,
-            'dead_neuron_ratio': dead_ratio
-        }
-
-    def analyze_feature_ablation(self, sample_inputs, n_samples=100):
-        """特征消融分析: 逐一遮盖各特征，测量输出变化"""
-        print("\n[特征消融分析]")
-
-        sample_inputs = np.array(sample_inputs[:n_samples])
-
-        with torch.no_grad():
-            sample_inputs_tensor = torch.tensor(sample_inputs, dtype=torch.float32, device=self.device)
-            base_output = self.embedding_module(sample_inputs_tensor)
-            base_norm = torch.norm(base_output).item()
-
-            importance_scores = []
-
-            for j, name in enumerate(self.FEATURE_NAMES):
-                masked_input = sample_inputs.copy()
-                masked_input[:, :, j] = self.NEUTRAL_VALUES[j]
-
-                masked_tensor = torch.tensor(masked_input, dtype=torch.float32, device=self.device)
-                masked_output = self.embedding_module(masked_tensor)
-                masked_norm = torch.norm(masked_output).item()
-
-                relative_change = abs(masked_norm - base_norm) / (base_norm + 1e-6)
-                importance_scores.append(relative_change)
-
-        sorted_indices = np.argsort(importance_scores)[::-1]
-        print(f"  特征重要性排序:")
-        for rank, idx in enumerate(sorted_indices, 1):
-            print(f"    {rank}. {self.FEATURE_NAMES[idx]:8s}: {importance_scores[idx]*100:.2f}%")
-
-        return {
-            'feature_names': self.FEATURE_NAMES,
-            'importance_scores': [float(s) for s in importance_scores],
-            'sorted_indices': sorted_indices.tolist()
-        }
-
-    # ==================== 可视化 ====================
-
-    def visualize_results(self, sample_inputs, results, save_dir=None):
-        """生成2x3可视化图表"""
-        if save_dir is None:
-            save_dir = os.path.join(PROJECT_ROOT, 'out_eval_results')
-
-        os.makedirs(save_dir, exist_ok=True)
-        sample_inputs = np.array(sample_inputs[:500])
-
-        fig, axes = plt.subplots(2, 3, figsize=(18, 11))
-        fig.suptitle('Embedding评估：维度间交互编码质量', fontsize=14, fontweight='bold')
-
-        # ---- [0,0] 跨维度交互热力图 ----
-        ax = axes[0, 0]
-        if 'cross_interaction' in results:
-            matrix = results['cross_interaction']['interaction_matrix']
-            n = matrix.shape[0]
-            im = ax.imshow(matrix, cmap='YlOrRd', aspect='auto')
-            ax.set_xticks(range(n))
-            ax.set_yticks(range(n))
-            ax.set_xticklabels(self.FEATURE_NAMES, rotation=45, ha='right')
-            ax.set_yticklabels(self.FEATURE_NAMES)
-            ax.set_title('跨维度交互强度')
-            for i in range(n):
-                for j in range(n):
-                    if i != j:
-                        ax.text(j, i, f'{matrix[i,j]:.3f}', ha='center', va='center',
-                                fontsize=7, color='black' if matrix[i,j] < matrix.max()*0.7 else 'white')
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-        # ---- [0,1] 方向对比柱状图 ----
-        ax = axes[0, 1]
-        if 'directional_contrast' in results:
-            dc = results['directional_contrast']
-            ratios = dc['contrast_ratios']
-            colors = ['#2ecc71' if r > 3.0 else '#f39c12' if r > 1.5 else '#e74c3c' for r in ratios]
-            bars = ax.bar(self.FEATURE_NAMES, ratios, color=colors, alpha=0.85)
-            ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, label='ratio=1.0')
-            ax.axhline(y=3.0, color='green', linestyle='--', alpha=0.5, label='ratio=3.0')
-            ax.set_ylabel('对比率 (翻转/平移)')
-            ax.set_title('方向对比敏感性')
-            ax.legend(fontsize=8)
-            ax.grid(axis='y', alpha=0.3)
-            for bar, r in zip(bars, ratios):
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
-                        f'{r:.1f}', ha='center', va='bottom', fontsize=8)
-
-        # ---- [0,2] 语义模式距离矩阵 ----
-        ax = axes[0, 2]
-        if 'semantic_patterns' in results:
-            sp = results['semantic_patterns']
-            dist_mat = sp['distance_matrix']
-            descs = sp['pattern_descs']
-            im = ax.imshow(dist_mat, cmap='Blues', aspect='auto')
-            ax.set_xticks(range(len(descs)))
-            ax.set_yticks(range(len(descs)))
-            ax.set_xticklabels(descs, rotation=45, ha='right', fontsize=7)
-            ax.set_yticklabels(descs, fontsize=7)
-            ax.set_title(f'语义模式距离 (一致性={sp["consistency_score"]:.2f})')
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-        # ---- [1,0] Close轴连续性曲线 ----
-        ax = axes[1, 0]
-        if 'continuity' in results:
-            profiles = results['continuity']['profiles']
-            if 'Close' in profiles:
-                p = profiles['Close']
-                sweep = p['sweep_values']
-                curvatures = p['curvatures']
-                velocities = p['velocities']
-
-                # 曲率曲线（归一化到0-1以便叠加显示）
-                curv_x = sweep[1:-1]
-                curv_norm = curvatures / (curvatures.max() + 1e-8)
-                ax.plot(curv_x, curv_norm, 'r-o', markersize=3, label='曲率 (归一化)')
-
-                # 速度曲线
-                vel_x = sweep[1:]
-                vel_norm = velocities / (velocities.max() + 1e-8)
-                ax.plot(vel_x, vel_norm, 'b-o', markersize=3, label='速度 (归一化)')
-
-                ax.axvline(x=0, color='gray', linestyle='--', alpha=0.5, label='Close=0')
-                ax.set_xlabel('Close值')
-                ax.set_ylabel('归一化强度')
-                ax.set_title('Close轴连续性（曲率+速度）')
-                ax.legend(fontsize=8)
-                ax.grid(True, alpha=0.3)
-
-        # ---- [1,1] 信息保留度R² ----
-        ax = axes[1, 1]
-        if 'info_preservation' in results:
-            ip = results['info_preservation']
-            r2_vals = ip['r2_values']
-            colors = ['#2ecc71' if r > 0.8 else '#f39c12' if r > 0.5 else '#e74c3c' for r in r2_vals]
-            bars = ax.bar(self.FEATURE_NAMES, r2_vals, color=colors, alpha=0.85)
-            ax.axhline(y=0.5, color='orange', linestyle='--', alpha=0.5, label='R²=0.5')
-            ax.axhline(y=0.8, color='green', linestyle='--', alpha=0.5, label='R²=0.8')
-            ax.set_ylabel('R²')
-            ax.set_title(f'信息保留度 (均值={ip["mean_r2"]:.3f})')
-            ax.set_ylim(0, 1.05)
-            ax.legend(fontsize=8)
-            ax.grid(axis='y', alpha=0.3)
-            for bar, r in zip(bars, r2_vals):
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                        f'{r:.2f}', ha='center', va='bottom', fontsize=8)
-
-        # ---- [1,2] PCA散点图（按量价关系着色）----
-        ax = axes[1, 2]
-        n_pca = min(500, len(sample_inputs))
-        pca_inputs = sample_inputs[:n_pca]
-        pca_outputs = self._embed_batch(pca_inputs).reshape(n_pca, -1)
-
-        from sklearn.decomposition import PCA
-        pca = PCA(n_components=2)
-        pca_2d = pca.fit_transform(pca_outputs)
-
-        # 用最后时间步的Close和VWAP着色
-        close_vals = pca_inputs[:, -1, 3]
-        vol_vals = pca_inputs[:, -1, 4]
-        categories = []
-        for c, v in zip(close_vals, vol_vals):
-            if c > 0.01 and v > 0.5:
-                categories.append(0)  # 放量上涨
-            elif c > 0.01:
-                categories.append(1)  # 缩量上涨
-            elif c < -0.01 and v > 0.5:
-                categories.append(2)  # 放量下跌
-            elif c < -0.01:
-                categories.append(3)  # 缩量下跌
-            else:
-                categories.append(4)  # 横盘
-        categories = np.array(categories)
-
-        cat_names = ['放量上涨', '缩量上涨', '放量下跌', '缩量下跌', '横盘']
-        cat_colors = ['#e74c3c', '#f39c12', '#3498db', '#9b59b6', '#95a5a6']
-        for cat_id in range(5):
-            mask = categories == cat_id
-            if mask.any():
-                ax.scatter(pca_2d[mask, 0], pca_2d[mask, 1], c=cat_colors[cat_id],
-                           label=cat_names[cat_id], alpha=0.5, s=10)
-
-        ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})')
-        ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})')
-        ax.set_title('Embedding PCA（按量价关系着色）')
-        ax.legend(fontsize=7, markerscale=2)
-
-        plt.tight_layout()
-        save_path = os.path.join(save_dir, 'embedding_module_analysis.png')
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-        print(f"\n  可视化图表已保存到: {save_path}")
-
-    # ==================== 总结 ====================
-
-    def print_summary(self, results):
-        """生成分析总结，给出PASS/WEAK评定"""
-        print("\n" + "=" * 70)
-        print("Embedding评估总结")
-        print("=" * 70)
-
-        issues = []
-        recommendations = []
-
-        # 1. 跨维度交互
-        if 'cross_interaction' in results:
-            ci = results['cross_interaction']
-            mean_int = ci['mean_abs_interaction']
-            status = "STRONG" if mean_int > 0.1 else ("MODERATE" if mean_int > 0.01 else "WEAK")
-            print(f"\n[1] 跨维度交互: {status}")
-            print(f"    平均交互强度: {mean_int:.6f}")
-            for name, score in ci['key_pair_scores'].items():
-                print(f"    {name}: {score:.6f}")
-
-            if status == "WEAK":
-                issues.append("维度间几乎无非线性交互，embedding接近线性映射")
-                recommendations.append("增加embedding层的非线性能力（更深/更宽的MLP，或使用更强的激活函数）")
-            # 检查Close-Amount是否在top 5
-            top5 = ci['strongest_interactions'][:5]
-            top5_pairs = {(s[0], s[1]) for s in top5}
-            if (3, 5) not in top5_pairs:
-                issues.append("Close-Amount交互不在Top5，量价关系未被重点编码")
-                recommendations.append("考虑显式构造Close×Amount交互特征")
-
-        # 2. 方向对比
-        if 'directional_contrast' in results:
-            dc = results['directional_contrast']
-            print(f"\n[2] 方向对比敏感性:")
-            for j, name in enumerate(self.FEATURE_NAMES):
-                r = dc['contrast_ratios'][j]
-                tag = "强" if r > 3.0 else ("中" if r > 1.5 else "弱")
-                print(f"    {name:8s}: {tag} (对比率={r:.2f})")
-
-            close_ratio = dc['contrast_ratios'][3]
-            if close_ratio < 1.5:
-                issues.append(f"Close方向对比弱 (ratio={close_ratio:.2f})，涨跌方向区分不足")
-                recommendations.append("确保Close维度的正负值映射到embedding的不同区域")
-
-        # 3. 语义一致性
-        if 'semantic_patterns' in results:
-            sp = results['semantic_patterns']
-            cs = sp['consistency_score']
-            tag = "STRONG" if cs > 2.0 else ("MODERATE" if cs > 1.0 else "WEAK")
-            print(f"\n[3] 语义一致性: {tag} (分数={cs:.2f})")
-
-            if cs < 1.0:
-                issues.append(f"语义一致性<1.0，对立模式反而比相似模式更近")
-                recommendations.append("embedding的语义空间混乱，需要重新设计或增加训练")
-
-        # 4. 连续性
-        if 'continuity' in results:
-            profiles = results['continuity']['profiles']
-            print(f"\n[4] 高维连续性:")
-            for dim_name, p in profiles.items():
-                print(f"    {dim_name}: 最大曲率={p['max_curvature']:.6f} "
-                      f"(在 {dim_name}={p['max_curvature_at']:.3f} 处)", end="")
-                if p['curvature_at_zero'] is not None:
-                    ratio = p['curvature_at_zero'] / (p['avg_curvature'] + 1e-8)
-                    print(f", 零点曲率倍数={ratio:.1f}x")
-                else:
-                    print()
-
-            if 'Close' in profiles:
-                p = profiles['Close']
-                if p['curvature_at_zero'] is not None:
-                    ratio = p['curvature_at_zero'] / (p['avg_curvature'] + 1e-8)
-                    if ratio < 1.5:
-                        issues.append(f"Close零点曲率无尖峰 (仅平均值的{ratio:.1f}倍)")
-                        recommendations.append("期望在Close=0处有曲率突增，表明涨跌方向有清晰的决策边界")
-
-        # 5. 信息保留
-        if 'info_preservation' in results:
-            ip = results['info_preservation']
-            print(f"\n[5] 信息保留度: 平均R²={ip['mean_r2']:.4f}")
-            for name, r2 in ip['r2_per_feature'].items():
-                print(f"    {name:8s}: R²={r2:.4f}")
-
-            lost = [name for name, r2 in ip['r2_per_feature'].items() if r2 < 0.5]
-            if lost:
-                issues.append(f"以下特征信息丢失风险高 (R²<0.5): {', '.join(lost)}")
-                recommendations.append(f"检查embedding是否充分保留了 {', '.join(lost)} 的信息")
-
-        # 6. 饱和度
-        if 'saturation' in results:
-            sat = results['saturation']
-            print(f"\n[6] 饱和度:")
-            print(f"    均值={sat['hidden_mean']:.4f}, 标准差={sat['hidden_std']:.4f}")
-            print(f"    饱和={sat['saturation_ratio']*100:.1f}%, 死神经元={sat['dead_neuron_ratio']*100:.1f}%")
-
-            if sat['dead_neuron_ratio'] > 0.1:
-                issues.append(f"死神经元比例 {sat['dead_neuron_ratio']*100:.1f}% > 10%")
-                recommendations.append("调整初始化或增加学习率，避免embedding输出坍缩到0附近")
-            if sat['saturation_ratio'] > 0.1:
-                issues.append(f"饱和比例 {sat['saturation_ratio']*100:.1f}% > 10%")
-                recommendations.append("考虑添加LayerNorm或降低权重初始化增益")
-
-        # 7. 特征消融
-        if 'feature_ablation' in results:
-            fa = results['feature_ablation']
-            print(f"\n[7] 特征重要性排序:")
-            for rank, idx in enumerate(fa['sorted_indices'], 1):
-                print(f"    {rank}. {fa['feature_names'][idx]:8s}: {fa['importance_scores'][idx]*100:.2f}%")
-
-        # 总结
-        if issues:
-            print(f"\n{'='*70}")
-            print("发现的问题:")
-            for i, issue in enumerate(issues, 1):
-                print(f"  {i}. {issue}")
-            print("\n优化建议:")
-            for i, rec in enumerate(recommendations, 1):
-                print(f"  {i}. {rec}")
-        else:
-            print(f"\n{'='*70}")
-            print("所有指标表现良好，embedding层编码质量合格。")
-
-        return {
-            'issues': issues,
-            'recommendations': recommendations
-        }
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Embedding模块评估')
-    parser.add_argument('--model', type=str, default=None,
-                        help='指定要分析的模型文件路径')
-    parser.add_argument('--list-models', action='store_true',
-                        help='列出所有可用的模型文件并退出')
-    args = parser.parse_args()
-
-    print("Embedding模块评估...")
-    print("评估方向: 维度间交互编码质量")
-
-    out_dir = DataConfig.OUTPUT_DIR
-    model_files = []
-    # 搜索 out/ 和 out/embedding_pretrain/ 下的模型文件
-    search_dirs = [out_dir]
-    from config import EmbeddingConfig
-    if hasattr(EmbeddingConfig, 'OUTPUT_DIR'):
-        search_dirs.append(EmbeddingConfig.OUTPUT_DIR)
-    for search_dir in search_dirs:
-        if os.path.exists(search_dir):
-            for f in os.listdir(search_dir):
-                if f.endswith('.pth'):
-                    model_files.append(os.path.join(search_dir, f))
-
-    if args.list_models:
-        print("\n可用的模型文件:")
-        if model_files:
-            model_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-            for i, mf in enumerate(model_files, 1):
-                mtime = datetime.fromtimestamp(os.path.getmtime(mf)).strftime('%Y-%m-%d %H:%M:%S')
-                size = os.path.getsize(mf) / (1024 * 1024)
-                print(f"  {i}. {os.path.basename(mf)} ({mtime}, {size:.2f} MB)")
-        else:
-            print("  未找到任何模型文件")
-        return None, None
-
-    if args.model:
-        if os.path.sep not in args.model and '/' not in args.model:
-            potential_path = os.path.join(out_dir, args.model)
-            if os.path.exists(potential_path):
-                args.model = potential_path
-
-        if not os.path.exists(args.model):
-            print(f"\n错误: 指定的模型文件不存在: {args.model}")
-            return None, None
-        model_path = args.model
-        print(f"\n使用指定的模型: {os.path.basename(model_path)}")
-    else:
-        if model_files:
-            model_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-            print(f"\n找到 {len(model_files)} 个模型文件，使用最新的: {os.path.basename(model_files[0])}")
-            model_path = model_files[0]
-        else:
-            print("\n未找到模型文件，将使用随机初始化模型")
-            model_path = None
-
-    save_dir = os.path.join(PROJECT_ROOT, 'out_eval_results')
-    os.makedirs(save_dir, exist_ok=True)
-
-    if os.path.exists(DataConfig.NORMALIZER_PATH):
-        feature_normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
-    else:
-        print(f"\n未找到归一化器文件: {DataConfig.NORMALIZER_PATH}")
-        return None, None
-
-    print("\n" + "=" * 60)
-    print("[步骤1] 加载数据...")
-    train_stock_info, val_stock_info, test_stock_info = load_and_preprocess_data()
-
-    print("\n[步骤2] 准备测试样本...")
-    from data import normalize_and_validate_context_window
-    eval_ctx = DataConfig.CONTEXT_LENGTH
-    eval_req = DataConfig.REQUIRED_LENGTH
-    all_inputs = []
-    for stock in test_stock_info[:50]:
+    with torch.no_grad():
+        t = torch.tensor(np.ascontiguousarray(x_np, dtype=np.float32),
+                         device=device)
+        return embed_fn(t).cpu().numpy()
+
+
+def list_model_files():
+    """收集 out/embedding_pretrain 与 out/ 下的 .pth，按修改时间降序"""
+    candidates = []
+    for d in {EmbeddingConfig.OUTPUT_DIR, DataConfig.OUTPUT_DIR}:
+        if os.path.isdir(d):
+            candidates += [os.path.join(d, f) for f in os.listdir(d)
+                           if f.endswith('.pth')]
+    candidates.sort(key=os.path.getmtime, reverse=True)
+    return candidates
+
+
+def load_embedding_fn(model_path, device):
+    """
+    加载 .pth，返回 (embed_fn, recipe_str)
+
+    embed_fn: callable，[N, input_dim] 细处理向量 tensor → [N, d_model]
+              即单日K线 embedding 的前向映射。
+    支持两种格式，均带严格校验：
+      A) 预训练格式（pretrain_embedding.save_pretrained_embedding 落盘）：
+         键 embed_proj_weight / embed_mlp_0_weight / embed_mlp_2_weight
+         + input_dim/d_model/expand_ratio 元数据 + config 配方快照
+      B) 完整模型格式：state_dict + model_arch，加载 StockTransformer
+         后取其 embedding 前段
+    """
+    ckpt = torch.load(model_path, map_location=device, weights_only=True)
+    if not isinstance(ckpt, dict):
+        raise ValueError(f"无法识别的 checkpoint 格式: {model_path}")
+
+    # ---- A) 预训练 embedding 格式 ----
+    if 'embed_proj_weight' in ckpt:
+        input_dim = int(ckpt.get('input_dim', ModelConfig.INPUT_DIM))
+        d_model = int(ckpt.get('d_model', ModelConfig.D_MODEL))
+        expand_ratio = int(ckpt.get('expand_ratio', 2))
+        if input_dim != ModelConfig.INPUT_DIM or d_model != ModelConfig.D_MODEL:
+            raise ValueError(
+                f"checkpoint 维度 (input={input_dim}, d_model={d_model}) "
+                f"与当前配置 (INPUT_DIM={ModelConfig.INPUT_DIM}, "
+                f"D_MODEL={ModelConfig.D_MODEL}) 不一致——产物来自另一代"
+                f"特征/模型口径，拒绝评估以免输出无意义结果")
+
+        emb = KLineEmbedding(input_dim=input_dim, d_model=d_model,
+                             expand_ratio=expand_ratio).to(device)
+        key_map = {'embed_proj_weight': 'embed_proj.weight',
+                   'embed_mlp_0_weight': 'embed_mlp.0.weight',
+                   'embed_mlp_2_weight': 'embed_mlp.2.weight'}
+        missing = [src for src in key_map if src not in ckpt]
+        if missing:
+            raise ValueError(
+                f"预训练 Embedding 缺少必需的权重 {missing}: {model_path}")
+        pretrain_state = {dst: ckpt[src] for src, dst in key_map.items()}
+        _validate_state_dict_match(emb.state_dict(), pretrain_state, model_path)
+        emb.load_state_dict(pretrain_state)
+        emb.eval()
+
+        cfg = ckpt.get('config') or {}
+        recipe = (f"预训练格式 | 训练配方(checkpoint内嵌): tag={cfg.get('tag')}"
+                  f", w_shape={cfg.get('visreg_w_shape')}"
+                  f", w_scale={cfg.get('visreg_w_scale')}"
+                  f", lam={cfg.get('visreg_weight')}"
+                  f", epochs={cfg.get('epochs')}")
+
+        return (lambda x: emb(x)), recipe
+
+    # ---- B) 完整模型格式 ----
+    if 'state_dict' in ckpt:
+        if 'model_arch' not in ckpt:
+            raise ValueError(f"checkpoint 缺少 'model_arch' 元数据: {model_path}")
+        model = create_model(model_arch=ckpt['model_arch']).to(device)
+        _validate_state_dict_match(model.state_dict(), ckpt['state_dict'], model_path)
+        model.load_state_dict(ckpt['state_dict'])
+        model.eval()
+        if not (hasattr(model, 'embed_proj') and hasattr(model, 'embed_mlp')):
+            raise ValueError("模型不含 embed_proj/embed_mlp，评估器不适用于此架构")
+        ffn = FFNEmbedding(model.embed_proj, model.embed_mlp)
+        return (lambda x: ffn(x)), f"完整模型格式 | arch={ckpt['model_arch']}"
+
+    raise ValueError(f"无法识别的 checkpoint 格式: {model_path}")
+
+
+# ==================== 测试池构建与校准 ====================
+
+def resolve_feature_names(feature_normalizer, expected_dim):
+    """特征名取自 normalizer 的权威定义并校验维度（原则 P3）"""
+    names = [n for n, _ in feature_normalizer._feature_groups]
+    if len(names) != expected_dim:
+        raise ValueError(
+            f"FeatureNormalizer 定义了 {len(names)} 列特征 {names}，但当前模型"
+            f"输入维度为 {expected_dim}——normalizer.pkl 与权重不是同一代口径，"
+            f"拒绝继续以免产出无意义结果")
+    return names
+
+
+def build_day_pool(n_max_days):
+    """
+    从测试集抽取单日K线（粗处理后 19 维向量）
+
+    复用 run/pretrain 同一条 normalize_and_validate_context_window 管线，
+    取每个上下文窗口最后一日；窗口起点大步进以降低相邻日的相关性。
+    KLineEmbedding 逐时间步独立作用（不含跨时间混合），因此分析
+    "单日19维 → d_model" 映射即可完整刻画 embedding 行为。
+    """
+    _, _, test_stock_info = load_and_preprocess_data()
+    ctx = DataConfig.CONTEXT_LENGTH
+    req = DataConfig.REQUIRED_LENGTH
+    stride = max(ctx * 2, req)
+    days, used_stocks = [], 0
+    for stock in test_stock_info[:80]:
         data = stock['data']
-        test_split = stock['test_split_point']
-        for i in range(test_split, min(test_split + 10, len(data) - eval_req)):
-            input_seq = normalize_and_validate_context_window(
-                data, i, eval_ctx, check_limit_up=False, required_length=eval_req,
-                feature_normalizer=None, apply_fine_normalization=False
-            )
-            if input_seq is not None:
-                all_inputs.append(input_seq)
+        split = stock['test_split_point']
+        end = min(split + req * 3, len(data) - req)
+        got_this = False
+        for i in range(split, max(split + 1, end), stride):
+            seq = normalize_and_validate_context_window(
+                data, i, ctx, check_limit_up=False, required_length=req,
+                feature_normalizer=None, apply_fine_normalization=False)
+            if seq is not None:
+                days.append(seq[-1])
+                got_this = True
+            if len(days) >= n_max_days:
+                break
+        used_stocks += 1 if got_this else 0
+        if len(days) >= n_max_days:
+            break
+    if len(days) < max(8, DEFAULT_SAMPLES // 4):
+        raise RuntimeError(f"测试池只抽到 {len(days)} 个有效日样本，不足以诊断")
+    pool = np.asarray(days, dtype=np.float32)
+    # 收集顺序=股票顺序，不打乱的话 [:args.samples] 截取会使诊断样本
+    # 集中在列表最前的股票；固定种子打乱保证可复现（校准用全池，
+    # 分位数/端点统计与顺序无关，打乱只影响子采样代表性）
+    np.random.default_rng(0).shuffle(pool)
+    print(f"  测试池: {pool.shape[0]} 个单日样本（粗处理空间），"
+          f"来自 {used_stocks} 只测试股票")
+    return pool
 
-    sample_inputs = np.array(all_inputs[:500])
-    print(f"  准备了 {len(sample_inputs)} 个测试样本")
 
-    analyzer = EmbeddingModuleAnalyzer(model_path=model_path)
-    analyzer.load_model(feature_normalizer=feature_normalizer)
+def calibrate(coarse_pool, feature_normalizer, names):
+    """
+    细处理空间校准（原则 P1 的落点），返回后续分析共用的基准量。
 
-    print("\n[步骤3] 执行分析...")
+    打印的表格供人工核查：mean≈0/std≈1 是 QuantileTransformer+
+    StandardScaler 的契约，明显偏离说明 normalizer 与数据口径不符。
+    """
+    fine = np.asarray(feature_normalizer.transform(coarse_pool), dtype=np.float32)
+
+    def _f32(a):
+        # np.percentile 恒返回 float64；不显式收敛的话，后续任何参与运算的
+        # 数组都会被提升为 double，而模型权重是 float32，混合即 RuntimeError
+        return np.asarray(a, dtype=np.float32)
+
+    q02, q50, q98 = map(_f32, np.percentile(
+        fine, [100 * SWEEP_QLO, 50, 100 * SWEEP_QHI], axis=0))
+    q25, q75 = map(_f32, np.percentile(fine, [25, 75], axis=0))
+
+    # 边界焊死检测（诊断 high 影线列失真后新增，2026-08）：粗空间里大量
+    # 样本恰好等于该列最小/最大值（一字板把影线钉死在 0），rank 变换把
+    # 这些并列值映射为同一常数，形成无梯度平台。此类列 z≈0 不再是语义
+    # 中心——连续性参考点自动改用池中位数，结论降权阅读。
+    edge_pct = np.zeros(len(names), dtype=np.float32)
+    for j in range(len(names)):
+        col = coarse_pool[:, j]
+        vmin, vmax = float(col.min()), float(col.max())
+        edge_pct[j] = 100 * max(float(np.mean(col == vmin)),
+                                float(np.mean(col == vmax)))
+    plateau = edge_pct >= EDGE_MASS_WARN_PCT
+    ref_z = np.where(plateau, q50, np.float32(0.0)).astype(np.float32)
+
+    stats = {'fine_pool': fine, 'q02': q02, 'q50': q50, 'q98': q98,
+             'iqr': q75 - q25,
+             'anchor': q50.copy(),              # 基线日 = 池中位数向量
+             'edge_pct': edge_pct, 'plateau': plateau, 'ref_z': ref_z}
+
+    print("\n[校准表] 细处理空间（embedding 直接输入空间）实测统计：")
+    print(f"  {'特征':<14s}{'mean':>8s}{'std':>8s}{'q02':>8s}"
+          f"{'q50':>8s}{'q98':>8s}{'IQR':>8s}{'端点焊死%':>9s}")
+    for j, name in enumerate(names):
+        col = fine[:, j]
+        print(f"  {name:<14s}{col.mean():>8.3f}{col.std():>8.3f}"
+              f"{stats['q02'][j]:>8.3f}{q50[j]:>8.3f}{q98[j]:>8.3f}"
+              f"{stats['iqr'][j]:>8.3f}{edge_pct[j]:>9.1f}")
+    bad = [(n, float(c.mean()), float(c.std()))
+           for n, c in zip(names, fine.T)
+           if abs(float(c.mean())) > 0.15 or abs(float(c.std()) - 1.0) > 0.3]
+    if bad:
+        print("  ⚠ 以下列偏离 mean≈0/std≈1 契约较远，相关结论需打折阅读:")
+        for n, m, s in bad:
+            print(f"    {n}: mean={m:.3f}, std={s:.3f}")
+    if plateau.any():
+        pl = ", ".join(f"{names[j]}({edge_pct[j]:.0f}%)" for j in np.where(plateau)[0])
+        print(f"  ⚠ 边界平台列: {pl} —— 大量样本焊死在支持域端点（rank 变换产物），"
+              f"其连续性/翻转读数自动以池中位数为参考并整体降权")
+    return stats
+
+
+# ==================== 分析一：方向对比 ====================
+
+def analyze_flip_contrast(pool, stats, embed_fn, names, device):
+    """
+    符号翻转 vs 同幅平移的响应比（逐列独立扰动，其余列保持原值）。
+
+    翻转定义为绕该列池中位数镜像 x'=2·q50−x：对标准化后的相对量列，
+    即把'高于历史典型水平'翻成同等程度的'低于'。此定义对所有列类型
+    语义正确（旧版对变化率列用 1-x 属于 bug）。比值大 = 该维的方向
+    信息被重点编码。
+    """
+    print("\n[1] 方向对比敏感性（翻转 vs 平移，逐列独立扰动）")
+    n, c = pool.shape
+    med = stats['q50']
+    delta = stats['iqr'] * SHIFT_IQR_FRAC
+
+    rows = np.repeat(np.arange(n), c)           # 样本优先展开
+    cols = np.tile(np.arange(c), n)
+    seq = np.arange(n * c)
+
+    base_rep = np.repeat(pool, c, axis=0)       # [N*C, C]，第 r 行 = 样本 r//c
+    plus = base_rep.copy()
+    minus = base_rep.copy()
+    flip = base_rep.copy()
+    plus[seq, cols] += delta[cols]
+    minus[seq, cols] -= delta[cols]
+    flip[seq, cols] = 2.0 * med[cols] - pool[rows, cols]
+
+    with torch.no_grad():
+        b = _embed_numpy(embed_fn, pool, device)                    # [N,d]
+        p_plus = _embed_numpy(embed_fn, plus, device).reshape(n, c, -1)
+        p_minus = _embed_numpy(embed_fn, minus, device).reshape(n, c, -1)
+        p_flip = _embed_numpy(embed_fn, flip, device).reshape(n, c, -1)
+
+    # 只允许被扰动的列产生差异；对样本维取均值得到每列一个标量
+    d_plus = np.linalg.norm(p_plus - b[:, None, :], axis=2).mean(axis=0)    # [C]
+    d_minus = np.linalg.norm(p_minus - b[:, None, :], axis=2).mean(axis=0)
+    flip_mag = np.linalg.norm(p_flip - b[:, None, :], axis=2).mean(axis=0)
+    shift_mag = 0.5 * (d_plus + d_minus)
+    ratios = flip_mag / (shift_mag + 1e-8)
+
+    print(f"  扰动幅度=各列IQR×{SHIFT_IQR_FRAC}；比值=翻转位移/平移平均位移")
+    print(f"  {'特征':<14s}{'ratio':>8s}{'翻转位移':>10s}{'平移位移':>10s}   参考")
+    for j, name in enumerate(names):
+        tag = ("强" if ratios[j] > RATIO_STRONG else
+               "中" if ratios[j] > RATIO_MODERATE else "弱")
+        print(f"  {name:<14s}{ratios[j]:>8.2f}{flip_mag[j]:>10.4f}"
+              f"{shift_mag[j]:>10.4f}   {tag}")
+    return {'ratios': ratios, 'flip_mag': flip_mag, 'shift_mag': shift_mag}
+
+
+# ==================== 分析二：跨维交互残差 ====================
+
+def analyze_interaction(pool, stats, embed_fn, names, device):
+    """
+    二阶交互残差：residual = f(x+δi+δj) − f(x+δi) − f(x+δj) + f(x)
+
+    若 embedding 近似逐维加性映射，残差≈0；显著非零说明存在跨维非
+    线性配合。除绝对强度外另报告 主效应归一比 = ‖residual‖ /
+    ((‖Δ_i‖+‖Δ_j‖)/2)，无量纲、跨权重文件可比。
+    """
+    print("\n[2] 跨维交互残差矩阵")
+    n, c = pool.shape
+    delta = stats['iqr'] * SHIFT_IQR_FRAC
+    pairs = [(i, j) for i in range(c) for j in range(i + 1, c)]
+    p_cnt = len(pairs)
+
+    # 构造批：base(N) + singles(N×C) + pairs(N×P)，全部一次 forward
+    blocks = [pool.reshape(n, 1, c)]
+    singles = np.repeat(pool, c, axis=0)             # [N*C, C] 样本优先
+    col_of_row = np.tile(np.arange(c), n)
+    singles[np.arange(n * c), col_of_row] += delta[col_of_row]
+    blocks.append(singles.reshape(n, c, c))          # [N][第k行=第k列扰动]
+    pair_blocks = np.empty((p_cnt, n, c), dtype=np.float32)
+    for p, (i, j) in enumerate(pairs):
+        blk = pool.copy()
+        blk[:, i] += delta[i]
+        blk[:, j] += delta[j]
+        pair_blocks[p] = blk
+    blocks.append(pair_blocks.transpose(1, 0, 2))    # [N, P, C]
+
+    X = np.concatenate(blocks, axis=1)               # [N, 1+C+P, C]
+    with torch.no_grad():
+        Y = _embed_numpy(embed_fn, X.reshape(-1, c), device) \
+            .reshape(n, 1 + c + p_cnt, -1)
+
+    base = Y[:, 0, :]                                # [N,d]
+    single = Y[:, 1:1 + c, :]                        # [N,C,d]
+    pair = Y[:, 1 + c:, :]                           # [N,P,d]
+
+    single_norm = np.linalg.norm(single - base[:, None, :], axis=2)  # [N,C]
+    main_effect = single_norm.mean(axis=0)                            # [C]
+
+    # 交互残差（向量化到配对轴）
+    ii = np.array([p[0] for p in pairs])
+    jj = np.array([p[1] for p in pairs])
+    res = np.linalg.norm(pair - single[:, ii, :] - single[:, jj, :]
+                         + base[:, None, :], axis=2)  # [N,P]
+    inter_abs = res.mean(axis=0)                     # [P]
+    denom = 0.5 * (main_effect[ii] + main_effect[jj]) + 1e-8
+    inter_rel = inter_abs / denom                    # 主效应归一比
+
+    mat = np.zeros((c, c))
+    for p, (i, j) in enumerate(pairs):
+        mat[i, j] = mat[j, i] = inter_abs[p]
+
+    order = np.argsort(-inter_rel)
+    print(f"  扰动幅度=各列IQR×{SHIFT_IQR_FRAC}；rel=残差/两侧主效应均值（无量纲）")
+    print(f"  平均绝对残差={inter_abs.mean():.4f}   中位 rel={np.median(inter_rel):.3f}")
+    print(f"  最强交互 Top{min(TOP_K_INTERACT, p_cnt)}:")
+    for rank, idx in enumerate(order[:TOP_K_INTERACT], 1):
+        i, j = pairs[idx]
+        print(f"    {rank:>2d}. {names[i]:<12s}-{names[j]:<12s}"
+              f"abs={inter_abs[idx]:.4f}  rel={inter_rel[idx]:.3f}")
+
+    name_idx = {nm: k for k, nm in enumerate(names)}
+    print("  关键语义对照对:")
+    for a, b in KEY_PAIR_NAMES:
+        if a in name_idx and b in name_idx:
+            i, j = sorted((name_idx[a], name_idx[b]))
+            p = pairs.index((i, j))
+            print(f"    {a}-{b}: abs={inter_abs[p]:.4f}  rel={inter_rel[p]:.3f}")
+
+    return {'matrix': mat, 'pairs': pairs, 'inter_abs': inter_abs,
+            'inter_rel': inter_rel, 'main_effect': main_effect}
+
+
+# ==================== 分析三：连续性扫值 ====================
+
+def analyze_continuity(stats, embed_fn, names, device, n_steps):
+    """
+    以池中位数为基线日，沿每列在 [q02,q98] 扫值，考察：
+      平滑性     —— 输出轨迹的速度/曲率是否均匀
+      边界尖锐度 —— 最大曲率位置是否落在 z≈0（历史中位水平）
+    """
+    print("\n[3] 连续性扫值")
+    c = len(names)
+    anchor = stats['anchor'][None, :].astype(np.float32)      # [1,C]
+    q02, q98 = stats['q02'], stats['q98']
+
+    grids = [np.linspace(q02[j], q98[j], n_steps) for j in range(c)]
+    X = np.tile(anchor, (c * n_steps, 1))                     # [C*S, C]
+    for j in range(c):
+        X[j * n_steps:(j + 1) * n_steps, j] = grids[j]
+
+    with torch.no_grad():
+        Y = _embed_numpy(embed_fn, X, device)        # [C*S,d]
+
     results = {}
+    print(f"  基线日=池中位数向量；每列扫 [{SWEEP_QLO:.2f},{SWEEP_QHI:.2f}] 分位区间")
+    print(f"  {'特征':<14s}{'锋利度':>8s}{'峰值@':>9s}{'参考z':>7s}{'参考倍数':>9s}")
+    for j, name in enumerate(names):
+        seg = Y[j * n_steps:(j + 1) * n_steps]                # [S,d]
+        curv = np.linalg.norm(seg[2:] - 2 * seg[1:-1] + seg[:-2], axis=1)  # [S-2]
+        grid_mid = grids[j][1:-1]                             # 曲率对应的输入值
+        sharp = float(curv.max() / (curv.mean() + 1e-8))
+        peak_at = float(grid_mid[int(np.argmax(curv))])
+        # 参考点自适应：符号对称列看 z=0（方向分界），边界平台列（影线族）
+        # 看池中位数——后者是它们唯一有语义的中心
+        ref = float(stats['ref_z'][j])
+        ref_ratio = None
+        lo, hi = grids[j][0], grids[j][-1]
+        if lo <= ref <= hi:
+            k = int(np.argmin(np.abs(grid_mid - ref)))
+            ref_ratio = float(curv[k] / (curv.mean() + 1e-8))
+        results[name] = {'sharpness': sharp, 'peak_at': peak_at,
+                         'ref_z': ref, 'ref_ratio': ref_ratio,
+                         'grid': grids[j], 'curv_norm':
+                             curv / (curv.max() + 1e-8)}
+        rr_str = f"{ref_ratio:>6.1f}x" if ref_ratio is not None else "      —"
+        print(f"  {name:<14s}{sharp:>8.1f}{peak_at:>9.2f}{ref:>+7.2f}{rr_str}")
 
-    results['cross_interaction'] = analyzer.analyze_cross_dimensional_interactions(
-        sample_inputs, n_samples=100)
-    results['directional_contrast'] = analyzer.analyze_directional_contrast(
-        sample_inputs, n_samples=100)
-    results['semantic_patterns'] = analyzer.analyze_semantic_patterns()
-    results['continuity'] = analyzer.analyze_continuity(
-        sample_inputs, n_steps=25)
-    results['info_preservation'] = analyzer.analyze_information_preservation(
-        sample_inputs, n_samples=200)
-    results['saturation'] = analyzer.analyze_saturation(
-        sample_inputs, n_samples=100)
-    results['feature_ablation'] = analyzer.analyze_feature_ablation(
-        sample_inputs, n_samples=100)
-
-    print("\n[步骤4] 生成可视化...")
-    analyzer.visualize_results(sample_inputs, results, save_dir)
-
-    print("\n[步骤5] 生成总结...")
-    analyzer.print_summary(results)
-
-    print(f"\n分析完成！可视化图表已保存到: {save_dir}/embedding_module_analysis.png")
-
+    ranked = sorted(results.items(), key=lambda kv: -kv[1]['sharpness'])
+    print(f"  边界最陡的 3 列: {', '.join(nm for nm, _ in ranked[:3])}"
+          f"（曲率峰越贴近各自参考点越好：符号对称列=方向分界，平台列=典型水平）")
     return results
 
 
+# ==================== 分析四：特征消融 ====================
+
+def analyze_ablation(pool, stats, embed_fn, names, device):
+    """
+    将某列替换为中性值（池中位数），测输出位移。
+
+    与旧版的差别：中性点从手调常数改为实测中位数；度量从"输出范数
+    变化"改为"输出位移的 L2 距离"——后者直接衡量信息通道强度，不被
+    输出尺度契约混淆。
+    """
+    print("\n[4] 特征消融（替换为池中位数）")
+    n, c = pool.shape
+    med = stats['q50']
+
+    masked = np.repeat(pool[:, None, :], c, axis=1)      # [N,C,C]
+    col_idx = np.arange(c)
+    for j in range(c):
+        masked[:, j, j] = med[j]
+
+    with torch.no_grad():
+        Y = _embed_numpy(embed_fn, pool, device)
+        Ym = _embed_numpy(embed_fn, masked.reshape(n * c, c), device) \
+            .reshape(n, c, -1)
+
+    disp = np.linalg.norm(Ym - Y[:, None, :], axis=2).mean(axis=0)   # [C]
+    share = disp / (disp.sum() + 1e-8)
+
+    order = np.argsort(-disp)
+    print(f"  {'排名':<4s}{'特征':<14s}{'位移':>10s}{'占比':>8s}")
+    for rank, j in enumerate(order, 1):
+        print(f"  {rank:<4d}{names[j]:<14s}{disp[j]:>10.4f}{share[j]*100:>7.1f}%")
+    return {'disp': disp, 'share': share}
+
+
+# ==================== 总结与可视化 ====================
+
+def summarize(names, results):
+    print("\n" + "=" * 70)
+    print("观察总结（非判卷；结合训练期指标阅读）")
+    print("=" * 70)
+    fc = results['flip_contrast']
+    strong = [names[j] for j in range(len(names))
+              if fc['ratios'][j] > RATIO_STRONG]
+    weak = [names[j] for j in range(len(names))
+            if fc['ratios'][j] <= RATIO_MODERATE]
+    print(f"\n[方向] 编码了明确方向的维度: {', '.join(strong) or '（无）'}；"
+          f"方向感弱的维度: {', '.join(weak) or '（无）'}")
+
+    it = results['interaction']
+    top_rel = np.argsort(-it['inter_rel'])[:3]
+    txt = ', '.join(f"{names[it['pairs'][k][0]]}-{names[it['pairs'][k][1]]}"
+                    f"(rel={it['inter_rel'][k]:.2f})" for k in top_rel)
+    print(f"[交互] 非线性配合最强的三维对: {txt}")
+    name_idx = {nm: k for k, nm in enumerate(names)}
+    hints = []
+    for a, b in KEY_PAIR_NAMES:
+        if a in name_idx and b in name_idx:
+            i, j = sorted((name_idx[a], name_idx[b]))
+            k = it['pairs'].index((i, j))
+            hints.append(f"{a}-{b} rel={it['inter_rel'][k]:.2f}")
+    print(f"[交互] 关键语义对照对读数: {'; '.join(hints)}"
+          f"（业务上预期这些应有可感知的非线性配合）")
+
+    ct = results['continuity']
+    peak_at_ref = [nm for nm, r in ct.items()
+                   if r['ref_ratio'] is not None and r['ref_ratio'] > 1.5]
+    sharpest = sorted(ct.items(), key=lambda kv: -kv[1]['sharpness'])[:3]
+    sharp_txt = ', '.join("{}({:.1f})".format(nm, r['sharpness'])
+                          for nm, r in sharpest)
+    print(f"[连续性] 全局轨迹锋利度 Top3: {sharp_txt}；"
+          f"在各自语义参考点（符号0/典型水平）出现曲率峰的维度: "
+          f"{', '.join(peak_at_ref) or '（无）'}")
+
+    ab = results['ablation']
+    top_ab = np.argsort(-ab['disp'])[:3]
+    ab_txt = ', '.join("{}({:.0f}%)".format(names[j], ab['share'][j] * 100)
+                       for j in top_ab)
+    print(f"[消融] 信息通道占比 Top3: {ab_txt}")
+
+
+def visualize(names, results, save_dir, model_tag):
+    os.makedirs(save_dir, exist_ok=True)
+    fig, axes = plt.subplots(2, 2, figsize=(15, 11))
+    fig.suptitle(f'Embedding 训后诊断（{model_tag}）', fontsize=14,
+                 fontweight='bold')
+
+    # [0,0] 交互热力图
+    ax = axes[0, 0]
+    mat = results['interaction']['matrix']
+    im = ax.imshow(mat, cmap='YlOrRd', aspect='auto')
+    ax.set_xticks(range(len(names)))
+    ax.set_yticks(range(len(names)))
+    ax.set_xticklabels(names, rotation=45, ha='right', fontsize=8)
+    ax.set_yticklabels(names, fontsize=8)
+    ax.set_title('跨维交互绝对残差')
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # [0,1] 方向对比柱状图
+    ax = axes[0, 1]
+    ratios = results['flip_contrast']['ratios']
+    colors = ['#2ecc71' if r > RATIO_STRONG else
+              '#f39c12' if r > RATIO_MODERATE else '#e74c3c' for r in ratios]
+    ax.bar(names, ratios, color=colors, alpha=0.85)
+    ax.axhline(RATIO_STRONG, color='green', ls='--', alpha=0.5)
+    ax.axhline(RATIO_MODERATE, color='orange', ls='--', alpha=0.5)
+    ax.set_ylabel('翻转/平移 位移比')
+    ax.set_title('方向对比敏感性')
+    ax.tick_params(axis='x', rotation=60, labelsize=8)
+    ax.grid(axis='y', alpha=0.3)
+
+    # [1,0] 连续性曲率曲线（Top4 锋利度）
+    ax = axes[1, 0]
+    ct = results['continuity']
+    top4 = [nm for nm, _ in
+            sorted(ct.items(), key=lambda kv: -kv[1]['sharpness'])[:4]]
+    palette = ['#e74c3c', '#3498db', '#2ecc71', '#9b59b6']
+    for k, nm in enumerate(top4):
+        r = ct[nm]
+        ax.plot(r['grid'][1:-1], r['curv_norm'], '-o', markersize=2,
+                color=palette[k % 4], label=f"{nm}(峰@{r['peak_at']:.2f})")
+        ax.axvline(0, color='gray', lw=0.5, ls=':', alpha=0.5)
+    ax.set_xlabel('细处理空间扫值 z')
+    ax.set_ylabel('曲率（按列内最大值归一）')
+    ax.set_title('连续性扫值（锋利度Top4）')
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # [1,1] 消融占比水平条形图
+    ax = axes[1, 1]
+    ab = results['ablation']
+    order = np.argsort(ab['share'])
+    ax.barh([names[j] for j in order], ab['share'][order] * 100,
+            color='#3498db', alpha=0.85)
+    ax.set_xlabel('消融位移占比 (%)')
+    ax.set_title('特征消融重要性')
+    ax.grid(axis='x', alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(save_dir, f"embedding_eval_{model_tag}.png")
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"\n可视化已保存: {path}")
+    return path
+
+
+# ==================== 主流程 ====================
+
+def main():
+    parser = argparse.ArgumentParser(description='Embedding 训后诊断 v2')
+    parser.add_argument('--model', type=str, default=None,
+                        help='待评估的 .pth 路径（默认取最新的预训练产物）')
+    parser.add_argument('--list-models', action='store_true',
+                        help='列出候选 .pth 并退出')
+    parser.add_argument('--samples', type=int, default=DEFAULT_SAMPLES,
+                        help=f'单日样本数（默认 {DEFAULT_SAMPLES}）')
+    parser.add_argument('--steps', type=int, default=DEFAULT_STEPS,
+                        help=f'连续性扫值步数（默认 {DEFAULT_STEPS}）')
+    parser.add_argument('--out', type=str, default=None,
+                        help='可视化输出目录')
+    parser.add_argument('--no-plot', action='store_true',
+                        help='不生成图（仅终端读数）')
+    args = parser.parse_args()
+
+    if args.list_models:
+        files = list_model_files()
+        print("候选 .pth（按修改时间）：")
+        for k, f in enumerate(files, 1):
+            mb = os.path.getsize(f) / 1024 / 1024
+            t = datetime.fromtimestamp(os.path.getmtime(f))
+            print(f"  {k}. {os.path.basename(f)}  {t:%Y-%m-%d %H:%M}  {mb:.2f}MB")
+        if not files:
+            print("  （未找到任何 .pth）")
+        return
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 权重
+    if args.model:
+        model_path = args.model
+        if not os.path.exists(model_path):
+            print(f"错误: 文件不存在 {model_path}")
+            return
+    else:
+        files = list_model_files()
+        if not files:
+            print("错误: 未找到任何 .pth，用 --model 显式指定路径")
+            return
+        model_path = files[0]
+    print(f"[步骤1] 加载权重: {os.path.basename(model_path)}")
+    embed_fn, recipe = load_embedding_fn(model_path, device)
+    print(f"  {recipe}")
+
+    # 归一化器（评估的坐标定义，必须存在）
+    if not os.path.exists(DataConfig.NORMALIZER_PATH):
+        print(f"错误: 归一化器不存在 {DataConfig.NORMALIZER_PATH}，"
+              f"先训练/重建它再评估")
+        return
+    normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
+
+    print("\n[步骤2] 构建测试池并校准...")
+    coarse_pool = build_day_pool(max(args.samples * 2, DEFAULT_SAMPLES))
+    names = resolve_feature_names(normalizer, ModelConfig.INPUT_DIM)
+    stats = calibrate(coarse_pool, normalizer, names)
+    pool = stats['fine_pool'][:args.samples]         # 分析统一在细处理空间
+
+    print("\n[步骤3] 执行四项诊断...")
+    results = {
+        'flip_contrast': analyze_flip_contrast(pool, stats, embed_fn, names, device),
+        'interaction': analyze_interaction(pool, stats, embed_fn, names, device),
+        'continuity': analyze_continuity(stats, embed_fn, names, device, args.steps),
+        'ablation': analyze_ablation(pool, stats, embed_fn, names, device),
+    }
+
+    summarize(names, results)
+
+    if not args.no_plot:
+        stem = os.path.splitext(os.path.basename(model_path))[0]
+        stem = ''.join(ch if (ch.isalnum() or ch in '_-') else '_'
+                       for ch in stem)[:40]
+        save_dir = args.out or os.path.join(PROJECT_ROOT, 'out_eval_results')
+        try:
+            visualize(names, results, save_dir, stem)
+        except Exception as exc:                      # 图表失败不影响读数
+            print(f"⚠ 可视化跳过: {exc}")
+
+
 if __name__ == "__main__":
-    results = main()
+    main()

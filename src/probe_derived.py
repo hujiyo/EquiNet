@@ -12,8 +12,8 @@
    （在留出集上评估）。这是"embedding 此刻内部有多少结构可线性读出"
    的最干净度量，不依赖训练过程。
 
-3. 线性拷贝下限 C：在原始16维特征上拟合线性回归 → 衍生特征
-   （留出集评估）。这是"embedding 若只是16维线性拷贝"时探针能达到的
+3. 线性拷贝下限 C：在原始19维特征上拟合线性回归 → 衍生特征
+   （留出集评估）。这是"embedding 若只是19维线性拷贝"时探针能达到的
    最佳误差（sign/绝对值/除法/乘积都不是线性组合，下限必然>0）。
 
 判定：B 显著低于 C（如 B/C < 0.5）→ 非线性结构确实被 embedding
@@ -138,7 +138,7 @@ def probe(checkpoint_path, train_stock_info, feature_normalizer,
     print(f"  [事后探针 B] z 上重新拟合线性回归 (fit={half:,} / eval={n-half:,})")
     probe_B = fit_and_eval_linear(z_all[fit_idx], y[fit_idx], m[fit_idx],
                                   z_all[eval_idx], y[eval_idx], m[eval_idx])
-    print(f"  [线性拷贝下限 C] 原始16维上拟合线性回归 (同上划分)")
+    print(f"  [线性拷贝下限 C] 原始19维上拟合线性回归 (同上划分)")
     probe_C = fit_and_eval_linear(x[fit_idx], y[fit_idx], m[fit_idx],
                                   x[eval_idx], y[eval_idx], m[eval_idx])
 
@@ -170,7 +170,7 @@ def probe(checkpoint_path, train_stock_info, feature_normalizer,
         mean_C = np.nanmean(probe_C[valid_feat])
         print(f"汇总: 探针A={mean_A:.4f}  探针B={mean_B:.4f}  "
               f"线性拷贝下限C={mean_C:.4f}  (B/C={mean_B/max(mean_C,1e-6):.2f})")
-    print(f"原始16维: 探针A={probe_A_orig:.6f}  (训练日志 O= 参考)")
+    print(f"原始19维: 探针A={probe_A_orig:.6f}  (训练日志 O= 参考)")
 
     if valid_feat.sum() == 0:
         print("\n结论: 无法评估（有效样本不足）")

@@ -93,10 +93,10 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             test_stock_info, feature_normalizer
         )
 
-    # 创建测试集评估数据集（训练结束后仅评估一次）
-    test_eval_inputs, test_eval_targets, test_eval_cumulative_returns, test_eval_day_indices, test_eval_daily_returns, test_eval_tradeable_mask = create_fixed_evaluation_dataset(
-        test_stock_info, feature_normalizer
-    )
+    # 测试集评估数据集延后到训练结束后构建（整个训练期间不消费，
+    # 提前构建只会让进入训练循环前多等一段只在收尾时用的预处理）
+    test_eval_inputs, test_eval_targets, test_eval_cumulative_returns = None, None, None
+    test_eval_day_indices, test_eval_daily_returns, test_eval_tradeable_mask = None, None, None
 
     # 创建优化器（embedding 已冻结，只传可训练参数）
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -387,6 +387,12 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
     eval_label = "验证集" if has_val else "测试集"
     print(f"最佳模型（按{eval_label} loss）: 第{best_loss_epoch}轮, Loss: {best_loss:.4f}, 实战收益率: {best_realistic_return_at_best_loss*100:.1f}%")
     print(f"最佳模型（按{eval_label}实战收益率）: 第{best_realistic_return_epoch}轮, 实战收益率: {best_realistic_return_value_at_best*100:.1f}%, Top1%: {best_return_at_best_realistic*100:+.2f}%")
+
+    # 此刻才构建测试集评估数据集（训练期间不消费，延后构建缩短训练前等待）
+    print("创建测试集评估数据集（训练结束后仅评估一次）...")
+    test_eval_inputs, test_eval_targets, test_eval_cumulative_returns, test_eval_day_indices, test_eval_daily_returns, test_eval_tradeable_mask = create_fixed_evaluation_dataset(
+        test_stock_info, feature_normalizer
+    )
 
     # 测试集评估（用测试集指标保存到模型文件中）
     test_return = 0.0

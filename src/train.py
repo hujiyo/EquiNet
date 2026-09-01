@@ -241,7 +241,6 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         # 转换为tensor
         epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.float32).to(device)
         epoch_targets_tensor = torch.tensor(epoch_targets, dtype=torch.float32).to(device)
-        epoch_returns_tensor = torch.tensor(epoch_cum_returns, dtype=torch.float32).to(device)
 
         # 计算实际可用的batch数量
         actual_batches = len(epoch_inputs_tensor) // batch_size
@@ -254,7 +253,6 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
 
             batch_inputs = epoch_inputs_tensor[start_idx:end_idx]
             batch_targets = epoch_targets_tensor[start_idx:end_idx]
-            batch_returns = epoch_returns_tensor[start_idx:end_idx]
 
             def _loss_fn():
                 output = model(batch_inputs)
@@ -276,7 +274,7 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         print()
 
         # 清理内存
-        del epoch_inputs_tensor, epoch_targets_tensor, epoch_returns_tensor
+        del epoch_inputs_tensor, epoch_targets_tensor
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

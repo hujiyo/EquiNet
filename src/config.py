@@ -4,6 +4,7 @@ EquiNet 模型配置文件
 
 import os
 import sys
+import numpy as np
 import torch
 
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -396,6 +397,35 @@ def generate_label(day1_change, day2_change, day3_change):
 
     return 0
 
+
+def _generate_label_batch(day1_change, day2_change, day3_change):
+    """
+    generate_label 的向量化版本（逐位等价：比较/加减均为元素级 IEEE 运算，
+    NaN 与标量版行为一致——所有比较为 False → 标签 0）
+
+    由 data._vectorized_process_stock 等批量路径通过 generate_label.batch 调用，
+    消除百万级样本上逐样本 Python 函数调用的解释器开销。
+    """
+    day1 = np.asarray(day1_change)
+    day2 = np.asarray(day2_change)
+    day3 = np.asarray(day3_change)
+    cum_2day = day1 + day2
+    cum_3day = day1 + day2 + day3          # 左结合，与标量版求值顺序一致
+    max_day = np.maximum(np.maximum(day1, day2), day3)
+    cond = (
+        ((day1 >= 0.05) & (cum_3day >= 0.03))
+        | ((cum_2day >= 0.06) & (day1 > 0.01) & (day2 > 0.01) & (cum_3day >= 0.03))
+        | ((day1 >= 0.01) & (day2 >= 0.01) & (day3 >= 0.01) & (cum_3day >= 0.06))
+        | ((max_day >= 0.08) & (cum_3day >= 0.06) & (day1 >= -0.02))
+        | ((cum_3day >= 0.08) & (day1 >= -0.02))
+    )
+    return cond.astype(np.float32)
+
+
+# 向量化快路径挂载：data 侧 getattr(label_fn, 'batch') 探测使用，
+# 自定义标签函数（无 .batch 属性）自动回退逐样本循环
+generate_label.batch = _generate_label_batch
+
 # ==================== 用户自定义收益率计算函数 ====================
 def calculate_returns(t1_open, t1_close, t2_open=None, t2_close=None, t3_close=None,
                       day1_change=None, day2_change=None, day3_change=None):
@@ -486,6 +516,79 @@ def calculate_returns(t1_open, t1_close, t2_open=None, t2_close=None, t3_close=N
     daily_returns.append(day3_return)
     cumulative_return = day1_return + day2_return + day3_return
     return cumulative_return, daily_returns
+
+
+def _calculate_returns_batch(t1_open, t1_close, t2_open, t2_close, t3_close,
+                             day1_change, day2_change, available_days):
+    """
+    calculate_returns 的向量化版本（逐位等价）
+
+    与标量版的参数对应关系：
+    - 标量版对 Day2/Day3 缺失传 None；此处传全量数组（无效位置为越界
+      clip 出的垃圾值），由 available_days >= 2 / >= 3 掩码承担 None 语义，
+      垃圾车道先安全化（置 1/0）再统一运算，杜绝垃圾值影响结果
+    - day3_change 标量版未使用，此处同样不需要
+    - day1_change 由调用方保证恒为数组（与标量调用点一致：从不为 None）
+
+    Returns:
+        (cumulative [N] float64, daily [N,3] float64 右侧以 0 填充, n_days [N] int)
+        daily/n_days 组合还原出与标量版相同的变长逐日收益列表
+    """
+    day1_change = np.asarray(day1_change)
+    day2_change = np.asarray(day2_change)
+    n = len(day1_change)
+    has2 = available_days >= 2
+    has3 = available_days >= 3
+
+    # 无效车道安全化：除法分母置 1、分子置 0，结果被掩码丢弃，仅避免
+    # 垃圾值产生 inf/NaN 告警（errstate 双保险）
+    with np.errstate(divide='ignore', invalid='ignore'):
+        safe_t1_open = np.where(has2, t1_open, 1.0)
+        safe_t2_open = np.where(has2, t2_open, 1.0)
+        safe_t2_close = np.where(has2, t2_close, 0.0)
+        safe_t3_close = np.where(has3, t3_close, 0.0)
+
+        day1_return = (t1_close - t1_open) / t1_open
+        ret_stop1 = (safe_t2_open - t1_open) / safe_t1_open   # 止损1: 第二天开盘卖
+        day2_return = (safe_t2_close - t1_close) / safe_t1_open
+        day3_return = (safe_t3_close - safe_t2_close) / safe_t1_open
+
+        # 止损条件（标量版的 None 判断 → 掩码化）：
+        # day1_change 恒非 None；止损2/3 仅 has2（day2_change 非 None）时判断
+        stop1 = day1_change <= -0.03
+        stop1_exec = stop1 & has2                 # 止损1 且有 Day2 开盘 → 第二天开盘卖
+        m2 = has2 & ~stop1                        # 走到 Day2 的车道
+        stop2 = m2 & (day1_change + day2_change < -0.02)
+        stop3 = m2 & (day1_change < 0.01) & (day2_change < 0.01)
+        stop23 = stop2 | stop3                    # 第二天收盘止损（收益= d1+d2）
+        full3 = m2 & ~stop23 & has3               # 持有满 3 天
+        till2 = m2 & ~stop23 & ~has3              # 只有两天数据（收益= d1+d2）
+        ret2_lanes = stop23 | till2               # 两天收益车道（均 ⊂ m2）
+
+        two_day = day1_return + day2_return
+        three_day = two_day + day3_return
+
+        cumulative = day1_return.copy()
+        cumulative[stop1_exec] = ret_stop1[stop1_exec]
+        cumulative[ret2_lanes] = two_day[ret2_lanes]
+        cumulative[full3] = three_day[full3]
+
+        daily = np.zeros((n, 3), dtype=np.float64)
+        daily[:, 0] = day1_return
+        daily[stop1_exec, 0] = ret_stop1[stop1_exec]
+        daily[m2, 1] = day2_return[m2]
+        daily[full3, 2] = day3_return[full3]
+
+        n_days = np.ones(n, dtype=np.int64)
+        n_days[ret2_lanes] = 2
+        n_days[full3] = 3
+
+    return cumulative, daily, n_days
+
+
+# 向量化快路径挂载（同 generate_label.batch）：data 侧探测使用，
+# 自定义收益函数（无 .batch 属性）自动回退逐样本循环
+calculate_returns.batch = _calculate_returns_batch
 
 
 # ==================== 设备配置 ====================

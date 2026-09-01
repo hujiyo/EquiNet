@@ -965,8 +965,11 @@ def measure_embedding_std(checkpoint_path, kline_pool, device, n_probe=10000):
     with torch.no_grad():
         # 从池中抽 n_probe 条真实归一化K线作为探测输入
         # （比合成 N(0,1) 噪声更贴近推理时的输入分布：真实特征间高度相关）
+        # argpartition 取 n 个最小随机键：与 choice(replace=False) 同分布，
+        # 避免 legacy choice 对 4000万+ 池做全量 Fisher-Yates 洗牌
         n = min(n_probe, len(kline_pool))
-        probe_idx = np.random.choice(len(kline_pool), n, replace=False)
+        keys = np.random.random(len(kline_pool))
+        probe_idx = np.argpartition(keys, n - 1)[:n]
         test_input = torch.tensor(kline_pool[probe_idx], dtype=torch.float32).to(device)
 
         # 从磁盘加载权重，新建模型灌入（验证落盘文件可正确还原）
@@ -1009,9 +1012,15 @@ def pretrain(train_stock_info, feature_normalizer=None, device=None, tag=None):
     loader_batch_size = batch_size * oversample
 
     if pool_size >= total_needed * oversample:
-        indices = np.random.choice(pool_size, total_needed * oversample, replace=False)
+        # 无重复均匀子集：随机键 argpartition（O(N) 选择）替代 legacy
+        # np.random.choice(replace=False) 的全量 Fisher-Yates 洗牌——
+        # 池~1亿时洗牌要 ~10s/800MB 峰值。两者同为"均匀无放回子集"分布，
+        # 但随机数流不同（不同 seed 下采到的具体子集会有差异）
+        k = total_needed * oversample
+        keys = np.random.random(pool_size)
+        indices = np.argpartition(keys, k - 1)[:k]
         print(f"\n[数据] 池中有 {pool_size:,} 条K线，"
-              f"无重复采样 {total_needed * oversample:,} 条")
+              f"无重复采样 {k:,} 条")
     else:
         indices = np.random.choice(pool_size, total_needed * oversample, replace=True)
         repeat_ratio = total_needed * oversample / pool_size

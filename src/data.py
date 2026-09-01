@@ -471,7 +471,9 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
     df = pd.read_sql_query(query, conn)
     conn.close()
 
-    cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange', 'm5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'macd_hist_diff', 'bb_upper', 'bb_lower']
+    cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange',
+            'm5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'macd_hist_diff',
+            'bb_upper', 'bb_lower']
     stock_codes = []
     stock_data_arrays = []
     stock_times_arrays = []
@@ -479,6 +481,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
         stock_codes.append(stock_code)
         stock_data_arrays.append(group[cols].values)
         stock_times_arrays.append(group['date'].values)
+    del df
 
     print(f"总共 {len(stock_codes)} 只股票 (训练池)")
     print(f"- 训练集: {train_start_date} ~ {train_end_date}")
@@ -491,6 +494,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
                          [val_start_date] * len(stock_codes),
                          [val_end_date] * len(stock_codes),
                          [test_start_date] * len(stock_codes)))
+
     num_workers = min(cpu_count(), 8)
 
     with Pool(num_workers) as pool:
@@ -542,7 +546,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
 
 def compute_label_distance_exclusions(stock_info_list, distance=None):
     """
-    计算正样本距离保护区域
+    计算正样本距离保护区域（向量化版，结果与逐位置 Python 循环严格等价）
 
     规则：如果位置i是正样本，则i-distance到i-1的负样本不参与训练（被排除）
     distance=0时不排除任何样本（等价于原始行为）
@@ -564,53 +568,65 @@ def compute_label_distance_exclusions(stock_info_list, distance=None):
             stock_info['excluded_positions'] = set()
         return
 
+    context_length = DataConfig.CONTEXT_LENGTH
+    future_days = DataConfig.FUTURE_DAYS
+    use_open = DataConfig.LABEL_DAY1_USE_OPEN
+    label_batch = getattr(generate_label, 'batch', None)
+
     total_positive = 0
     total_excluded = 0
 
     for stock_info in stock_info_list:
         data = stock_info['data']
+        T = len(data)
         train_start = stock_info.get('train_start_idx', 0)
         train_end = stock_info.get('train_end_idx', len(data))
-        context_length = DataConfig.CONTEXT_LENGTH
-        future_days = DataConfig.FUTURE_DAYS
 
-        # 轻量级标签计算：只用价格数据，不做完整样本验证
-        # 必须与 _vectorized_process_stock() 中的标签计算逻辑保持一致
-        labels = {}
-        use_open = DataConfig.LABEL_DAY1_USE_OPEN
-        for pos in range(max(1, train_start + 1), train_end + 1):
-            if pos + context_length + future_days > len(data):
-                continue
+        # 候选位置 = 原循环 range(max(1, ts+1), train_end+1) ∩
+        # 守卫 pos+context_length+future_days <= len(data)
+        lo = max(1, train_start + 1)
+        hi = min(train_end, T - context_length - future_days)
+        if hi < lo:
+            stock_info['excluded_positions'] = set()
+            continue
 
-            future_start = pos + context_length
-            closes = data[future_start - 1 : future_start + future_days, 3]
+        pos = np.arange(lo, hi + 1, dtype=np.int64)
+        fs = pos + context_length
+        # closes[p] = [T, T+1, T+2, T+3] 收盘（与原循环 data[fs-1 : fs+F] 同切片）
+        close_col = data[:, 3]
+        close_idx = (fs[:, None] - 1) + np.arange(future_days + 1, dtype=np.int64)[None, :]
+        closes = close_col[close_idx]                       # [P, F+1]
 
-            if any(c <= 0 for c in closes):
-                continue
-
+        # 原守卫 any(c <= 0) → continue：取反得有效掩码
+        # （NaN 与原语义一致：NaN<=0 为 False → 不跳过，标签计算得 NaN → 标签0）
+        valid = ~np.any(closes <= 0, axis=1)
+        with np.errstate(divide='ignore', invalid='ignore'):
             if use_open:
-                # day1: 开盘到收盘（对齐实际买入价）
-                t1_open = data[future_start, 0]
-                if t1_open <= 0:
-                    continue
-                day1 = (closes[1] - t1_open) / t1_open
+                t1_open = data[:, 0][fs]
+                valid &= ~(t1_open <= 0)    # 原守卫 t1_open <= 0 → continue
+                day1 = (closes[:, 1] - t1_open) / t1_open
             else:
-                # day1: 收盘到收盘（原始行为）
-                day1 = (closes[1] - closes[0]) / closes[0]
-            day2 = (closes[2] - closes[1]) / closes[1]
-            day3 = (closes[3] - closes[2]) / closes[2]
-            labels[pos] = generate_label(day1, day2, day3)
+                day1 = (closes[:, 1] - closes[:, 0]) / closes[:, 0]
+            day2 = (closes[:, 2] - closes[:, 1]) / closes[:, 1]
+            day3 = (closes[:, 3] - closes[:, 2]) / closes[:, 2]
 
-        # 构建排除集：正样本左侧distance范围内的负样本
-        excluded = set()
-        for pos, label in labels.items():
-            if label == 1:
-                total_positive += 1
-                for d in range(1, distance + 1):
-                    prev_pos = pos - d
-                    if prev_pos in labels and labels[prev_pos] == 0:
-                        excluded.add(prev_pos)
+        if label_batch is not None:
+            lbl = label_batch(day1, day2, day3).astype(bool)
+        else:
+            lbl = np.array([generate_label(d1, d2, d3) == 1
+                            for d1, d2, d3 in zip(day1, day2, day3)], dtype=bool)
 
+        # 排除：p 为有效负样本，且 p+1..p+distance 内存在有效正样本
+        # （等价于原"正样本位置向左 distance 逐个查 labels dict"）
+        pos_is_one = valid & lbl
+        near_pos = pos_is_one.copy()
+        for d in range(1, distance + 1):
+            if d < len(pos_is_one):
+                near_pos[:-d] |= pos_is_one[d:]
+        excluded_mask = valid & ~lbl & near_pos
+
+        total_positive += int(pos_is_one.sum())
+        excluded = set(int(p) for p in pos[excluded_mask])
         stock_info['excluded_positions'] = excluded
         total_excluded += len(excluded)
 
@@ -901,6 +917,7 @@ def create_recent_days_dataset(test_stock_info, feature_normalizer=None, max_day
             compute_returns=True,
             start_min_override=start_min,
             start_max_override=start_max,
+            return_daily_returns=False,
         )
 
         if inputs is None:
@@ -1152,7 +1169,9 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
                               compute_returns=True,
                               start_min_override=None,
                               start_max_override=None,
-                              excluded_market_dates=None):
+                              excluded_market_dates=None,
+                              compute_keys=True,
+                              return_daily_returns=True):
     """
     向量化处理单只股票的所有合法窗口
 
@@ -1178,6 +1197,10 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
         compute_returns: 是否计算累计收益（默认 True）
         start_min_override: 覆盖默认的采样起始范围（用于评估集等非训练场景）
         start_max_override: 覆盖默认的采样截止范围
+        compute_keys: 是否构建 (stock_idx, start_idx) 键列表（仅时间顺序采样
+            消费，random 策略/采样模式下传 False 省去百万级 tuple 构建）
+        return_daily_returns: 是否物化变长逐日收益列表（评估集需要；
+            训练池等只消费累计收益的场景传 False，省去逐样本列表构建）
 
     Returns:
         (inputs, targets, returns_arr, keys, available_days, daily_returns_list) 或
@@ -1376,9 +1399,12 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
     Nv = len(vs)
 
     # ========== 未来数据处理 ==========
-    # 不需要标签和收益时，跳过未来数据验证（如归一化器训练数据收集）
-    if not compute_labels and not compute_returns:
-        keys = [(stock_idx, int(s)) for s in vs]
+    # 不需要标签和收益、且不要求完整未来窗口时，跳过未来数据验证
+    # （如归一化器训练数据收集）。注意：require_full_future=True 时即使
+    # 不要标签/收益也必须走未来验证——K线池采样（embedding 预训练）依赖
+    # 它剔除末尾无完整未来数据的窗口，跳过会改变池构成
+    if not compute_labels and not compute_returns and not require_full_future:
+        keys = [(stock_idx, int(s)) for s in vs] if compute_keys else []
         return input_seqs, np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32), keys, np.empty(0, dtype=np.int32), [], np.empty(0, dtype=bool)
 
     future_offsets = np.arange(future_days, dtype=np.intp)
@@ -1448,41 +1474,60 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
         (f_closes[:, 2] - f_closes[:, 1]) / safe_f_closes1,
         0.0)
 
-    # 标签计算（可选）
+    # 标签计算（可选）——优先向量化快路径（config.generate_label.batch，
+    # 与标量版逐位等价），仅自定义标签函数（无 .batch 属性）回退逐样本循环
     targets = np.empty(0, dtype=np.float32)
     if compute_labels:
-        targets = np.zeros(Nv, dtype=np.float32)
-        for i in range(Nv):
-            targets[i] = float(label_fn(
-                day1_change=day1_change[i],
-                day2_change=day2_change[i],
-                day3_change=day3_change[i]
-            ))
+        label_batch = getattr(label_fn, 'batch', None)
+        if label_batch is not None:
+            targets = label_batch(day1_change, day2_change, day3_change).astype(np.float32)
+        else:
+            targets = np.zeros(Nv, dtype=np.float32)
+            for i in range(Nv):
+                targets[i] = float(label_fn(
+                    day1_change=day1_change[i],
+                    day2_change=day2_change[i],
+                    day3_change=day3_change[i]
+                ))
 
-    # 收益计算（可选）
+    # 收益计算（可选）——同上走 calculate_returns.batch 快路径；
+    # t2/t3 传全量数组，None 语义由 available_days 掩码在 batch 内部承担
     returns_arr = np.empty(0, dtype=np.float32)
     daily_returns_list = []
     if compute_returns:
-        returns_arr = np.zeros(Nv, dtype=np.float32)
-        daily_returns_list = [None] * Nv
-        for i in range(Nv):
-            t1_open = future_data[i, 0, 0]
-            t1_close = f_closes[i, 0]
-            t2_open = future_data[i, 1, 0] if available_days[i] >= 2 else None
-            t2_close = f_closes[i, 1] if available_days[i] >= 2 else None
-            t3_close = f_closes[i, 2] if available_days[i] >= 3 else None
-            cum_ret, dr = returns_fn(
-                t1_open=t1_open, t1_close=t1_close,
-                t2_open=t2_open, t2_close=t2_close,
-                t3_close=t3_close,
-                day1_change=day1_change[i],
-                day2_change=day2_change[i] if available_days[i] >= 2 else None,
-                day3_change=day3_change[i] if available_days[i] >= 3 else None,
-            )
-            returns_arr[i] = cum_ret
-            daily_returns_list[i] = dr
+        returns_batch = getattr(returns_fn, 'batch', None)
+        if returns_batch is not None:
+            cum, daily_mat, daily_lens = returns_batch(
+                t1_open=future_data[:, 0, 0], t1_close=f_closes[:, 0],
+                t2_open=future_data[:, 1, 0], t2_close=f_closes[:, 1],
+                t3_close=f_closes[:, 2],
+                day1_change=day1_change, day2_change=day2_change,
+                available_days=available_days)
+            returns_arr = cum.astype(np.float32)
+            if return_daily_returns:
+                daily_returns_list = [daily_mat[i, :daily_lens[i]].tolist()
+                                      for i in range(Nv)]
+        else:
+            returns_arr = np.zeros(Nv, dtype=np.float32)
+            daily_returns_list = [None] * Nv
+            for i in range(Nv):
+                t1_open = future_data[i, 0, 0]
+                t1_close = f_closes[i, 0]
+                t2_open = future_data[i, 1, 0] if available_days[i] >= 2 else None
+                t2_close = f_closes[i, 1] if available_days[i] >= 2 else None
+                t3_close = f_closes[i, 2] if available_days[i] >= 3 else None
+                cum_ret, dr = returns_fn(
+                    t1_open=t1_open, t1_close=t1_close,
+                    t2_open=t2_open, t2_close=t2_close,
+                    t3_close=t3_close,
+                    day1_change=day1_change[i],
+                    day2_change=day2_change[i] if available_days[i] >= 2 else None,
+                    day3_change=day3_change[i] if available_days[i] >= 3 else None,
+                )
+                returns_arr[i] = cum_ret
+                daily_returns_list[i] = dr
 
-    keys = [(stock_idx, int(s)) for s in vs]
+    keys = [(stock_idx, int(s)) for s in vs] if compute_keys else []
 
     return input_seqs, targets, returns_arr, keys, available_days, daily_returns_list, tradeable_mask
 
@@ -1604,6 +1649,14 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None, max_pool
     # 加载极端行情日期，过滤 beta 驱动的噪声标签
     excluded_market_dates = load_excluded_market_dates()
 
+    # 采样模式（embedding 预训练/probe 的 K线池）只消费K线本身：
+    # targets/returns 展平采样后即被丢弃，逐样本标签/收益计算纯属浪费，
+    # 直接跳过（未来窗口完整性验证与 tradeable_mask 仍执行，池构成不变）
+    sampling_mode = max_pool_size is not None
+    # (stock_idx, start_idx)->pool_index 映射仅时间顺序采样策略消费；
+    # random 策略下百万级 tuple+dict 构建占数秒与数百MB内存，纯浪费
+    need_keys = (not sampling_mode) and DataConfig.SAMPLING_STRATEGY == 'temporal'
+
     for stock_idx, stock_info in enumerate(train_stock_info):
         result = _vectorized_process_stock(
             stock_info, stock_idx,
@@ -1612,6 +1665,10 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None, max_pool
             label_day1_use_open,
             generate_label, calculate_returns,
             excluded_market_dates=excluded_market_dates,
+            compute_labels=not sampling_mode,
+            compute_returns=not sampling_mode,
+            compute_keys=need_keys,
+            return_daily_returns=False,
         )
         inputs, targets, returns_arr, keys, _, _, tradeable_mask = result
 
@@ -1620,10 +1677,12 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None, max_pool
 
         # 过滤（可选）：排除T+1开盘涨停的不可交易样本
         # 仅训练阶段受 FILTER_LIMIT_UP_OPEN 控制；评估阶段始终过滤（在 create_fixed_evaluation_dataset 中）
+        # （采样模式下 targets/returns 为空数组，长度不匹配时跳过对应过滤）
         if filter_limit_up_open and tradeable_mask is not None and not np.all(tradeable_mask):
             inputs = inputs[tradeable_mask]
-            targets = targets[tradeable_mask]
-            returns_arr = returns_arr[tradeable_mask]
+            if len(targets) == len(tradeable_mask):
+                targets = targets[tradeable_mask]
+                returns_arr = returns_arr[tradeable_mask]
             keys = [k for k, m in zip(keys, tradeable_mask) if m]
 
         base_idx = total_samples

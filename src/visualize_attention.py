@@ -93,8 +93,19 @@ def load_test_samples(test_stock_info, feature_normalizer, max_samples=300):
                 t1_close = closes[start_idx + context_len]
 
                 day1_change = (t1_close - t1_open) / t1_open if t1_open > 0 else 0
-                day2_change = (closes[start_idx + context_len + 1] - closes[start_idx + context_len]) / closes[start_idx + context_len] if start_idx + context_len + 1 < data_length else 0
-                day3_change = (closes[start_idx + context_len + 2] - closes[start_idx + context_len + 1]) / closes[start_idx + context_len + 1] if start_idx + context_len + 2 < data_length else 0
+                # 日 2/3 涨跌幅：除以 0 检查（异常行情/缺失数据时 close 可能 =0）
+                day2_change = (
+                    (closes[start_idx + context_len + 1] - closes[start_idx + context_len])
+                    / closes[start_idx + context_len]
+                    if (start_idx + context_len + 1 < data_length
+                        and closes[start_idx + context_len] > 0) else 0
+                )
+                day3_change = (
+                    (closes[start_idx + context_len + 2] - closes[start_idx + context_len + 1])
+                    / closes[start_idx + context_len + 1]
+                    if (start_idx + context_len + 2 < data_length
+                        and closes[start_idx + context_len + 1] > 0) else 0
+                )
 
                 label = generate_label(day1_change, day2_change, day3_change)
 

@@ -640,7 +640,7 @@ class KLineEmbedding(nn.Module):
     网络足够浅（3层），无需残差连接，纯 MLP 即可充分学习非线性特征交互。
     """
 
-    def __init__(self, input_dim=ModelConfig.INPUT_DIM, d_model=128, expand_ratio=2):
+    def __init__(self, input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL, expand_ratio=2):
         super().__init__()
         hidden_dim = d_model * expand_ratio
         self.embed_proj = nn.Linear(input_dim, d_model, bias=False)
@@ -712,7 +712,7 @@ class PretrainModel(nn.Module):
     decoder、projector 与分类头均在预训练完成后丢弃，只保留 embedding 权重。
     """
 
-    def __init__(self, input_dim=ModelConfig.INPUT_DIM, d_model=128,
+    def __init__(self, input_dim=ModelConfig.INPUT_DIM, d_model=ModelConfig.D_MODEL,
                  expand_ratio=2, n_derived=0, cls_heads=None):
         super().__init__()
         self.embedding = KLineEmbedding(input_dim, d_model, expand_ratio)

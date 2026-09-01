@@ -488,7 +488,7 @@ def main():
     print(f"  [1/2] 位置编码清零    AUC={masked_auc:.6f}({auc_change:+.6f})  Loss={masked_loss:.6f}({loss_change:+.6f})")
 
     rng = np.random.RandomState(42)
-    perm = rng.permutation(45).tolist()
+    perm = rng.permutation(DataConfig.CONTEXT_LENGTH).tolist()
     model.load_state_dict(copy.deepcopy(original_state_dict))
     with torch.no_grad():
         orig_weight = model.pos_encoding.pe.weight.data.clone()

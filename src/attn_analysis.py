@@ -18,11 +18,7 @@
 实验三 · 位置编码:
   将可学习位置编码清零，测量 AUC 和 Loss 变化，验证模型是否真正利用了时序信息。
 
-屏蔽方法:
-  将 nn.MultiheadAttention 的 in_proj_weight 中对应头的 Q/K/V 投影行置零，
-  等效于该头输出全零向量，不影响其他头的计算。
-
-模型选择方式与 run.py 完全一致。
+模型选择方式与 run.py 保持一致。
 """
 
 import os
@@ -46,12 +42,35 @@ from run import list_available_models, select_model, load_model
 
 
 def _mask_mha_head(mha, head_idx, head_dim):
-    d_model = mha.embed_dim
+    """
+    屏蔽指定头（等效于移除该头对最终输出的全部贡献，头输出恒为 0）
+
+    兼容两种实现：
+    - 对于nn.MultiheadAttention（标准库，如 AttentionPooling.cross_attn）：
+      in_proj_weight 中该头的 Q/K/V 行置零。
+    - 对于自定义 MultiHeadAttention（src/model.py，TransformerLayer.attn，
+      分离的 q/k/v/o_proj、bias=False）：仅置零 v_proj 中该头对应的
+      输出行即可——V_h = 0 使该头输出恒为 0，与注意力权重取值无关；
+      o_proj 无需改动（该头输入恒 0），也不影响其他头的计算。
+
+    注意：对自定义 MHA 只置零 q_proj 是错误的——Q = 0 仅使注意力
+    权重均匀化（softmax 全等），头输出变为 V 的序列均值 mean(V_h)
+    而非 0，头仍然向残差流注入信号，屏蔽实验的结论会失真。
+    """
     with torch.no_grad():
-        for offset in [0, d_model, 2 * d_model]:
-            s = offset + head_idx * head_dim
-            e = offset + (head_idx + 1) * head_dim
-            mha.in_proj_weight[s:e, :] = 0
+        if hasattr(mha, 'in_proj_weight') and mha.in_proj_weight is not None:
+            d_model = mha.embed_dim
+            for offset in [0, d_model, 2 * d_model]:
+                s = offset + head_idx * head_dim
+                e = offset + (head_idx + 1) * head_dim
+                mha.in_proj_weight[s:e, :] = 0
+            return
+        
+        # 对于自定义 MultiHeadAttention: 头维度连续排列，头 h 的输出行区间
+        # = [h*head_dim, (h+1)*head_dim)，置零 v_proj 对应行实现真屏蔽。
+        s = head_idx * head_dim
+        e = (head_idx + 1) * head_dim
+        mha.v_proj.weight[s:e, :] = 0
 
 
 def _create_eval_criterion(eval_targets):

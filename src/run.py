@@ -751,7 +751,7 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
     
     print(f"└───────────────────────────────────────────────┘")
 
-    stats['eval_targets'] = np.array(eval_targets)
+    stats['eval_targets'] = stats['all_targets']
 
     return stats
 

@@ -145,18 +145,32 @@ def _print_weight_stats(model, num_layers):
     print(f"  embed_mlp[2]      {_s2(model.embed_mlp[2].weight.std().item())}")
     for i, layer in enumerate(model.layers):
         mha = layer.attn
+        # 兼容两种实现：nn.MultiheadAttention（in_proj_weight/out_proj）
+        # 与 EquiNet 自定义 MultiHeadAttention（分离的 q/k/v/o_proj）。
+        # EquiNet MHA 没有 in_proj_weight 属性，原 hasattr 守卫会静默跳过
+        # 所有 Q/K/V 投影打印，使注意力权重 std 在诊断输出中完全缺失。
         if hasattr(mha, 'in_proj_weight') and mha.in_proj_weight is not None:
             print(f"  L{i+1}.in_proj      {_s2(mha.in_proj_weight.std().item())}")
-        if hasattr(mha, 'out_proj') and mha.out_proj.weight is not None:
-            print(f"  L{i+1}.out_proj     {_s2(mha.out_proj.weight.std().item())}")
+        elif hasattr(mha, 'q_proj'):
+            print(f"  L{i+1}.q_proj       {_s2(mha.q_proj.weight.std().item())}")
+            print(f"  L{i+1}.k_proj       {_s2(mha.k_proj.weight.std().item())}")
+            print(f"  L{i+1}.v_proj       {_s2(mha.v_proj.weight.std().item())}")
+        if hasattr(mha, 'out_proj'):
+            out_w = mha.out_proj.weight if hasattr(mha.out_proj, 'weight') else None
+            if out_w is not None:
+                print(f"  L{i+1}.out_proj     {_s2(out_w.std().item())}")
+        elif hasattr(mha, 'o_proj'):
+            print(f"  L{i+1}.o_proj       {_s2(mha.o_proj.weight.std().item())}")
         print(f"  L{i+1}.ffn_w1       {_s2(layer.ffn_w1.weight.std().item())}")
         print(f"  L{i+1}.ffn_w3       {_s2(layer.ffn_w3.weight.std().item())}")
         print(f"  L{i+1}.ffn_w2       {_s2(layer.ffn_w2.weight.std().item())}")
     pool_mha = model.attention_pooling.cross_attn
+    # AttentionPooling 使用标准 nn.MultiheadAttention（有 in_proj_weight）；
+    # 走 in_proj_weight 路径打印 Q/K/V 合并权重与 out_proj
     if hasattr(pool_mha, 'in_proj_weight') and pool_mha.in_proj_weight is not None:
         print(f"  pool.in_proj      {_s2(pool_mha.in_proj_weight.std().item())}")
-    if hasattr(pool_mha, 'out_proj') and pool_mha.out_proj.weight is not None:
-        print(f"  pool.out_proj     {_s2(pool_mha.out_proj.weight.std().item())}")
+        if hasattr(pool_mha, 'out_proj') and pool_mha.out_proj.weight is not None:
+            print(f"  pool.out_proj     {_s2(pool_mha.out_proj.weight.std().item())}")
     print(f"  output            {_s2(model.output_projection.weight.std().item())}")
     print("─" * 45)
 

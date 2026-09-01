@@ -534,8 +534,8 @@ def visualize_classification(preds, targets, title="模型分类能力可视化"
 
     plt.tight_layout()
 
-    save_path = os.path.join('output', 'classification_visualization.png')
-    os.makedirs('output', exist_ok=True)
+    os.makedirs(DataConfig.OUTPUT_DIR, exist_ok=True)
+    save_path = os.path.join(DataConfig.OUTPUT_DIR, 'classification_visualization.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f'分类可视化已保存: {save_path}')
     plt.close()

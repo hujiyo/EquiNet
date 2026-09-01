@@ -137,7 +137,8 @@ def _print_gradient_flow(grad_stats):
     print("─" * 40)
 
 
-def _print_weight_stats(model, num_layers):
+def _print_weight_stats(model):
+    """打印各层权重 std。"""
     print("\n权重 std")
     print("─" * 45)
     print(f"  embed_proj        {_s2(model.embed_proj.weight.std().item())}")
@@ -235,7 +236,7 @@ def main():
     model.eval()
 
     # 权重统计
-    _print_weight_stats(model, num_layers)
+    _print_weight_stats(model)
 
 
 if __name__ == "__main__":

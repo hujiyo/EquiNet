@@ -28,6 +28,64 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_RUN_DIR = os.path.join(_PROJECT_ROOT, 'out_run')
 
 
+# ==================== MC Dropout 推理（可选，--mc-dropout 启用） ====================
+
+MC_DROPOUT_P = 0.1       # MC Dropout 概率（默认值，可用 --mc-p 覆盖）
+MC_SAMPLES = 100          # 每个样本的前向传播次数（默认值，可用 --mc-samples 覆盖）
+
+
+def set_mc_dropout(model, p=MC_DROPOUT_P):
+    """
+    将模型中所有 Dropout 层的概率设为 p，用于 MC Dropout 推理。
+    返回被修改的 Dropout 层数量。
+    """
+    count = 0
+    for module in model.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.p = p
+            count += 1
+    return count
+
+
+def mc_dropout_predict(model, eval_inputs, device, num_samples=MC_SAMPLES,
+                       batch_size=DataConfig.EVAL_BATCH_SIZE):
+    """
+    MC Dropout 推理：对每个样本执行 num_samples 次前向传播（保持 Dropout 激活），
+    返回 sigmoid 后的平均预测。
+
+    Args:
+        model: 已加载的模型（会被设为 train 模式以使 Dropout 生效）
+        eval_inputs: numpy 数组，形状 (N, seq_len, input_dim)
+        device: torch.device
+        num_samples: MC 采样次数
+        batch_size: 每次前向传播的批大小
+
+    Returns:
+        numpy 数组，形状 (N,)
+    """
+    model.train()  # 保持 Dropout 激活
+    amp_ctx = _get_amp_context(device)
+    num_total = len(eval_inputs)
+    num_batches = (num_total + batch_size - 1) // batch_size
+
+    # 累加器：逐 batch、逐 sample 累加 sigmoid 预测值
+    accum = np.zeros(num_total, dtype=np.float64)
+
+    for t in range(num_samples):
+        with torch.no_grad():
+            for i in range(num_batches):
+                start = i * batch_size
+                end = min((i + 1) * batch_size, num_total)
+                batch = torch.tensor(eval_inputs[start:end], dtype=torch.float32, device=device)
+                with amp_ctx:
+                    logits = model(batch)
+                preds = torch.sigmoid(logits.float()).cpu().numpy().flatten()
+                accum[start:end] += preds
+                del batch, logits
+
+    return (accum / num_samples).astype(np.float32)
+
+
 # ==================== 工具函数 ====================
 
 def parse_model_filename(filename):
@@ -193,16 +251,19 @@ def load_all_stock_data(db_path=DataConfig.DB_PATH):
     return stock_list
 
 
-def score_all_stocks(model, stock_list, device, feature_normalizer=None):
+def score_all_stocks(model, stock_list, device, feature_normalizer=None,
+                     mc_dropout=False, mc_samples=MC_SAMPLES):
     """
     为所有股票打分
-    
+
     Args:
         model: 模型实例
         stock_list: 股票数据列表
         device: 设备
         feature_normalizer: 可选的特征归一化器实例
-    
+        mc_dropout: 启用 MC Dropout 推理（多次前向取平均）
+        mc_samples: MC Dropout 前向传播次数
+
     返回: [(stock_code, score, latest_date, latest_close, latest_change_pct), ...]
     """
     results = []
@@ -238,23 +299,26 @@ def score_all_stocks(model, stock_list, device, feature_normalizer=None):
     if len(all_inputs) == 0:
         return [], skipped
     
-    # 批量推理
+    # 批量推理（MC Dropout 模式下多次前向取平均）
     batch_size = DataConfig.EVAL_BATCH_SIZE
     all_inputs_np = np.array(all_inputs)
-    all_scores = []
-    amp_ctx = _get_amp_context(device)
+    if mc_dropout:
+        all_scores = mc_dropout_predict(model, all_inputs_np, device, num_samples=mc_samples)
+    else:
+        all_scores = []
+        amp_ctx = _get_amp_context(device)
 
-    num_batches = (len(all_inputs_np) + batch_size - 1) // batch_size
-    with torch.no_grad():
-        for i in range(num_batches):
-            start = i * batch_size
-            end = min((i + 1) * batch_size, len(all_inputs_np))
-            batch = torch.tensor(all_inputs_np[start:end], dtype=torch.float32, device=device)
-            with amp_ctx:
-                logits = model(batch)
-            preds = torch.sigmoid(logits.float()).cpu().numpy().flatten()
-            all_scores.extend(preds)
-            del batch, logits
+        num_batches = (len(all_inputs_np) + batch_size - 1) // batch_size
+        with torch.no_grad():
+            for i in range(num_batches):
+                start = i * batch_size
+                end = min((i + 1) * batch_size, len(all_inputs_np))
+                batch = torch.tensor(all_inputs_np[start:end], dtype=torch.float32, device=device)
+                with amp_ctx:
+                    logits = model(batch)
+                preds = torch.sigmoid(logits.float()).cpu().numpy().flatten()
+                all_scores.extend(preds)
+                del batch, logits
     
     # 组合结果
     for i in range(len(all_codes)):
@@ -530,7 +594,7 @@ def select_model(models):
 
 
 def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
-                   begin_date=None):
+                   begin_date=None, mc_dropout=False, mc_p=MC_DROPOUT_P, mc_samples=MC_SAMPLES):
     """
     执行模型评估（与 train.py 中对模型A的评估完全一致）
     返回评估统计字典
@@ -539,6 +603,9 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
         feature_normalizer: 可选的特征归一化器实例
         begin_date: 可选，每日统计的起始测评日期(int YYYYMMDD)。
                     仅展示/导出 预测日 >= begin_date 的交易日，不影响阈值计算。
+        mc_dropout: 启用 MC Dropout 推理（多次前向取平均）
+        mc_p: MC Dropout 概率
+        mc_samples: MC Dropout 前向传播次数
     """
     print(f"正在创建评估数据集...")
     if begin_date is not None:
@@ -549,7 +616,16 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
         create_fixed_evaluation_dataset(test_stock_info, feature_normalizer, start_date=begin_date)
 
     print(f"- 评估样本数: {len(eval_inputs)}")
-    print(f"正在评估模型...")
+
+    # MC Dropout：强制所有 Dropout 层生效
+    predict_fn = None
+    if mc_dropout:
+        num_dropout = set_mc_dropout(model, p=mc_p)
+        print(f"- 已将 {num_dropout} 个 Dropout 层设为 p={mc_p}")
+        print(f"正在评估模型 (MC Dropout ×{mc_samples})...")
+        predict_fn = lambda m, x, d: mc_dropout_predict(m, x, d, num_samples=mc_samples)
+    else:
+        print(f"正在评估模型...")
 
     # 创建评估损失函数（与 train.py 一致）
     if LossConfig.LOSS_TYPE.lower() == 'dynamic_bce':
@@ -572,7 +648,7 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
     else:
         raise ValueError(f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE} (支持: dynamic_bce / pairwise_bce / balanced_bce)")
 
-    # 评估模型（同时计算测试损失，避免冗余前向传播）
+    # 评估模型（同时计算测试损失，避免冗余前向传播；MC Dropout 时预测走 predict_fn）
     stats = evaluate_model(
         model, eval_inputs, eval_targets, eval_cumulative_returns,
         device, model_name="选中模型",
@@ -580,7 +656,8 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
         eval_daily_returns=eval_daily_returns,
         criterion=eval_criterion,
         enable_portfolio_simulation=True,
-        tradeable_mask=eval_tradeable_mask
+        tradeable_mask=eval_tradeable_mask,
+        predict_fn=predict_fn
     )
     test_loss = stats['test_loss']
 
@@ -594,7 +671,10 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
 
     # 打印评估结果（与 train.py 格式一致）
     print()
-    print(f"┌── 评估结果 ──────────────────────────────────┐")
+    if mc_dropout:
+        print(f"┌── 评估结果 (MC Dropout: p={mc_p}, samples={mc_samples}) ──┐")
+    else:
+        print(f"┌── 评估结果 ──────────────────────────────────┐")
     print(f"│  测试损失:          {test_loss:.4f}")
     print(f"│  AUC:              {stats['auc']:.4f}")
     base_rate = stats.get('base_positive_rate', 0)
@@ -676,17 +756,20 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
     return stats
 
 
-def run_stock_selection(model, threshold, device, feature_normalizer=None):
+def run_stock_selection(model, threshold, device, feature_normalizer=None,
+                        mc_dropout=False, mc_samples=MC_SAMPLES):
     """
     执行选股
-    
+
     Args:
         model: 模型实例
         threshold: 选股阈值
         device: 设备
         feature_normalizer: 可选的特征归一化器实例
+        mc_dropout: 启用 MC Dropout 推理（多次前向取平均）
+        mc_samples: MC Dropout 前向传播次数
     """
-    print_section("选股推理")
+    print_section("选股推理 (MC Dropout)" if mc_dropout else "选股推理")
     print(f"│  正在加载全部股票数据...")
     
     stock_list = load_all_stock_data()
@@ -707,9 +790,13 @@ def run_stock_selection(model, threshold, device, feature_normalizer=None):
     
     print(f"│  数据截至日期: {main_date}")
     print(f"│  使用阈值: {threshold:.10f}")
-    print(f"│  正在对所有股票打分...")
-    
-    results, skipped = score_all_stocks(model, stock_list, device, feature_normalizer)
+    if mc_dropout:
+        print(f"│  正在对所有股票打分 (MC Dropout ×{mc_samples})...")
+    else:
+        print(f"│  正在对所有股票打分...")
+
+    results, skipped = score_all_stocks(model, stock_list, device, feature_normalizer,
+                                        mc_dropout=mc_dropout, mc_samples=mc_samples)
     
     print(f"│  有效股票: {len(results)} 只，跳过（涨停/数据不足）: {skipped} 只")
     
@@ -871,15 +958,16 @@ def print_recent_days_chart(daily_stats, last_n=10):
     print("╚" + "═"*52 + "╝")
 
 
-def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4, threshold=None, feature_normalizer=None):
+def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4, threshold=None, feature_normalizer=None,
+                                mc_dropout=False, mc_samples=MC_SAMPLES):
     """
     计算最近几天的实战收益率（用于展示，包含临时数据）
-    
+
     关键设计：
     - 阈值来源：直接使用传入的阈值（由 run_evaluation 计算，基于固定评估集）
     - 选股范围：所有样本（包括临时样本），用于展示最近几天的选股情况
     - 临时样本：仅用于展示，方便用户决策，不参与任何阈值计算
-    
+
     Args:
         model: 模型实例
         test_stock_info: 测试集股票信息列表
@@ -887,30 +975,35 @@ def calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=4,
         top_n_per_day: 每日选股数量
         threshold: 选股阈值
         feature_normalizer: 可选的特征归一化器实例
-    
+        mc_dropout: 启用 MC Dropout 推理（多次前向取平均）
+        mc_samples: MC Dropout 前向传播次数
+
     返回: daily_stats [(count, return, available_days), ...]
     """
     recent_inputs, recent_returns, recent_day_indices, recent_available_days = \
         create_recent_days_dataset(test_stock_info, feature_normalizer, max_days=15)
-    
+
     if recent_inputs is None or len(recent_inputs) == 0:
         return []
-    
-    model.eval()
-    all_preds = []
-    amp_ctx = _get_amp_context(device)
 
-    with torch.no_grad():
-        batch_size = DataConfig.EVAL_BATCH_SIZE
-        for i in range(0, len(recent_inputs), batch_size):
-            batch = torch.tensor(recent_inputs[i:i+batch_size], dtype=torch.float32, device=device)
-            with amp_ctx:
-                logits = model(batch)
-            preds = torch.sigmoid(logits.float()).cpu().numpy().flatten()
-            all_preds.extend(preds)
-            del batch, logits
-    
-    all_preds = np.array(all_preds)
+    if mc_dropout:
+        all_preds = mc_dropout_predict(model, np.array(recent_inputs), device, num_samples=mc_samples)
+    else:
+        model.eval()
+        all_preds = []
+        amp_ctx = _get_amp_context(device)
+
+        with torch.no_grad():
+            batch_size = DataConfig.EVAL_BATCH_SIZE
+            for i in range(0, len(recent_inputs), batch_size):
+                batch = torch.tensor(recent_inputs[i:i+batch_size], dtype=torch.float32, device=device)
+                with amp_ctx:
+                    logits = model(batch)
+                preds = torch.sigmoid(logits.float()).cpu().numpy().flatten()
+                all_preds.extend(preds)
+                del batch, logits
+
+        all_preds = np.array(all_preds)
     all_returns = np.array(recent_returns)
     all_available_days = np.array(recent_available_days)
     
@@ -983,6 +1076,13 @@ def main():
     parser.add_argument('--begin', type=str, default=None, metavar='YYYYMMDD',
                         help='每日统计的起始测评日期(如 20260301)：仅展示并导出 该日及之后的'
                              '交易日，不影响选股阈值计算。')
+    parser.add_argument('--mc-dropout', action='store_true',
+                        help='启用 MC Dropout 推理：评估、选股、最近几天统计均使用多次前向传播取平均，'
+                             'Dropout 层在推理时保持激活以估计预测不确定性。')
+    parser.add_argument('--mc-p', type=float, default=MC_DROPOUT_P, metavar='P',
+                        help=f'MC Dropout 概率 (默认 {MC_DROPOUT_P})')
+    parser.add_argument('--mc-samples', type=int, default=MC_SAMPLES, metavar='N',
+                        help=f'MC Dropout 每个样本的前向传播次数 (默认 {MC_SAMPLES})')
     args = parser.parse_args()
 
     begin_date = None
@@ -994,6 +1094,8 @@ def main():
         begin_date = int(raw)
 
     print_banner()
+    if args.mc_dropout:
+        print(f"  *** MC Dropout 模式 (p={args.mc_p}, samples={args.mc_samples}) ***")
 
     # 获取设备
     device = DeviceConfig.get_device()
@@ -1054,7 +1156,8 @@ def main():
 
     # 运行评估
     stats = run_evaluation(model, test_stock_info, device, feature_normalizer,
-                           begin_date=begin_date)
+                           begin_date=begin_date,
+                           mc_dropout=args.mc_dropout, mc_p=args.mc_p, mc_samples=args.mc_samples)
     threshold = stats['top_threshold']
 
     # 导出每日统计 JSON 到 out_run/（功能2）
@@ -1083,10 +1186,13 @@ def main():
     else:
         print(f"\n  （无可导出的每日统计数据）")
 
+    viz_title = f"模型分类能力可视化 (AUC={stats['auc']:.4f})"
+    if args.mc_dropout:
+        viz_title += f", MC Dropout (p={args.mc_p}, ×{args.mc_samples})"
     visualize_classification(
         preds=stats['all_preds'],
         targets=stats['eval_targets'],
-        title=f"模型分类能力可视化 (AUC={stats['auc']:.4f})"
+        title=viz_title
     )
     
     # 询问是否选股
@@ -1100,11 +1206,15 @@ def main():
             return
         print("  请输入 y 或 n")
     
-    # 执行选股
-    results = run_stock_selection(model, threshold, device, feature_normalizer)
-    
+    # 执行选股（MC Dropout 模式下选股前确保 Dropout 已激活）
+    if args.mc_dropout:
+        set_mc_dropout(model, p=args.mc_p)
+    results = run_stock_selection(model, threshold, device, feature_normalizer,
+                                  mc_dropout=args.mc_dropout, mc_samples=args.mc_samples)
+
     # 计算并打印最近10天实战收益率表格（包含临时数据，仅用于展示）
-    recent_stats = calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=DataConfig.TOP_N_PER_DAY, threshold=threshold, feature_normalizer=feature_normalizer)
+    recent_stats = calculate_recent_days_stats(model, test_stock_info, device, top_n_per_day=DataConfig.TOP_N_PER_DAY, threshold=threshold, feature_normalizer=feature_normalizer,
+                                               mc_dropout=args.mc_dropout, mc_samples=args.mc_samples)
     if recent_stats:
         print_recent_days_chart(recent_stats, last_n=10)
     

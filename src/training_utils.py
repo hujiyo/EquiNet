@@ -394,12 +394,18 @@ class PairwiseWeightedBCE(DynamicWeightedBCE):
 
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
                    device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None,
-                   criterion=None, enable_portfolio_simulation=False, tradeable_mask=None):
+                   criterion=None, enable_portfolio_simulation=False, tradeable_mask=None,
+                   predict_fn=None):
     """
     模型评估函数
     涨停样本已在向量化批处理中过滤，无需再次过滤
 
     分批处理，减少显存占用
+
+    Args:
+        predict_fn: 可选的自定义推理函数 (model, eval_inputs, device) -> preds(np.ndarray)。
+                    提供时（如 MC Dropout 推理）预测由它完成，损失仍用 eval 模式确定性前向计算；
+                    为 None 时走默认单次前向推理。
 
     返回统计字典，包含：
         auc：AUC得分
@@ -430,27 +436,46 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     num_batches = (num_samples + batch_size - 1) // batch_size
     amp_ctx = _get_amp_context(device)
 
-    with torch.no_grad():
-        for i in range(num_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, num_samples)
+    if predict_fn is not None:
+        # 自定义推理路径（如 MC Dropout）：predict_fn 内部自行管理 train/eval 模式
+        all_preds = predict_fn(model, eval_inputs, device)
+        if criterion is not None:
+            model.eval()  # 损失用确定性 eval 前向计算
+            with torch.no_grad():
+                for i in range(num_batches):
+                    start_idx = i * batch_size
+                    end_idx = min((i + 1) * batch_size, num_samples)
 
-            batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], dtype=torch.float32, device=device)
-            with amp_ctx:
-                logits = model(batch_inputs)
-            logits = logits.float()
-            scores = torch.sigmoid(logits)
-            all_preds.append(scores.cpu().numpy().flatten())
+                    batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], dtype=torch.float32, device=device)
+                    batch_targets = torch.tensor(eval_targets[start_idx:end_idx], dtype=torch.float32, device=device)
+                    with amp_ctx:
+                        logits = model(batch_inputs)
+                    logits = logits.float()
+                    loss = criterion(logits.squeeze(-1), batch_targets)
+                    total_loss += loss.item() * (end_idx - start_idx)
+                    del batch_inputs, batch_targets, logits
+    else:
+        with torch.no_grad():
+            for i in range(num_batches):
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, num_samples)
 
-            if criterion is not None:
-                batch_targets = torch.tensor(eval_targets[start_idx:end_idx], dtype=torch.float32, device=device)
-                loss = criterion(logits.squeeze(-1), batch_targets)
-                total_loss += loss.item() * (end_idx - start_idx)
-                del batch_targets
+                batch_inputs = torch.tensor(eval_inputs[start_idx:end_idx], dtype=torch.float32, device=device)
+                with amp_ctx:
+                    logits = model(batch_inputs)
+                logits = logits.float()
+                scores = torch.sigmoid(logits)
+                all_preds.append(scores.cpu().numpy().flatten())
 
-            del batch_inputs, logits
+                if criterion is not None:
+                    batch_targets = torch.tensor(eval_targets[start_idx:end_idx], dtype=torch.float32, device=device)
+                    loss = criterion(logits.squeeze(-1), batch_targets)
+                    total_loss += loss.item() * (end_idx - start_idx)
+                    del batch_targets
 
-    all_preds = np.concatenate(all_preds)
+                del batch_inputs, logits
+
+        all_preds = np.concatenate(all_preds)
     all_targets = np.array(eval_targets)
     all_returns = np.array(eval_cumulative_returns)
 

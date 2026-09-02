@@ -16,7 +16,7 @@ from data import (
     create_fixed_evaluation_dataset,
     FeatureNormalizer,
 )
-from training_utils import DynamicWeightedBCE, BalancedBCE
+from training_utils import create_eval_criterion
 from run import list_available_models, select_model, load_model
 
 
@@ -54,27 +54,6 @@ def _register_gradient_hooks(model):
         hooks.append(h)
 
     return hooks, grad_stats
-
-
-def _create_eval_criterion(eval_targets):
-    if LossConfig.LOSS_TYPE.lower() == 'dynamic_bce':
-        criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
-        test_targets = np.array(eval_targets)
-        test_pos = np.sum(test_targets >= 0.5)
-        test_neg = np.sum(test_targets < 0.5)
-        if test_pos > 0 and test_neg > 0:
-            neg_w = LossConfig.POS_WEIGHT * (test_pos / test_neg)
-        elif test_pos == 0:
-            neg_w = float(LossConfig.POS_WEIGHT)
-        else:
-            neg_w = 0.1
-        criterion.weight_0_0.fill_(neg_w)
-    elif LossConfig.LOSS_TYPE.lower() == 'balanced_bce':
-        criterion = BalancedBCE(reduction='mean')
-        criterion.update_weights(np.array(eval_targets))
-    else:
-        raise ValueError(f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE} (支持: dynamic_bce / pairwise_bce / balanced_bce)")
-    return criterion
 
 
 def _print_forward_flow(model, eval_inputs, device):
@@ -223,7 +202,7 @@ def main():
     # 梯度流
     grad_hooks, grad_stats = _register_gradient_hooks(model)
     model.train()
-    eval_criterion = _create_eval_criterion(eval_targets)
+    eval_criterion = create_eval_criterion(eval_targets)
     grad_batch = torch.tensor(eval_inputs[:64], dtype=torch.float32, device=device)
     grad_targets = torch.tensor(eval_targets[:64], dtype=torch.float32, device=device)
     model.zero_grad()

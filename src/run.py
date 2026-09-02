@@ -20,7 +20,7 @@ from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
                   create_recent_days_dataset, normalize_and_validate_context_window)
-from training_utils import evaluate_model, DynamicWeightedBCE, BalancedBCE, _get_amp_context
+from training_utils import evaluate_model, create_eval_criterion, _get_amp_context
 
 
 # 每日统计 JSON 与可视化输出目录（项目根 /out_run，已被 .gitignore 的 out*/ 覆盖）
@@ -627,26 +627,8 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
     else:
         print(f"正在评估模型...")
 
-    # 创建评估损失函数（与 train.py 一致）
-    if LossConfig.LOSS_TYPE.lower() == 'dynamic_bce':
-        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
-
-        # 测试集权重
-        test_targets = np.array(eval_targets)
-        test_pos_count = np.sum(test_targets >= 0.5)
-        test_neg_count = np.sum(test_targets < 0.5)
-        if test_pos_count > 0 and test_neg_count > 0:
-            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
-        elif test_pos_count == 0:
-            test_neg_weight = float(LossConfig.POS_WEIGHT)
-        else:
-            test_neg_weight = 0.1
-        eval_criterion.weight_0_0.fill_(test_neg_weight)
-    elif LossConfig.LOSS_TYPE.lower() == 'balanced_bce':
-        eval_criterion = BalancedBCE(reduction='mean')
-        eval_criterion.update_weights(np.array(eval_targets))
-    else:
-        raise ValueError(f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE} (支持: dynamic_bce / pairwise_bce / balanced_bce)")
+    # 创建评估损失函数（与 train.py 一致；走统一入口 create_eval_criterion）
+    eval_criterion = create_eval_criterion(eval_targets)
 
     # 评估模型（同时计算测试损失，避免冗余前向传播；MC Dropout 时预测走 predict_fn）
     stats = evaluate_model(

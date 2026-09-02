@@ -186,6 +186,61 @@ def print_dispersion_sparkline(all_preds, epoch_returns_history=None, all_target
         
         print(f'    趋势: {status} ({std_change:+.1f}%) | 收益率变化: ({return_change:+.1f}%)')
 
+def create_eval_criterion(eval_targets):
+    """
+    统一构造评估损失函数（与 train.py 训练末段测试集损失一致的口径）
+
+    训练与诊断脚本过去各自复制粘贴同一段"按 LossConfig.LOSS_TYPE 选损失类、
+    按正负比例校准权重"的样板代码，新增 LossConfig.LOSS_TYPE 分支时极易遗漏。
+    统一入口让新增分支只动一处。
+
+    Args:
+        eval_targets: 评估集标签序列（标量/数组均可，内部统一转 np.array）
+
+    Returns:
+        配好权重的损失函数实例：
+        - dynamic_bce / pairwise_bce → DynamicWeightedBCE
+        - balanced_bce → BalancedBCE
+
+    Raises:
+        ValueError: 当 LossConfig.LOSS_TYPE 不在已知分支中
+    """
+    targets_arr = np.asarray(eval_targets)
+    if LossConfig.LOSS_TYPE.lower() == 'dynamic_bce':
+        criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        pos_count = int(np.sum(targets_arr >= 0.5))
+        neg_count = int(np.sum(targets_arr < 0.5))
+        if pos_count > 0 and neg_count > 0:
+            neg_w = LossConfig.POS_WEIGHT * (pos_count / neg_count)
+        elif pos_count == 0:
+            neg_w = float(LossConfig.POS_WEIGHT)
+        else:
+            neg_w = 0.1
+        criterion.weight_0_0.fill_(neg_w)
+        return criterion
+    if LossConfig.LOSS_TYPE.lower() == 'balanced_bce':
+        criterion = BalancedBCE(reduction='mean')
+        criterion.update_weights(targets_arr)
+        return criterion
+    if LossConfig.LOSS_TYPE.lower() == 'pairwise_bce':
+        # Pairwise 仅用于训练；评估口径与 train.py 旧版一致：纯 DynamicWeightedBCE
+        # 按正负比例填 neg_weight。
+        criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
+        pos_count = int(np.sum(targets_arr >= 0.5))
+        neg_count = int(np.sum(targets_arr < 0.5))
+        if pos_count > 0 and neg_count > 0:
+            neg_w = LossConfig.POS_WEIGHT * (pos_count / neg_count)
+        elif pos_count == 0:
+            neg_w = float(LossConfig.POS_WEIGHT)
+        else:
+            neg_w = 0.1
+        criterion.weight_0_0.fill_(neg_w)
+        return criterion
+    raise ValueError(
+        f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE} "
+        "(支持: dynamic_bce / pairwise_bce / balanced_bce)")
+
+
 class DynamicWeightedBCE(nn.Module):
     """
     动态加权BCE损失函数：按标签桶分配权重

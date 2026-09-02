@@ -36,7 +36,7 @@ from data import (
     create_fixed_evaluation_dataset,
     FeatureNormalizer,
 )
-from training_utils import _get_amp_context, DynamicWeightedBCE, BalancedBCE
+from training_utils import _get_amp_context, create_eval_criterion
 from run import list_available_models, select_model, load_model
 
 
@@ -73,27 +73,6 @@ def _mask_mha_head(mha, head_idx, head_dim):
         mha.v_proj.weight[s:e, :] = 0
 
 
-def _create_eval_criterion(eval_targets):
-    if LossConfig.LOSS_TYPE.lower() == 'dynamic_bce':
-        criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
-        test_targets = np.array(eval_targets)
-        test_pos_count = np.sum(test_targets >= 0.5)
-        test_neg_count = np.sum(test_targets < 0.5)
-        if test_pos_count > 0 and test_neg_count > 0:
-            test_neg_weight = LossConfig.POS_WEIGHT * (test_pos_count / test_neg_count)
-        elif test_pos_count == 0:
-            test_neg_weight = float(LossConfig.POS_WEIGHT)
-        else:
-            test_neg_weight = 0.1
-        criterion.weight_0_0.fill_(test_neg_weight)
-    elif LossConfig.LOSS_TYPE.lower() == 'balanced_bce':
-        criterion = BalancedBCE(reduction='mean')
-        criterion.update_weights(np.array(eval_targets))
-    else:
-        raise ValueError(f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE} (支持: dynamic_bce / pairwise_bce / balanced_bce)")
-    return criterion
-
-
 def _compute_auc_and_loss(model, eval_inputs, eval_targets, device, criterion=None, batch_size=DataConfig.EVAL_BATCH_SIZE, tradeable_mask=None):
     model.eval()
     all_preds = []
@@ -103,7 +82,7 @@ def _compute_auc_and_loss(model, eval_inputs, eval_targets, device, criterion=No
     amp_ctx = _get_amp_context(device)
 
     if criterion is None:
-        criterion = _create_eval_criterion(eval_targets)
+        criterion = create_eval_criterion(eval_targets)
 
     with torch.no_grad():
         for i in range(num_batches):
@@ -331,7 +310,7 @@ def main():
     print(f"  验证集样本数: {len(eval_inputs)}")
 
     original_state_dict = copy.deepcopy(model.state_dict())
-    eval_criterion = _create_eval_criterion(eval_targets)
+    eval_criterion = create_eval_criterion(eval_targets)
 
     print(f"\n正在计算 Baseline...")
     baseline_auc, baseline_loss = _compute_auc_and_loss(model, eval_inputs, eval_targets, device, eval_criterion, tradeable_mask=eval_tradeable_mask)

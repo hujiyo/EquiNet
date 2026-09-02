@@ -38,7 +38,8 @@ from training_utils import (
     print_dispersion_sparkline,
     create_optimizer_from_config_for_params,
     create_scheduler_from_config,
-    training_step
+    training_step,
+    create_eval_criterion,
 )
 
 def train(model, train_stock_info, val_stock_info, test_stock_info,
@@ -123,39 +124,30 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             sigma=LossConfig.PAIRWISE_SIGMA,
             num_neg=LossConfig.PAIRWISE_NUM_NEG
         )
-        # 评估损失始终使用纯BCE（Pairwise仅用于训练）
-        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
     elif LossConfig.LOSS_TYPE.lower() == 'dynamic_bce':
         print("损失函数: DynamicWeightedBCE (正样本权重4.0，负样本动态调整)")
         criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
-        eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
     elif LossConfig.LOSS_TYPE.lower() == 'balanced_bce':
         print("损失函数: BalancedBCE (正负各占一半损失，量纲与标准BCE一致)")
         criterion = BalancedBCE(reduction='mean')
-        eval_criterion = BalancedBCE(reduction='mean')
     else:
         raise ValueError(f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE} (支持: dynamic_bce / pairwise_bce / balanced_bce)")
 
-    # 设置验证集评估损失权重（BCE类损失共享此逻辑）
+    # 评估损失走统一入口 create_eval_criterion：pairwise_bce 路径下评估仍用纯 BCE，
+    # 与 train.py 旧版本行为一致；dynamic_bce / balanced_bce 路径下按正负比例填权重。
+    eval_criterion = create_eval_criterion(eval_targets)
+
+    eval_set_name = "验证集" if has_val else "测试集"
     if isinstance(eval_criterion, DynamicWeightedBCE):
         val_targets = np.array(eval_targets)
-        val_pos_count = np.sum(val_targets >= 0.5)
-        val_neg_count = np.sum(val_targets < 0.5)
-        if val_pos_count > 0 and val_neg_count > 0:
-            val_neg_weight = LossConfig.POS_WEIGHT * (val_pos_count / val_neg_count)
-        elif val_pos_count == 0:
-            val_neg_weight = float(LossConfig.POS_WEIGHT)
-        else:
-            val_neg_weight = 0.1
-        eval_criterion.weight_0_0.fill_(val_neg_weight)
-        eval_set_name = "验证集" if has_val else "测试集"
+        val_pos_count = int(np.sum(val_targets >= 0.5))
+        val_neg_count = int(np.sum(val_targets < 0.5))
+        val_neg_weight = eval_criterion.weight_0_0.item()
         print(f"{eval_set_name}权重: 正样本={LossConfig.POS_WEIGHT}, 负样本={val_neg_weight:.4f} (正负比例={val_pos_count}:{val_neg_count})")
     elif isinstance(eval_criterion, BalancedBCE):
         eval_targets_arr = np.array(eval_targets)
-        eval_criterion.update_weights(eval_targets_arr)
-        pos_count = np.sum(eval_targets_arr >= 0.5)
-        neg_count = np.sum(eval_targets_arr < 0.5)
-        eval_set_name = "验证集" if has_val else "测试集"
+        pos_count = int(np.sum(eval_targets_arr >= 0.5))
+        neg_count = int(np.sum(eval_targets_arr < 0.5))
         print(f"{eval_set_name}BalancedBCE权重: 正样本={eval_criterion.pos_weight.item():.4f}, 负样本={eval_criterion.neg_weight.item():.4f} (正{pos_count}:负{neg_count})")
 
     # 按loss保存的最佳模型（条件：预热结束后, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
@@ -410,24 +402,8 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         print("测试集最终评估（即将保存的模型）")
         print("=" * 60)
 
-        # 创建测试集评估损失
-        if isinstance(eval_criterion, DynamicWeightedBCE):
-            test_eval_criterion = DynamicWeightedBCE(pos_weight=LossConfig.POS_WEIGHT, reduction='mean')
-            t_targets = np.array(test_eval_targets)
-            t_pos = np.sum(t_targets >= 0.5)
-            t_neg = np.sum(t_targets < 0.5)
-            if t_pos > 0 and t_neg > 0:
-                t_neg_w = LossConfig.POS_WEIGHT * (t_pos / t_neg)
-            elif t_pos == 0:
-                t_neg_w = float(LossConfig.POS_WEIGHT)
-            else:
-                t_neg_w = 0.1
-            test_eval_criterion.weight_0_0.fill_(t_neg_w)
-        elif isinstance(eval_criterion, BalancedBCE):
-            test_eval_criterion = BalancedBCE(reduction='mean')
-            test_eval_criterion.update_weights(np.array(test_eval_targets))
-        else:
-            raise ValueError(f"未知 LOSS_TYPE: {LossConfig.LOSS_TYPE}")
+        # 创建测试集评估损失（统一走 create_eval_criterion，消除与 run.py / signal_flow 的复制粘贴）
+        test_eval_criterion = create_eval_criterion(test_eval_targets)
 
         # 评估按loss选出的最佳模型
         if best_model_by_loss is not None:

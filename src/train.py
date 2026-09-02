@@ -232,11 +232,12 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             )
 
         # 打印标签分布
-        count_positive = np.sum(epoch_targets >= 0.9)
-        count_boundary = np.sum((epoch_targets > 0.1) & (epoch_targets < 0.9))
-        count_negative = np.sum(epoch_targets <= 0.1)
+        # 标签目前为二分类（generate_label 返回 0/1），早期版本曾设计软标签边界，
+        # 但实际从未启用——保留 0.5 阈值的二分类统计更贴合现状，避免误读
+        count_positive = np.sum(epoch_targets >= 0.5)
+        count_negative = np.sum(epoch_targets < 0.5)
         total_count = len(epoch_targets)
-        print(f'  标签分布: 上涨={count_positive}({count_positive/total_count:.1%}), 边界={count_boundary}({count_boundary/total_count:.1%}), 不涨={count_negative}({count_negative/total_count:.1%})')
+        print(f'  标签分布: 上涨={count_positive}({count_positive/total_count:.1%}), 不涨={count_negative}({count_negative/total_count:.1%})')
 
         # 转换为tensor
         epoch_inputs_tensor = torch.tensor(epoch_inputs, dtype=torch.float32).to(device)

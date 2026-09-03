@@ -252,6 +252,11 @@ def _print_ranking_table(results, pool_results, baseline_auc, baseline_loss):
     for r in critical:
         print(f"    - {r['desc']} ({r['type']})  AUC Δ% = {r['auc_change_pct']:+.3f}%  Loss Δ% = {r['loss_change_pct']:+.3f}%")
 
+    # 偷懒头（|Δ%|<0.05%）= 屏蔽该头 AUC 几乎不变，剪枝/共享候选。
+    print(f"  偷懒头 (|AUC Δ%| < 0.05%): {len(lazy)} 个 "
+          f"（潜在剪枝/头共享候选）")
+    for r in lazy:
+        print(f"    - {r['desc']} ({r['type']})  AUC Δ% = {r['auc_change_pct']:+.3f}%  Loss Δ% = {r['loss_change_pct']:+.3f}%")
     print()
 
 

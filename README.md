@@ -98,13 +98,15 @@ python src/run.py --begin 20230101            # 全区间回测：从 2023-01-01
 python src/run.py --begin 2023-03-01          # 容错：2023-03-01 / 2023/03/01 等写法均可
 ```
 
-`--begin` 指定后评估区间变为 `[begin, 最新]`，忽略训练/验证/测试集划分——模型用 begin 之前的历史做上下文，首个预测日恰好落在 begin 当天（无数据泄漏）。区间过长时终端只显示首尾，完整逐日统计导出到 `out_run/daily_stats_<时间戳>.json`。
+`--begin` 指定后评估区间变为 `[begin, 最新]`，忽略训练/验证/测试集划分——模型用 begin 之前的历史做上下文，首个预测日恰好落在 begin 当天（无数据泄漏）。区间过长时终端只显示首尾，完整逐日统计导出到所选模型所在的 run 目录 `out/<日期戳>/daily_stats_<时间戳>.json`（与该模型的 `<模型名>_classification.png` 同住一个 run 目录）。
+
+> **目录即模型**：每次训练在 `out/` 下创建独立 run 目录（`out/<日期戳>/`），该次训练的模型（`model_loss_*.pth` / `model_realistic_*.pth`）、训练日志 CSV，以及后续评估产物（每日统计 JSON、分类可视化 PNG、看板 HTML）都集中在这个目录里。同一 run 的两个候选模型会成对出现在选择列表中，评估产物按模型命名，互不覆盖。
 
 ### 每日统计可视化
 
 ```bash
-python src/visualize_daily.py                 # 自动取 out_run/ 下最新的 daily_stats_*.json
-python src/visualize_daily.py out_run/xxx.json --open   # 指定文件并浏览器打开
+python src/visualize_daily.py                 # 自动取 out/ 各 run 目录下最新的 daily_stats_*.json
+python src/visualize_daily.py out/<日期戳>/xxx.json --open   # 指定文件并浏览器打开
 ```
 
 读取每日统计 JSON 生成 HTML 看板，直观展示回测期间每个交易日的选股数量与收益率。

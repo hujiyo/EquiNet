@@ -1,10 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-读取 out_run/ 下的每日统计 JSON，生成 HTML 可视化看板。
+读取各训练 run 目录下的每日统计 JSON，生成 HTML 可视化看板。
+
+目录即模型：每个模型的 daily_stats_<时间戳>.json 由 run.py 写入该模型
+所在的 run 目录（out/<日期戳>/），本脚本按此布局扫描。
 
 用法:
-    python src/visualize_daily.py                       # 自动取 out_run/ 下最新的 daily_stats_*.json
+    python src/visualize_daily.py                       # 自动取 out/ 各 run 目录下最新的 daily_stats_*.json
     python src/visualize_daily.py path/to/xxx.json      # 指定 JSON
     python src/visualize_daily.py xxx.json --open       # 生成后自动在浏览器打开
 """
@@ -16,7 +19,8 @@ import argparse
 import webbrowser
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT_RUN_DIR = os.path.join(PROJECT_ROOT, 'out_run')
+# 每日统计 JSON 的家是各 run 目录（out/<日期戳>/），这里只是"默认扫描根"
+DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out')
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 
 # ── 占位符（替换顺序无关：两个 token 字符串互不相同） ──
@@ -161,10 +165,12 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
 '''
 
 
-def find_latest_json(directory=OUT_RUN_DIR):
-    """在 out_run/ 下找最新的 daily_stats_*.json"""
-    pattern = os.path.join(directory, 'daily_stats_*.json')
-    files = glob.glob(pattern)
+def find_latest_json(directory=DEFAULT_OUTPUT_DIR):
+    """在 directory 的各 run 目录下找最新的 daily_stats_*.json。
+
+    目录即模型：daily_stats 只会出现在 out/<日期戳>/ 里，扫一层子目录即可。
+    """
+    files = glob.glob(os.path.join(directory, '*', 'daily_stats_*.json'))
     if not files:
         return None
     return max(files, key=os.path.getmtime)
@@ -204,9 +210,9 @@ def render_html(payload):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='读取 out_run/ 每日统计 JSON 生成 HTML 可视化')
+    parser = argparse.ArgumentParser(description='读取各 run 目录下每日统计 JSON 生成 HTML 可视化')
     parser.add_argument('json_path', nargs='?', default=None,
-                        help='daily_stats_*.json 路径；省略则自动取 out_run/ 下最新一个')
+                        help='daily_stats_*.json 路径；省略则自动取 out/ 各 run 目录下最新一个')
     parser.add_argument('--open', action='store_true', help='生成后在默认浏览器打开')
     parser.add_argument('--out', default=None, help='输出 HTML 路径（默认与 JSON 同目录）')
     args = parser.parse_args()
@@ -229,7 +235,8 @@ def main():
         out_path = args.out
     else:
         stem = os.path.splitext(os.path.basename(json_path))[0]
-        out_dir = os.path.dirname(os.path.abspath(json_path)) or OUT_RUN_DIR
+        # 跟随 JSON 所在目录：HTML 与其数据同住一个家
+        out_dir = os.path.dirname(os.path.abspath(json_path)) or DEFAULT_OUTPUT_DIR
         out_path = os.path.join(out_dir, f'{stem}_dashboard.html')
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(html)

@@ -16,16 +16,11 @@ from collections import defaultdict
 from datetime import datetime
 import matplotlib.pyplot as plt
 
-from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
+from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig, EmbeddingConfig)
 from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
                   create_recent_days_dataset, normalize_and_validate_context_window)
 from training_utils import evaluate_model, create_eval_criterion, _get_amp_context
-
-
-# 每日统计 JSON 与可视化输出目录（项目根 /out_run，已被 .gitignore 的 out*/ 覆盖）
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT_RUN_DIR = os.path.join(_PROJECT_ROOT, 'out_run')
 
 
 # ==================== MC Dropout 推理（可选，--mc-dropout 启用） ====================
@@ -92,7 +87,9 @@ def parse_model_filename(filename):
     """
     从模型文件名中解析元信息
     格式示例: modelA_top1_p1_05pct_thr0_512_auc0_6377_ep15_0227_2110.pth
+    （filename 允许带 run 目录前缀，如 2026-08-30_193045/xxx.pth，解析只看 basename）
     """
+    filename = os.path.basename(filename)
     info = {'filename': filename, 'prefix': '', 'return_pct': '', 'threshold': '', 'auc': '', 'epoch': '', 'time': ''}
     
     # 提取模型前缀 (model_loss, model_realistic 等)
@@ -133,17 +130,30 @@ def parse_model_filename(filename):
 
 
 def list_available_models(output_dir=DataConfig.OUTPUT_DIR):
-    """列出 out/ 目录下所有可用的 .pth 模型文件"""
+    """列出所有 run 目录下的 .pth 模型文件
+
+    目录即模型：每次训练 run 独占 out/<日期戳>/，模型与产物都住在里面。
+    只扫一层子目录（<run>/xxx.pth），并排除 embedding 预训练目录——
+    那里的 .pth 是 embedding 权重，不是可评估的主模型。
+
+    返回相对 output_dir 的路径（如 2026-08-30_193045/model_loss_xxx.pth），
+    选择/加载逻辑按相对路径处理。
+    """
     if not os.path.exists(output_dir):
         print(f"  ✗ 输出目录 {output_dir} 不存在")
         return []
-    
-    pth_files = sorted(glob.glob(os.path.join(output_dir, '*.pth')))
+
+    embedding_dir = os.path.abspath(EmbeddingConfig.OUTPUT_DIR)
+    pth_files = [
+        f for f in glob.glob(os.path.join(output_dir, '*', '*.pth'))
+        if os.path.abspath(os.path.dirname(f)) != embedding_dir
+    ]
+
     if not pth_files:
         print(f"  ✗ {output_dir} 下没有找到 .pth 模型文件")
         return []
-    
-    return [os.path.basename(f) for f in pth_files]
+
+    return sorted(os.path.relpath(f, output_dir) for f in pth_files)
 
 
 def load_model(model_path, device):
@@ -431,9 +441,9 @@ def build_daily_kept(realistic_stats, day_to_date):
     return kept
 
 
-def write_daily_json(kept, meta, out_dir=OUT_RUN_DIR):
+def write_daily_json(kept, meta, run_dir):
     """
-    将过滤后的每日统计写入 out_run/ 下的 JSON。
+    将过滤后的每日统计写入指定 run 目录下的 JSON。
 
     JSON 结构（自设计）：
         {
@@ -442,8 +452,14 @@ def write_daily_json(kept, meta, out_dir=OUT_RUN_DIR):
                       "return_pct": 0.9, "count": 4}, ... ]
         }
     每条 daily 记录即"每日统计"中的第二位数（当日收益率%），并附带年月日。
+
+    Args:
+        kept: [(yyyymmdd, count, return), ...]
+        meta: meta dict
+        run_dir: 所选模型所在的 run 目录，daily_stats 与该模型其他产物
+                 （<模型名>_classification.png 等）落在同一目录。
     """
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(run_dir, exist_ok=True)
     daily = [
         {
             "date": _format_date(d),
@@ -456,7 +472,7 @@ def write_daily_json(kept, meta, out_dir=OUT_RUN_DIR):
     payload = {"meta": meta, "daily": daily}
 
     fname = f"daily_stats_{meta.get('generated_tag', 'run')}.json"
-    path = os.path.join(out_dir, fname)
+    path = os.path.join(run_dir, fname)
     with open(path, 'w', encoding='utf-8') as f:
         # default=_json_default 兜底 meta 中可能残留的 numpy 标量
         json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
@@ -483,7 +499,8 @@ def print_section_end():
     print(f"└" + "─"*62)
 
 
-def visualize_classification(preds, targets, title="模型分类能力可视化"):
+def visualize_classification(preds, targets, title="模型分类能力可视化",
+                             run_dir=None, model_stem=""):
     """
     可视化模型的分类能力
 
@@ -491,6 +508,11 @@ def visualize_classification(preds, targets, title="模型分类能力可视化"
         preds: 模型预测值数组 (0-1)
         targets: 真实标签数组 (0或1)
         title: 图表标题
+        run_dir: 保存目录。推荐由 main() 传入所选模型所在的 run 目录，
+                 让 png 与该模型其他产物落在同一目录；None 时兜底到 DataConfig.OUTPUT_DIR。
+        model_stem: 模型文件名（去 .pth）。一个 run 目录可能有 loss/realistic
+                    两个候选模型，png 命名带上 stem（<stem>_classification.png）
+                    避免互相覆盖；空串时退回固定名 classification_visualization.png。
     """
     plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
     plt.rcParams['axes.unicode_minus'] = False
@@ -534,8 +556,10 @@ def visualize_classification(preds, targets, title="模型分类能力可视化"
 
     plt.tight_layout()
 
-    os.makedirs(DataConfig.OUTPUT_DIR, exist_ok=True)
-    save_path = os.path.join(DataConfig.OUTPUT_DIR, 'classification_visualization.png')
+    run_dir = run_dir or DataConfig.OUTPUT_DIR
+    os.makedirs(run_dir, exist_ok=True)
+    png_name = f"{model_stem}_classification.png" if model_stem else 'classification_visualization.png'
+    save_path = os.path.join(run_dir, png_name)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f'分类可视化已保存: {save_path}')
     plt.close()
@@ -548,7 +572,7 @@ def select_model(models):
     
     for i, fname in enumerate(models):
         info = parse_model_filename(fname)
-        
+
         # 格式化显示
         prefix_display = {
             'model_loss': '模型(按loss)',
@@ -557,7 +581,7 @@ def select_model(models):
             'modelA_realistic': '模型(按实战收益率)',
             'modelA_loss': '模型(按loss)',
         }.get(info['prefix'], info['prefix'])
-        
+
         detail_parts = []
         if info['return_pct']:
             detail_parts.append(f"收益{info['return_pct']}")
@@ -567,12 +591,13 @@ def select_model(models):
             detail_parts.append(f"阈值={info['threshold']}")
         if info['epoch']:
             detail_parts.append(f"Ep{info['epoch']}")
-        
+
         detail_str = ', '.join(detail_parts)
-        
+
         print(f"│  [{i+1}] {prefix_display}")
         print(f"│      {detail_str}")
-        print(f"│      文件: {fname}")
+        print(f"│      run目录: {os.path.dirname(fname) or '.'}")
+        print(f"│      文件: {os.path.basename(fname)}")
         if i < len(models) - 1:
             print(f"│")
     
@@ -643,13 +668,13 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
     )
     test_loss = stats['test_loss']
 
-    # ========== 每日统计：对齐日历日期（供展示与 out_run/ JSON 导出）==========
+    # ========== 每日统计：对齐日历日期（供展示与run 目录 JSON 导出）==========
     # split_point 口径必须与上面 create_fixed_evaluation_dataset 一致（start_date=begin_date）
     day_to_date = build_day_to_date_map(test_stock_info, start_date=begin_date)
     daily_kept = []  # [(date, count, return), ...] 有效交易日(count>0)
     if stats.get('realistic_stats') is not None:
         daily_kept = build_daily_kept(stats['realistic_stats'], day_to_date)
-    stats['daily_kept'] = daily_kept  # 供 main() 写入 out_run/ JSON
+    stats['daily_kept'] = daily_kept  # 供 main() 写入 run 目录 JSON
 
     # 打印评估结果（与 train.py 格式一致）
     print()
@@ -689,7 +714,7 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
                   f"（{len(daily_kept)}个有效交易日）")
         if begin_date is not None:
             print(f"│  --begin 起始测评日期: {_format_date(begin_date)}（全区间回测，不分训练/验证/测试集）")
-        # 内联展示：区间短则全量；区间长(--begin 多年)则只显示首尾，完整数据见 out_run/ JSON
+        # 内联展示：区间短则全量；区间长(--begin 多年)则只显示首尾，完整数据见 run 目录 JSON
         if len(ds) <= 60:
             daily_stats_str = ', '.join([f'({c},{r*100:.1f}%)' for c, r in ds])
             print(f"│  每日统计: {{{daily_stats_str}}}")
@@ -697,7 +722,7 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
             head = ', '.join([f'({c},{r*100:.1f}%)' for c, r in ds[:8]])
             tail = ', '.join([f'({c},{r*100:.1f}%)' for c, r in ds[-4:]])
             print(f"│  每日统计: {{{head}, ... 共{len(ds)}天 ..., {tail}}}")
-            print(f"│            （区间较长，完整逐日数据见 out_run/ JSON）")
+            print(f"│            （区间较长，完整逐日数据见 run 目录下的 daily_stats_*.json）")
         print(f"│  平均实战收益率: {rs['avg_realistic_return']*100:.1f}%")
         print(f"│")
     
@@ -1096,8 +1121,13 @@ def main():
     model_idx = select_model(models)
     selected_file = models[model_idx]
     model_path = os.path.join(DataConfig.OUTPUT_DIR, selected_file)
-    
+
+    # 目录即模型：所选模型所在的 run 目录就是它所有产物（daily_stats JSON、
+    # 分类可视化 …）的家，直接取 dirname，无需任何反解/兜底逻辑
+    run_dir = os.path.dirname(model_path)
+
     print(f"正在加载模型: {selected_file}")
+    print(f"  run目录: {run_dir}")
     model, metadata = load_model(model_path, device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  模型参数量: {total_params:,}")
@@ -1142,7 +1172,7 @@ def main():
                            mc_dropout=args.mc_dropout, mc_p=args.mc_p, mc_samples=args.mc_samples)
     threshold = stats['top_threshold']
 
-    # 导出每日统计 JSON 到 out_run/（功能2）
+    # 导出每日统计 JSON 到所选模型的 run 目录（功能2）
     daily_kept = stats.get('daily_kept') or []
     if daily_kept and stats.get('realistic_stats') is not None:
         rs = stats['realistic_stats']
@@ -1162,7 +1192,7 @@ def main():
             'generated_at': now.strftime('%Y-%m-%d %H:%M:%S'),
             'generated_tag': now.strftime('%Y%m%d_%H%M%S'),
         }
-        json_path = write_daily_json(daily_kept, meta)
+        json_path = write_daily_json(daily_kept, meta, run_dir=run_dir)
         print(f"\n  📄 每日统计已导出: {json_path}")
         print(f"     可视化: python src/visualize_daily.py \"{json_path}\"")
     else:
@@ -1171,10 +1201,13 @@ def main():
     viz_title = f"模型分类能力可视化 (AUC={stats['auc']:.4f})"
     if args.mc_dropout:
         viz_title += f", MC Dropout (p={args.mc_p}, ×{args.mc_samples})"
+    model_stem = os.path.splitext(os.path.basename(selected_file))[0]
     visualize_classification(
         preds=stats['all_preds'],
         targets=stats['eval_targets'],
-        title=viz_title
+        title=viz_title,
+        run_dir=run_dir,
+        model_stem=model_stem,
     )
     
     # 询问是否选股

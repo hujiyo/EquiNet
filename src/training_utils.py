@@ -963,6 +963,31 @@ def _calculate_max_drawdown(daily_portfolio_values):
 
 
 
+def create_run_dir(output_dir):
+    """
+    在 output_dir 下为本次训练 run 创建独立目录（run 目录）。
+
+    目录即模型：一个 run 目录容纳该次训练的全部产物
+    （model_loss_*.pth / model_realistic_*.pth / epoch_returns_*.csv），
+    后续评估产物（daily_stats JSON、分类可视化等）也落回所选模型所在的
+    run 目录——产物跟着模型走，永不互串。
+
+    目录名取当前时间戳（YYYY-MM-DD_HHMMSS）；同一秒内重复训练时
+    自动追加 _2、_3 后缀，绝不覆盖旧 run。
+
+    Returns:
+        新创建的 run 目录绝对路径。
+    """
+    tag = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    run_dir = os.path.join(output_dir, tag)
+    suffix = 2
+    while os.path.exists(run_dir):
+        run_dir = os.path.join(output_dir, f"{tag}_{suffix}")
+        suffix += 1
+    os.makedirs(run_dir)
+    return run_dir
+
+
 def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
                              epoch, model_prefix="model", extra_info="",
                              output_dir=DataConfig.OUTPUT_DIR):
@@ -974,6 +999,11 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
     - 'train_params': 训练超参数快照
     - 'eval_stats': 评估指标
     - 'state_dict': 模型权重
+
+    Args:
+        output_dir: 保存目录。典型用法传 train.py 的 run 目录
+                    （create_run_dir 创建的 out/<日期戳>/），让每次训练
+                    run 的产物集中在一个目录里。
     """
     from config import ModelConfig, TrainingConfig, LossConfig
     os.makedirs(output_dir, exist_ok=True)

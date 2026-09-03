@@ -40,6 +40,7 @@ from training_utils import (
     create_scheduler_from_config,
     training_step,
     create_eval_criterion,
+    create_run_dir,
 )
 
 def train(model, train_stock_info, val_stock_info, test_stock_info,
@@ -48,7 +49,8 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
           device=None,
           batch_size=TrainingConfig.BATCH_SIZE,
           batches_per_epoch=TrainingConfig.BATCHES_PER_EPOCH,
-          feature_normalizer=None):
+          feature_normalizer=None,
+          run_dir=None):
     """
     模型训练函数
 
@@ -63,7 +65,13 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         batch_size: 批大小
         batches_per_epoch: 每轮批次数
         feature_normalizer: 特征归一化器实例
+        run_dir: 本次训练的 run 目录（create_run_dir 创建）。所有训练产物
+                 （model_loss/model_realistic 的 .pth、epoch_returns CSV）
+                 都落在该目录内；None 时兜底到 DataConfig.OUTPUT_DIR。
     """
+    # run 目录：None 时兜底到顶层输出目录（正常路径由 __main__ 用 create_run_dir 创建）
+    run_dir = run_dir or DataConfig.OUTPUT_DIR
+
     print("\n" + "="*60)
     print("模型训练")
     print("="*60)
@@ -455,16 +463,16 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
 
         print("=" * 60)
 
-    # 保存模型（嵌入测试集评估指标）
+    # 保存模型（嵌入测试集评估指标）——统一落入本次 run 目录
     if best_model_by_loss is not None:
         save_path = save_model_with_metadata(
             best_model_by_loss,
             save_loss_return, save_loss_threshold, save_loss_auc,
             best_loss_epoch,
             model_prefix="model_loss",
-            output_dir=DataConfig.OUTPUT_DIR,
+            output_dir=run_dir,
         )
-        print(f"✓ 模型(loss)已保存: {os.path.basename(save_path)}")
+        print(f"✓ 模型(loss)已保存: {os.path.relpath(save_path, DataConfig.OUTPUT_DIR)}")
         print(f"  测试集 Top1%收益: {save_loss_return*100:+.2f}%, AUC: {save_loss_auc:.4f}")
 
     if best_model_by_realistic_return is not None:
@@ -473,14 +481,14 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             save_realistic_return, save_realistic_threshold, save_realistic_auc,
             best_realistic_return_epoch,
             model_prefix="model_realistic",
-            output_dir=DataConfig.OUTPUT_DIR,
+            output_dir=run_dir,
         )
-        print(f"✓ 模型(realistic)已保存: {os.path.basename(save_path_realistic)}")
+        print(f"✓ 模型(realistic)已保存: {os.path.relpath(save_path_realistic, DataConfig.OUTPUT_DIR)}")
         print(f"  测试集 Top1%收益: {save_realistic_return*100:+.2f}%, AUC: {save_realistic_auc:.4f}")
 
-    # 保存每轮收益率到CSV
+    # 保存每轮收益率到CSV（与模型同住本次 run 目录，产物集中追溯）
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
-    returns_csv_path = os.path.join(DataConfig.OUTPUT_DIR, f"epoch_returns_{timestamp}.csv")
+    returns_csv_path = os.path.join(run_dir, f"epoch_returns_{timestamp}.csv")
 
     fieldnames = ['turn', 'top_return', 'daily_return', 'train_loss', 'val_loss', 'auc', 'prec_top10', 'prec_top3', 'prec_top1', 'avg_realistic_return']
 
@@ -503,7 +511,7 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             }
             writer.writerow(row)
 
-    print(f"✓ 训练日志已保存: {os.path.basename(returns_csv_path)}")
+    print(f"✓ 训练日志已保存: {os.path.relpath(returns_csv_path, DataConfig.OUTPUT_DIR)}")
     return test_return, test_realistic_return
 
 
@@ -514,8 +522,9 @@ if __name__ == "__main__":
     # 获取设备
     device = DeviceConfig.get_device()
 
-    # 创建输出目录
-    os.makedirs(DataConfig.OUTPUT_DIR, exist_ok=True)
+    # 创建本次训练的 run 目录（目录即模型：本次 run 的所有产物都落在里面）
+    run_dir = create_run_dir(DataConfig.OUTPUT_DIR)
+    print(f"  本次训练 run 目录: {run_dir}")
 
     # ========== 特征归一化器配置 ==========
     print("\n" + "="*60)
@@ -572,7 +581,8 @@ if __name__ == "__main__":
     best_return, best_realistic_return = train(
         model, train_stock_info, val_stock_info, test_stock_info,
         device=device,
-        feature_normalizer=feature_normalizer
+        feature_normalizer=feature_normalizer,
+        run_dir=run_dir,
     )
 
     print(f"\n最终结果:")

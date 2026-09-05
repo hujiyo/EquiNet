@@ -1,8 +1,32 @@
+<div align="center">
+
 # EquiNet
+
+![Python](https://img.shields.io/badge/Python-3.x-3776AB?logo=python&logoColor=white) ![PyTorch](https://img.shields.io/badge/PyTorch-2.6.0-EE4C2C?logo=pytorch&logoColor=white) ![CUDA](https://img.shields.io/badge/CUDA-12.4-76B900?logo=nvidia&logoColor=white) ![scikit-learn](https://img.shields.io/badge/scikit--learn-F7931E?logo=scikitlearn&logoColor=white) ![SQLite](https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white) ![Data Source](https://img.shields.io/badge/Data%20Source-Baostock%20%2F%20AKShare-F9A03C) ![License](https://img.shields.io/badge/License-Apache_2.0-blue?logo=apache&logoColor=white)
+
+</div>
+
+<p align="center">
+  <img src="docs/equinet-architecture-demo.gif" alt="EquiNet 项目架构动态演示:行情数据 → data_maintenance → equinet.db → src/ 核心库 → 两阶段训练 → 评估选股" width="860">
+  <br>
+  <sub>▲ 架构图由开源项目 <a href="https://github.com/tt-a1i/archify">Archify</a> 生成 · <a href="docs/equinet-architecture.html">交互式演示请点击这里</a>(明暗主题 · 节点搜索 · 路径追踪 · 自动导览)</sub>
+</p>
+
+---
 
 ## 项目简介
 
- - EquiNet基于历史数据进行统计建模，对未来3天是否具有短期上涨趋势进行打分
+基于历史数据进行统计建模，对未来3天是否具有短期上涨趋势进行打分
+
+## 核心方法与文献
+
+项目实现中借鉴了以下论文技术：
+
+| 技术 | 用途 | 出处 |
+|------|------|------|
+| VISReg | Embedding 预训练的几何正则(尺度/形状/中心化三解耦,`src/visreg.py`) | [Wu, Balestriero & Levine, 2026 (arXiv:2606.02572)](https://arxiv.org/abs/2606.02572);SIGReg 改进版,源自 [LeJEPA (Balestriero & LeCun, 2025)](https://github.com/galilai-group/lejepa) |
+| SupCon 对比学习 | 预训练中多头一致度核加权的对比目标 | [Khosla et al., 2020 (arXiv:1911.05371)](https://arxiv.org/abs/1911.05371) |
+| Lion / Muon | 可选优化器(`training_utils.py`) | [arXiv:2302.06675](https://arxiv.org/abs/2302.06675) / [Muon](https://github.com/KellerJordan/Muon) |
 
 ## 目录结构
 
@@ -20,6 +44,7 @@ EquiNet/
 │   ├── pretrain_embedding.py  # Embedding 预训练（VISReg 几何正则）
 │   └── ...                    # 其他模块
 ├── data_maintenance.py        # 数据维护工具入口
+├── docs/                      # 技术文档 + 交互式架构图(equinet-architecture.html)
 ├── LICENSE                    # Apache-2.0许可证
 └── README.md
 ```
@@ -60,7 +85,7 @@ python data_maintenance.py
 | 5. 数据库状态 | 查看统计信息 | 股票数、数据量、日期范围等 |
 | 6. 备份数据库 | SQLite 内置备份 | 按时间戳保存到 data_maintenance/backup/ |
 
-### 典型工作流
+### 开始使用
 
 ```bash
 # 首次使用（从零开始）
@@ -156,24 +181,13 @@ ep29 - 第29轮
    python src/run.py
    ```
 
-## 注意力可视化工具
+## 注意力可视化
 
 ```bash
 python src/visualize_attention.py
 ```
 
 ![注意力可视化示例](docs/attention_visualizer_example.png)
-
-界面由上到下分为四个区域：
-
-| 区域 | 内容 | 说明 |
-|------|------|------|
-| **K线图** | 45天OHLC蜡烛图 | 橙色背景高亮为 Rollout 注意力覆盖层，颜色越亮表示该天对预测的贡献越大 |
-| **成交量** | 每日成交量柱状图 | 与K线共享时间轴 |
-| **注意力强度条** | Rollout 归一化色带 | 一行薄色带，直观展示各天的综合注意力贡献强弱 |
-| **注意力热力图** | 逐层/逐头注意力矩阵 | 行为各层自注意力均值 + Pooling 聚合注意力 + Attention Rollout，列为45个交易日 |
-
-交互操作：`Space` 下一个样本 / `Backspace` 上一个 / `L` 切换逐层/逐头视图 / `R` 开关Rollout覆盖层 / `Q` 退出
 
 ## 项目修改LOG
 

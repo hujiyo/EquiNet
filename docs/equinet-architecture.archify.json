@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "EquiNet v2 · 项目架构总览",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1355, 630],
+    "views": [
+      { "id": "main-path", "label": "端到端主线", "focus": ["api-src", "dm-pipeline", "equinet-db", "data", "train", "run-dir", "run"], "note": "从行情拉取到每日选股的完整主链路:数据生产 → 数据库 → 特征/样本 → 训练 → 产物 → 评估选股。" },
+      { "id": "two-stage", "label": "两阶段训练", "focus": ["pretrain", "emb-pth", "data", "norm-pkl", "train"], "note": "先自监督预训练 FFN-Embedding(VISReg+SupCon+重建),再冻结 embedding 训练 Transformer 主干。" },
+      { "id": "core-lib", "label": "核心库 src/", "focus": ["config", "data", "model", "tutils", "pretrain"], "note": "src/ 五大基础模块:全部模块导入 config.py 配置中心(含标签/收益领域规则)。" },
+      { "id": "data-prod", "label": "数据生产与边界", "focus": ["api-src", "dm-menu", "dm-pipeline", "equinet-db", "market-index"], "note": "data_maintenance/ 是数据库唯一写入方;src/ 侧只读,形成单向数据边界。" },
+      { "id": "diag-loop", "label": "评估诊断回路", "focus": ["run-dir", "run", "analysis"], "note": "训练产物被 run.py 评估,并回流到注意力诊断、信号流检查与 HTML 看板。" }
+    ]
+  },
+  "components": [
+    { "id": "api-src", "type": "external", "label": "行情数据源", "sublabel": "Baostock · AKShare", "pos": [60, 122], "size": [160, 65] },
+    { "id": "dm-menu", "type": "backend", "label": "data_maintenance.py", "sublabel": "交互式菜单入口", "pos": [280, 30], "size": [200, 55] },
+    { "id": "dm-pipeline", "type": "backend", "label": "data_maintenance/", "sublabel": "update·select·check·features", "tag": "同步·筛选·质检·衍生特征", "pos": [280, 112], "size": [200, 85] },
+    { "id": "market-index", "type": "backend", "label": "market_index.py", "sublabel": "市场宽度→market_index.json", "pos": [280, 235], "size": [200, 55] },
+    { "id": "equinet-db", "type": "database", "label": "equinet.db (SQLite)", "sublabel": "stock_daily·pool·metadata", "tag": "src 侧只读", "pos": [560, 112], "size": [190, 85] },
+    { "id": "config", "type": "backend", "label": "config.py 配置中心", "sublabel": "五大配置类 + 领域规则", "tag": "generate_label·calculate_returns", "pos": [560, 400], "size": [230, 60] },
+    { "id": "data", "type": "backend", "label": "data.py", "sublabel": "加载·19维特征·采样·归一化", "tag": "FeatureNormalizer", "pos": [830, 112], "size": [200, 85] },
+    { "id": "norm-pkl", "type": "database", "label": "normalizer.pkl", "sublabel": "src/ 两阶段归一化器", "pos": [845, 232], "size": [170, 50] },
+    { "id": "model", "type": "backend", "label": "model.py", "sublabel": "StockTransformer", "tag": "6层Post-Norm·MHA·SwiGLU", "pos": [830, 322], "size": [200, 75] },
+    { "id": "tutils", "type": "backend", "label": "training_utils.py", "sublabel": "损失·优化器·调度·评估", "tag": "DynamicWeightedBCE", "pos": [830, 435], "size": [200, 75] },
+    { "id": "pretrain", "type": "backend", "label": "pretrain_embedding.py", "sublabel": "重建·VISReg·SupCon·分类头", "tag": "+ visreg.py", "pos": [1110, 25], "size": [190, 70] },
+    { "id": "emb-pth", "type": "database", "label": "best_embedding.pth", "sublabel": "out/embedding_pretrain/", "pos": [1120, 128], "size": [170, 50] },
+    { "id": "train", "type": "backend", "label": "train.py", "sublabel": "两阶段训练 · 80 epochs", "tag": "冻结Embedding·BF16·双轨保存", "pos": [1110, 211], "size": [190, 85] },
+    { "id": "run-dir", "type": "database", "label": "out/日期戳/ 产物", "sublabel": "model_*.pth·daily_stats.json", "tag": "epoch_returns_*.csv", "pos": [1110, 329], "size": [190, 70] },
+    { "id": "run", "type": "backend", "label": "run.py", "sublabel": "评估 · 选股 · 回测", "tag": "--begin·--mc-dropout", "pos": [1110, 432], "size": [190, 80] },
+    { "id": "analysis", "type": "backend", "label": "诊断与可视化", "sublabel": "attn_analysis·visualize_daily", "tag": "signal_flow·embed_evaluator", "pos": [1110, 545], "size": [190, 70] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "数据生产 data_maintenance/", "wraps": ["dm-menu", "dm-pipeline"], "pad": 26 },
+    { "kind": "region", "label": "src/ 核心库(全部模块导入 config)", "wraps": ["data", "norm-pkl", "model", "tutils"], "pad": 26 }
+  ],
+  "connections": [
+    { "id": "api-to-dm", "from": "api-src", "to": "dm-pipeline", "label": "行情拉取" },
+    { "id": "menu-to-dm", "from": "dm-menu", "to": "dm-pipeline", "label": "交互调度", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "via": [[380, 98.5]] },
+    { "id": "dm-to-db", "from": "dm-pipeline", "to": "equinet-db", "label": "唯一写入方", "variant": "emphasis" },
+    { "id": "db-to-data", "from": "equinet-db", "to": "data", "label": "只读", "variant": "emphasis" },
+    { "id": "db-to-mkt", "from": "equinet-db", "to": "market-index", "label": "每日涨跌家数" },
+    { "id": "data-to-mkt", "from": "data", "to": "market-index", "label": "读取极端行情日期", "variant": "dashed", "labelAt": [700, 240] },
+    { "id": "data-to-pre", "from": "data", "to": "pretrain", "label": "K线窗口池", "variant": "dashed", "fromSide": "top", "toSide": "left", "via": [[930, 80], [1050, 80], [1050, 60]], "labelSegment": 1 },
+    { "id": "pre-to-emb", "from": "pretrain", "to": "emb-pth", "label": "预训练权重", "labelAt": [1205, 111.5] },
+    { "id": "data-to-norm", "from": "data", "to": "norm-pkl", "label": "拟合归一化", "fromSide": "bottom", "toSide": "top", "via": [[930, 214.5]] },
+    { "id": "emb-to-train", "from": "emb-pth", "to": "train", "label": "加载并冻结", "variant": "emphasis", "labelAt": [1205, 194.5] },
+    { "id": "norm-to-train", "from": "norm-pkl", "to": "train", "label": "归一化", "labelAt": [1040, 295] },
+    { "id": "data-to-train", "from": "data", "to": "train", "label": "样本与标签", "variant": "emphasis", "labelAt": [1070, 204] },
+    { "id": "model-to-train", "from": "model", "to": "train" },
+    { "id": "tutils-to-train", "from": "tutils", "to": "train", "label": "损失·优化器·评估", "labelAt": [1070, 415] },
+    { "id": "train-to-rundir", "from": "train", "to": "run-dir", "label": "双轨保存", "variant": "emphasis", "labelAt": [1205, 312.5] },
+    { "id": "rundir-to-run", "from": "run-dir", "to": "run", "label": "加载候选模型", "variant": "emphasis", "labelAt": [1205, 415.5] },
+    { "id": "run-to-rundir", "from": "run", "to": "run-dir", "label": "写回", "variant": "dashed", "fromSide": "right", "toSide": "right", "via": [[1330, 472], [1330, 364]], "labelSegment": 1 },
+    { "id": "run-to-analysis", "from": "run", "to": "analysis", "label": "模型与统计", "variant": "dashed", "labelAt": [1205, 528.5] }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "项目定位", "items": [
+      "输入单只股票 45 个交易日 × 19 维特征,预测未来 3 天是否出现短期强势上涨信号(0~1 概率)",
+      "用于每日从 selected 股票池选股,以实战收益率(T+1 开盘买入 + 智能止损)为核心指标",
+      "v2 模型为 Post-Norm Transformer;名称 EquiNet 与等变性无关"
+    ] },
+    { "dot": "emerald", "title": "数据边界与两阶段训练", "items": [
+      "data_maintenance/ 是数据库唯一写入方;src/ 只读:stock_daily JOIN stock_pool WHERE pool_type='selected'",
+      "阶段一 pretrain_embedding.py:重建+VISReg+SupCon+分类头 → best_embedding.pth;阶段二 train.py 冻结 embedding 训练主干",
+      "损失 DynamicWeightedBCE(默认)/pairwise_bce,正负 25:75 上采样;双轨保存 model_loss_* 与 model_realistic_*"
+    ] },
+    { "dot": "violet", "title": "模型结构与评估", "items": [
+      "StockTransformer:FFN-Embedding(19→128) → 可学习位置编码 → 6×Post-Norm 层(手写 4 头 MHA+SwiGLU+ZeroRMSNorm) → 注意力池化 → Linear(128→1)",
+      "标签:config.generate_label 五条件强势规则,正样本约 3-5%,距离保护 3 天,涨停/极端行情过滤",
+      "评估:AUC、Top-K 收益、实战收益率(T+1 开盘买入+智能止损);run.py 支持 --begin 回测与 --mc-dropout"
+    ] }
+  ]
+}

@@ -22,3 +22,9 @@ AGENT*.md
 
 note
 .codegraph/
+
+# 临时验证/探针脚本与产物（不入库）
+tmp_tests/
+# Agent 工作记忆与状态（不入库）
+.workbuddy/
+.pytest_cache/

@@ -28,7 +28,9 @@ LIMIT_MAIN = 0.10        # 主板 ±10%
 LIMIT_GEM = 0.20         # 创业板 ±20%（2020-08-24 起）
 LIMIT_STAR = 0.20        # 科创板 ±20%（设立起）
 GEM_20PCT_FROM = 20200824
-LIMIT_TOLERANCE = 1.15   # 容差：允许超过理论上限 15%（应对四舍五入/数据源误差）
+# 注意：不要用「百分比容差」判涨跌停（曾用 LIMIT_TOLERANCE=1.15）——
+# 低价股一个最小变动价位就是百分之几，正确做法是比较舍入后的涨跌停价，
+# 见 check_price_anomaly。
 
 # 新股上市初期无涨跌幅限制，这段时间的巨大波动是正常的
 IPO_FREE_DAYS = 5
@@ -217,11 +219,30 @@ def check_price_anomaly(df: pd.DataFrame, stock_code: str) -> np.ndarray:
         return bad
 
     prev = close[:-1]
-    with np.errstate(divide='ignore', invalid='ignore'):
-        ret = np.where(prev > 0, (close[1:] - prev) / prev, 0.0)
 
     limits = np.array([price_limit(stock_code, int(d)) for d in dates[1:]])
-    hit = np.abs(ret) > limits * LIMIT_TOLERANCE
+    # 涨跌停价按交易所规则取「前收 × (1±涨跌幅) 后四舍五入到最小变动价位（0.01 元）」，
+    # 再与当日收盘比较 —— **不能用百分比容差判**。
+    #
+    # 原因：低价股一个 tick 就是百分之几。面值退市股在 0.1~0.3 元区间，
+    # 0.26→0.23 恰好是 3 个 tick、也正是 round(0.26*0.9,2)=0.23 的跌停价，
+    # 用百分比（±11.5%）判会把正常涨跌停报成跳变 —— 实测 23 条「真错价候选」
+    # 里 20 条是这一类，占当前驱动排除量的 70%。
+    #
+    # 比较时放 1 个 tick + 极小 epsilon：
+    #   - 1 tick：交易所的四舍五入无法用二进制浮点精确复现。例：2.55×1.1 的精确值
+    #     是 2.805，交易所给 2.81；而 2.55 的浮点表示略小，浮点积 ≈2.80499999...，
+    #     round() 给 2.80 —— 恰差一个 tick。实测 627 条「+10.01%~+10.20%」全是这种
+    #     合法涨停（中位 +10.07%）。
+    #   - epsilon：浮点加法误差会吃掉恰好 1 tick 的容差（2.80+0.01 在 IEEE754 下
+    #     略小于字面量 2.81），不加它这 1 tick 等于没加。
+    # 真异常（跌 22%、跌 36%、+38%）远超 1 tick，不受影响。
+    TICK = 0.01
+    EPS = 1e-9
+    up = np.round(prev * (1 + limits), 2) + TICK + EPS
+    dn = np.round(prev * (1 - limits), 2) - TICK - EPS
+    with np.errstate(invalid='ignore'):
+        hit = (close[1:] > up) | (close[1:] < dn)
 
     if 'is_dividend' in df.columns:
         # hit 对应 dates[1:]，除权标记要按同一偏移对齐

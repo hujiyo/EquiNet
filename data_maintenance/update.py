@@ -150,13 +150,21 @@ class StockDataUpdater:
         return normalize_stock_df(df, source='baostock')
 
     def fetch_stock_data(self, stock_code: str, start_date: str = None) -> Optional[pd.DataFrame]:
-        """获取单只股票的 K 线数据（带超时保护）"""
+        """获取单只股票的 K 线数据（带超时保护）
+
+        end_date 收口到「最近已收盘交易日」（`_latest_possible_trading_date`），
+        **绝不请求当天**。原因：baostock 在盘中会返回当天尚未收盘的半根 K 线，
+        一旦入库，之后所有增量更新都从 last_date+1 起拉，这行错误数据
+        **永远不会再被覆盖** —— 2026-05-22 上午 10:02 的一次更新就是这样
+        把 626 只股票的盘中快照永久写进库的（updated_at 时间戳实锤）。
+        """
         try:
             code_with_prefix = self._format_stock_code(stock_code)
             if code_with_prefix is None:
                 return None
 
-            end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+            cutoff = self._latest_possible_trading_date()
+            end_date = f"{cutoff // 10000}-{cutoff // 100 % 100:02d}-{cutoff % 100:02d}"
             query_start = start_date if start_date else "2010-01-01"
 
             with ThreadPoolExecutor(max_workers=1) as executor:
@@ -482,7 +490,9 @@ class AKShareDataUpdater(StockDataUpdater):
 
     def fetch_stock_data(self, stock_code: str, start_date: str = None) -> Optional[pd.DataFrame]:
         try:
-            end_date = datetime.datetime.now().strftime("%Y%m%d")
+            # end_date 同样收口到最近已收盘交易日，理由见父类同名方法的说明
+            cutoff = self._latest_possible_trading_date()
+            end_date = str(cutoff)
             query_start = start_date.replace('-', '') if start_date else "20100101"
 
             df = self.ak.stock_zh_a_hist(

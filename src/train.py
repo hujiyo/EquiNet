@@ -516,6 +516,43 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
     return test_return, test_realistic_return
 
 
+def _run_selfcheck_before_training():
+    """训练前的数据自检（不变量：关键步骤不可跳过）。
+
+    校验的是「训练所依赖的数据前提还在不在」：
+    审计范围是否等于训练用的池、派生状态是否比源数据旧、派生表是否只有一份表达。
+
+    为什么要做成代码而不是文档叮嘱：审计必须在数据更新之后跑，这一步原来只写在
+    docs/data-quality-system.md 第 7 节里，而且那条流水线**还漏了复权物化**。
+    漏跑不会报错，只会让训练拿到过期的排除区间，或让一部分股票带着未物化的
+    复权列（特征基准静默异常）。
+    """
+    print("\n" + "=" * 60)
+    print("训练前自检")
+    print("=" * 60)
+    try:
+        from data_maintenance.selfcheck import prerequisites
+        findings = prerequisites(DataConfig.DB_PATH)
+    except Exception as e:
+        print(f"  ⚠ 自检无法运行：{e}")
+        print("  ⚠ 训练继续，但「数据前提是否成立」未经验证")
+        return
+
+    for f in findings:
+        print(f"  {f}")
+    if not findings:
+        print("  ✓ 全部不变量成立")
+
+    errors = [f for f in findings if f.level == 'error']
+    if errors and getattr(DataConfig, 'STRICT_SELFCHECK', True):
+        raise RuntimeError(
+            f"训练前自检发现 {len(errors)} 个错误，已中止。"
+            f"修完后重跑；确要强行训练就把 DataConfig.STRICT_SELFCHECK 设为 False。")
+    if errors:
+        print(f"  [!] {len(errors)} 个错误被忽略（STRICT_SELFCHECK=False）")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     # 打印配置摘要
     print_config_summary()
@@ -550,7 +587,13 @@ if __name__ == "__main__":
     # 正样本距离保护
     compute_label_distance_exclusions(train_stock_info)
 
-    # 数据质量排除（除权跳空 / 停牌填充 / 量纲异常附近的样本）
+    # 数据质量排除（真错价 / 停牌填充 / 量纲异常附近的样本）
+    #
+    # 在此之前先做自检：审计范围是否等于训练用的池、派生状态是否比源数据旧。
+    # 「顺序很重要」原来是文档里的一句叮嘱（而且那条流水线还漏了复权物化），
+    # 一旦漏跑，下游不会报错、只会拿到过期或残缺的结论 —— 所以把它变成代码。
+    _run_selfcheck_before_training()
+
     if DataConfig.EXCLUDE_DATA_ISSUE_SAMPLES:
         apply_quality_exclusions(train_stock_info)
     else:

@@ -276,12 +276,18 @@ def print_report(all_issues, stats, elapsed):
         for kind, n in sorted(excl_kinds, key=lambda x: -x[1]):
             print(f'    {ISSUE_LABELS.get(kind, kind):38s} {n:>9,}')
         if info_kinds:
-            print('  仅记录、不驱动排除的类型（正常市场事件）：')
+            # ⚠️ 这里的 n 是「若计入排除将会涉及的位置数」（与上面驱动排除的口径一致），
+            # 不是问题日数 —— 问题日数看「--- 问题分布 ---」。两种口径差 40 倍，
+            # 混读会得出错误结论（审核时我就把 1,142,411 个位置当成了 1,142,411 个问题日）。
+            print('  仅记录、不驱动排除的类型（正常市场事件；下述为若计入将涉及的位置数）：')
             for kind, n in sorted(info_kinds, key=lambda x: -x[1]):
                 print(f'    {ISSUE_LABELS.get(kind, kind):38s} {n:>9,}')
+            info_pos = sum(v for k, v in info_kinds)
             print(f'    └ 这些**不计入排除**：排除策略由 '
-                  f'contract.INFORMATIONAL_ISSUE_TYPES 显式声明。'
-                  f'把它们计进去会让「数据质量」机制变成样本过滤器。')
+                  f'contract.INFORMATIONAL_ISSUE_TYPES 显式声明。若计入，排除量会从 '
+                  f'{stats["n_excluded_positions"]:,} 涨到约 '
+                  f'{stats["n_excluded_positions"] + info_pos:,} 个位置 —— '
+                  f'「数据质量」会变成「停牌附近样本过滤器」。')
     print(f'  展开规则: 采样起始索引 s ∈ [p-{SAMPLING.label_backspan + SAMPLING.context_length - 1}, p]'
           f'（p = 问题日位次，每个问题日 {SAMPLING.contaminate_t_span} 个位置）')
     print('  该数字在扫描侧用 contract.SAMPLING 算出，与 src/data.py 消费侧同一函数，')

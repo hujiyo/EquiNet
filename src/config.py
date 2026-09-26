@@ -23,7 +23,6 @@ from data_maintenance.contract import (  # noqa: E402
     MODEL_INPUT_DIM, FEATURE_PRICE_COL, MAX_WORKERS, CURRENT_POOL,
     INFORMATIONAL_ISSUE_TYPES, is_exclusion_type,
     pool_join_sql, load_stock_codes, pool_scope_label,
-    MARKET_CAP_MIN, MARKET_CAP_MAX, VALID_STOCK_PREFIXES,
 )
 
 # ==================== 数据参数 ====================
@@ -37,10 +36,10 @@ class DataConfig:
 
     # 数据源配置
     DATA_SOURCE = 'baostock'  # 'baostock' 或 'akshare'
-    # 池准入三项硬条件的定义处在 contract（与 pit_pool / select 共用），这里只引用
-    MARKET_CAP_MAX = MARKET_CAP_MAX  # 市值上限（元），200亿
-    MARKET_CAP_MIN = MARKET_CAP_MIN  # 市值下限（元），10亿
-    VALID_STOCK_PREFIXES = list(VALID_STOCK_PREFIXES)  # 主板股票代码前缀
+    # 池准入三项硬条件（市值区间/代码前缀）的定义处在 contract，消费方是
+    # pit_pool.py 与 select.py —— 这里**不再转载**：曾写成
+    # `MARKET_CAP_MAX = MARKET_CAP_MAX` 这种自赋值（RHS 落到模块全局，能跑，
+    # 但极易被误读成 no-op、或被「清理」回字面量从而重新造成两处定义）。
 
     # 数据分割参数（按时间划分）
     TRAIN_START_DATE = 20160101      # 训练集起始日期（含）

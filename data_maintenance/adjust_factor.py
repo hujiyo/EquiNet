@@ -42,9 +42,10 @@ import os
 import sqlite3
 import sys
 import time
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 
-DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'equinet.db')
+from .contract import DEFAULT_DB, MAX_WORKERS
+
 FACTOR_START = '1990-01-01'      # 必须早于所有股票的首次除权
 ADJ_COLS = ('open_adj', 'high_adj', 'low_adj', 'close_adj', 'vwap_adj')
 RAW_FOR_ADJ = {'open_adj': 'open', 'high_adj': 'high', 'low_adj': 'low',
@@ -154,7 +155,7 @@ def _fetch_worker(args):
     return out
 
 
-def fetch_factors(db_path, workers=4, end_date=None, only_missing=False):
+def fetch_factors(db_path, workers=MAX_WORKERS, end_date=None, only_missing=False):
     """拉取全市场复权因子，写入 adjust_factor 表
 
     Args:
@@ -356,7 +357,8 @@ def main():
                     help='断点续拉：只补 adjust_factor 表里尚无记录的股票')
     ap.add_argument('--materialize', action='store_true', help='按因子填充复权列')
     ap.add_argument('--verify', action='store_true', help='抽样验证')
-    ap.add_argument('--workers', type=int, default=4)
+    ap.add_argument('--workers', type=int, default=MAX_WORKERS,
+                    help=f'并行度（默认 {MAX_WORKERS}，见 contract.MAX_WORKERS）')
     args = ap.parse_args()
 
     db_path = os.path.abspath(args.db)

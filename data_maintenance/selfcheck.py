@@ -101,7 +101,7 @@ def run_fast(db_path: str = DEFAULT_DB) -> List[Finding]:
     if scope is None:
         out.append(Finding('provenance', 'warn',
                            'data_issues 没有登记 provenance，无法判断它扫的是哪个池'))
-    elif scope != CURRENT_POOL and scope != f'{CURRENT_POOL}':
+    elif scope != CURRENT_POOL:
         out.append(Finding('provenance', 'error',
                            f'data_issues 的范围是 {scope!r}，而当前生效池是 '
                            f'{CURRENT_POOL!r} —— 训练会用到一个没被审计覆盖的池'))

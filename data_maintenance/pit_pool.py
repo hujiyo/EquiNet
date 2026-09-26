@@ -44,9 +44,9 @@ from multiprocessing import Pool
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.config import DataConfig  # noqa: E402  只读常量，不引入训练链路
-from .contract import DEFAULT_DB, MAX_WORKERS  # noqa: E402
+from .contract import (  # noqa: E402
+    DEFAULT_DB, MAX_WORKERS, MARKET_CAP_MIN, MARKET_CAP_MAX, VALID_STOCK_PREFIXES,
+)
 from . import provenance  # noqa: E402
 
 OPEN_ENDED = 99999999
@@ -171,9 +171,11 @@ def main():
     args = ap.parse_args()
 
     db_path = os.path.abspath(args.db)
-    min_cap = DataConfig.MARKET_CAP_MIN
-    max_cap = DataConfig.MARKET_CAP_MAX
-    prefixes = DataConfig.VALID_STOCK_PREFIXES
+    # 准入口径来自 contract（与训练配置同源），不再 import src.config ——
+    # 那会连带引入 torch，破坏「data_maintenance 离线工具可在无 torch 环境运行」的约束。
+    min_cap = MARKET_CAP_MIN
+    max_cap = MARKET_CAP_MAX
+    prefixes = VALID_STOCK_PREFIXES
 
     con = sqlite3.connect(f'file:{db_path.replace(chr(92), "/")}?mode=ro', uri=True)
     codes = [r[0] for r in con.execute('SELECT DISTINCT stock_code FROM stock_daily ORDER BY stock_code')]

@@ -23,6 +23,7 @@ from data_maintenance.contract import (  # noqa: E402
     MODEL_INPUT_DIM, FEATURE_PRICE_COL, MAX_WORKERS, CURRENT_POOL,
     INFORMATIONAL_ISSUE_TYPES, is_exclusion_type,
     pool_join_sql, load_stock_codes, pool_scope_label,
+    MARKET_CAP_MIN, MARKET_CAP_MAX, VALID_STOCK_PREFIXES,
 )
 
 # ==================== 数据参数 ====================
@@ -36,9 +37,10 @@ class DataConfig:
 
     # 数据源配置
     DATA_SOURCE = 'baostock'  # 'baostock' 或 'akshare'
-    MARKET_CAP_MAX = 200e8  # 市值上限（元），200亿
-    MARKET_CAP_MIN = 10e8   # 市值下限（元），10亿
-    VALID_STOCK_PREFIXES = ['600', '601', '603', '605', '000', '001', '002', '003']  # 主板股票代码前缀
+    # 池准入三项硬条件的定义处在 contract（与 pit_pool / select 共用），这里只引用
+    MARKET_CAP_MAX = MARKET_CAP_MAX  # 市值上限（元），200亿
+    MARKET_CAP_MIN = MARKET_CAP_MIN  # 市值下限（元），10亿
+    VALID_STOCK_PREFIXES = list(VALID_STOCK_PREFIXES)  # 主板股票代码前缀
 
     # 数据分割参数（按时间划分）
     TRAIN_START_DATE = 20160101      # 训练集起始日期（含）
@@ -111,18 +113,18 @@ class DataConfig:
     EVAL_BATCH_SIZE = 4096            # 评估批处理大小（分批处理，减少显存占用）
 
     # ========== 数据质量排除 ==========
-    # data_maintenance/audit.py 扫描全库后产出的 sample_exclusion 表，记录了
-    # 「已识别脏数据」会污染的采样位置区间。识别对象：
-    #   - 价格异常跳变（不复权下的除权日 / 错价）
-    #   - 僵尸价格（停牌期用最后一刻 K 线填充）
-    #   - 零成交量、占位垃圾行、vwap 越界
-    # 区间语义：样本以 [start_date, end_date] 内任一交易日为上下文末日时，
-    # 其 45 天输入或 3+1 天标签会包含被污染的数据 → 该样本不参与训练。
+    # 离线审计（python -m data_maintenance.audit --write）产出的 `data_issues`
+    # 表记录「哪天有什么问题」（事实层）；训练加载时由
+    # src/data.py:apply_quality_exclusions 用 contract.SAMPLING 把问题日
+    # 换算成被污染的采样起始位置（决策层）。没有预先展开好的区间表 ——
+    # 曾经的 sample_exclusion 就是那种副本，因单位错位漏排 74.5%，已删除。
+    # 区间语义：问题日 g 在该股序列中的位次为 p 时，采样起始索引
+    # s ∈ [p-48, p] 的样本被排除（45 天输入或 3+1 天标签包含 g）。
     #
     # True : 启用（推荐）。表不存在时自动跳过并打印提示，不影响训练
     # False: 忽略质量排除（退回旧行为）
     #
-    # 重新生成区间：python -m data_maintenance.audit --write
+    # 重新生成问题日：python -m data_maintenance.audit --write
     EXCLUDE_DATA_ISSUE_SAMPLES = True
 
     # ========== 训练前自检 ==========

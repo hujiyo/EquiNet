@@ -22,6 +22,7 @@ EquiNet 数据契约 —— 系统内部「同一份数据以什么口径被理�
 | 样本矩阵的列语义（第几列是什么） | `SAMPLE_COLUMNS` / `CLOSE_IDX` / `CLOSE_RAW_IDX` |
 | 污染半径（一个脏数据日污染哪些样本） | `SAMPLING.excluded_starts()` |
 | 股票池口径（训练与审计必须是同一个池） | `CURRENT_POOL` / `pool_join_sql()` / `load_stock_codes()` |
+| 股票池准入口径（市值区间 / 代码前缀） | `MARKET_CAP_MIN` / `MARKET_CAP_MAX` / `VALID_STOCK_PREFIXES` |
 | 特征计算基准 | `FEATURE_PRICE_COL` |
 | 并行度上限（本机 31.7 GB，与用户共用） | `MAX_WORKERS` |
 
@@ -42,6 +43,7 @@ __all__ = [
     'FEATURE_PRICE_COL', 'MAX_WORKERS', 'DEFAULT_DB',
     'INFORMATIONAL_ISSUE_TYPES', 'is_exclusion_type',
     'CURRENT_POOL', 'pool_join_sql', 'load_stock_codes', 'pool_scope_label',
+    'MARKET_CAP_MIN', 'MARKET_CAP_MAX', 'VALID_STOCK_PREFIXES',
 ]
 
 DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'equinet.db')
@@ -182,6 +184,17 @@ FEATURE_PRICE_COL = 'close_adj'
 # 悄悄回退掉后复权的全部收益，且没有任何提示。
 FEATURE_FALLBACK_IS_ERROR = True
 
+
+# ==================== 股票池准入口径 ====================
+
+# 入池筛选的三项硬条件（市值区间 + 代码前缀）。
+# 消费方：src/config.py（引用）、data_maintenance/pit_pool.py（PIT 逐日判定）、
+# data_maintenance/select.py（旧口径 selected 池筛选）。
+# 这里是唯一定义处 —— 三处各写一份的话，改市值区间就会让 PIT 池与
+# 训练配置静默分叉。
+MARKET_CAP_MAX = 200e8  # 流通市值上限（元），200亿
+MARKET_CAP_MIN = 10e8   # 流通市值下限（元），10亿
+VALID_STOCK_PREFIXES = ['600', '601', '603', '605', '000', '001', '002', '003']  # 主板前缀
 
 # ==================== 股票池口径 ====================
 

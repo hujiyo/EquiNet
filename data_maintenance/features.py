@@ -14,11 +14,11 @@
 """
 
 import numpy as np
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 from typing import List
 
 from .database import DatabaseManager
-from .contract import FEATURE_PRICE_COL
+from .contract import FEATURE_PRICE_COL, MAX_WORKERS, CURRENT_POOL, pool_join_sql
 
 
 MA_WINDOWS = [5, 10, 20]
@@ -271,22 +271,45 @@ def _process_single_stock(args):
         return (stock_code, f'error: {e}')
 
 
-def compute_features(db: DatabaseManager, pool_type: str = 'selected',
+def _pool_stock_codes(db: DatabaseManager, pool_type: str, force: bool) -> List[str]:
+    """按契约口径取「需要算特征的池内股票」。
+
+    用 contract.pool_join_sql 生成 JOIN，selected / pit 两种池同一套代码 ——
+    不再依赖只认 stock_pool 表的 get_stocks_missing_features（那个对 PIT 池
+    会返回空列表，然后静默「无需处理」）。
+    """
+    import sqlite3
+    missing = (" AND (sd.m5 IS NULL OR sd.dif IS NULL OR sd.macd_hist_diff IS NULL "
+               "OR sd.bb_upper IS NULL)") if not force else ""
+    join = '' if pool_type == 'all' else pool_join_sql('sd', pool_type)
+    sql = (f"SELECT DISTINCT sd.stock_code FROM stock_daily sd "
+           f"{join}{missing} ORDER BY sd.stock_code")
+    con = sqlite3.connect(f'file:{db.db_path.replace(chr(92), "/")}?mode=ro', uri=True)
+    try:
+        return [r[0] for r in con.execute(sql)]
+    finally:
+        con.close()
+
+
+def compute_features(db: DatabaseManager, pool_type: str = None,
                      stock_codes: List[str] = None, force: bool = False):
     """
-    为指定池的股票计算 MA + MACD 特征
+    为指定池的股票批量计算 MA + MACD + BB 特征
 
     Args:
         db: 数据库管理器
-        pool_type: 股票池类型 ('all' 或 'selected')
+        pool_type: 股票池类型。None = contract.CURRENT_POOL（与训练/审计同池）。
         stock_codes: 指定股票列表，None 表示处理整个池
         force: 是否强制重新计算（即使已有特征）
+
+    ⚠️ 并行度来自 contract.MAX_WORKERS（=4）：本机 31.7 GB 且与用户共用，
+    `min(cpu_count(), 8)` 这种按核数定的默认值曾把机器压死过一次。
     """
+    if pool_type is None:
+        pool_type = CURRENT_POOL
+
     if stock_codes is None:
-        if force:
-            stock_codes = db.get_pool_stocks(pool_type)
-        else:
-            stock_codes = db.get_stocks_missing_features(pool_type)
+        stock_codes = _pool_stock_codes(db, pool_type, force)
 
     if not stock_codes:
         print("✓ 所有股票的特征已计算，无需处理")
@@ -296,7 +319,7 @@ def compute_features(db: DatabaseManager, pool_type: str = 'selected',
 
     db_path = db.db_path
     file_args = [(db_path, code) for code in stock_codes]
-    num_workers = min(cpu_count(), 8)
+    num_workers = MAX_WORKERS
 
     with Pool(num_workers) as pool:
         results = pool.map(_process_single_stock, file_args)

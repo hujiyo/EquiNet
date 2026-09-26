@@ -298,13 +298,17 @@ class StockDataUpdater:
                 failed.append((code, str(e)))
         if failed:
             print(f'[!] {len(failed)} 只重算仍失败：{failed[:3]}')
+            # 有失败就**不登记** KEY_FEATURES 的新鲜度 —— 血缘必须与实际一致：
+            # 登记了 fresh 但特征其实没算全，selfcheck 的新鲜度检查就永远绿灯，
+            # 「失败残留」从此不可见。留它过期，让训练前自检把这件事顶出来。
         else:
             print(f'✓ {len(codes)} 只已补齐复权列并重算特征')
 
         provenance.record(self.db.db_path, key=provenance.KEY_ADJUST,
                           scope=f'{len(codes)} 只（更新流程内自愈）', rows=len(codes))
-        provenance.record(self.db.db_path, key=provenance.KEY_FEATURES,
-                          scope=f'{len(codes)} 只（更新流程内自愈）', rows=len(codes))
+        if not failed:
+            provenance.record(self.db.db_path, key=provenance.KEY_FEATURES,
+                              scope=f'{len(codes)} 只（更新流程内自愈）', rows=len(codes))
 
     def update_all_stocks(self, mode: str = 'incremental', stock_codes: List[str] = None):
         """批量更新所有股票数据，支持中断续传"""

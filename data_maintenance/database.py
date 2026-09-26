@@ -82,7 +82,10 @@ class DatabaseManager:
 
     _STOCK_DAILY_COLUMNS = ('date', 'open', 'high', 'low', 'close', 'amount', 'volume',
                             'exchange', 'vwap', 'm5', 'm10', 'm20', 'dif', 'dea',
-                            'macd_hist', 'macd_hist_diff', 'bb_upper', 'bb_lower')
+                            'macd_hist', 'macd_hist_diff', 'bb_upper', 'bb_lower',
+                            # 后复权列（见 adjust_factor.py）
+                            'adj_factor', 'open_adj', 'high_adj', 'low_adj',
+                            'close_adj', 'vwap_adj')
 
     def __init__(self, db_path=None):
         if db_path is None:

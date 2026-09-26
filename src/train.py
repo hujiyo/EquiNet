@@ -21,6 +21,7 @@ from data import (
     load_and_preprocess_data,
     create_fixed_evaluation_dataset,FeatureNormalizer,
     compute_label_distance_exclusions,
+    apply_quality_exclusions,
     precompute_training_pool,
     sample_from_pool,
     sample_temporal_from_pool,
@@ -548,6 +549,12 @@ if __name__ == "__main__":
 
     # 正样本距离保护
     compute_label_distance_exclusions(train_stock_info)
+
+    # 数据质量排除（除权跳空 / 停牌填充 / 量纲异常附近的样本）
+    if DataConfig.EXCLUDE_DATA_ISSUE_SAMPLES:
+        apply_quality_exclusions(train_stock_info)
+    else:
+        print("  数据质量排除: 已由 EXCLUDE_DATA_ISSUE_SAMPLES=False 关闭")
 
     # 打印数据集统计
     print("\n" + "="*60)

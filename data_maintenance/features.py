@@ -180,18 +180,35 @@ def compute_bb_features(closes: np.ndarray) -> tuple:
     return bb_upper, bb_lower
 
 
-def compute_features_for_stock(db: DatabaseManager, stock_code: str, auto_commit: bool = True) -> bool:
+def compute_features_for_stock(db: DatabaseManager, stock_code: str, auto_commit: bool = True,
+                               price_col: str = 'close_adj') -> bool:
     """为单只股票计算并写入衍生特征（内联版本，复用已有数据库连接）。
 
     数据更新后直接调用即可，读取完整历史 → 计算 MA/MACD/BB → 写回，
     单股耗时在毫秒级，无需多进程开销。
+
+    Args:
+        price_col: 用作计算基准的价格列。
+            'close_adj'（默认）= 后复权收盘价 —— 除权日不会产生虚假跳变，
+                窗口跨越除权日时 MA/MACD/BB 依然连续。
+            'close' = 原始不复权收盘价（对照/回滚用）。
+            若目标列为 NULL 或非正，自动回退到 'close'。
     """
     df = db.get_stock_data(stock_code, chronological=True)
 
     if len(df) == 0:
         return False
 
-    closes = df['close'].values.astype(np.float64)
+    if price_col not in df.columns:
+        price_col = 'close'
+    closes = df[price_col].values.astype(np.float64)
+
+    # 后复权列尚未物化时（全 NULL）回退到原始收盘价
+    if not np.all(np.isfinite(closes)) or np.any(closes <= 0):
+        if price_col != 'close':
+            closes = df['close'].values.astype(np.float64)
+            price_col = 'close'
+
     dates = df['date'].values
 
     m5 = compute_ma_features(closes, 5).astype(np.float32)

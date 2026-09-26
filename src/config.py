@@ -92,6 +92,21 @@ class DataConfig:
     # 评估参数
     EVAL_BATCH_SIZE = 4096            # 评估批处理大小（分批处理，减少显存占用）
 
+    # ========== 数据质量排除 ==========
+    # data_maintenance/audit.py 扫描全库后产出的 sample_exclusion 表，记录了
+    # 「已识别脏数据」会污染的采样位置区间。识别对象：
+    #   - 价格异常跳变（不复权下的除权日 / 错价）
+    #   - 僵尸价格（停牌期用最后一刻 K 线填充）
+    #   - 零成交量、占位垃圾行、vwap 越界
+    # 区间语义：样本以 [start_date, end_date] 内任一交易日为上下文末日时，
+    # 其 45 天输入或 3+1 天标签会包含被污染的数据 → 该样本不参与训练。
+    #
+    # True : 启用（推荐）。表不存在时自动跳过并打印提示，不影响训练
+    # False: 忽略质量排除（退回旧行为）
+    #
+    # 重新生成区间：python -m data_maintenance.audit --write
+    EXCLUDE_DATA_ISSUE_SAMPLES = True
+
     # ========== 特征归一化配置 ==========
     # 使用 QuantileTransformer + StandardScaler 进行高级特征归一化
     # 优点：

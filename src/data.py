@@ -446,7 +446,9 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
                              train_end_date=DataConfig.TRAIN_END_DATE,
                              val_start_date=DataConfig.VAL_START_DATE,
                              val_end_date=DataConfig.VAL_END_DATE,
-                             test_start_date=DataConfig.TEST_START_DATE):
+                             test_start_date=DataConfig.TEST_START_DATE,
+                             max_stocks=None,
+                             num_workers=None):
     """
     数据加载和预处理，使用多进程并行加载
 
@@ -457,23 +459,50 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
     - 训练集：TRAIN_START_DATE ~ TRAIN_END_DATE
     - 验证集：VAL_START_DATE ~ VAL_END_DATE（训练时用于模型选择）
     - 测试集：TEST_START_DATE ~ 数据库最新日期（训练结束后仅评估一次）
+
+    Args:
+        max_stocks: 只加载训练池中代码最小的 N 只股票。None = 全量（默认，训练用）。
+            用于**低内存冒烟验证**：全量加载 678 万行时父进程峰值可达数 GB，
+            子集模式下可压到几十 MB。
+        num_workers: 并行进程数。None = min(cpu_count(), 8)（默认）。
+            内存受限时显式传小值（如 2）。
     """
     import sqlite3
 
     conn = sqlite3.connect(db_path)
-    query = """SELECT sd.stock_code, sd.date, sd.open, sd.high, sd.low, sd.close,
-                      sd.vwap, sd.volume, sd.exchange, sd.m5, sd.m10, sd.m20,
-                      sd.dif, sd.dea, sd.macd_hist, sd.macd_hist_diff, sd.bb_upper, sd.bb_lower
+    # 价格列取**后复权**（`*_adj`），列别名保持原名以免下游索引大改。
+    # 目的：除权日不再产生虚假跳空，涨跌幅/MA 偏离度/标签全部基于连续序列。
+    # 末尾附一列 `close_raw`（不复权原始收盘价）—— 仅供下面的高价股过滤使用，
+    # 不进入模型输入（见 normalize_and_validate_context_window 与
+    # _vectorized_process_stock 里的 `<= 40` 判定）。
+    # 后复权机制见 data_maintenance/adjust_factor.py 与 docs/data-quality-system.md 第 8 节。
+    pool_filter = ("JOIN stock_pool sp ON sd.stock_code = sp.stock_code\n"
+                   "               WHERE sp.pool_type='selected' AND sp.is_active=1")
+    params = []
+    if max_stocks:
+        # 取训练池中代码最小的 N 只，便于可复现的冒烟验证
+        pool_filter = ("JOIN (SELECT stock_code FROM stock_pool\n"
+                       "                    WHERE pool_type='selected' AND is_active=1\n"
+                       "                    ORDER BY stock_code LIMIT ?) sp\n"
+                       "                 ON sd.stock_code = sp.stock_code")
+        params.append(int(max_stocks))
+
+    query = """SELECT sd.stock_code, sd.date,
+                      sd.open_adj  AS open,  sd.high_adj AS high,
+                      sd.low_adj   AS low,   sd.close_adj AS close,
+                      sd.vwap_adj  AS vwap,
+                      sd.volume, sd.exchange, sd.m5, sd.m10, sd.m20,
+                      sd.dif, sd.dea, sd.macd_hist, sd.macd_hist_diff, sd.bb_upper, sd.bb_lower,
+                      sd.close     AS close_raw
                FROM stock_daily sd
-               JOIN stock_pool sp ON sd.stock_code = sp.stock_code
-               WHERE sp.pool_type='selected' AND sp.is_active=1
-               ORDER BY sd.stock_code, sd.date ASC"""
-    df = pd.read_sql_query(query, conn)
+               %s
+               ORDER BY sd.stock_code, sd.date ASC""" % pool_filter
+    df = pd.read_sql_query(query, conn, params=params)
     conn.close()
 
     cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange',
             'm5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'macd_hist_diff',
-            'bb_upper', 'bb_lower']
+            'bb_upper', 'bb_lower', 'close_raw']
     stock_codes = []
     stock_data_arrays = []
     stock_times_arrays = []
@@ -495,7 +524,11 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
                          [val_end_date] * len(stock_codes),
                          [test_start_date] * len(stock_codes)))
 
-    num_workers = min(cpu_count(), 8)
+    # 并行度：内存敏感。默认沿用 8，但可通过 num_workers 显式压低
+    # （每个 worker 会收到一份 pickle 后的股票数据，机器内存紧张时传 2）
+    if num_workers is None:
+        num_workers = min(cpu_count(), 8)
+    num_workers = max(1, int(num_workers))
 
     with Pool(num_workers) as pool:
         all_stock_info = [r for r in pool.map(process_single_file, file_args) if r is not None]
@@ -632,6 +665,89 @@ def compute_label_distance_exclusions(stock_info_list, distance=None):
 
     print(f"  正样本距离保护(distance={distance}): "
           f"{total_positive}个正样本, 排除{total_excluded}个负样本")
+
+def load_sample_exclusion_spans(db_path=None):
+    """从 data_maintenance 产出的 sample_exclusion 表加载「采样位置排除区间」
+
+    表由 `python -m data_maintenance.audit --write` 生成，区间为闭区间，
+    作用在「样本的上下文末日」上（样本 t 的输入是 [t-C+1, t]，标签是 [t+1, t+4]）。
+
+    表不存在时返回空 dict（向后兼容，不影响训练）。
+
+    Returns:
+        {stock_code: [(start_date, end_date), ...]}
+    """
+    import sqlite3
+    if db_path is None:
+        db_path = DataConfig.DB_PATH
+    out = {}
+    try:
+        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        rows = conn.execute(
+            'SELECT stock_code, start_date, end_date FROM sample_exclusion'
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return out
+    for code, l, r in rows:
+        out.setdefault(code, []).append((int(l), int(r)))
+    return out
+
+
+def apply_quality_exclusions(stock_info_list, spans=None):
+    """把数据质量排除区间转成采样起始位置，并入 excluded_positions
+
+    与 compute_label_distance_exclusions 同一出口（stock_info['excluded_positions']），
+    因此对下游采样器完全透明，无需改动 _vectorized_process_stock。
+
+    位置换算：样本起始索引 s 的上下文末日 = times[s + C - 1]
+    故区间 [l, r]（作用在末日上）对应的 s 范围为
+        [pos(l) - (C-1), pos_after(r) - 1 - (C-1)]
+
+    Args:
+        stock_info_list: 股票信息列表（就地修改 excluded_positions）
+        spans: 预加载的区间字典；None 时自动从数据库加载
+
+    Returns:
+        新增排除的位置总数
+    """
+    if spans is None:
+        spans = load_sample_exclusion_spans()
+
+    if not spans:
+        print("  数据质量排除: 未找到 sample_exclusion 表或表为空，跳过"
+              "（运行 python -m data_maintenance.audit --write 生成）")
+        return 0
+
+    C = DataConfig.CONTEXT_LENGTH
+    total = 0
+    hit_stocks = 0
+
+    for si in stock_info_list:
+        code = si.get('file_name')
+        sp = spans.get(code)
+        if not sp:
+            continue
+        times = np.asarray(si['times'])
+        T = len(times)
+        excl = si.setdefault('excluded_positions', set())
+        n_before = len(excl)
+
+        for l, r in sp:
+            lo = int(np.searchsorted(times, l, side='left')) - (C - 1)
+            hi = int(np.searchsorted(times, r, side='right')) - 1 - (C - 1)
+            lo = max(lo, 0)
+            hi = min(hi, T - 1)
+            if hi >= lo:
+                excl.update(range(lo, hi + 1))
+
+        if len(excl) > n_before:
+            hit_stocks += 1
+        total += len(excl) - n_before
+
+    print(f"  数据质量排除: {hit_stocks} 只股票命中, 新增排除 {total} 个采样位置")
+    return total
+
 
 class TemporalSampler:
     """
@@ -1018,7 +1134,10 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     if np.any(closes == 0) or np.any(amounts == 0):
         return None
 
-    if closes[-1] > 40:
+    # 高价股过滤：必须用**不复权**收盘价（第 16 列 close_raw）。
+    # 列 3 现在存的是后复权价，它随时间膨胀（复权因子单调递增），
+    # 用它判 `> 40` 会让越靠近今天的样本被误杀越严重 —— 正好毁掉验证/测试集。
+    if input_seq_raw[:, 16][-1] > 40:
         return None
 
     if check_limit_up:
@@ -1252,7 +1371,9 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
     valid &= np.all(prev_days[:, :4] != 0, axis=1)
     valid &= np.all(raw_windows[:, :, 3] != 0, axis=1)
     valid &= np.all(raw_windows[:, :, 5] != 0, axis=1)
-    valid &= raw_windows[:, -1, 3] <= 40
+    # 高价股过滤：用**不复权**收盘价（第 16 列 close_raw），保持原语义。
+    # 列 3 是后复权价，随时间膨胀，用它判定会系统性误杀近年样本。
+    valid &= raw_windows[:, -1, 16] <= 40
 
     # 涨停过滤（可选）
     if check_limit_up:

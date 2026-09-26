@@ -82,9 +82,12 @@ class DatabaseManager:
 
     _STOCK_DAILY_COLUMNS = ('date', 'open', 'high', 'low', 'close', 'amount', 'volume',
                             'exchange', 'vwap', 'm5', 'm10', 'm20', 'dif', 'dea',
-                            'macd_hist', 'macd_hist_diff', 'bb_upper', 'bb_lower')
+                            'macd_hist', 'macd_hist_diff', 'bb_upper', 'bb_lower',
+                            # 后复权列（见 adjust_factor.py）
+                            'adj_factor', 'open_adj', 'high_adj', 'low_adj',
+                            'close_adj', 'vwap_adj')
 
-    def __init__(self, db_path=None):
+    def __init__(self, db_path=None, gate_enabled: bool = True):
         if db_path is None:
             db_path = self._default_db_path()
         self.db_path = str(db_path)
@@ -93,7 +96,37 @@ class DatabaseManager:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # 写入门禁：所有落库路径的**唯一收口**。
+        # 放在这里而不是各个抓取函数里，是因为「守门员」只有在唯一入口才成立 ——
+        # 历史上门禁挂在 update.py 的两条抓取路径上，而 check.py 的修复流程
+        # 直接调 upsert_daily_data 就绕过去了（恰恰是最需要门禁的路径：修数据时）。
+        self.gate_enabled = gate_enabled
+        self.gate_stats = {'rejected': 0, 'stocks_hit': 0}
         self.init_schema()
+
+    def _apply_gate(self, stock_code: str, df: pd.DataFrame, verbose: bool = True):
+        """入库前剔除结构性非法行。返回清洗后的 df。"""
+        if not self.gate_enabled or df is None or len(df) == 0:
+            return df
+        from .quality import gate_dataframe
+        clean, dropped = gate_dataframe(df, stock_code)
+        if dropped:
+            self.gate_stats['rejected'] += len(dropped)
+            self.gate_stats['stocks_hit'] += 1
+            if verbose:
+                sample = ', '.join(f"{i.date}({i.issue_type})" for i in dropped[:3])
+                more = f' 等{len(dropped)}条' if len(dropped) > 3 else ''
+                print(f'  [门禁] {stock_code} 剔除 {len(dropped)} 行非法数据: {sample}{more}')
+        return clean
+
+    def report_gate_stats(self) -> None:
+        """汇总本轮门禁拦截量。**静默丢数据的机制必须可观测**，
+        否则「门禁到底拦了多少行」永远是个问号（原实现只累加、从不读取）。"""
+        r = self.gate_stats['rejected']
+        if r:
+            print(f'\n[门禁汇总] 共剔除 {r:,} 行非法数据（涉及 {self.gate_stats["stocks_hit"]:,} 只股票）')
+        else:
+            print('\n[门禁汇总] 本次无非法行被剔除')
 
     @staticmethod
     def _default_db_path():
@@ -138,11 +171,21 @@ class DatabaseManager:
 
     # ==================== 行情数据写入 ====================
 
-    def upsert_daily_data(self, stock_code: str, df: pd.DataFrame, auto_commit: bool = True):
+    def upsert_daily_data(self, stock_code: str, df: pd.DataFrame, auto_commit: bool = True) -> int:
         """将 DataFrame 格式的行情数据写入数据库（UPSERT），向量化构建。
 
         只更新行情列（open/close/volume 等），ON CONFLICT 时不覆盖已有的特征列。
+        入库前经过**写入门禁**（见 `_apply_gate`）—— 这是全系统唯一的写入收口。
+
+        Returns:
+            实际写入的行数（被门禁剔除的不计）。调用方不关心时可忽略返回值。
         """
+        df = self._apply_gate(stock_code, df)
+        if df is None or len(df) == 0:
+            if auto_commit:
+                self._conn.commit()
+            return 0
+
         all_cols = self.MARKET_COLS + self.FEATURE_COLS
 
         n = len(df)
@@ -172,10 +215,28 @@ class DatabaseManager:
         )
         if auto_commit:
             self._conn.commit()
+        return n
 
-    def bulk_upsert_daily(self, records: List[tuple], auto_commit: bool = True):
-        """批量写入行情数据。records: [(stock_code, date, open, high, ...), ...]"""
+    def bulk_upsert_daily(self, records: List[tuple], auto_commit: bool = True) -> int:
+        """批量写入行情数据。records: [(stock_code, date, open, high, ...), ...]
+
+        同样经过写入门禁。目前没有调用方，但保留门禁是为了让「收口唯一」
+        成为结构事实 —— 而不是靠「恰好没人用这条路径」。
+        """
         cols = ['stock_code', 'date'] + list(self.MARKET_COLS) + list(self.FEATURE_COLS)
+        if self.gate_enabled and records:
+            df = pd.DataFrame(list(records), columns=cols)
+            kept = []
+            for code, grp in df.groupby('stock_code', sort=False):
+                kept.append(self._apply_gate(code, grp))
+            df = pd.concat([k for k in kept if len(k)]) if any(len(k) for k in kept) \
+                else df.iloc[0:0]
+            records = list(df.itertuples(index=False, name=None))
+            if not records:
+                if auto_commit:
+                    self._conn.commit()
+                return 0
+
         placeholders = ', '.join(['?'] * len(cols))
         col_str = ', '.join(cols)
         update_set = ', '.join(f"{c}=excluded.{c}" for c in self.MARKET_COLS)
@@ -186,6 +247,7 @@ class DatabaseManager:
         )
         if auto_commit:
             self._conn.commit()
+        return len(records)
 
     def update_features(self, stock_code: str, feature_records: List[tuple], auto_commit: bool = True):
         """更新指定股票的衍生特征。

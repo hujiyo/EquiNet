@@ -10,8 +10,6 @@
 - 市值筛选：流通市值在 [10亿, 200亿] 范围
 """
 
-import os
-import sys
 import time
 import datetime
 from typing import List, Optional, Dict
@@ -29,19 +27,12 @@ class DataSelector:
                  valid_prefixes: list = None):
         self.db = db
 
-        # 从 config 读取默认值
-        if market_cap_min is None or market_cap_max is None or valid_prefixes is None:
-            src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src')
-            if src_dir not in sys.path:
-                sys.path.insert(0, src_dir)
-            from config import DataConfig
-            self.market_cap_min = market_cap_min if market_cap_min is not None else DataConfig.MARKET_CAP_MIN
-            self.market_cap_max = market_cap_max if market_cap_max is not None else DataConfig.MARKET_CAP_MAX
-            self.valid_prefixes = valid_prefixes or DataConfig.VALID_STOCK_PREFIXES
-        else:
-            self.market_cap_min = market_cap_min
-            self.market_cap_max = market_cap_max
-            self.valid_prefixes = valid_prefixes
+        # 准入口径唯一定义处是 contract（与 PIT 池、训练配置同源），
+        # 不再 lazy-import src/config（那会连带引入 torch 依赖）
+        from .contract import MARKET_CAP_MIN, MARKET_CAP_MAX, VALID_STOCK_PREFIXES
+        self.market_cap_min = market_cap_min if market_cap_min is not None else MARKET_CAP_MIN
+        self.market_cap_max = market_cap_max if market_cap_max is not None else MARKET_CAP_MAX
+        self.valid_prefixes = valid_prefixes or list(VALID_STOCK_PREFIXES)
 
     def _get_all_stock_codes(self) -> List[str]:
         return self.db.get_pool_stocks('all')

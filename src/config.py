@@ -10,6 +10,21 @@ import torch
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SRC_DIR)
 
+# ==================== 数据契约 ====================
+# 采样几何 / 样本列语义 / 股票池口径 / 特征基准 / 并行度上限的**唯一事实来源**
+# 是 data_maintenance/contract.py。这里只做引用与断言，绝不复述数值。
+# 原因：这些数曾经在 config.py 与 quality.py 各写一份，改动任一处会让污染区间
+# 静默错位（且方向是「排漏」——脏数据照常进训练集，不报错）。
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from data_maintenance.contract import (  # noqa: E402
+    SAMPLING, SAMPLE_COLUMNS, SAMPLE_SELECT_SQL, CLOSE_IDX, CLOSE_RAW_IDX,
+    MODEL_INPUT_DIM, FEATURE_PRICE_COL, MAX_WORKERS, CURRENT_POOL,
+    INFORMATIONAL_ISSUE_TYPES, is_exclusion_type,
+    pool_join_sql, load_stock_codes, pool_scope_label,
+)
+
 # ==================== 数据参数 ====================
 class DataConfig:
     """数据相关参数"""
@@ -21,9 +36,10 @@ class DataConfig:
 
     # 数据源配置
     DATA_SOURCE = 'baostock'  # 'baostock' 或 'akshare'
-    MARKET_CAP_MAX = 200e8  # 市值上限（元），200亿
-    MARKET_CAP_MIN = 10e8   # 市值下限（元），10亿
-    VALID_STOCK_PREFIXES = ['600', '601', '603', '605', '000', '001', '002', '003']  # 主板股票代码前缀
+    # 池准入三项硬条件（市值区间/代码前缀）的定义处在 contract，消费方是
+    # pit_pool.py 与 select.py —— 这里**不再转载**：曾写成
+    # `MARKET_CAP_MAX = MARKET_CAP_MAX` 这种自赋值（RHS 落到模块全局，能跑，
+    # 但极易被误读成 no-op、或被「清理」回字面量从而重新造成两处定义）。
 
     # 数据分割参数（按时间划分）
     TRAIN_START_DATE = 20160101      # 训练集起始日期（含）
@@ -33,11 +49,14 @@ class DataConfig:
     TEST_START_DATE = 20260101       # 测试集起始日期（含），截止日期为数据库最新日期，训练结束后仅评估一次
     RANDOM_SEED = 42                 # 随机种子
     
-    # 样本生成参数
-    CONTEXT_LENGTH = 45              # 历史数据长度（这是核心参数，其他地方应引用这个值）
-    FUTURE_DAYS = 3                  # 未来预测天数
-    BUFFER_DAY = True                # 额外采集1天安全余量（用于跌停推迟判断）
-    REQUIRED_LENGTH = CONTEXT_LENGTH + FUTURE_DAYS + (1 if BUFFER_DAY else 0)
+    # 样本生成参数（定义处：data_maintenance/contract.py:SAMPLING）
+    CONTEXT_LENGTH = SAMPLING.context_length   # 历史数据长度（核心参数）
+    FUTURE_DAYS = SAMPLING.future_days         # 未来预测天数
+    BUFFER_DAY = SAMPLING.buffer_days > 0      # 额外采集1天安全余量（用于跌停推迟判断）
+    REQUIRED_LENGTH = SAMPLING.required_length
+    # 污染半径：脏数据日 g 会污染的样本起始索引为 [p-48, p]（p = g 在序列中的位次）
+    CONTAMINATE_LEFT = SAMPLING.label_backspan + SAMPLING.context_length - 1
+    CONTAMINATE_RIGHT = 0
 
     # 量能/换手率归一化配置
     MA_WINDOW = 10                   # 量能与换手率相对均值的滑动窗口大小（N日均值基准）,左侧数据不够时自动向右侧借数据为预期机制
@@ -91,6 +110,29 @@ class DataConfig:
 
     # 评估参数
     EVAL_BATCH_SIZE = 4096            # 评估批处理大小（分批处理，减少显存占用）
+
+    # ========== 数据质量排除 ==========
+    # 离线审计（python -m data_maintenance.audit --write）产出的 `data_issues`
+    # 表记录「哪天有什么问题」（事实层）；训练加载时由
+    # src/data.py:apply_quality_exclusions 用 contract.SAMPLING 把问题日
+    # 换算成被污染的采样起始位置（决策层）。没有预先展开好的区间表 ——
+    # 曾经的 sample_exclusion 就是那种副本，因单位错位漏排 74.5%，已删除。
+    # 区间语义：问题日 g 在该股序列中的位次为 p 时，采样起始索引
+    # s ∈ [p-48, p] 的样本被排除（45 天输入或 3+1 天标签包含 g）。
+    #
+    # True : 启用（推荐）。表不存在时自动跳过并打印提示，不影响训练
+    # False: 忽略质量排除（退回旧行为）
+    #
+    # 重新生成问题日：python -m data_maintenance.audit --write
+    EXCLUDE_DATA_ISSUE_SAMPLES = True
+
+    # ========== 训练前自检 ==========
+    # DataConfig.STRICT_SELFCHECK: 训练启动前跑 data_maintenance.selfcheck 的快速档，
+    # 校验「数据前提」是否还成立（审计范围=训练池、派生状态未过期、派生表只有一份表达）。
+    #   True : 发现 error 直接中止训练（推荐）—— 这些错误都会静默污染训练数据
+    #   False: 只打印，继续训练
+    # 单项检查失败但确定为无害时，改这里而不是删断言。
+    STRICT_SELFCHECK = True
 
     # ========== 特征归一化配置 ==========
     # 使用 QuantileTransformer + StandardScaler 进行高级特征归一化
@@ -601,6 +643,24 @@ class DeviceConfig:
         else:
             print("ERROR:CUDA 不可用，程序退出")
             sys.exit(1)
+
+# ==================== 契约一致性断言 ====================
+# 这些都是「两个地方各自定义、可能悄悄跑偏」的点。启动即校验，宁可启动失败
+# 也不要带着错位的口径跑完一整个训练。
+def _assert_contract() -> None:
+    assert MODEL_INPUT_DIM == ModelConfig.INPUT_DIM, (
+        f'契约 MODEL_INPUT_DIM={MODEL_INPUT_DIM} 与 '
+        f'ModelConfig.INPUT_DIM={ModelConfig.INPUT_DIM} 不一致')
+    assert SAMPLE_COLUMNS[CLOSE_IDX] == 'close', f'CLOSE_IDX={CLOSE_IDX} 不是 close'
+    assert SAMPLE_COLUMNS[CLOSE_RAW_IDX] == 'close_raw', \
+        f'CLOSE_RAW_IDX={CLOSE_RAW_IDX} 不是 close_raw'
+    assert len(SAMPLE_COLUMNS) == 17, f'样本列应为 17（16 输入列 + close_raw），实际 {len(SAMPLE_COLUMNS)}'
+    assert DataConfig.CONTAMINATE_LEFT == SAMPLING.label_backspan + SAMPLING.context_length - 1
+    assert DataConfig.CONTAMINATE_RIGHT == 0, '污染区间右界就是问题日自身（序号空间）'
+
+
+_assert_contract()
+
 
 # ==================== 配置打印函数 ====================
 def print_config_summary():

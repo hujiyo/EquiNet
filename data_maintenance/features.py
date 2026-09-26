@@ -14,10 +14,11 @@
 """
 
 import numpy as np
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 from typing import List
 
 from .database import DatabaseManager
+from .contract import FEATURE_PRICE_COL, MAX_WORKERS, CURRENT_POOL, pool_join_sql
 
 
 MA_WINDOWS = [5, 10, 20]
@@ -180,18 +181,57 @@ def compute_bb_features(closes: np.ndarray) -> tuple:
     return bb_upper, bb_lower
 
 
-def compute_features_for_stock(db: DatabaseManager, stock_code: str, auto_commit: bool = True) -> bool:
+class FeatureBasisMissing(RuntimeError):
+    """特征计算基准价格列尚未物化（例如后复权列还全是空的）。
+
+    单独定义类型，是为了让调用方能把它与「真的算错了」区分开：
+    这一类是**流程顺序问题**（先物化复权再算特征），可以自动修复，
+    不该像普通异常那样把同一事务里刚抓到的行情数据一起回滚掉。
+    """
+
+
+def compute_features_for_stock(db: DatabaseManager, stock_code: str, auto_commit: bool = True,
+                               price_col: str = None) -> bool:
     """为单只股票计算并写入衍生特征（内联版本，复用已有数据库连接）。
 
     数据更新后直接调用即可，读取完整历史 → 计算 MA/MACD/BB → 写回，
     单股耗时在毫秒级，无需多进程开销。
+
+    Args:
+        price_col: 用作计算基准的价格列。None = `contract.FEATURE_PRICE_COL`
+            （后复权收盘价）。'close' 只留给对照/回滚，正常流程不该用：
+            窗口跨除权日时均线会断裂。
+
+    Raises:
+        FeatureBasisMissing: 基准列存在空值 / 非正数。
+
+            **绝不静默回退到不复权价。** 这里原来是 `not np.all(isfinite)`
+            就整只股票改用 `close` 重算 —— 而增量更新写进来的新行必然没有
+            复权列（`upsert` 只写行情列），于是**一次增量更新就能把整只股票的
+            历史特征悄悄退回旧口径**，与其它股票口径不一致，且没有任何提示。
+            整个后复权体系的价值会被这一行悄悄抹掉。
     """
+    if price_col is None:
+        price_col = FEATURE_PRICE_COL
+
     df = db.get_stock_data(stock_code, chronological=True)
 
     if len(df) == 0:
         return False
 
-    closes = df['close'].values.astype(np.float64)
+    if price_col not in df.columns:
+        raise FeatureBasisMissing(
+            f'{stock_code}: 基准列 {price_col!r} 不存在（数据库 schema 未迁移？）')
+
+    closes = df[price_col].values.astype(np.float64)
+    n_bad = int((~np.isfinite(closes)).sum()) + int((closes <= 0).sum())
+    if n_bad:
+        raise FeatureBasisMissing(
+            f'{stock_code}: 基准列 {price_col} 有 {n_bad} 行为空/非正，拒绝计算。'
+            f'请先物化复权列：'
+            f'python -m data_maintenance.adjust_factor --fetch --only-missing '
+            f'&& python -m data_maintenance.adjust_factor --materialize')
+
     dates = df['date'].values
 
     m5 = compute_ma_features(closes, 5).astype(np.float32)
@@ -231,22 +271,45 @@ def _process_single_stock(args):
         return (stock_code, f'error: {e}')
 
 
-def compute_features(db: DatabaseManager, pool_type: str = 'selected',
+def _pool_stock_codes(db: DatabaseManager, pool_type: str, force: bool) -> List[str]:
+    """按契约口径取「需要算特征的池内股票」。
+
+    用 contract.pool_join_sql 生成 JOIN，selected / pit 两种池同一套代码 ——
+    不再依赖只认 stock_pool 表的 get_stocks_missing_features（那个对 PIT 池
+    会返回空列表，然后静默「无需处理」）。
+    """
+    import sqlite3
+    missing = (" AND (sd.m5 IS NULL OR sd.dif IS NULL OR sd.macd_hist_diff IS NULL "
+               "OR sd.bb_upper IS NULL)") if not force else ""
+    join = '' if pool_type == 'all' else pool_join_sql('sd', pool_type)
+    sql = (f"SELECT DISTINCT sd.stock_code FROM stock_daily sd "
+           f"{join}{missing} ORDER BY sd.stock_code")
+    con = sqlite3.connect(f'file:{db.db_path.replace(chr(92), "/")}?mode=ro', uri=True)
+    try:
+        return [r[0] for r in con.execute(sql)]
+    finally:
+        con.close()
+
+
+def compute_features(db: DatabaseManager, pool_type: str = None,
                      stock_codes: List[str] = None, force: bool = False):
     """
-    为指定池的股票计算 MA + MACD 特征
+    为指定池的股票批量计算 MA + MACD + BB 特征
 
     Args:
         db: 数据库管理器
-        pool_type: 股票池类型 ('all' 或 'selected')
+        pool_type: 股票池类型。None = contract.CURRENT_POOL（与训练/审计同池）。
         stock_codes: 指定股票列表，None 表示处理整个池
         force: 是否强制重新计算（即使已有特征）
+
+    ⚠️ 并行度来自 contract.MAX_WORKERS（=4）：本机 31.7 GB 且与用户共用，
+    `min(cpu_count(), 8)` 这种按核数定的默认值曾把机器压死过一次。
     """
+    if pool_type is None:
+        pool_type = CURRENT_POOL
+
     if stock_codes is None:
-        if force:
-            stock_codes = db.get_pool_stocks(pool_type)
-        else:
-            stock_codes = db.get_stocks_missing_features(pool_type)
+        stock_codes = _pool_stock_codes(db, pool_type, force)
 
     if not stock_codes:
         print("✓ 所有股票的特征已计算，无需处理")
@@ -256,7 +319,7 @@ def compute_features(db: DatabaseManager, pool_type: str = 'selected',
 
     db_path = db.db_path
     file_args = [(db_path, code) for code in stock_codes]
-    num_workers = min(cpu_count(), 8)
+    num_workers = MAX_WORKERS
 
     with Pool(num_workers) as pool:
         results = pool.map(_process_single_stock, file_args)

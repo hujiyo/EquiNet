@@ -68,16 +68,17 @@ def price_limit(stock_code: str, date: int) -> float:
     """返回该股票在该日期的涨跌幅限制（小数形式）
 
     依据：
-    - 科创板 688xxx：设立起 ±20%
+    - 科创板 688xxx / 689xxx（CDR）：设立起 ±20%
     - 创业板 300xxx：2020-08-24 起 ±20%，此前 ±10%
-    - 北交所 4xxxxx / 8xxxxx：±30%（本项目暂不涉及）
+    - 创业板 301xxx / 302xxx：注册制新代码段（2021 起），只在 ±20% 时代存在
+    - 北交所 4xxxxx / 8xxxxx / 92xxxx：±30%（本项目暂不涉及）
     - 其余（主板）：±10%
     """
-    if stock_code.startswith('688'):
+    if stock_code.startswith(('688', '689')):
         return LIMIT_STAR
-    if stock_code.startswith('300'):
+    if stock_code.startswith(('300', '301', '302')):
         return LIMIT_GEM if date >= GEM_20PCT_FROM else LIMIT_MAIN
-    if stock_code.startswith(('4', '8')):
+    if stock_code.startswith(('4', '8', '92')):
         return 0.30
     return LIMIT_MAIN
 

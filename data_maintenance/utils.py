@@ -27,8 +27,7 @@ def normalize_stock_df(
     3. 数值类型转换 + fillna
     4. turn → exchange（换手率）
     5. VWAP 计算
-    6. 丢弃 OHLC 含 NaN 的行
-    7. 过滤零成交幽灵记录（volume <= 0）
+    6. 不做行过滤 —— 非法行统一由 DatabaseManager 的门禁拦截并报告
 
     Args:
         df: 原始 DataFrame
@@ -36,7 +35,7 @@ def normalize_stock_df(
         volume_scale_factor: AKShare 成交量需 ×100（手→股）
 
     Returns:
-        标准 9 列 DataFrame，或 None（输入为空 / 结果为空）
+        标准 9 列 DataFrame，或 None（输入为空）
     """
     if df is None or len(df) == 0:
         return None
@@ -80,11 +79,11 @@ def normalize_stock_df(
     df['vwap'] = df['amount'] / df['volume'].replace(0, float('nan'))
     df['vwap'] = df['vwap'].fillna(df['close'])
 
-    # --- 清洗 ---
-    df = df.dropna(subset=['open', 'high', 'low', 'close'])
-    df = df[df['volume'] > 0]  # 过滤零成交幽灵记录（停牌快照等）
-
-    if len(df) == 0:
-        return None
+    # --- 清洗：这里**不做任何行过滤** ---
+    #
+    # 历史上这里有两行静默过滤（dropna(OHLC) + volume>0），与门禁拦的是同一批行，
+    # 但不打印、不计数 —— 门禁汇总因此会谎报「无非法行被剔除」，而数据已经丢了。
+    # 「哪些行非法」只有一处定义（quality.HARD_RULES），过滤只发生在
+    # DatabaseManager 的门禁里（带报告）。本函数只做重塑：列名 / 类型 / 量纲。
 
     return df[STANDARD_COLUMNS]

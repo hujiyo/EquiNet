@@ -18,6 +18,7 @@ from multiprocessing import Pool, cpu_count
 from typing import List
 
 from .database import DatabaseManager
+from .contract import FEATURE_PRICE_COL
 
 
 MA_WINDOWS = [5, 10, 20]
@@ -180,34 +181,56 @@ def compute_bb_features(closes: np.ndarray) -> tuple:
     return bb_upper, bb_lower
 
 
+class FeatureBasisMissing(RuntimeError):
+    """特征计算基准价格列尚未物化（例如后复权列还全是空的）。
+
+    单独定义类型，是为了让调用方能把它与「真的算错了」区分开：
+    这一类是**流程顺序问题**（先物化复权再算特征），可以自动修复，
+    不该像普通异常那样把同一事务里刚抓到的行情数据一起回滚掉。
+    """
+
+
 def compute_features_for_stock(db: DatabaseManager, stock_code: str, auto_commit: bool = True,
-                               price_col: str = 'close_adj') -> bool:
+                               price_col: str = None) -> bool:
     """为单只股票计算并写入衍生特征（内联版本，复用已有数据库连接）。
 
     数据更新后直接调用即可，读取完整历史 → 计算 MA/MACD/BB → 写回，
     单股耗时在毫秒级，无需多进程开销。
 
     Args:
-        price_col: 用作计算基准的价格列。
-            'close_adj'（默认）= 后复权收盘价 —— 除权日不会产生虚假跳变，
-                窗口跨越除权日时 MA/MACD/BB 依然连续。
-            'close' = 原始不复权收盘价（对照/回滚用）。
-            若目标列为 NULL 或非正，自动回退到 'close'。
+        price_col: 用作计算基准的价格列。None = `contract.FEATURE_PRICE_COL`
+            （后复权收盘价）。'close' 只留给对照/回滚，正常流程不该用：
+            窗口跨除权日时均线会断裂。
+
+    Raises:
+        FeatureBasisMissing: 基准列存在空值 / 非正数。
+
+            **绝不静默回退到不复权价。** 这里原来是 `not np.all(isfinite)`
+            就整只股票改用 `close` 重算 —— 而增量更新写进来的新行必然没有
+            复权列（`upsert` 只写行情列），于是**一次增量更新就能把整只股票的
+            历史特征悄悄退回旧口径**，与其它股票口径不一致，且没有任何提示。
+            整个后复权体系的价值会被这一行悄悄抹掉。
     """
+    if price_col is None:
+        price_col = FEATURE_PRICE_COL
+
     df = db.get_stock_data(stock_code, chronological=True)
 
     if len(df) == 0:
         return False
 
     if price_col not in df.columns:
-        price_col = 'close'
-    closes = df[price_col].values.astype(np.float64)
+        raise FeatureBasisMissing(
+            f'{stock_code}: 基准列 {price_col!r} 不存在（数据库 schema 未迁移？）')
 
-    # 后复权列尚未物化时（全 NULL）回退到原始收盘价
-    if not np.all(np.isfinite(closes)) or np.any(closes <= 0):
-        if price_col != 'close':
-            closes = df['close'].values.astype(np.float64)
-            price_col = 'close'
+    closes = df[price_col].values.astype(np.float64)
+    n_bad = int((~np.isfinite(closes)).sum()) + int((closes <= 0).sum())
+    if n_bad:
+        raise FeatureBasisMissing(
+            f'{stock_code}: 基准列 {price_col} 有 {n_bad} 行为空/非正，拒绝计算。'
+            f'请先物化复权列：'
+            f'python -m data_maintenance.adjust_factor --fetch --only-missing '
+            f'&& python -m data_maintenance.adjust_factor --materialize')
 
     dates = df['date'].values
 

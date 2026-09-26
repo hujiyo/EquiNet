@@ -19,9 +19,9 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from typing import List, Optional, Tuple
 
 from .database import DatabaseManager
-from .features import compute_features_for_stock
+from .features import compute_features_for_stock, FeatureBasisMissing
 from .utils import normalize_stock_df
-from .quality import gate_dataframe
+from . import provenance
 
 # 进度持久化文件路径
 _PROGRESS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backup', 'update_progress.json')
@@ -51,27 +51,15 @@ def _clear_progress():
         os.remove(_PROGRESS_FILE)
 
 
-# 本次进程内的门禁统计
-_gate_stats = {'rejected': 0}
+# 基准列（后复权）尚未物化、需要在**本轮结束时统一自愈**的股票。
+# 增量更新写入的新行必然没有复权列，特征因此无法计算 ——
+# 这里不静默回退，也不逐只触发（那样每只股票都要登录一次数据源）。
+_pending_basis: List[str] = []
 
-
-def _apply_ingest_gate(df, stock_code: str):
-    """写入门禁：入库前剔除结构性非法行
-
-    拦截：OHLC 不自洽 / 价格非正 / 零成交量（停牌快照）/ 占位垃圾行（amount<=1）。
-    这些行在任何数据源下都不该存在，属硬错误，直接丢弃。
-
-    不拦截：vwap 越界、价格跳变（除权）—— 属软问题，交 audit.py 记录。
-    """
-    if df is None or len(df) == 0:
-        return df
-    clean, dropped = gate_dataframe(df, stock_code)
-    if dropped:
-        _gate_stats['rejected'] += len(dropped)
-        sample = ', '.join(f"{i.date}({i.issue_type})" for i in dropped[:3])
-        more = f" 等{len(dropped)}条" if len(dropped) > 3 else ""
-        print(f"  [门禁] {stock_code} 剔除 {len(dropped)} 行非法数据: {sample}{more}")
-    return clean
+# 写入门禁已下沉到 DatabaseManager.upsert_daily_data —— 这里不再有独立的门禁调用。
+# 原因：守门员只有在**唯一入口**才成立。原来门禁挂在本文件的两条抓取路径上，
+# 而 check.py 的修复流程直接调 db.upsert_daily_data 就绕过去了
+# （那恰恰是最需要门禁的路径：修数据的时候）。
 
 
 class StockDataUpdater:
@@ -159,8 +147,7 @@ class StockDataUpdater:
             return pd.DataFrame()
 
         df = pd.DataFrame(data_list, columns=rs.fields)
-        df = normalize_stock_df(df, source='baostock')
-        return _apply_ingest_gate(df, code_with_prefix.split('.')[-1])
+        return normalize_stock_df(df, source='baostock')
 
     def fetch_stock_data(self, stock_code: str, start_date: str = None) -> Optional[pd.DataFrame]:
         """获取单只股票的 K 线数据（带超时保护）"""
@@ -238,7 +225,7 @@ class StockDataUpdater:
                     return True
                 with self.db.transaction():
                     self.db.upsert_daily_data(stock_code, df, auto_commit=False)
-                    compute_features_for_stock(self.db, stock_code, auto_commit=False)
+                self._compute_features(stock_code)
                 new_latest = self.db.get_latest_date(stock_code)
                 print(f"✓ {stock_code} 增量更新：{last_date} → {new_latest} (新增 {len(df)} 条)")
                 return True
@@ -250,7 +237,7 @@ class StockDataUpdater:
                 with self.db.transaction():
                     self.db.upsert_daily_data(stock_code, df, auto_commit=False)
                     self.db.add_to_pool([stock_code], pool_type, auto_commit=False)
-                    compute_features_for_stock(self.db, stock_code, auto_commit=False)
+                self._compute_features(stock_code)
                 print(f"✓ {stock_code} 全量保存：{len(df)} 条")
                 return True
         else:
@@ -261,9 +248,63 @@ class StockDataUpdater:
             with self.db.transaction():
                 self.db.upsert_daily_data(stock_code, df, auto_commit=False)
                 self.db.add_to_pool([stock_code], pool_type, auto_commit=False)
-                compute_features_for_stock(self.db, stock_code, auto_commit=False)
+            self._compute_features(stock_code)
             print(f"✓ {stock_code} 全量更新：{len(df)} 条")
             return True
+
+    def _compute_features(self, stock_code: str) -> None:
+        """算特征。基准列未物化时登记待补，**不中断整批更新**。
+
+        行情落库与特征计算必须分开：行情是唯一不可再生的输入，特征是可重算的
+        派生量。原来两者放在同一个事务里，一旦特征因复权列未物化而失败，
+        同一事务里刚抓到的行情会被一起回滚，下一轮重试结果完全相同 ——
+        整条更新流水线会卡死在一个「永远失败」的股票上。
+        """
+        try:
+            compute_features_for_stock(self.db, stock_code)
+        except FeatureBasisMissing as e:
+            if stock_code not in _pending_basis:
+                _pending_basis.append(stock_code)
+            print(f"\n  [!] {e}")
+
+    def _resolve_pending_basis(self) -> None:
+        """自愈：为本轮新抓到的、复权列还没物化的股票补因子并重算特征。
+
+        「数据更新完还得记得手动跑一次 adjust_factor」原来只是一段文档叮嘱，
+        而且那条运维流水线里还漏了它。这里把它变成更新流程自身的一步：
+        漏了就自己补，补不上就显式报错——不再有「静默地用不复权价算特征」这条路。
+        """
+        codes = sorted(set(_pending_basis))
+        if not codes:
+            return
+        print('\n' + '=' * 60)
+        print(f'复权列未物化：{len(codes)} 只 → 自愈（拉因子 → 物化 → 重算特征）')
+        print('=' * 60)
+        from . import adjust_factor
+        try:
+            adjust_factor.fetch_factors(self.db.db_path, workers=2, only_missing=True)
+            adjust_factor.materialize(self.db.db_path, only_codes=codes)
+        except Exception as e:
+            print(f'[!] 自愈失败（复权物化）：{e}')
+            print(f'[!] 以下股票的特征仍按旧口径，需人工处理：{codes[:10]}'
+                  f'{" ..." if len(codes) > 10 else ""}')
+            return
+
+        failed = []
+        for code in codes:
+            try:
+                compute_features_for_stock(self.db, code)
+            except Exception as e:
+                failed.append((code, str(e)))
+        if failed:
+            print(f'[!] {len(failed)} 只重算仍失败：{failed[:3]}')
+        else:
+            print(f'✓ {len(codes)} 只已补齐复权列并重算特征')
+
+        provenance.record(self.db.db_path, key=provenance.KEY_ADJUST,
+                          scope=f'{len(codes)} 只（更新流程内自愈）', rows=len(codes))
+        provenance.record(self.db.db_path, key=provenance.KEY_FEATURES,
+                          scope=f'{len(codes)} 只（更新流程内自愈）', rows=len(codes))
 
     def update_all_stocks(self, mode: str = 'incremental', stock_codes: List[str] = None):
         """批量更新所有股票数据，支持中断续传"""
@@ -370,6 +411,18 @@ class StockDataUpdater:
 
             _clear_progress()
 
+            # 自愈：本轮新抓到的股票若还没有复权列，补因子 → 物化 → 重算特征。
+            # 这一步原来只写在文档里（且运维流水线里还漏了），现在是更新流程自身的一环。
+            self._resolve_pending_basis()
+
+            self.db.report_gate_stats()
+
+            # 登记 ingestion 血缘：后续 adjust/features/audit 的新鲜度都以它为基准
+            provenance.record(self.db.db_path, key=provenance.KEY_INGEST,
+                              scope=f'mode={mode} pool={pool_type}',
+                              rows=success_count,
+                              detail=f'成功 {success_count}/{total}，失败 {len(failed_stocks)}')
+
             print("*" * 32 + " 更新完成统计 " + "*" * 32)
             print(f"成功：{success_count}/{total}")
             print(f"失败：{len(failed_stocks)}")
@@ -439,9 +492,7 @@ class AKShareDataUpdater(StockDataUpdater):
             if df is None or len(df) == 0:
                 return None
 
-            return _apply_ingest_gate(
-                normalize_stock_df(df, source='akshare', volume_scale_factor=100.0),
-                stock_code)
+            return normalize_stock_df(df, source='akshare', volume_scale_factor=100.0)
 
         except Exception as e:
             print(f"✗ {stock_code} AKShare 获取失败：{e}")

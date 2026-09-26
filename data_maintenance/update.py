@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 from .database import DatabaseManager
 from .features import compute_features_for_stock
 from .utils import normalize_stock_df
+from .quality import gate_dataframe
 
 # 进度持久化文件路径
 _PROGRESS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backup', 'update_progress.json')
@@ -48,6 +49,29 @@ def _clear_progress():
     """删除进度文件"""
     if os.path.exists(_PROGRESS_FILE):
         os.remove(_PROGRESS_FILE)
+
+
+# 本次进程内的门禁统计
+_gate_stats = {'rejected': 0}
+
+
+def _apply_ingest_gate(df, stock_code: str):
+    """写入门禁：入库前剔除结构性非法行
+
+    拦截：OHLC 不自洽 / 价格非正 / 零成交量（停牌快照）/ 占位垃圾行（amount<=1）。
+    这些行在任何数据源下都不该存在，属硬错误，直接丢弃。
+
+    不拦截：vwap 越界、价格跳变（除权）—— 属软问题，交 audit.py 记录。
+    """
+    if df is None or len(df) == 0:
+        return df
+    clean, dropped = gate_dataframe(df, stock_code)
+    if dropped:
+        _gate_stats['rejected'] += len(dropped)
+        sample = ', '.join(f"{i.date}({i.issue_type})" for i in dropped[:3])
+        more = f" 等{len(dropped)}条" if len(dropped) > 3 else ""
+        print(f"  [门禁] {stock_code} 剔除 {len(dropped)} 行非法数据: {sample}{more}")
+    return clean
 
 
 class StockDataUpdater:
@@ -135,7 +159,8 @@ class StockDataUpdater:
             return pd.DataFrame()
 
         df = pd.DataFrame(data_list, columns=rs.fields)
-        return normalize_stock_df(df, source='baostock')
+        df = normalize_stock_df(df, source='baostock')
+        return _apply_ingest_gate(df, code_with_prefix.split('.')[-1])
 
     def fetch_stock_data(self, stock_code: str, start_date: str = None) -> Optional[pd.DataFrame]:
         """获取单只股票的 K 线数据（带超时保护）"""
@@ -414,7 +439,9 @@ class AKShareDataUpdater(StockDataUpdater):
             if df is None or len(df) == 0:
                 return None
 
-            return normalize_stock_df(df, source='akshare', volume_scale_factor=100.0)
+            return _apply_ingest_gate(
+                normalize_stock_df(df, source='akshare', volume_scale_factor=100.0),
+                stock_code)
 
         except Exception as e:
             print(f"✗ {stock_code} AKShare 获取失败：{e}")

@@ -36,10 +36,12 @@ def print_header():
     print(" 0. SQL 控制台    (手动执行 SQL)")
     print(" 1. 更新数据      (从外部数据源同步)")
     print(" 2. 筛选股票      (全量池 → 训练池)")
-    print(" 3. 检查数据质量  (完整性验证与修复)")
+    print(" 3. 检查数据质量  (联网比对与修复)")
     print(" 4. 数据库状态")
     print(" 5. 备份数据库")
-    print(" 6. 退出")
+    print(" 6. 离线质量审计  (全库扫描 → 污染样本区间)")
+    print(" 7. 生成 PIT 池   (逐日市值，修正幸存者偏差)")
+    print(" 8. 退出")
     print("=" * 50)
 
 
@@ -172,6 +174,52 @@ def handle_backup(db: DatabaseManager):
     db.backup_database()
 
 
+def _run_with_argv(module, argv):
+    """以指定命令行参数调用模块的 main()"""
+    old = sys.argv
+    sys.argv = argv
+    try:
+        module.main()
+    finally:
+        sys.argv = old
+
+
+def handle_quality_audit(db: DatabaseManager):
+    """离线数据质量审计（不联网，不修改行情数据）"""
+    print("\n--- 离线数据质量审计 ---")
+    print("扫描 OHLC 自洽性 / 零成交 / 占位垃圾行 / vwap 量纲 / 除权跳变 / 僵尸价格")
+    print("并展开成「污染样本区间」，供 src/train.py 跳过对应样本。")
+
+    pool = 'all' if input("扫描池 (1=全量池all, 2=训练池selected) [2]: ").strip() == '1' else 'selected'
+    workers = min(os.cpu_count() or 4, 8)
+    write = input("结果写入 data_issues / sample_exclusion？(Y/n): ").strip().lower() != 'n'
+
+    argv = ['audit', '--db', db.db_path, '--pool', pool, '--workers', str(workers)]
+    if write:
+        argv.append('--write')
+
+    from data_maintenance import audit
+    _run_with_argv(audit, argv)
+
+
+def handle_pit_pool(db: DatabaseManager):
+    """生成 Point-in-Time 股票池"""
+    print("\n--- 生成 PIT 股票池 ---")
+    print("逐日重算流通市值 = amount × 100 / exchange，按日判定入池资格。")
+    print("退出池的股票（退市/市值越界）在其存续期内仍保留，用于修正幸存者偏差。")
+
+    days = input("最短连续区间天数 [60]: ").strip()
+    min_run = int(days) if days.isdigit() else 60
+    write = input("写入 pool_membership 表？(Y/n): ").strip().lower() != 'n'
+
+    argv = ['pit_pool', '--db', db.db_path, '--min-run-days', str(min_run)]
+    if write:
+        argv.append('--write')
+
+    from data_maintenance import pit_pool
+    _run_with_argv(pit_pool, argv)
+
+
 def main():
     """主交互循环"""
     db = DatabaseManager()
@@ -179,7 +227,7 @@ def main():
     try:
         while True:
             print_header()
-            choice = input("请选择 [0-6]: ").strip()
+            choice = input("请选择 [0-8]: ").strip()
 
             if choice == '0':
                 handle_sql(db)
@@ -194,6 +242,10 @@ def main():
             elif choice == '5':
                 handle_backup(db)
             elif choice == '6':
+                handle_quality_audit(db)
+            elif choice == '7':
+                handle_pit_pool(db)
+            elif choice == '8':
                 print("退出")
                 break
             else:

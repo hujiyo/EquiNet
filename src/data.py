@@ -17,7 +17,11 @@ import pickle
 import json
 import numpy as np
 import pandas as pd
-from config import DataConfig, ModelConfig, generate_label, calculate_returns
+from config import (
+    DataConfig, ModelConfig, generate_label, calculate_returns,
+    SAMPLING, SAMPLE_COLUMNS, SAMPLE_SELECT_SQL, CLOSE_RAW_IDX, MAX_WORKERS,
+    CURRENT_POOL, INFORMATIONAL_ISSUE_TYPES, pool_join_sql, load_stock_codes,
+)
 from multiprocessing import Pool, cpu_count
 from sklearn.preprocessing import QuantileTransformer, StandardScaler
 from typing import Dict, List, Set, Optional
@@ -464,45 +468,40 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
         max_stocks: 只加载训练池中代码最小的 N 只股票。None = 全量（默认，训练用）。
             用于**低内存冒烟验证**：全量加载 678 万行时父进程峰值可达数 GB，
             子集模式下可压到几十 MB。
-        num_workers: 并行进程数。None = min(cpu_count(), 8)（默认）。
-            内存受限时显式传小值（如 2）。
+        num_workers: 并行进程数。None = contract.MAX_WORKERS（默认）。
+            内存受限时显式传更小的值（如 2）。
     """
     import sqlite3
 
     conn = sqlite3.connect(db_path)
-    # 价格列取**后复权**（`*_adj`），列别名保持原名以免下游索引大改。
-    # 目的：除权日不再产生虚假跳空，涨跌幅/MA 偏离度/标签全部基于连续序列。
-    # 末尾附一列 `close_raw`（不复权原始收盘价）—— 仅供下面的高价股过滤使用，
-    # 不进入模型输入（见 normalize_and_validate_context_window 与
-    # _vectorized_process_stock 里的 `<= 40` 判定）。
-    # 后复权机制见 data_maintenance/adjust_factor.py 与 docs/data-quality-system.md 第 8 节。
-    pool_filter = ("JOIN stock_pool sp ON sd.stock_code = sp.stock_code\n"
-                   "               WHERE sp.pool_type='selected' AND sp.is_active=1")
+    # 列语义（哪一列是复权价、哪一列是不复权收盘价）的唯一来源是
+    # contract.SAMPLE_COLUMNS / SAMPLE_SELECT_SQL —— SELECT 由契约生成，
+    # 因此不存在「改了 SELECT 忘了改 cols」这种会让模型静默读错列的错位。
+    # 价格取**后复权**：除权日不再产生虚假跳空，涨跌幅/MA 偏离度/标签全部
+    # 基于连续序列。`close_raw` 仅供高价股过滤，不进入模型输入。
+    # 后复权机制见 data_maintenance/adjust_factor.py。
+    #
+    # 池口径的唯一来源是 contract.CURRENT_POOL（训练与审计必须同一个池）。
+    # 历史上这里是一段写死的 SQL，与审计的 CLI 默认值各说各话 —— 切换池时
+    # 审计覆盖不到的股票会静默失去质量筛查。
+    pool_filter = pool_join_sql('sd')
     params = []
     if max_stocks:
-        # 取训练池中代码最小的 N 只，便于可复现的冒烟验证
-        pool_filter = ("JOIN (SELECT stock_code FROM stock_pool\n"
-                       "                    WHERE pool_type='selected' AND is_active=1\n"
-                       "                    ORDER BY stock_code LIMIT ?) sp\n"
-                       "                 ON sd.stock_code = sp.stock_code")
-        params.append(int(max_stocks))
+        # 低内存冒烟验证：取池内代码最小的 N 只，保证可复现
+        subset = sorted(load_stock_codes(db_path, CURRENT_POOL))[:int(max_stocks)]
+        if not subset:
+            raise RuntimeError(f'池 {CURRENT_POOL!r} 为空，无法加载数据')
+        pool_filter = f"WHERE sd.stock_code IN ({','.join('?' * len(subset))})"
+        params = list(subset)
 
-    query = """SELECT sd.stock_code, sd.date,
-                      sd.open_adj  AS open,  sd.high_adj AS high,
-                      sd.low_adj   AS low,   sd.close_adj AS close,
-                      sd.vwap_adj  AS vwap,
-                      sd.volume, sd.exchange, sd.m5, sd.m10, sd.m20,
-                      sd.dif, sd.dea, sd.macd_hist, sd.macd_hist_diff, sd.bb_upper, sd.bb_lower,
-                      sd.close     AS close_raw
+    query = f"""SELECT sd.stock_code, sd.date, {SAMPLE_SELECT_SQL}
                FROM stock_daily sd
-               %s
-               ORDER BY sd.stock_code, sd.date ASC""" % pool_filter
+               {pool_filter}
+               ORDER BY sd.stock_code, sd.date ASC"""
     df = pd.read_sql_query(query, conn, params=params)
     conn.close()
 
-    cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange',
-            'm5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'macd_hist_diff',
-            'bb_upper', 'bb_lower', 'close_raw']
+    cols = list(SAMPLE_COLUMNS)
     stock_codes = []
     stock_data_arrays = []
     stock_times_arrays = []
@@ -512,7 +511,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
         stock_times_arrays.append(group['date'].values)
     del df
 
-    print(f"总共 {len(stock_codes)} 只股票 (训练池)")
+    print(f"总共 {len(stock_codes)} 只股票 (池={CURRENT_POOL})")
     print(f"- 训练集: {train_start_date} ~ {train_end_date}")
     print(f"- 验证集: {val_start_date} ~ {val_end_date}")
     print(f"- 测试集: {test_start_date} ~ 最新")
@@ -524,10 +523,11 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
                          [val_end_date] * len(stock_codes),
                          [test_start_date] * len(stock_codes)))
 
-    # 并行度：内存敏感。默认沿用 8，但可通过 num_workers 显式压低
-    # （每个 worker 会收到一份 pickle 后的股票数据，机器内存紧张时传 2）
+    # 并行度：内存敏感。上限来自 contract.MAX_WORKERS（本机 31.7 GB 且与用户共用，
+    # 按核数定的 min(cpu_count(), 8) 曾把机器压死过一次）。
+    # 每个 worker 会收到一份 pickle 后的股票数据，内存紧张时显式传更小的值。
     if num_workers is None:
-        num_workers = min(cpu_count(), 8)
+        num_workers = MAX_WORKERS
     num_workers = max(1, int(num_workers))
 
     with Pool(num_workers) as pool:
@@ -666,86 +666,104 @@ def compute_label_distance_exclusions(stock_info_list, distance=None):
     print(f"  正样本距离保护(distance={distance}): "
           f"{total_positive}个正样本, 排除{total_excluded}个负样本")
 
-def load_sample_exclusion_spans(db_path=None):
-    """从 data_maintenance 产出的 sample_exclusion 表加载「采样位置排除区间」
+def load_data_issue_dates(db_path=None, only_types=None):
+    """加载质量审计产出的「问题日」，按股票分组
 
-    表由 `python -m data_maintenance.audit --write` 生成，区间为闭区间，
-    作用在「样本的上下文末日」上（样本 t 的输入是 [t-C+1, t]，标签是 [t+1, t+4]）。
+    来源：`python -m data_maintenance.audit --write` 写出的 `data_issues` 表。
+    **不加载任何预先展开好的区间** —— 展开是索引空间的事，只在本模块做一次。
+    历史上审计侧也展开一遍并落成 `sample_exclusion`，两份表达最终不一致：
+    审计侧把序号空间的 ±4/±44 加在日期整数上，导致 74.5% 的污染采样位置漏排，
+    且 3961/3961 个区间日期非法。同一个语义两处表达，必然分叉。
 
-    表不存在时返回空 dict（向后兼容，不影响训练）。
+    Args:
+        only_types: 只取这些 issue_type（None = 全部非 informational 类型）。
+            默认全取，宁可多排不可漏排。
 
     Returns:
-        {stock_code: [(start_date, end_date), ...]}
+        {stock_code: [date, ...]}；表不存在时返回空 dict（不影响训练）
     """
     import sqlite3
     if db_path is None:
         db_path = DataConfig.DB_PATH
+    sql = 'SELECT stock_code, date FROM data_issues'
+    params = ()
+    if only_types:
+        sql += ' WHERE issue_type IN (%s)' % ','.join('?' * len(only_types))
+        params = tuple(only_types)
+    elif INFORMATIONAL_ISSUE_TYPES:
+        # 正常市场事件（如停牌复牌跳空）只记录、不排除 —— 见 contract 的说明。
+        # 把它们计进排除会让「数据质量」机制变成样本过滤器：
+        # 实测排除量会从约 2,900 涨到 687,279 个位置（占行数 10.1%）。
+        sql += ' WHERE issue_type NOT IN (%s)' % ','.join('?' * len(INFORMATIONAL_ISSUE_TYPES))
+        params = tuple(INFORMATIONAL_ISSUE_TYPES)
     out = {}
     try:
-        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
-        rows = conn.execute(
-            'SELECT stock_code, start_date, end_date FROM sample_exclusion'
-        ).fetchall()
-        conn.close()
+        conn = sqlite3.connect(f'file:{db_path.replace(chr(92), "/")}?mode=ro', uri=True)
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
     except Exception:
         return out
-    for code, l, r in rows:
-        out.setdefault(code, []).append((int(l), int(r)))
+    for code, d in rows:
+        out.setdefault(code, []).append(int(d))
     return out
 
 
-def apply_quality_exclusions(stock_info_list, spans=None):
-    """把数据质量排除区间转成采样起始位置，并入 excluded_positions
+def apply_quality_exclusions(stock_info_list, issues=None):
+    """把「问题日」映射成被污染的采样起始位置，并入 excluded_positions
 
     与 compute_label_distance_exclusions 同一出口（stock_info['excluded_positions']），
-    因此对下游采样器完全透明，无需改动 _vectorized_process_stock。
+    对下游采样器完全透明，无需改动 _vectorized_process_stock。
 
-    位置换算：样本起始索引 s 的上下文末日 = times[s + C - 1]
-    故区间 [l, r]（作用在末日上）对应的 s 范围为
-        [pos(l) - (C-1), pos_after(r) - 1 - (C-1)]
+    换算规则由 `contract.SAMPLING.excluded_starts` 唯一定义：
+    问题日在序列中的位次 p → 采样起始索引 s ∈ [p-48, p]。
+    本函数**不做任何日期算术** —— p 由 times 上的二分查找得到，
+    「交易日序号」这个单位从定义处到出口始终一致。
 
     Args:
         stock_info_list: 股票信息列表（就地修改 excluded_positions）
-        spans: 预加载的区间字典；None 时自动从数据库加载
+        issues: 预加载的 {code: [date,...]}；None 时自动从数据库加载
 
     Returns:
         新增排除的位置总数
     """
-    if spans is None:
-        spans = load_sample_exclusion_spans()
+    if issues is None:
+        issues = load_data_issue_dates()
 
-    if not spans:
-        print("  数据质量排除: 未找到 sample_exclusion 表或表为空，跳过"
+    if not issues:
+        print("  数据质量排除: 未找到 data_issues 表或表为空，跳过"
               "（运行 python -m data_maintenance.audit --write 生成）")
         return 0
 
-    C = DataConfig.CONTEXT_LENGTH
     total = 0
     hit_stocks = 0
+    span = SAMPLING.label_backspan + SAMPLING.context_length - 1
 
     for si in stock_info_list:
         code = si.get('file_name')
-        sp = spans.get(code)
-        if not sp:
+        dates = issues.get(code)
+        if not dates:
             continue
         times = np.asarray(si['times'])
         T = len(times)
         excl = si.setdefault('excluded_positions', set())
-        n_before = len(excl)
+        before = len(excl)
 
-        for l, r in sp:
-            lo = int(np.searchsorted(times, l, side='left')) - (C - 1)
-            hi = int(np.searchsorted(times, r, side='right')) - 1 - (C - 1)
-            lo = max(lo, 0)
-            hi = min(hi, T - 1)
+        for g in dates:
+            p = int(np.searchsorted(times, g, side='left'))
+            if p >= T or times[p] != g:
+                continue          # 问题日不在该股序列里（正常不该发生）
+            lo, hi = SAMPLING.excluded_starts(p, T)
             if hi >= lo:
                 excl.update(range(lo, hi + 1))
 
-        if len(excl) > n_before:
+        if len(excl) > before:
             hit_stocks += 1
-        total += len(excl) - n_before
+        total += len(excl) - before
 
-    print(f"  数据质量排除: {hit_stocks} 只股票命中, 新增排除 {total} 个采样位置")
+    print(f"  数据质量排除: {hit_stocks} 只股票命中, 新增排除 {total} 个采样位置"
+          f"（每个问题日展开 {span + 1} 个起始位置）")
     return total
 
 
@@ -1134,10 +1152,10 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     if np.any(closes == 0) or np.any(amounts == 0):
         return None
 
-    # 高价股过滤：必须用**不复权**收盘价（第 16 列 close_raw）。
-    # 列 3 现在存的是后复权价，它随时间膨胀（复权因子单调递增），
+    # 高价股过滤：必须用**不复权**收盘价（CLOSE_RAW_IDX）。
+    # CLOSE_IDX 存的是后复权价，它随时间膨胀（复权因子单调递增），
     # 用它判 `> 40` 会让越靠近今天的样本被误杀越严重 —— 正好毁掉验证/测试集。
-    if input_seq_raw[:, 16][-1] > 40:
+    if input_seq_raw[:, CLOSE_RAW_IDX][-1] > 40:
         return None
 
     if check_limit_up:
@@ -1371,9 +1389,9 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
     valid &= np.all(prev_days[:, :4] != 0, axis=1)
     valid &= np.all(raw_windows[:, :, 3] != 0, axis=1)
     valid &= np.all(raw_windows[:, :, 5] != 0, axis=1)
-    # 高价股过滤：用**不复权**收盘价（第 16 列 close_raw），保持原语义。
-    # 列 3 是后复权价，随时间膨胀，用它判定会系统性误杀近年样本。
-    valid &= raw_windows[:, -1, 16] <= 40
+    # 高价股过滤：用**不复权**收盘价（CLOSE_RAW_IDX），保持原语义。
+    # CLOSE_IDX 是后复权价，随时间膨胀，用它判定会系统性误杀近年样本。
+    valid &= raw_windows[:, -1, CLOSE_RAW_IDX] <= 40
 
     # 涨停过滤（可选）
     if check_limit_up:

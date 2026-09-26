@@ -5,28 +5,23 @@
 1. 每条规则只做一件事，可单独单测
 2. 规则只"报告"，不"修复" —— 修复策略由调用方决定
 3. 所有阈值显式暴露，便于按板块/日期调整
-
-术语对齐下游（src/data.py）：
-- 上下文 CONTEXT_LENGTH = 45：样本 t 的输入是 [t-44, t]
-- 前瞻 FUTURE_DAYS = 3 + BUFFER_DAY = 1：样本 t 的标签落在 [t+1, t+4]
-- 故「日期 g 的数据有问题」会污染的样本位置是 t ∈ [g-4, g+44]
+4. **本模块只产出「哪天有问题」（Issue），不产出「哪些样本不能用」**
+   —— 后者是索引空间的事，由消费方用 `contract.SAMPLING` 换算。
+   历史缺陷：本模块曾把序号空间的 ±4/±44 偏移直接加在日期整数上
+   （`g + 44` 得到的 20150955 不是合法日期），下游按日期查回来时
+   右界永远落在「g 所在月月末」，导致 74.5% 的污染样本漏排。
+   单位只在一个地方定义，才能避免这类错误。
 """
 
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from dataclasses import dataclass
+from typing import List
 
 import numpy as np
 import pandas as pd
 
 # ==================== 常量 ====================
-
-# 样本污染半径（与 src/config.py 保持一致，此处冗余以免 quality 依赖 config）
-CONTEXT_LENGTH = 45
-FUTURE_DAYS = 3
-BUFFER_DAY = 1
-LABEL_BACKSPAN = FUTURE_DAYS + BUFFER_DAY      # 4：标签侧回溯
-CONTAMINATE_LEFT = LABEL_BACKSPAN              # g-4
-CONTAMINATE_RIGHT = CONTEXT_LENGTH - 1         # g+44
+# 注意：采样几何（上下文长度/前瞻天数/污染半径）**不在这里定义**。
+# 唯一定义处是 contract.SAMPLING；本模块只判定「哪天有问题」，不碰索引空间。
 
 # 涨跌幅限制（按板块 / 日期）
 LIMIT_MAIN = 0.10        # 主板 ±10%
@@ -44,6 +39,11 @@ ZOMBIE_MIN_RUN = 5       # 连续多少天收盘价完全不变即判为僵尸�
 # 占位垃圾行判定
 PLACEHOLDER_MAX_AMOUNT = 1.0     # 成交额 <= 1 元
 PLACEHOLDER_MIN_VOLUME = 1.0     # 成交量 <= 1 股
+
+# 复牌判定（**退化口径**，仅在 audit 未提供 `is_resume` 列时使用）：
+# 正常最长假期（春节/国庆连休）约 8 个自然日，超过它基本只能是停牌。
+# 但长假本身会被误判 → 只作为兜底，正式口径是真实交易日历（见 find_resume_gaps）。
+RESUME_GAP_DAYS = 8
 
 
 # ==================== 数据结构 ====================
@@ -90,13 +90,26 @@ def check_ohlc_consistency(df: pd.DataFrame) -> np.ndarray:
 
 
 def check_positive_prices(df: pd.DataFrame) -> np.ndarray:
-    """价格必须为正"""
-    for col in ('open', 'high', 'low', 'close'):
-        v = df[col].values
-        if np.any(v <= 0):
-            pass
-    o, h, l, c = df['open'].values, df['high'].values, df['low'].values, df['close'].values
+    """OHLC 必须为正"""
+    o, h, l, c = (df['open'].values, df['high'].values,
+                  df['low'].values, df['close'].values)
     return (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)
+
+
+# 参与模型输入、因此不允许缺失的列。任何一列非有限数即视为该行不可用。
+REQUIRED_FINITE_COLS = ('open', 'high', 'low', 'close', 'vwap', 'volume', 'amount')
+
+
+def check_nonfinite(df: pd.DataFrame) -> np.ndarray:
+    """必需列存在 NULL / NaN / inf。
+
+    为什么必须单独列一条规则：其余规则全是 `<=` / `>=` 这类比较，而 **NaN 参与
+    比较恒为 False** —— 一行 OHLC 全是 NULL 的记录会被所有比较型规则静默放过，
+    顺利写入数据库（`upsert` 还会把它当成正常行覆盖已有值）。
+    守门员不能依赖上游恰好没给 NULL。
+    """
+    v = np.asarray(df[list(REQUIRED_FINITE_COLS)], dtype=np.float64)
+    return ~np.isfinite(v).all(axis=1)
 
 
 def check_volume(df: pd.DataFrame) -> np.ndarray:
@@ -104,12 +117,34 @@ def check_volume(df: pd.DataFrame) -> np.ndarray:
     return (df['volume'].values <= 0) | (df['amount'].values <= 0)
 
 
+# vwap 越界容差
+#   有振幅日：vwap 由 amount/volume 反推，必须落在 [low, high] 内，留千分之一相对容差
+#   一字板日（low == high）：整日只有一个成交价，区间退化成一点，
+#       此时 vwap 与价格的偏差只反映 amount/volume 的精度。
+#       实测 908/919 条越界都发生在一字板日，中位偏差 0.234%、871 条在 1% 以内，
+#       而 amount/volume 的整数精度只能解释 0.0002%~0.05% —— 说明这是**源的精度伪报**，
+#       不是量纲问题。1% 以上的才可能是真问题（实测 37 条）。
+VWAP_TOL_RANGE = 1e-3
+VWAP_TOL_FLAT = 0.01
+
+
 def check_vwap_range(df: pd.DataFrame) -> np.ndarray:
-    """vwap 必须落在 [low, high] 内。越界说明 amount/volume 量纲不一致（数据源混用指纹）"""
+    """vwap 必须与当日价格区间自洽
+
+    本规则原本想抓的是「amount/volume 量纲不一致」（那会产生数量级偏差），
+    但原实现对**一字板日**用了和有振幅日一样的千分之一容差，
+    于是把 908 条纯精度伪报当成问题报了出来 —— 占当时全部问题的 77%，
+    既把真问题淹没，又连带排除掉 2015-2017 一片本来干净的样本。
+    一字板日改用 1% 容差（见 VWAP_TOL_FLAT 的依据）。
+    """
     vwap = df['vwap'].values
     lo = np.minimum(df['low'].values, df['high'].values)
     hi = np.maximum(df['low'].values, df['high'].values)
-    tol = np.abs(hi) * 1e-3 + 1e-9
+
+    flat = hi <= lo + np.abs(hi) * 1e-9          # 一字：区间退化成一点
+    tol = np.where(flat, np.abs(hi) * VWAP_TOL_FLAT,
+                   np.abs(hi) * VWAP_TOL_RANGE + 1e-9)
+
     return (vwap < lo - tol) | (vwap > hi + tol)
 
 
@@ -119,11 +154,60 @@ def check_placeholder(df: pd.DataFrame) -> np.ndarray:
            (df['volume'].values <= PLACEHOLDER_MIN_VOLUME)
 
 
-def check_price_anomaly(df: pd.DataFrame, stock_code: str) -> np.ndarray:
-    """价格异常跳变：不复权数据下的除权日 / 错价
+def find_resume_gaps(df: pd.DataFrame) -> np.ndarray:
+    """停牌后复牌的首个交易日。
 
-    判定：|日涨跌幅| > 板块涨跌幅上限 × 容差
-    豁免：新股上市前 IPO_FREE_DAYS 个交易日（注册制下无涨跌幅限制）
+    复牌日的涨跌幅**不受常规涨跌幅限制**（重组类甚至无限制），
+    所以它既不是数据错误，也不能用「日涨跌幅 > 板块上限」去判。
+    实测：131 条 price_anomaly 里 **113 条（86%）属于这一类**
+    （前一记录在 346~538 天前，跳幅 +87%/-72% 配正常量能）。
+
+    判定必须用**真实交易日历**：某行的前一条记录若不等于「市场在该日之前的
+    最后一个交易日」，说明该股在中间有停牌。
+
+    不要用「自然日间隔」启发式 —— 实测阈值 3 天会把每个周末都算成停牌
+    （86,849 条 vs 真实的 113 条），阈值 8 天又会把春节/国庆长假误判成停牌。
+    日历由 audit.py 通过 `df['is_resume']` 列提供（外部事实随数据一起传，
+    与 `is_dividend` / `series_truncated` 同一模式）。
+
+    缺列时退化为「自然日间隔 >= RESUME_GAP_DAYS（=8）」，
+    该退化口径**偏保守**（宁可少豁免，多报几个复牌跳空），并在自检里可被察觉。
+    """
+    n = len(df)
+    out = np.zeros(n, dtype=bool)
+    if n < 2:
+        return out
+    if 'is_resume' in df.columns:
+        return df['is_resume'].values.astype(bool)
+    d = pd.to_datetime(df['date'].astype(str), format='%Y%m%d').values
+    gaps = np.zeros(n, dtype=np.int64)
+    gaps[1:] = (d[1:] - d[:-1]).astype('timedelta64[D]').astype(np.int64)
+    out[1:] = gaps[1:] >= RESUME_GAP_DAYS
+    return out
+
+
+def check_price_anomaly(df: pd.DataFrame, stock_code: str) -> np.ndarray:
+    """价格异常跳变：真错价（除权日与复牌日已豁免）
+
+    判定：**连续交易日之间** |日涨跌幅| > 板块涨跌幅上限 × 容差。
+    规则必须显式列出「合法例外」，否则会把正常事件报成问题、并把真问题淹没。
+    本规则有两类豁免，都是实测逼出来的：
+
+    1. **除权日**（`df['is_dividend'] == 1`）。后复权体系（见 adjust_factor.py）
+       落地后，除权造成的跳变在模型输入里已经消失，`stock_daily` 的不复权价
+       只是事实层。实测原 3,491 条里 **3,360 条（96.2%）当天恰有除权事件**。
+
+    2. **复牌日**（`find_resume_gaps`）。前一记录相隔多日的跳空是停牌复牌，
+       不受常规涨跌幅限制。实测剩下 131 条里 **113 条（86%）属于这一类**。
+
+    两类加起来，原来 3,491 条「问题」里只有个位数是真正需要人看的错价。
+
+    3. **上市初期**（前 IPO_FREE_DAYS 个交易日，注册制下无涨跌幅限制）。
+       仅在该股数据未被库起点截断时适用：数据首日恰好是库内最早日期，
+       说明这是「数据起始」而不是「上市」（训练池里 960/2307 只如此）。
+
+    豁免上下文通过 DataFrame 上的可选列传入（`is_dividend` / `series_truncated`，
+    由 audit.py 提供）。**缺列时不豁免** —— 宁可多报，不可漏报。
     """
     close = df['close'].values.astype(np.float64)
     dates = df['date'].values
@@ -137,11 +221,20 @@ def check_price_anomaly(df: pd.DataFrame, stock_code: str) -> np.ndarray:
         ret = np.where(prev > 0, (close[1:] - prev) / prev, 0.0)
 
     limits = np.array([price_limit(stock_code, int(d)) for d in dates[1:]])
-    thresh = limits * LIMIT_TOLERANCE
+    hit = np.abs(ret) > limits * LIMIT_TOLERANCE
 
-    hit = np.abs(ret) > thresh
-    # 豁免新股上市初期
-    hit[:IPO_FREE_DAYS] = False
+    if 'is_dividend' in df.columns:
+        # hit 对应 dates[1:]，除权标记要按同一偏移对齐
+        hit &= df['is_dividend'].values[1:] == 0
+
+    # 复牌日豁免（同样对齐到 dates[1:]）
+    hit &= ~find_resume_gaps(df)[1:]
+
+    truncated = True
+    if 'series_truncated' in df.columns:
+        truncated = bool(df['series_truncated'].iloc[0])
+    if not truncated:
+        hit[:IPO_FREE_DAYS] = False
 
     bad[1:] = hit
     return bad
@@ -187,92 +280,102 @@ def find_zombie_runs(df: pd.DataFrame, stock_code: str) -> List[Issue]:
     return issues
 
 
+# ==================== 规则注册表 ====================
+#
+# 门禁（写库前丢弃）与审计（全库记录）**共用这一份规则清单**。
+# 历史上两者各列一份，是口径分叉的直接来源：同一种行在一处被拒、在另一处被保留，
+# 于是「库里有什么」与「门禁允许什么」永远对不上。
+#
+# 判定函数签名统一为 detect(df, stock_code) -> bool mask
+# 详情函数签名统一为 detail(df, i) -> str
+
+@dataclass(frozen=True)
+class Rule:
+    kind: str
+    detect: object
+    detail: object
+
+
+def _fmt_ohlc(df, i) -> str:
+    return (f"O={df['open'].values[i]} H={df['high'].values[i]} "
+            f"L={df['low'].values[i]} C={df['close'].values[i]}")
+
+
+def _fmt_nonfinite(df, i) -> str:
+    bad = [c for c in REQUIRED_FINITE_COLS
+           if not np.isfinite(np.float64(df[c].values[i]))]
+    return '必需列非有限数: ' + ', '.join(bad)
+
+
+# 硬规则：这些行在任何数据源下都不是一根 K 线，写库前直接丢弃。
+#
+# 关于 zero_volume 的口径（曾自相矛盾）：门禁拒收 `volume/amount <= 0`，
+# 但 8.8 节曾决定「保留停牌记录」。两者取一，本处统一为**拒收**，
+# 依据是本文件 `find_zombie_runs` 已经写下的原则：
+# 「真正的停牌应该是「没有记录」，而不是「复制一条记录」」。
+# 存量的 4,763 行停牌记录属于历史遗留（写入时还没有门禁），
+# 由审计报出、由 selfcheck 断言其数量，不再作为「应当保留」的口径。
+HARD_RULES = (
+    Rule('nonfinite_value', lambda df, code: check_nonfinite(df), _fmt_nonfinite),
+    Rule('ohlc_inconsistent', lambda df, code: check_ohlc_consistency(df), _fmt_ohlc),
+    Rule('nonpositive_price', lambda df, code: check_positive_prices(df), _fmt_ohlc),
+    Rule('zero_volume', lambda df, code: check_volume(df),
+         lambda df, i: f"volume={df['volume'].values[i]} amount={df['amount'].values[i]}"),
+    Rule('placeholder_row', lambda df, code: check_placeholder(df),
+         lambda df, i: f"amount={df['amount'].values[i]} volume={df['volume'].values[i]} "
+                       f"close={df['close'].values[i]}"),
+)
+
+# 软规则：可能是真实数据（除权、复牌、量纲差异、数据源特性），只记录、不下发删除。
+SOFT_RULES = (
+    Rule('resume_gap', lambda df, code: find_resume_gaps(df),
+         lambda df, i: f"停牌后复牌首日（前一记录 "
+                       f"{int(df['date'].values[i-1]) if i else '?'}），"
+                       f"跳空属正常事件 —— 与「真错价」分开列，否则真错价会被淹没"),
+    Rule('vwap_out_of_range', lambda df, code: check_vwap_range(df),
+         lambda df, i: f"vwap={df['vwap'].values[i]} low={df['low'].values[i]} "
+                       f"high={df['high'].values[i]}"),
+    Rule('price_anomaly', lambda df, code: check_price_anomaly(df, code),
+         lambda df, i: f"连续交易日间跳变，close={df['close'].values[i]}"
+                       f"（除权日与复牌日已豁免，剩下的才是真错价）"),
+)
+
+ALL_RULES = HARD_RULES + SOFT_RULES
+
+
 # ==================== 组合扫描 ====================
 
 def scan_stock(df: pd.DataFrame, stock_code: str) -> List[Issue]:
-    """对单只股票的完整历史执行全部规则
+    """对单只股票的完整历史执行全部规则（硬 + 软 + 僵尸段）
 
     Args:
-        df: 至少包含 date/open/high/low/close/volume/amount/vwap，按 date 升序
+        df: 至少包含 date/open/high/low/close/volume/amount/vwap，按 date 升序。
+            ⚠️ **必须是原始（不复权）OHLC**。价格跳变与「一字」判定都以不复权价为
+            事实依据：后复权会把除权日抹平（跳变检不出来），同时把复权因子差
+            混进 OHLC 恒等关系（一字板判别失真）。
         stock_code: 股票代码（用于板块判定）
 
     Returns:
-        Issue 列表
+        Issue 列表（只到「哪天有问题」，不展开污染区间）
     """
     if df is None or len(df) == 0:
         return []
 
     issues: List[Issue] = []
     dates = df['date'].values
-
-    def _emit(mask: np.ndarray, kind: str, fmt) -> None:
-        idx = np.flatnonzero(mask)
-        for i in idx:
-            issues.append(Issue(stock_code, int(dates[i]), kind, fmt(i)))
-
-    _emit(check_ohlc_consistency(df), 'ohlc_inconsistent',
-          lambda i: f"O={df['open'].values[i]} H={df['high'].values[i]} "
-                    f"L={df['low'].values[i]} C={df['close'].values[i]}")
-
-    _emit(check_positive_prices(df), 'nonpositive_price',
-          lambda i: f"close={df['close'].values[i]}")
-
-    _emit(check_volume(df), 'zero_volume',
-          lambda i: f"volume={df['volume'].values[i]} amount={df['amount'].values[i]}")
-
-    _emit(check_placeholder(df), 'placeholder_row',
-          lambda i: f"amount={df['amount'].values[i]} volume={df['volume'].values[i]} "
-                    f"close={df['close'].values[i]}")
-
-    _emit(check_vwap_range(df), 'vwap_out_of_range',
-          lambda i: f"vwap={df['vwap'].values[i]} low={df['low'].values[i]} "
-                    f"high={df['high'].values[i]}")
-
-    _emit(check_price_anomaly(df, stock_code), 'price_anomaly',
-          lambda i: f"较前日跳变，close={df['close'].values[i]}（不复权下疑似除权或错价）")
-
+    for rule in ALL_RULES:
+        for i in np.flatnonzero(rule.detect(df, stock_code)):
+            issues.append(Issue(stock_code, int(dates[i]), rule.kind,
+                                rule.detail(df, int(i))))
     issues.extend(find_zombie_runs(df, stock_code))
     return issues
-
-
-# ==================== 污染区间 ====================
-
-def contaminate_span(g_date: int) -> tuple:
-    """返回问题日 g 会污染的样本位置区间 [left, right]（闭区间，以样本末日 t 表示）
-
-    样本 t 的输入 = [t-44, t]，标签 = [t+1, t+4]
-    - 输入被污染 <=> t-44 <= g <= t  <=> t ∈ [g, g+44]
-    - 标签被污染 <=> t+1 <= g <= t+4 <=> t ∈ [g-4, g-1]
-    合并得 t ∈ [g-4, g+44]
-    """
-    return (g_date - CONTAMINATE_LEFT, g_date + CONTAMINATE_RIGHT)
-
-
-def build_exclusions(issues: List[Issue]) -> Dict[str, List[tuple]]:
-    """把问题日展开成「样本位置排除区间」，按股票分组
-
-    Returns:
-        {stock_code: [(left, right, reason), ...]}
-    """
-    out: Dict[str, List[tuple]] = {}
-    for iss in issues:
-        left, right = contaminate_span(iss.date)
-        out.setdefault(iss.stock_code, []).append((left, right, iss.issue_type))
-    for code in out:
-        out[code].sort()
-    return out
 
 
 def gate_dataframe(df: pd.DataFrame, stock_code: str) -> tuple:
     """写入门禁：在入库前剔除「结构性不可能」的行
 
-    只做上下文无关的硬校验（不需要历史数据）：
-    - OHLC 不自洽 / 价格非正
-    - 零成交量（停牌快照，不是 K 线）
-    - 占位垃圾行（amount<=1 或 volume<=1）
-
-    vwap 越界与价格跳变属于「软问题」（可能是数据源量纲差异或真实除权），
-    不在门禁里删除，交由 audit.py 记录为 data_issues 供人工决策。
+    应用 `HARD_RULES`（与审计同一份清单，口径不可能分叉）。
+    `SOFT_RULES` 不在此处删除 —— 它们可能是真实数据，交给审计记录后由人工决策。
 
     Returns:
         (df_clean, dropped)  dropped 为被剔除行的 Issue 列表
@@ -280,26 +383,18 @@ def gate_dataframe(df: pd.DataFrame, stock_code: str) -> tuple:
     if df is None or len(df) == 0:
         return df, []
 
-    n = len(df)
     dates = df['date'].values
-
-    hard = check_ohlc_consistency(df) | check_positive_prices(df) | \
-        check_volume(df) | check_placeholder(df)
+    masks = [(rule, rule.detect(df, stock_code)) for rule in HARD_RULES]
+    hard = np.zeros(len(df), dtype=bool)
+    for _, m in masks:
+        hard |= m
 
     if not hard.any():
         return df, []
 
     dropped = []
     for i in np.flatnonzero(hard):
-        kinds = []
-        if check_ohlc_consistency(df)[i]:
-            kinds.append('ohlc_inconsistent')
-        if check_positive_prices(df)[i]:
-            kinds.append('nonpositive_price')
-        if check_volume(df)[i]:
-            kinds.append('zero_volume')
-        if check_placeholder(df)[i]:
-            kinds.append('placeholder_row')
+        kinds = [rule.kind for rule, m in masks if m[i]]
         dropped.append(Issue(
             stock_code, int(dates[i]), '|'.join(kinds),
             f"O={df['open'].values[i]} H={df['high'].values[i]} L={df['low'].values[i]} "
@@ -308,20 +403,3 @@ def gate_dataframe(df: pd.DataFrame, stock_code: str) -> tuple:
 
     return df.loc[~hard].reset_index(drop=True), dropped
 
-
-def merge_spans(spans: List[tuple]) -> List[tuple]:
-    """合并重叠区间，减少下游排除判定的开销。reason 合并为去重后的字符串"""
-    if not spans:
-        return []
-    spans = sorted(spans)
-    merged = []
-    cur_l, cur_r, reasons = spans[0][0], spans[0][1], {spans[0][2]}
-    for l, r, reason in spans[1:]:
-        if l <= cur_r + 1:
-            cur_r = max(cur_r, r)
-            reasons.add(reason)
-        else:
-            merged.append((cur_l, cur_r, '|'.join(sorted(reasons))))
-            cur_l, cur_r, reasons = l, r, {reason}
-    merged.append((cur_l, cur_r, '|'.join(sorted(reasons))))
-    return merged

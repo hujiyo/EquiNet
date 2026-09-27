@@ -74,6 +74,11 @@ def _mask_mha_head(mha, head_idx, head_dim):
 
 
 def _compute_auc_and_loss(model, eval_inputs, eval_targets, device, criterion=None, batch_size=DataConfig.EVAL_BATCH_SIZE, tradeable_mask=None):
+    # ⚠ 已知局限：这里算的是 **pooled AUC**（整个评估期样本拼在一起算一次）。
+    # 它会把「哪几天整体好」也算成判别力，而那部分无法交易。
+    # 实测 pooled 与逐日口径可以差 0.12（跨日信号 pooled 0.62 / 逐日 0.51）。
+    # 所以本脚本的 Δ AUC 只说明「该部件对 pooled 判别力的贡献」，
+    # 不等于「对选股收益的贡献」。要下收益结论请用 evaluate_model 的 daily_auc / ic_mean。
     model.eval()
     all_preds = []
     total_loss = 0.0

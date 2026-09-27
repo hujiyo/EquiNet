@@ -574,11 +574,14 @@ def select_model(models):
         info = parse_model_filename(fname)
 
         # 格式化显示
+        # 注意：'model_realistic' 是 2026-09-27 之前的前缀（按验证集收益 argmax 选模，
+        # 属 winner's curse）。新前缀 'model_ic' 按逐日判别力选模。旧文件仍能识别。
         prefix_display = {
             'model_loss': '模型(按loss)',
-            'model_realistic': '模型(按实战收益率)',
+            'model_ic': '模型(按判别力)',
+            'model_realistic': '模型(按实战收益率·旧)',
             'modelA': '模型(按loss)',
-            'modelA_realistic': '模型(按实战收益率)',
+            'modelA_realistic': '模型(按实战收益率·旧)',
             'modelA_loss': '模型(按loss)',
         }.get(info['prefix'], info['prefix'])
 
@@ -636,9 +639,18 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
     if begin_date is not None:
         print(f"- 评估区间: --begin {_format_date(begin_date)} ~ 最新（忽略训练/验证/测试集划分）")
 
-    # --begin 给定时，评估区间变为 [begin, 最新]；否则为默认测试集区间
-    eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns, eval_tradeable_mask = \
-        create_fixed_evaluation_dataset(test_stock_info, feature_normalizer, start_date=begin_date)
+    # --begin 给定时，评估区间变为 [begin, 最新]；否则为默认测试集区间。
+    # 两条路径都走 start_date/end_date 口径（首预测日=起日当天）：
+    # 显式传 TEST_END_DATE，测试集窗口由配置决定，而不是由「数据更新到哪天」决定。
+    if begin_date is not None:
+        eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns, eval_tradeable_mask = \
+            create_fixed_evaluation_dataset(test_stock_info, feature_normalizer, start_date=begin_date)
+    else:
+        eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns, eval_tradeable_mask = \
+            create_fixed_evaluation_dataset(
+                test_stock_info, feature_normalizer,
+                start_date=DataConfig.TEST_START_DATE,
+                end_date=DataConfig.TEST_END_DATE)
 
     print(f"- 评估样本数: {len(eval_inputs)}")
 
@@ -669,8 +681,12 @@ def run_evaluation(model, test_stock_info, device, feature_normalizer=None,
     test_loss = stats['test_loss']
 
     # ========== 每日统计：对齐日历日期（供展示与run 目录 JSON 导出）==========
-    # split_point 口径必须与上面 create_fixed_evaluation_dataset 一致（start_date=begin_date）
-    day_to_date = build_day_to_date_map(test_stock_info, start_date=begin_date)
+    # split_point 口径必须与上面 create_fixed_evaluation_dataset 一致。
+    # 默认路径现在也走 start_date 口径（首个预测日 = TEST_START_DATE），
+    # 若此处仍传 None（旧 test_split_point 口径），日期会整体错位约 CONTEXT_LENGTH 天。
+    day_to_date = build_day_to_date_map(
+        test_stock_info,
+        start_date=begin_date if begin_date is not None else DataConfig.TEST_START_DATE)
     daily_kept = []  # [(date, count, return), ...] 有效交易日(count>0)
     if stats.get('realistic_stats') is not None:
         daily_kept = build_daily_kept(stats['realistic_stats'], day_to_date)

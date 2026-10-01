@@ -163,15 +163,29 @@ ep29 - 第29轮
 
 ## 环境配置示例
 
-- 环境配置：environment.yaml
+环境拆成两份清单，二者是唯一事实来源：
+
+- `environment.yaml`：conda 层（Python 3.12 + pip）
+- `requirements.txt`：pip 层，锁定全部 Python 包版本与 CUDA 源
+
+> 之所以拆开：torch 的 CUDA wheel 只存在于 PyTorch 官方源，而 `environment.yaml` 的 pip 段无法指定 index-url。若直接写进去，重建时 pip 会回退安装 **CPU 版 torch**。
 
 ## 快速开始
 
 1. **克隆项目 & 创建虚拟环境**
    ```bash
    git clone https://github.com/hujiyo/EquiNet-v2.git
-   conda env create -f environment.yaml && conda activate equinet
+   conda env create -f environment.yaml
+   conda activate equinet
+   pip install -r requirements.txt
    ```
+
+   装完**务必验证是 CUDA 版 torch**（`version.cuda` 为 `None` 即 CPU 版，必须重装）：
+   ```bash
+   python -c "import torch;print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+   # 期望: 2.14.1+cu126 12.6 True
+   ```
+
 2. **数据获取**（详见上方「数据管理」）
 3. **生成市场宽度数据**（供极端行情过滤；不生成也可训练，会自动跳过）
    ```bash
@@ -193,6 +207,8 @@ python src/visualize_attention.py
 
 ## 项目修改LOG
 
+- 2026.10.1:环境全面升级并锁定版本（Python 3.13→3.12、torch 2.6.0+cu124→2.14.1+cu126、pandas 2.3.2→3.0.6、numpy 2.3.3→2.5.3、scikit-learn 1.7.1→1.9.1）；环境清单拆分为 `environment.yaml`（conda 层）+ `requirements.txt`（pip 层，含 CUDA 源与全部锁版本）；修复 `muon-optimizer` 误装 PyPI 同名包导致优化器缺少 `p.grad is None` 保护与 `reshape` 的问题；本地环境与实验室服务器（RTX 4090）逐包对齐
+- 2026.9.27:数据区间重划（训练 `2016~2022`、验证 `2023~2025`、测试 `2026~最新`），三个区间统一为「首个预测日 = 区间起始日当天」；Transformer 层数 6→4；归一化器随之在训练区间上重新拟合；`create_fixed_evaluation_dataset` 新增 `start_date` / `end_date` 口径，`attn_analysis.py` / `signal_flow.py` 同步改用验证集口径
 - 2026.8.31:新增K线形态特征
 - 2026.8:重构pretrain_embedding.py训练方法
 - 2026.8.15:embedding预训练解码器改为线性decoder并新增11维衍生特征掩码MSE损失项；新增衍生特征线性探针对照工具probe_derived.py验证跨维结构是否编码进Embedding内

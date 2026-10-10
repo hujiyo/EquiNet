@@ -5,6 +5,8 @@
 输出标准化的行情数据格式，消除 update.py / check.py 中的重复逻辑。
 """
 
+import datetime
+
 import pandas as pd
 import numpy as np
 from typing import Optional
@@ -12,6 +14,38 @@ from typing import Optional
 # 标准输出列
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close',
                      'amount', 'volume', 'exchange', 'vwap']
+
+
+# ==================== 取数窗口收口 ====================
+
+def latest_closed_trading_date() -> int:
+    """当前时刻最近一个「已收盘的交易日」（YYYYMMDD 整数）。
+
+    规则：
+    1. A 股 15:00 收盘，数据源通常 18:00 后才有当日数据；此前视为未更新 → 回退一天。
+    2. 周六 / 周日回退到周五。
+    3. 法定节假日不穷举，留给服务端判断。
+
+    **为什么所有取数路径都必须走这里**：数据源在盘中会返回当天**尚未收盘的半根 K 线**。
+    一旦入库，之后所有增量更新都从 last_date+1 起拉，这行错误数据**永远不会再被覆盖** ——
+    2026-05-22 的一次更新就是这样把 626 只股票的盘中快照永久写进库的。
+    `update.py` 的抓取路径已收口；`check.py` 的**修复路径**曾直接用
+    `datetime.datetime.now()`，而修复恰恰是唯一会写这种永久脏行的地方。
+    """
+    now = datetime.datetime.now()
+    if now.hour < 18:
+        now -= datetime.timedelta(days=1)
+    weekday = now.weekday()          # 0=Mon ... 6=Sun
+    if weekday == 5:                 # 周六 → 周五
+        now -= datetime.timedelta(days=1)
+    elif weekday == 6:               # 周日 → 周五
+        now -= datetime.timedelta(days=2)
+    return int(now.strftime('%Y%m%d'))
+
+
+def bs_date(compact: int) -> str:
+    """20260731 → '2026-07-31'（数据源日期参数的格式）"""
+    return f'{compact // 10000}-{compact // 100 % 100:02d}-{compact % 100:02d}'
 
 
 def normalize_stock_df(

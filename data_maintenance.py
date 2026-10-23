@@ -121,7 +121,14 @@ def handle_select(db: DatabaseManager):
     dry_run = input("仅预览不修改？(y/N): ").strip().lower() == 'y'
 
     from data_maintenance.select import run_select
-    selected = run_select(db, dry_run=dry_run)
+    try:
+        selected = run_select(db, dry_run=dry_run)
+    except (RuntimeError, ValueError) as e:
+        # 筛选是「静默筛错」的高危环节（ST 过滤失效 / 空结果清池）。
+        # 这些失败必须显式中止，不能带着错的池继续跑。
+        print(f"\n✗ 筛选中止：{e}")
+        print("  未对 selected 池做任何修改。")
+        return
 
     if dry_run:
         print(f"\n预览: 筛选出 {len(selected)} 只股票")

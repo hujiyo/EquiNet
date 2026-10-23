@@ -99,8 +99,11 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         print(f"  验证集样本数: {len(eval_inputs)}")
     else:
         print("⚠ 无验证集数据，使用测试集进行模型选择（不推荐）")
+        # 必须显式给 start_date/end_date：否则预测日会溢出 TEST_END_DATE
+        # （旧 end_key 口径下会多出约 CONTEXT_LENGTH 个交易日的 2026 年样本）
         eval_inputs, eval_targets, eval_cumulative_returns, eval_day_indices, eval_daily_returns, eval_tradeable_mask = create_fixed_evaluation_dataset(
-            test_stock_info, feature_normalizer
+            test_stock_info, feature_normalizer,
+            start_date=DataConfig.TEST_START_DATE, end_date=DataConfig.TEST_END_DATE
         )
 
     # 测试集评估数据集延后到训练结束后构建（整个训练期间不消费，
@@ -159,7 +162,11 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         neg_count = int(np.sum(eval_targets_arr < 0.5))
         print(f"{eval_set_name}BalancedBCE权重: 正样本={eval_criterion.pos_weight.item():.4f}, 负样本={eval_criterion.neg_weight.item():.4f} (正{pos_count}:负{neg_count})")
 
-    # 按loss保存的最佳模型（条件：预热结束后, 实战收益率>=1.4%, 收益率>0.8%, AUC>65%）
+    # 按loss保存的最佳模型（预热结束后即生效）
+    #
+    # 为什么去掉硬门槛：这里原来是 `top_return >= 0.006 and auc > 0.69`。
+    # 低于门槛的 epoch 从不落盘，于是「模型怎么都过不了 70%」其实是**左截断假象**——
+    # 真正存在的低分段你根本没看见。选模标准可以严，记录必须完整。
     best_loss = float('inf')
     best_loss_epoch = 0
     best_model_by_loss = None
@@ -167,15 +174,27 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
     best_auc_at_best_loss = 0.0
     best_threshold_at_best_loss = 0.0
     best_realistic_return_at_best_loss = 0.0
+    best_daily_auc_at_best_loss = float('nan')
+    best_ic_at_best_loss = float('nan')
 
-    # 按实战收益率保存的最佳模型（预热结束后）
-    best_realistic_return = -float('inf')
-    best_realistic_return_epoch = 0
-    best_model_by_realistic_return = None
-    best_return_at_best_realistic = 0.0
-    best_auc_at_best_realistic = 0.0
-    best_threshold_at_best_realistic = 0.0
-    best_realistic_return_value_at_best = 0.0
+    # 按逐日判别力保存的最佳模型（预热结束后）
+    #
+    # 为什么换成 IC：这里原来是 `realistic_return > best_realistic_return`——
+    # 在约 243 天的验证集上对**收益**无条件取 argmax。这个量的标准误约 0.5%，
+    # 也就是说在噪声主导的数上挑最大值，是典型的 winner's curse：
+    # 挑出来的 epoch 到测试集必然回落。IC 的日间方差比收益小一到两个量级，
+    # 且不吃「哪几天整体好」这种无法交易的部分。
+    best_ic = -float('inf')
+    best_ic_epoch = 0
+    best_model_by_ic = None
+    best_return_at_best_ic = 0.0
+    best_auc_at_best_ic = 0.0
+    best_daily_auc_at_best_ic = float('nan')
+    best_threshold_at_best_ic = 0.0
+    best_return_value_at_best_ic = 0.0
+
+    # 逐日指标是否可用（依赖 eval_day_indices）。退化时只警告一次，不刷屏。
+    daily_metrics_available = None
 
     # 早停机制（patience = EPOCHS * 0.25）
     patience = int(epochs * 0.25)
@@ -301,7 +320,27 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         val_loss = stats['test_loss']
         eval_label = "验证集" if has_val else "测试集"
 
-        print(f'  [模型] 训练损失: {avg_loss:.4f}, {eval_label}损失: {val_loss:.4f}, AUC: {stats["auc"]:.4f}, Prec@10%: {stats["precision_top10"]:.3f}, Prec@3%: {stats["precision_top3"]:.3f}, Prec@1%: {stats["precision_top1"]:.3f} (基线: {stats["base_positive_rate"]:.3f})')
+        # 两个 AUC 口径必须并列打印：pooled 会吸收「哪几天整体好」这种无法交易的成分，
+        # 逐日 AUC 才是「同一天里买的和没买的有无区别」。二者差多少，就是虚高多少。
+        print(f'  [模型] 训练损失: {avg_loss:.4f}, {eval_label}损失: {val_loss:.4f}, '
+              f'AUC(pooled): {stats["auc"]:.4f}, AUC(逐日): {_fmt_or_na(stats.get("daily_auc"))}, '
+              f'Prec@10%: {stats["precision_top10"]:.3f}, Prec@3%: {stats["precision_top3"]:.3f}, '
+              f'Prec@1%: {stats["precision_top1"]:.3f} (基线: {stats["base_positive_rate"]:.3f})')
+        print(f'         逐日判别力: IC {_fmt_or_na(stats.get("ic_mean"), "{:+.4f}")}, '
+              f'ICIR {_fmt_or_na(stats.get("icir"), "{:+.3f}")}, '
+              f'IC的t值 {_fmt_or_na(stats.get("ic_t"), "{:+.2f}")}, '
+              f'日Top{DataConfig.TOP_K}%命中率 {_fmt_or_na(stats.get("daily_precision"), "{:.3f}")} '
+              f'(统计天数 {stats.get("eval_days", 0)})')
+        if daily_metrics_available is None:
+            daily_metrics_available = bool(stats.get('eval_days', 0) >= 2 and
+                                           np.isfinite(stats.get('ic_mean', np.nan)))
+            if not daily_metrics_available:
+                print(f'         ⚠ 本轮拿不到逐日指标（eval_day_indices 缺失或每日样本过少），'
+                      f'选模已退回 pooled AUC；该口径会把跨日行情算成判别力，不要拿它下结论。')
+            elif stats.get('eval_days', 0) < DataConfig.MIN_EVAL_DAYS:
+                print(f'         ⚠ {eval_label}只有 {stats.get("eval_days", 0)} 个预测日'
+                      f'（建议 ≥ {DataConfig.MIN_EVAL_DAYS}）：在这个天数上 IC 的日间波动很大，'
+                      f'选 epoch 看 ICIR，别看单期收益。')
         print(f'         预测均值: {stats["pred_mean"]:.3f}, 高置信(>0.7): {stats["high_conf_count"]}, 低置信(<0.2): {stats["low_conf_count"]}')
         daily_str = f', 日Top{DataConfig.TOP_K}%收益: {stats["daily_top_return"]*100:+.2f}%' if stats.get("daily_top_return") is not None else ''
         print(f'         Top{DataConfig.TOP_K}%收益: {stats["top_return"]*100:+.2f}%{daily_str}')
@@ -320,6 +359,12 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             'train_loss': avg_loss,
             'val_loss': val_loss,
             'auc': stats['auc'],
+            'daily_auc': stats.get('daily_auc'),
+            'ic_mean': stats.get('ic_mean'),
+            'icir': stats.get('icir'),
+            'ic_t': stats.get('ic_t'),
+            'daily_precision': stats.get('daily_precision'),
+            'eval_days': stats.get('eval_days', 0),
             'precision_top10': stats['precision_top10'],
             'precision_top3': stats['precision_top3'],
             'precision_top1': stats['precision_top1'],
@@ -339,7 +384,8 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             avg_loss=val_loss,
             top_return=stats['top_return'],
             auc=stats['auc'],
-            threshold=stats['top_threshold']
+            threshold=stats['top_threshold'],
+            ic=stats.get('ic_mean'),          # 首选判据；拿不到时内部退化到收益
         )
 
         if improved:
@@ -351,7 +397,19 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
 
         # 按loss保存最佳模型（基于验证集指标）
         realistic_return = stats['realistic_stats']['avg_realistic_return'] if stats.get('realistic_stats') else 0.0
-        if (epoch + 1) > warmup_epochs and stats['top_return'] >= 0.006 and stats['auc'] > 0.69:
+
+        # 选模主键：优先逐日 IC，其次逐日 AUC，最后才退回 pooled AUC。
+        # 三者都不依赖全局阈值，也不把「哪几天整体好」算成选股能力。
+        sel_key = stats.get('ic_mean')
+        if sel_key is None or not np.isfinite(sel_key):
+            sel_key = stats.get('daily_auc')
+        if sel_key is None or not np.isfinite(sel_key):
+            sel_key = stats.get('auc', 0.5)
+        sel_key = float(sel_key)
+
+        # 硬门槛已删除。原条件是 top_return >= 0.006 且 auc > 0.69，
+        # 它会让低于门槛的 epoch 永远不落盘 —— 「过不了 70%」是这么来的，不是模型上限。
+        if (epoch + 1) > warmup_epochs:
             if val_loss < best_loss:
                 best_loss = val_loss
                 best_loss_epoch = epoch + 1
@@ -360,19 +418,27 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
                 best_auc_at_best_loss = stats['auc']
                 best_threshold_at_best_loss = stats['top_threshold']
                 best_realistic_return_at_best_loss = realistic_return
-                print(f'         ✓ 新最佳模型（{eval_label} loss）！Loss: {best_loss:.4f}, 实战收益率: {best_realistic_return_at_best_loss*100:.1f}% (第{best_loss_epoch}轮)')
+                best_daily_auc_at_best_loss = stats.get('daily_auc', float('nan'))
+                best_ic_at_best_loss = stats.get('ic_mean', float('nan'))
+                print(f'         ✓ 新最佳模型（{eval_label} loss）！Loss: {best_loss:.4f}, '
+                      f'逐日AUC: {_fmt_or_na(best_daily_auc_at_best_loss)}, '
+                      f'IC: {_fmt_or_na(best_ic_at_best_loss, "{:+.4f}")} (第{best_loss_epoch}轮)')
 
-        # 按实战收益率保存最佳模型（基于验证集指标）
+        # 按逐日判别力保存最佳模型（基于验证集指标）
         if (epoch + 1) > warmup_epochs:
-            if realistic_return > best_realistic_return:
-                best_realistic_return = realistic_return
-                best_realistic_return_epoch = epoch + 1
-                best_model_by_realistic_return = copy.deepcopy(model.state_dict())
-                best_return_at_best_realistic = stats['top_return']
-                best_auc_at_best_realistic = stats['auc']
-                best_threshold_at_best_realistic = stats['top_threshold']
-                best_realistic_return_value_at_best = realistic_return
-                print(f'         ✓ 新最佳模型（{eval_label}实战收益率）！实战: {best_realistic_return*100:.1f}%, Top1%: {best_return_at_best_realistic*100:+.2f}% (第{best_realistic_return_epoch}轮)')
+            if sel_key > best_ic:
+                best_ic = sel_key
+                best_ic_epoch = epoch + 1
+                best_model_by_ic = copy.deepcopy(model.state_dict())
+                best_return_at_best_ic = stats['top_return']
+                best_auc_at_best_ic = stats['auc']
+                best_daily_auc_at_best_ic = stats.get('daily_auc', float('nan'))
+                best_threshold_at_best_ic = stats['top_threshold']
+                best_return_value_at_best_ic = realistic_return
+                print(f'         ✓ 新最佳模型（{eval_label}判别力）！'
+                      f'IC: {_fmt_or_na(stats.get("ic_mean"), "{:+.4f}")}, '
+                      f'逐日AUC: {_fmt_or_na(best_daily_auc_at_best_ic)}, '
+                      f'实战: {realistic_return*100:+.1f}% (第{best_ic_epoch}轮)')
 
         print("-" * 60)
 
@@ -385,13 +451,19 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
     print("\n" + "=" * 60)
     print(f"训练完成！")
     eval_label = "验证集" if has_val else "测试集"
-    print(f"最佳模型（按{eval_label} loss）: 第{best_loss_epoch}轮, Loss: {best_loss:.4f}, 实战收益率: {best_realistic_return_at_best_loss*100:.1f}%")
-    print(f"最佳模型（按{eval_label}实战收益率）: 第{best_realistic_return_epoch}轮, 实战收益率: {best_realistic_return_value_at_best*100:.1f}%, Top1%: {best_return_at_best_realistic*100:+.2f}%")
+    print(f"最佳模型（按{eval_label} loss）: 第{best_loss_epoch}轮, Loss: {best_loss:.4f}, "
+          f"逐日AUC: {_fmt_or_na(best_daily_auc_at_best_loss)}, IC: {_fmt_or_na(best_ic_at_best_loss, '{:+.4f}')}")
+    print(f"最佳模型（按{eval_label}判别力）: 第{best_ic_epoch}轮, "
+          f"IC: {_fmt_or_na(best_ic, '{:+.4f}')}, 逐日AUC: {_fmt_or_na(best_daily_auc_at_best_ic)}, "
+          f"实战收益率: {best_return_value_at_best_ic*100:+.1f}%, Top1%: {best_return_at_best_ic*100:+.2f}%")
 
     # 此刻才构建测试集评估数据集（训练期间不消费，延后构建缩短训练前等待）
     print("创建测试集评估数据集（训练结束后仅评估一次）...")
+    # start_date/end_date 必须显式给：否则首个预测日会推迟约 CONTEXT_LENGTH 个交易日
+    # （丢掉 2023 年头两个月），末个预测日又会溢出 TEST_END_DATE 进 2026 年。
     test_eval_inputs, test_eval_targets, test_eval_cumulative_returns, test_eval_day_indices, test_eval_daily_returns, test_eval_tradeable_mask = create_fixed_evaluation_dataset(
-        test_stock_info, feature_normalizer
+        test_stock_info, feature_normalizer,
+        start_date=DataConfig.TEST_START_DATE, end_date=DataConfig.TEST_END_DATE
     )
 
     # 测试集评估（用测试集指标保存到模型文件中）
@@ -402,9 +474,9 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
     save_loss_return = best_return_at_best_loss
     save_loss_threshold = best_threshold_at_best_loss
     save_loss_auc = best_auc_at_best_loss
-    save_realistic_return = best_return_at_best_realistic
-    save_realistic_threshold = best_threshold_at_best_realistic
-    save_realistic_auc = best_auc_at_best_realistic
+    save_ic_return = best_return_at_best_ic
+    save_ic_threshold = best_threshold_at_best_ic
+    save_ic_auc = best_auc_at_best_ic
 
     if len(test_eval_inputs) > 0:
         print("\n" + "=" * 60)
@@ -425,23 +497,17 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
                 criterion=test_eval_criterion,
                 tradeable_mask=test_eval_tradeable_mask
             )
-            print(f"\n  [测试集] 模型(loss): "
-                  f"Loss: {test_stats_loss['test_loss']:.4f}, "
-                  f"AUC: {test_stats_loss['auc']:.4f}, "
-                  f"Top{DataConfig.TOP_K}%收益: {test_stats_loss['top_return']*100:+.2f}%")
-            if test_stats_loss.get('realistic_stats'):
-                rs = test_stats_loss['realistic_stats']
-                print(f"           实战收益率: {rs['avg_realistic_return']*100:.1f}%")
+            _print_eval_summary("测试集·按loss选出的模型", test_stats_loss)
             # 用测试集指标覆盖保存指标
             save_loss_return = test_stats_loss['top_return']
             save_loss_threshold = test_stats_loss['top_threshold']
             save_loss_auc = test_stats_loss['auc']
             test_return = test_stats_loss['top_return']
 
-        # 评估按实战收益率选出的最佳模型
-        if best_model_by_realistic_return is not None:
-            model.load_state_dict(best_model_by_realistic_return)
-            test_stats_realistic = evaluate_model(
+        # 评估按逐日判别力选出的最佳模型
+        if best_model_by_ic is not None:
+            model.load_state_dict(best_model_by_ic)
+            test_stats_ic = evaluate_model(
                 model, test_eval_inputs, test_eval_targets, test_eval_cumulative_returns,
                 device,
                 eval_day_indices=test_eval_day_indices,
@@ -449,18 +515,26 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
                 criterion=test_eval_criterion,
                 tradeable_mask=test_eval_tradeable_mask
             )
-            print(f"\n  [测试集] 模型(realistic): "
-                  f"Loss: {test_stats_realistic['test_loss']:.4f}, "
-                  f"AUC: {test_stats_realistic['auc']:.4f}, "
-                  f"Top{DataConfig.TOP_K}%收益: {test_stats_realistic['top_return']*100:+.2f}%")
-            if test_stats_realistic.get('realistic_stats'):
-                rs = test_stats_realistic['realistic_stats']
-                print(f"           实战收益率: {rs['avg_realistic_return']*100:.1f}%")
+            _print_eval_summary("测试集·按判别力选出的模型", test_stats_ic)
             # 用测试集指标覆盖保存指标
-            save_realistic_return = test_stats_realistic['top_return']
-            save_realistic_threshold = test_stats_realistic['top_threshold']
-            save_realistic_auc = test_stats_realistic['auc']
-            test_realistic_return = rs['avg_realistic_return'] if test_stats_realistic.get('realistic_stats') else 0.0
+            save_ic_return = test_stats_ic['top_return']
+            save_ic_threshold = test_stats_ic['top_threshold']
+            save_ic_auc = test_stats_ic['auc']
+            test_realistic_return = test_stats_ic['realistic_stats']['avg_realistic_return'] if test_stats_ic.get('realistic_stats') else 0.0
+
+        # 测试集窗口太短时结论不可信 —— 这一条必须在流程里，不能只写在文档里。
+        # 依据：20 日反转这种固定因子，在 136 天窗口上的 95% 置信区间是 ±1.39%，
+        # 比多数模型报告的日均超额本身还大。
+        _test_days = 0
+        if len(test_eval_day_indices) > 0:
+            _test_days = int(len(np.unique(test_eval_day_indices)))
+        if 0 < _test_days < DataConfig.MIN_EVAL_DAYS:
+            print("\n" + "!" * 60)
+            print(f"⚠ 测试集只有 {_test_days} 个预测日（建议 ≥ {DataConfig.MIN_EVAL_DAYS}）。")
+            print("  在这个天数上，日均超额的标准误约 ±0.5%，")
+            print("  与你要分辨的差异同量级 —— 上面这些数字区分不了「模型好」和「运气好」。")
+            print("  不要拿它决定是否换架构、换标签。改用 IC / ICIR 判断，它们方差小得多。")
+            print("!" * 60)
 
         print("=" * 60)
 
@@ -476,22 +550,28 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         print(f"✓ 模型(loss)已保存: {os.path.relpath(save_path, DataConfig.OUTPUT_DIR)}")
         print(f"  测试集 Top1%收益: {save_loss_return*100:+.2f}%, AUC: {save_loss_auc:.4f}")
 
-    if best_model_by_realistic_return is not None:
-        save_path_realistic = save_model_with_metadata(
-            best_model_by_realistic_return,
-            save_realistic_return, save_realistic_threshold, save_realistic_auc,
-            best_realistic_return_epoch,
-            model_prefix="model_realistic",
+    if best_model_by_ic is not None:
+        save_path_ic = save_model_with_metadata(
+            best_model_by_ic,
+            save_ic_return, save_ic_threshold, save_ic_auc,
+            best_ic_epoch,
+            model_prefix="model_ic",
             output_dir=run_dir,
         )
-        print(f"✓ 模型(realistic)已保存: {os.path.relpath(save_path_realistic, DataConfig.OUTPUT_DIR)}")
-        print(f"  测试集 Top1%收益: {save_realistic_return*100:+.2f}%, AUC: {save_realistic_auc:.4f}")
+        print(f"✓ 模型(判别力)已保存: {os.path.relpath(save_path_ic, DataConfig.OUTPUT_DIR)}")
+        print(f"  测试集 Top1%收益: {save_ic_return*100:+.2f}%, AUC: {save_ic_auc:.4f}")
+        print(f"  选模依据：验证集 IC {_fmt_or_na(best_ic, '{:+.4f}')}（第{best_ic_epoch}轮）"
+              f"——不是收益 argmax，避免 winner's curse")
 
     # 保存每轮收益率到CSV（与模型同住本次 run 目录，产物集中追溯）
     timestamp = datetime.now().strftime("%m%d_%H%M%S")
     returns_csv_path = os.path.join(run_dir, f"epoch_returns_{timestamp}.csv")
 
-    fieldnames = ['turn', 'top_return', 'daily_return', 'train_loss', 'val_loss', 'auc', 'prec_top10', 'prec_top3', 'prec_top1', 'avg_realistic_return']
+    # 逐日口径字段与 pooled 并列落盘：事后要能看出「哪个 epoch 是 pooled 虚高」。
+    # 选 epoch 看 daily_auc / ic_mean / icir，不要看 avg_realistic_return。
+    fieldnames = ['turn', 'top_return', 'daily_return', 'train_loss', 'val_loss',
+                  'auc', 'daily_auc', 'ic_mean', 'icir', 'ic_t', 'daily_precision',
+                  'eval_days', 'prec_top10', 'prec_top3', 'prec_top1', 'avg_realistic_return']
 
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -505,6 +585,12 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
                 'train_loss': f"{er['train_loss']:.4f}" if er.get('train_loss') is not None else "",
                 'val_loss': f"{er['val_loss']:.4f}" if er.get('val_loss') is not None else "",
                 'auc': f"{er['auc']:.4f}" if er.get('auc') is not None else "",
+                'daily_auc': _fmt_or_na(er.get('daily_auc'), '{:.4f}', ''),
+                'ic_mean': _fmt_or_na(er.get('ic_mean'), '{:+.4f}', ''),
+                'icir': _fmt_or_na(er.get('icir'), '{:+.4f}', ''),
+                'ic_t': _fmt_or_na(er.get('ic_t'), '{:+.3f}', ''),
+                'daily_precision': _fmt_or_na(er.get('daily_precision'), '{:.4f}', ''),
+                'eval_days': er.get('eval_days', 0),
                 'prec_top10': f"{er['precision_top10']:.4f}" if er.get('precision_top10') is not None else "",
                 'prec_top3': f"{er['precision_top3']:.4f}" if er.get('precision_top3') is not None else "",
                 'prec_top1': f"{er['precision_top1']:.4f}" if er.get('precision_top1') is not None else "",
@@ -514,6 +600,40 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
 
     print(f"✓ 训练日志已保存: {os.path.relpath(returns_csv_path, DataConfig.OUTPUT_DIR)}")
     return test_return, test_realistic_return
+
+
+def _fmt_or_na(x, fmt='{:.4f}', na='n/a'):
+    """格式化数值；nan / None 一律显示成 n/a，绝不伪装成 0。
+
+    选模指标里出现 nan 是有含义的（这一天/这个口径算不出来），
+    打印成 0.0000 会让人误以为是「模型很烂」而不是「指标不可用」。
+    """
+    try:
+        if x is None or not np.isfinite(float(x)):
+            return na
+        return fmt.format(float(x))
+    except (TypeError, ValueError):
+        return na
+
+
+def _print_eval_summary(tag, stats):
+    """评估摘要：pooled 与逐日口径并列打印。
+
+    只报 pooled AUC 会导致「AUC 很高但赚不到钱」——pooled 把跨日行情也算成了
+    判别力。两个口径并列，差值就是虚高的部分。
+    """
+    print(f"\n  [{tag}] Loss: {_fmt_or_na(stats.get('test_loss'))}, "
+          f"AUC(pooled): {_fmt_or_na(stats.get('auc'))}, "
+          f"AUC(逐日): {_fmt_or_na(stats.get('daily_auc'))}")
+    print(f"       IC: {_fmt_or_na(stats.get('ic_mean'), '{:+.4f}')}, "
+          f"ICIR: {_fmt_or_na(stats.get('icir'), '{:+.3f}')}, "
+          f"IC的t值: {_fmt_or_na(stats.get('ic_t'), '{:+.2f}')}, "
+          f"统计天数: {stats.get('eval_days', 0)}")
+    print(f"       Top{DataConfig.TOP_K}%收益: {_fmt_or_na(stats.get('top_return'), '{:+.4f}')}, "
+          f"日Top{DataConfig.TOP_K}%命中率: {_fmt_or_na(stats.get('daily_precision'), '{:.3f}')}")
+    if stats.get('realistic_stats'):
+        rs = stats['realistic_stats']
+        print(f"       实战收益率: {rs['avg_realistic_return']*100:+.1f}%")
 
 
 def _run_selfcheck_before_training():

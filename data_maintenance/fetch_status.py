@@ -98,6 +98,25 @@ def ensure_schema(db_path: str) -> None:
         con.close()
 
 
+def _int_or_none(v):
+    """数据源的空值 → None，**不要填 0**。
+
+    tradestatus 的 `0` 意思是「停牌」、is_st 的 `0` 意思是「非 ST」——
+    两者都是**对一个我们并不知道的事实做了断言**。空值代表数据源没给这个字段，
+    如实存 NULL 才对：下游（pit_pool 的 fillna(0)）本来就按 NULL 处理，
+    但库里不该出现凭空捏造的状态值。
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except ValueError:
+        return None
+
+
 def _to_bs_code(code: str) -> str:
     if code.startswith(('6', '9')):
         return f'sh.{code}'
@@ -165,7 +184,7 @@ def _fetch_chunk(args):
                     while rs.next():
                         r = rs.get_row_data()
                         rows.append((code, int(r[0].replace('-', '')),
-                                     int(r[2] or 0), int(r[3] or 0)))
+                                     _int_or_none(r[2]), _int_or_none(r[3])))
                     done = True
                     break
                 if '登录' in err or 'login' in err.lower():
@@ -208,11 +227,10 @@ def fetch_status(db_path: str = DEFAULT_DB, workers: int = MAX_WORKERS,
         print('没有需要拉取的股票，跳过')
         return 0
 
-    if not only_missing:
-        con = sqlite3.connect(db_path)
-        con.execute('DELETE FROM stock_status')
-        con.commit()
-        con.close()
+    # 注意：这里**不能**先 `DELETE FROM stock_status` 再联网拉取。
+    # 拉全市场要 30~50 分钟，先清空的话，网络故障或用户 Ctrl-C 都会留下一张空表。
+    # 改为每个分片只清掉「本片确实抓到的股票」再插入（见下方循环），
+    # 抓失败的股票保留旧数据，任何时刻表里都有可用内容。
 
     chunks = [codes[i:i + CHUNK] for i in range(0, len(codes), CHUNK)]
     print(f'拉取 {len(codes):,} 只股票的逐日状态（{STATUS_START} ~ {end_date}）')
@@ -227,6 +245,14 @@ def fetch_status(db_path: str = DEFAULT_DB, workers: int = MAX_WORKERS,
         with Pool(workers) as pool:
             for i, (rows, failed) in enumerate(pool.imap_unordered(_fetch_chunk, tasks), 1):
                 if rows:
+                    if not only_missing:
+                        # 只清本片确实抓到的股票，再插入 —— 失败的保留旧数据。
+                        codes_in = sorted({r[0] for r in rows})
+                        for j in range(0, len(codes_in), 900):   # 900 < SQLite 变量数上限
+                            batch = codes_in[j:j + 900]
+                            con.execute(
+                                f'DELETE FROM stock_status WHERE stock_code IN '
+                                f'({",".join("?" * len(batch))})', batch)
                     con.executemany(INSERT_SQL, rows)
                     total_rows += len(rows)
                 all_failed.extend(failed)
@@ -236,15 +262,23 @@ def fetch_status(db_path: str = DEFAULT_DB, workers: int = MAX_WORKERS,
                     print(f'  进度 {done:,}/{len(codes):,}  行 {total_rows:,}  '
                           f'失败 {len(all_failed):,}  耗时 {time.time()-t0:.0f}s')
         con.commit()
+
+        # 统计与血缘登记都在**同一个写连接**上完成，再统一 commit ——
+        # 原来统计走只读连接、provenance 又自建连接单独 commit，
+        # 于是「数据已提交、血缘还是旧值」中间存在一个窗口，
+        # 崩溃时会留下新数据配旧血缘（selfcheck 据此判断新鲜度）。
+        elapsed = time.time() - t0
+        n_stock = con.execute('SELECT COUNT(DISTINCT stock_code) FROM stock_status').fetchone()[0]
+        n_susp = con.execute('SELECT COUNT(*) FROM stock_status WHERE tradestatus=0').fetchone()[0]
+        n_st = con.execute('SELECT COUNT(*) FROM stock_status WHERE is_st=1').fetchone()[0]
+        provenance.record(db_path, key=provenance.KEY_STATUS,
+                          scope=f'{n_stock} 只 / {STATUS_START}~{end_date}',
+                          rows=total_rows,
+                          detail=f'停牌日 {n_susp}; ST 日 {n_st}; 失败 {len(all_failed)}',
+                          con=con)
+        con.commit()
     finally:
         con.close()
-
-    elapsed = time.time() - t0
-    con = sqlite3.connect(f'file:{db_path.replace(chr(92), "/")}?mode=ro', uri=True)
-    n_stock = con.execute('SELECT COUNT(DISTINCT stock_code) FROM stock_status').fetchone()[0]
-    n_susp = con.execute('SELECT COUNT(*) FROM stock_status WHERE tradestatus=0').fetchone()[0]
-    n_st = con.execute('SELECT COUNT(*) FROM stock_status WHERE is_st=1').fetchone()[0]
-    con.close()
 
     print(f'\n耗时 {elapsed/60:.1f} 分钟  写入 {total_rows:,} 行  覆盖 {n_stock:,} 只')
     print(f'  停牌日 {n_susp:,} 行    ST 日 {n_st:,} 行')
@@ -252,10 +286,6 @@ def fetch_status(db_path: str = DEFAULT_DB, workers: int = MAX_WORKERS,
         print(f'  [!] 失败 {len(all_failed):,} 只，示例: {all_failed[:8]}')
         print('      （用 --only-missing 续拉）')
 
-    provenance.record(db_path, key=provenance.KEY_STATUS,
-                      scope=f'{n_stock} 只 / {STATUS_START}~{end_date}',
-                      rows=total_rows,
-                      detail=f'停牌日 {n_susp}; ST 日 {n_st}; 失败 {len(all_failed)}')
     print(f'provenance 已登记: {provenance.KEY_STATUS}')
     return total_rows
 
@@ -263,23 +293,25 @@ def fetch_status(db_path: str = DEFAULT_DB, workers: int = MAX_WORKERS,
 def report(db_path: str = DEFAULT_DB) -> None:
     con = sqlite3.connect(f'file:{db_path.replace(chr(92), "/")}?mode=ro', uri=True)
     try:
-        n = con.execute('SELECT COUNT(*) FROM stock_status').fetchone()[0]
-    except sqlite3.OperationalError:
-        print('stock_status 表不存在，先跑 --fetch')
-        return
-    print(f'stock_status 共 {n:,} 行，覆盖 '
-          f'{con.execute("SELECT COUNT(DISTINCT stock_code) FROM stock_status").fetchone()[0]:,} 只')
-    print(f'日期范围: {con.execute("SELECT MIN(date), MAX(date) FROM stock_status").fetchone()}')
-    print(f'停牌日 {con.execute("SELECT COUNT(*) FROM stock_status WHERE tradestatus=0").fetchone()[0]:,}')
-    st_stocks = con.execute(
-        'SELECT COUNT(DISTINCT stock_code) FROM stock_status WHERE is_st=1').fetchone()[0]
-    print(f'曾被 ST 的股票: {st_stocks:,} 只')
-    print('\nST 天数最多的股票（前 10）:')
-    for r in con.execute(
-            'SELECT stock_code, COUNT(*) c FROM stock_status WHERE is_st=1 '
-            'GROUP BY stock_code ORDER BY c DESC LIMIT 10'):
-        print(f'  {r[0]}: {r[1]:,} 天')
-    con.close()
+        try:
+            n = con.execute('SELECT COUNT(*) FROM stock_status').fetchone()[0]
+        except sqlite3.OperationalError:
+            print('stock_status 表不存在，先跑 --fetch')
+            return
+        print(f'stock_status 共 {n:,} 行，覆盖 '
+              f'{con.execute("SELECT COUNT(DISTINCT stock_code) FROM stock_status").fetchone()[0]:,} 只')
+        print(f'日期范围: {con.execute("SELECT MIN(date), MAX(date) FROM stock_status").fetchone()}')
+        print(f'停牌日 {con.execute("SELECT COUNT(*) FROM stock_status WHERE tradestatus=0").fetchone()[0]:,}')
+        st_stocks = con.execute(
+            'SELECT COUNT(DISTINCT stock_code) FROM stock_status WHERE is_st=1').fetchone()[0]
+        print(f'曾被 ST 的股票: {st_stocks:,} 只')
+        print('\nST 天数最多的股票（前 10）:')
+        for r in con.execute(
+                'SELECT stock_code, COUNT(*) c FROM stock_status WHERE is_st=1 '
+                'GROUP BY stock_code ORDER BY c DESC LIMIT 10'):
+            print(f'  {r[0]}: {r[1]:,} 天')
+    finally:
+        con.close()
 
 
 def verify(db_path: str = DEFAULT_DB) -> None:
@@ -297,7 +329,8 @@ def verify(db_path: str = DEFAULT_DB) -> None:
     except sqlite3.OperationalError:
         print('stock_status 表不存在，先跑 --fetch')
         return
-    con.close()
+    finally:
+        con.close()
 
     total = len(rows)
     susp = sum(1 for r in rows if r[2] == 0)

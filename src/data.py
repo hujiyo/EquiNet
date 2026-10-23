@@ -359,7 +359,8 @@ class FeatureNormalizer:
         return normalizer
 
 def process_single_file(args):
-    stock_code, data, times, train_start_date, train_end_date, val_start_date, val_end_date, test_start_date = args
+    (stock_code, data, times, train_start_date, train_end_date,
+     val_start_date, val_end_date, test_start_date, test_end_date) = args
     """
     处理预加载的股票数据，返回包含训练、验证和测试数据的字典
 
@@ -375,6 +376,7 @@ def process_single_file(args):
         val_start_date: 验证集起始日期 (YYYYMMDD)，0表示无验证集
         val_end_date: 验证集截止日期 (YYYYMMDD)
         test_start_date: 测试集起始日期 (YYYYMMDD)
+        test_end_date: 测试集截止日期 (YYYYMMDD)，0/None = 到数据末尾
 
     Returns:
         dict or None: 包含股票信息的字典，数据不足时返回None
@@ -388,6 +390,17 @@ def process_single_file(args):
         if len(test_indices) == 0:
             return None
         test_split_point = test_indices[0]
+
+        # 测试集截止位置（不含）。原本测试集一律延伸到数据末尾，
+        # 于是「数据库最新日期」悄悄决定了评估区间 —— 想把窗口定死在 2023-2025
+        # 时做不到。0/None 保持原行为，非 0 时截断到该日期。
+        if test_end_date:
+            test_end_indices = np.where(times <= test_end_date)[0]
+            test_end_point = test_end_indices[-1] + 1 if len(test_end_indices) > 0 else test_split_point
+            # 末尾要留 REQUIRED_LENGTH 的余量，否则最后一个样本凑不出完整窗口
+            test_end_point = min(test_end_point + required_length, data_length)
+        else:
+            test_end_point = data_length
 
         # 找到验证集起始位置（如果配置了验证集）
         if val_start_date > 0:
@@ -437,6 +450,7 @@ def process_single_file(args):
             'val_split_point': val_split_point,
             'val_end_point': val_end_point,
             'test_split_point': test_split_point,
+            'test_end_point': test_end_point,
             'times': times
         }
 
@@ -451,6 +465,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
                              val_start_date=DataConfig.VAL_START_DATE,
                              val_end_date=DataConfig.VAL_END_DATE,
                              test_start_date=DataConfig.TEST_START_DATE,
+                             test_end_date=DataConfig.TEST_END_DATE,
                              max_stocks=None,
                              num_workers=None):
     """
@@ -514,14 +529,15 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
     print(f"总共 {len(stock_codes)} 只股票 (池={CURRENT_POOL})")
     print(f"- 训练集: {train_start_date} ~ {train_end_date}")
     print(f"- 验证集: {val_start_date} ~ {val_end_date}")
-    print(f"- 测试集: {test_start_date} ~ 最新")
+    print(f"- 测试集: {test_start_date} ~ {test_end_date if test_end_date else '最新'}")
 
     file_args = list(zip(stock_codes, stock_data_arrays, stock_times_arrays,
                          [train_start_date] * len(stock_codes),
                          [train_end_date] * len(stock_codes),
                          [val_start_date] * len(stock_codes),
                          [val_end_date] * len(stock_codes),
-                         [test_start_date] * len(stock_codes)))
+                         [test_start_date] * len(stock_codes),
+                         [test_end_date] * len(stock_codes)))
 
     # 并行度：内存敏感。上限来自 contract.MAX_WORKERS（本机 31.7 GB 且与用户共用，
     # 按核数定的 min(cpu_count(), 8) 曾把机器压死过一次）。
@@ -568,6 +584,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
             'data': stock_info['test_data'],
             'data_length': stock_info['data_length'],
             'test_split_point': stock_info['test_split_point'],
+            'test_end_point': stock_info['test_end_point'],
             'times': stock_info['times'],
         })
 
@@ -879,7 +896,7 @@ class TemporalSampler:
 
 def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
                                      start_key='test_split_point', end_key=None,
-                                     start_date=None):
+                                     start_date=None, end_date=None):
     """
     创建固定评估数据集（向量化批处理）
 
@@ -891,10 +908,17 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
         start_key: stock_info 中评估起始位置的键名（默认 'test_split_point'）
         end_key: stock_info 中评估结束位置的键名（默认 None，表示到数据末尾）
                  验证集传 'test_split_point' 表示验证样本截止到测试集之前
-        start_date: 可选(int YYYYMMDD)。给定后忽略 start_key/end_key，评估范围变为
-                    [start_date, 数据末尾]——即 run.py 的 --begin 全区间回测口径，
-                    不再区分训练/验证/测试集。每只股票的 split_point 取其 times 中
-                    首个 >= start_date 的索引。
+        start_date: 可选(int YYYYMMDD)。给定后 start_key 被忽略，评估区间的
+                    **首个预测日**恰好落在 start_date 当天。
+        end_date: 可选(int YYYYMMDD)。给定后 end_key 被忽略，评估区间的
+                  **末个预测日**不晚于 end_date。必须与 start_date 语义一致，
+                  否则 [start,end] 区间会错位。
+
+    ⚠ 口径统一（2026-09-27 修）：过去 train.py 的测试集走 start_key/end_key 分支，
+      导致测试窗口相较 [TEST_START, TEST_END] **整体后移约 CONTEXT_LENGTH 个交易日**
+      —— 丢掉 2023 年头两个多月，却把预测日溢出到 2026 年一季度。
+      run.py --begin 一直用的是 start_date 口径，两条路径互不一致。
+      现在测试集评估统一走 start_date/end_date；start_key/end_key 仅供验证集使用。
 
     返回: (inputs, targets, cumulative_returns, day_indices, daily_returns)
     """
@@ -915,30 +939,44 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
 
     for stock_idx, stock_info in enumerate(test_stock_info):
         data_length = len(stock_info['data'])
+        times_info = stock_info.get('times')
 
+        # ---- 起点 ----
         if start_date is not None:
-            # --begin 口径：评估区间 = [start_date, 数据末尾]，忽略 train/val/test 划分。
-            # split_point 取 begin_idx - CONTEXT_LENGTH + 1（并夹到 >=1），
-            # 使"首个预测日"恰好落在 begin 当天——模型用 begin 之前的历史做上下文，
-            # 回测从 begin 开始（而非 begin+45 天后）。--begin 无训练/测试之分，无泄漏顾虑。
-            times = stock_info.get('times')
-            if times is None:
+            # [start_date, ...] 口径：ignore train/val/test 划分。
+            # start_min = begin_idx - CONTEXT_LENGTH + 1（并夹到 >=1），
+            # 使"首个预测日"恰好落在 begin 当天——模型用 begin 之前的历史做上下文。
+            # 上下文是 begin 之前的真实行情，不存在前视泄漏。
+            if times_info is None:
                 continue
-            mask = np.where(np.asarray(times) >= start_date)[0]
+            mask = np.where(np.asarray(times_info) >= start_date)[0]
             if len(mask) == 0:
                 continue
             begin_idx = int(mask[0])
             split_point = max(1, begin_idx - context_length + 1)
             start_min = max(1, split_point)
-            start_max = data_length - required_length
         else:
+            # 旧口径：从 split_point 起，首个预测日 = split_point + CONTEXT_LENGTH - 1
             split_point = stock_info.get(start_key, 0)
             start_min = max(1, split_point)
-            if end_key is not None:
-                end_point = stock_info.get(end_key, data_length)
-                start_max = min(end_point, data_length) - required_length
-            else:
-                start_max = data_length - required_length
+
+        # ---- 终点 ----
+        if end_date is not None:
+            # 语义：**最后一个预测日** <= end_date。
+            # 预测日下标 = start_idx + CONTEXT_LENGTH - 1，故 start_idx 上界为
+            # last_idx - CONTEXT_LENGTH + 1；再与「留出 FUTURE_DAYS 给标签」的上界取小。
+            if times_info is None:
+                continue
+            mask_end = np.where(np.asarray(times_info) <= end_date)[0]
+            if len(mask_end) == 0:
+                continue
+            start_max = int(mask_end[-1]) - context_length + 1
+        elif end_key is not None:
+            end_point = stock_info.get(end_key, data_length)
+            start_max = min(end_point, data_length) - required_length
+        else:
+            start_max = data_length - required_length
+        start_max = min(start_max, data_length - required_length)
 
         if start_max < start_min:
             continue

@@ -22,8 +22,8 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .database import DatabaseManager
-from .features import compute_features_for_stock
-from .utils import normalize_stock_df
+from .features import compute_features_for_stock, FeatureBasisMissing
+from .utils import normalize_stock_df, latest_closed_trading_date, bs_date
 
 
 class CheckStatus(Enum):
@@ -275,8 +275,17 @@ class DataChecker:
                 if len(patch_df) == 0:
                     print(f"  ⚠ 补丁数据已存在")
                     return True
-                self.db.upsert_daily_data(stock_code, patch_df)
-                print(f"  ✓ 补入 {len(patch_df)} 条")
+                written = self.db.upsert_daily_data(stock_code, patch_df)
+                if written == 0:
+                    # 门禁把这些行全判为非法（通常是零成交的停牌快照）。
+                    # 也就是说「缺失」的那些天本来就不是交易日 —— 完整性检查误报了。
+                    # 必须说清楚，否则下次检查会报同样的「缺失」，看起来像修不好。
+                    print(f"  ⚠ {len(patch_df)} 行补丁全被门禁剔除（多为零成交的停牌日）"
+                          f"→ 这些日期本就不是交易日，完整性检查属误报")
+                else:
+                    print(f"  ✓ 补入 {written} 条" +
+                          (f"（门禁剔除 {len(patch_df) - written} 行）"
+                           if written != len(patch_df) else ""))
                 return True
             except Exception as e:
                 print(f"  ✗ 写入失败：{e}")
@@ -285,17 +294,25 @@ class DataChecker:
         # 情况2：价格不匹配 / OHLC 逻辑错误 → 全量重拉（INSERT OR REPLACE 覆盖，无需先删）
         if any(k in msg for k in ["不匹配", "OHLC", "超出范围", "无法读取", "最高价"]):
             print(f"  → 修复：重新全量拉取 {stock_code}")
+            # 取数窗口必须收口到「最近已收盘交易日」，不能请求当天 ——
+            # 数据源盘中会返回当天未收盘的半根 K 线，入库后再也不会被增量更新覆盖。
+            # 这正是 2026-05-22 把 626 只股票盘中快照永久写进库的那条路径。
             df = self.fetch_external_data(
                 stock_code, "2010-01-01",
-                datetime.datetime.now().strftime("%Y-%m-%d")
+                bs_date(latest_closed_trading_date())
             )
             if df is None or len(df) == 0:
                 print(f"  ✗ 全量拉取失败")
                 return False
             try:
-                self.db.upsert_daily_data(stock_code, df)
+                written = self.db.upsert_daily_data(stock_code, df)
                 compute_features_for_stock(self.db, stock_code)
-                print(f"  ✓ 全量写入 {len(df)} 条")
+                print(f"  ✓ 全量写入 {written} 条")
+                return True
+            except FeatureBasisMissing as e:
+                print(f"  ⚠ 行情已写入，但复权列未物化导致特征未算：{e}")
+                print(f"     跑 `python -m data_maintenance.adjust_factor "
+                      f"--fetch --only-missing --materialize` 后重算特征")
                 return True
             except Exception as e:
                 print(f"  ✗ 写入失败：{e}")
@@ -310,16 +327,21 @@ class DataChecker:
             print(f"  → 修复：增量补更 {stock_code}（从 {next_day} 起）")
             patch_df = self.fetch_external_data(
                 stock_code, next_day,
-                datetime.datetime.now().strftime("%Y-%m-%d")
+                bs_date(latest_closed_trading_date())   # 同样绝不请求当天，见情况2
             )
             if patch_df is None or len(patch_df) == 0:
                 print(f"  ⚠ 无新数据可补")
                 return True
             try:
-                self.db.upsert_daily_data(stock_code, patch_df)
+                written = self.db.upsert_daily_data(stock_code, patch_df)
                 compute_features_for_stock(self.db, stock_code)
                 new_latest = self.db.get_latest_date(stock_code)
-                print(f"  ✓ 补入 {len(patch_df)} 条，最新：{new_latest}")
+                print(f"  ✓ 补入 {written} 条，最新：{new_latest}")
+                return True
+            except FeatureBasisMissing as e:
+                print(f"  ⚠ 行情已写入，但复权列未物化导致特征未算：{e}")
+                print(f"     跑 `python -m data_maintenance.adjust_factor "
+                      f"--fetch --only-missing --materialize` 后重算特征")
                 return True
             except Exception as e:
                 print(f"  ✗ 写入失败：{e}")

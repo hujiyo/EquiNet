@@ -205,6 +205,9 @@ def fetch_factors(db_path, workers=MAX_WORKERS, end_date=None, only_missing=Fals
     print(f'\n耗时 {time.time()-t0:.1f}s  抓到事件 {len(rows):,} 条  错误 {len(errs):,}')
     if errs:
         print('  错误样本:', errs[:5])
+        if not only_missing:
+            print(f'  [!] {len(errs):,} 只未抓到 —— 它们的旧因子会被保留（不删除），'
+                  f'但仍是旧值。用 --only-missing 补拉。')
 
     if not rows:
         print('未抓到任何数据，跳过写入')
@@ -213,7 +216,19 @@ def fetch_factors(db_path, workers=MAX_WORKERS, end_date=None, only_missing=Fals
     con = sqlite3.connect(db_path)
     con.executescript(SCHEMA_SQL)
     if not only_missing:
-        con.execute('DELETE FROM adjust_factor')
+        # 只清掉**本轮确实抓到的股票**，失败的保留旧因子。
+        #
+        # 原来这里是 `DELETE FROM adjust_factor`（整表清空）。那意味着只要有一个分片
+        # 成功、其余全失败，本轮没抓到的股票其历史因子会被一并删除且不会补回 ——
+        # 而 `if not rows` 那道守卫只在「一条都没抓到」时才生效。
+        # 后果是 close_adj 大面积变 NULL，下游 compute_features_for_stock 直接抛
+        # FeatureBasisMissing，整条特征链断掉。
+        fetched_codes = sorted({r[0] for r in rows})
+        for j in range(0, len(fetched_codes), 900):     # 900 < SQLite 变量数上限
+            batch = fetched_codes[j:j + 900]
+            con.execute(
+                f'DELETE FROM adjust_factor WHERE stock_code IN '
+                f'({",".join("?" * len(batch))})', batch)
     con.executemany(
         'INSERT OR REPLACE INTO adjust_factor '
         '(stock_code, divid_operate_date, fore_adjust_factor, back_adjust_factor) '
@@ -318,14 +333,23 @@ def verify(db_path, n_stocks=5):
     codes = [r[0] for r in con.execute(
         "SELECT stock_code FROM stock_daily WHERE close_adj IS NOT NULL "
         "GROUP BY stock_code ORDER BY stock_code LIMIT ?", (n_stocks,))]
+    # 验证范围按**库内实际数据**取，不写死日期。
+    # 原来 end_date 硬编码为 '2026-09-25'：那是写这段代码的日子。数据一旦更新到
+    # 该日期之后，验证会静默停止覆盖新数据 —— 而它恰恰是整条复权链的**唯一**安全网。
+    max_date = con.execute('SELECT MAX(date) FROM stock_daily').fetchone()[0]
+    if max_date is None:
+        print('stock_daily 为空，无可验证数据')
+        con.close()
+        return True
+    end_date = f'{max_date // 10000}-{max_date // 100 % 100:02d}-{max_date % 100:02d}'
 
     lg = bs.login()
-    print(f'登录 {lg.error_code}')
+    print(f'登录 {lg.error_code}  验证区间 2000-01-01 ~ {end_date}')
     ok = bad = 0
     for code in codes:
         rs = bs.query_history_k_data_plus(
             _to_bs_code(code), "date,close", start_date='2000-01-01',
-            end_date='2026-09-25', frequency='d', adjustflag='1')
+            end_date=end_date, frequency='d', adjustflag='1')
         rows = []
         while rs.error_code == '0' and rs.next():
             rows.append(rs.get_row_data())

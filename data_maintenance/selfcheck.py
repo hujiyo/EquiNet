@@ -34,8 +34,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from .contract import (
-    DEFAULT_DB, SAMPLING, SAMPLE_COLUMNS, CLOSE_IDX, CLOSE_RAW_IDX, CURRENT_POOL,
-    load_stock_codes,
+    DEFAULT_DB, SAMPLING, CURRENT_POOL, load_stock_codes,
 )
 from . import provenance
 
@@ -59,10 +58,29 @@ def _connect(db_path: str) -> sqlite3.Connection:
 
 
 def _q(con, sql, params=()):
+    """查询单个标量。**不吞异常** —— 查不动就必须炸出来。
+
+    历史缺陷：本函数吞掉全部 `OperationalError` 返回 None，而调用点普遍写成
+    `_q(...) or 0`。于是「SQL 写错」或「库结构变了」被当成「0 个问题」，
+    自检静默放行 —— 与它「用断言消灭静默失效」的宗旨正好相反。
+    表必然存在的查询用本函数；**可选的表**用 `_q_opt`。
+    """
+    return con.execute(sql, params).fetchone()[0]
+
+
+def _q_opt(con, sql, params=()):
+    """查询**可选的**表/列：只有「表或列不存在」返回 None，其余异常照抛。
+
+    调用方必须显式判 `is None` 并给出结论，**不得写成 `or 0`** ——
+    那正是「未采集」与「没问题」被混为一谈的入口。
+    """
     try:
         return con.execute(sql, params).fetchone()[0]
-    except sqlite3.OperationalError:
-        return None
+    except sqlite3.OperationalError as e:
+        msg = str(e).lower()
+        if 'no such table' in msg or 'no such column' in msg:
+            return None
+        raise
 
 
 # ==================== 快速档（训练/更新前） ====================
@@ -137,28 +155,39 @@ def run_all(db_path: str = DEFAULT_DB) -> List[Finding]:
     out = run_fast(db_path)
     con = _connect(db_path)
 
-    total = _q(con, 'SELECT COUNT(*) FROM stock_daily') or 0
+    total = _q_opt(con, 'SELECT COUNT(*) FROM stock_daily') or 0
     if not total:
-        out.append(Finding('数据存在性', 'error', 'stock_daily 为空'))
+        out.append(Finding('数据存在性', 'error', 'stock_daily 不存在或为空'))
         con.close()
         return out
 
     # --- 不变量 2：后复权物化一致 ---
-    n_null = _q(con, 'SELECT COUNT(*) FROM stock_daily WHERE adj_factor IS NULL') or 0
-    if n_null:
+    # 用 _q_opt：复权**列**本身可能还没建出来（没跑过 adjust_factor），
+    # 那是「尚未物化」这个事实，应当报出来，而不是让 selfcheck 崩掉。
+    n_null = _q_opt(con, 'SELECT COUNT(*) FROM stock_daily WHERE adj_factor IS NULL')
+    n_mismatch = _q_opt(con, 'SELECT COUNT(*) FROM stock_daily '
+                             'WHERE close>0 AND abs(close_adj - close*adj_factor) > 1e-6')
+    if n_null is None or n_mismatch is None:
         out.append(Finding('复权物化', 'error',
-                           f'{n_null:,} 行 adj_factor 为 NULL —— 增量更新后的新行必然如此。'
-                           f'运行 adjust_factor --fetch --only-missing --materialize'))
-    n_mismatch = _q(con, 'SELECT COUNT(*) FROM stock_daily '
-                         'WHERE close>0 AND abs(close_adj - close*adj_factor) > 1e-6') or 0
-    if n_mismatch:
-        out.append(Finding('复权物化', 'error',
-                           f'{n_mismatch:,} 行 close_adj ≠ close × adj_factor'))
+                           '复权列（adj_factor / *_adj）不存在 —— 从未跑过 adjust_factor。'
+                           '运行 `python -m data_maintenance.adjust_factor '
+                           '--fetch --only-missing --materialize`'))
+    else:
+        if n_null:
+            out.append(Finding('复权物化', 'error',
+                               f'{n_null:,} 行 adj_factor 为 NULL —— 增量更新后的新行必然如此。'
+                               f'运行 adjust_factor --fetch --only-missing --materialize'))
+        if n_mismatch:
+            out.append(Finding('复权物化', 'error',
+                               f'{n_mismatch:,} 行 close_adj ≠ close × adj_factor'))
 
     # --- 不变量 2：必需列不得为空（门禁的兜底断言） ---
     for col in ('open', 'high', 'low', 'close', 'vwap', 'volume', 'amount'):
-        n = _q(con, f'SELECT COUNT(*) FROM stock_daily WHERE "{col}" IS NULL') or 0
-        if n:
+        n = _q_opt(con, f'SELECT COUNT(*) FROM stock_daily WHERE "{col}" IS NULL')
+        if n is None:
+            out.append(Finding('NULL 完整性', 'error',
+                               f'列 {col} 不存在 —— 表结构与契约不符'))
+        elif n:
             out.append(Finding('NULL 完整性', 'error', f'{col} 有 {n:,} 行为 NULL'))
 
     # --- 不变量 2：池内特征必须齐备 ---
@@ -170,18 +199,22 @@ def run_all(db_path: str = DEFAULT_DB) -> List[Finding]:
     if pool_sql:
         for col in ('m5', 'm10', 'm20', 'dif', 'dea', 'macd_hist',
                     'macd_hist_diff', 'bb_upper', 'bb_lower'):
-            n = _q(con, f'SELECT COUNT(*) FROM stock_daily WHERE {pool_sql} '
-                        f'AND "{col}" IS NULL') or 0
-            if n:
+            n = _q_opt(con, f'SELECT COUNT(*) FROM stock_daily WHERE {pool_sql} '
+                            f'AND "{col}" IS NULL')
+            if n is None:
+                out.append(Finding('特征完整性', 'error',
+                                   f'列 {col} 不存在 —— 表结构与契约不符'))
+            elif n:
                 out.append(Finding('特征完整性', 'error',
                                    f'池内 {col} 有 {n:,} 行为 NULL'))
 
     # --- 停牌行存量（口径为「不应存在」，见 quality.HARD_RULES 的说明） ---
-    n_kline = _q(con, 'SELECT COUNT(*) FROM stock_daily WHERE amount<=0 OR volume<=0') or 0
+    n_kline = _q(con, 'SELECT COUNT(*) FROM stock_daily WHERE amount<=0 OR volume<=0')
     if n_kline:
-        verified = _q(con, 'SELECT COUNT(*) FROM stock_daily sd JOIN stock_status ss '
-                           'ON ss.stock_code=sd.stock_code AND ss.date=sd.date '
-                           'WHERE (sd.amount<=0 OR sd.volume<=0) AND ss.tradestatus=0')
+        # stock_status 是可选表（尚未采集）→ _q_opt，None 分支已显式处理
+        verified = _q_opt(con, 'SELECT COUNT(*) FROM stock_daily sd JOIN stock_status ss '
+                               'ON ss.stock_code=sd.stock_code AND ss.date=sd.date '
+                               'WHERE (sd.amount<=0 OR sd.volume<=0) AND ss.tradestatus=0')
         if verified is None:
             out.append(Finding('停牌口径', 'warn',
                                f'{n_kline:,} 行 amount/volume<=0（应清理）；'
@@ -213,16 +246,17 @@ def run_all(db_path: str = DEFAULT_DB) -> List[Finding]:
         out.append(Finding('污染区间', 'error', f'excluded_starts 抛异常: {e}'))
 
     # --- PIT 池自洽（存在则检查） ---
-    n_pit = _q(con, 'SELECT COUNT(*) FROM pool_membership')
+    n_pit = _q_opt(con, 'SELECT COUNT(*) FROM pool_membership')
     if n_pit is None:
         out.append(Finding('PIT 池', 'warn', 'pool_membership 表不存在（尚未生成）'))
     elif n_pit == 0:
         out.append(Finding('PIT 池', 'warn', 'pool_membership 是空表'))
     else:
-        bad_span = _q(con, 'SELECT COUNT(*) FROM pool_membership WHERE start_date > end_date') or 0
+        # 这张表已确认存在，其中的列也必须存在 → 用 _q，查不动就炸
+        bad_span = _q(con, 'SELECT COUNT(*) FROM pool_membership WHERE start_date > end_date')
         if bad_span:
             out.append(Finding('PIT 池', 'error', f'{bad_span:,} 个区间的 start_date > end_date'))
-        cap = _q(con, 'SELECT COUNT(DISTINCT stock_code) FROM pool_membership') or 0
+        cap = _q(con, 'SELECT COUNT(DISTINCT stock_code) FROM pool_membership')
         if CURRENT_POOL != 'pit':
             out.append(Finding('PIT 池', 'warn',
                                f'PIT 池 {cap:,} 只已生成，但当前生效池是 {CURRENT_POOL!r} —— '
@@ -232,11 +266,11 @@ def run_all(db_path: str = DEFAULT_DB) -> List[Finding]:
             # end_date=99999999 表示「其数据末段仍符合条件」，会一直延伸到表尾，
             # 而 stock_status 采集到了「今天」—— 股票在数据停更之后才变成 ST 的日子
             # 会被这个区间罩进去，造成假阳性（实测 002743/600439/600530 三只全是）。
-            st_leak = _q(con, 'SELECT COUNT(DISTINCT pm.stock_code) FROM pool_membership pm '
-                              'JOIN stock_status ss ON ss.stock_code=pm.stock_code '
-                              'AND ss.date BETWEEN pm.start_date AND pm.end_date '
-                              'AND ss.date <= (SELECT MAX(date) FROM stock_daily) '
-                              'WHERE ss.is_st=1')
+            st_leak = _q_opt(con, 'SELECT COUNT(DISTINCT pm.stock_code) FROM pool_membership pm '
+                                  'JOIN stock_status ss ON ss.stock_code=pm.stock_code '
+                                  'AND ss.date BETWEEN pm.start_date AND pm.end_date '
+                                  'AND ss.date <= (SELECT MAX(date) FROM stock_daily) '
+                                  'WHERE ss.is_st=1')
             if st_leak is None:
                 out.append(Finding('PIT 池', 'warn',
                                    f'PIT 池 {cap:,} 只，但缺 stock_status 无法排除 ST 期'))

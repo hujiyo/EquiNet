@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple
 
 from .database import DatabaseManager
 from .features import compute_features_for_stock, FeatureBasisMissing
-from .utils import normalize_stock_df
+from .utils import normalize_stock_df, latest_closed_trading_date, bs_date
 from . import provenance
 
 # 进度持久化文件路径
@@ -164,43 +164,32 @@ class StockDataUpdater:
                 return None
 
             cutoff = self._latest_possible_trading_date()
-            end_date = f"{cutoff // 10000}-{cutoff // 100 % 100:02d}-{cutoff % 100:02d}"
+            end_date = bs_date(cutoff)
             query_start = start_date if start_date else "2010-01-01"
 
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(self._query_and_parse, code_with_prefix, query_start, end_date)
+            # 不能用 `with ThreadPoolExecutor(...)`: 超时抛出后 `__exit__` 会
+            # `shutdown(wait=True)`，阻塞等待那个卡在 socket 读上的线程 —— 超时等于没设。
+            # 显式 shutdown(wait=False)：线程杀不掉，但墙钟时间立刻归还调用方。
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                future = executor.submit(self._query_and_parse, code_with_prefix,
+                                         query_start, end_date)
                 return future.result(timeout=self._query_timeout)
+            except FuturesTimeoutError:
+                print(f"超时({self._query_timeout}s)", end=" ")
+                return None
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
-        except FuturesTimeoutError:
-            print(f"超时({self._query_timeout}s)", end=" ")
-            return None
         except Exception as e:
             print(f"✗ {stock_code} 数据处理异常：{e}")
             return None
 
     @staticmethod
     def _latest_possible_trading_date() -> int:
-        """
-        推算当前时刻最近一个「已收盘的交易日」日期（YYYYMMDD 整数）。
-
-        规则：
-        1. A 股 15:00 收盘，收盘前当天数据不完整，应取前一交易日。
-        2. 周末（周六/周日）自动回退到周五。
-        3. 法定节假日无法穷举，保守处理：只跳过确定的周末，
-           其余情况不跳过，留给服务端判断。
-        """
-        now = datetime.datetime.now()
-        # 服务器通常 18:00 后才有当日数据，此前视为未更新
-        if now.hour < 18:
-            now -= datetime.timedelta(days=1)
-
-        weekday = now.weekday()  # 0=Mon ... 6=Sun
-        if weekday == 5:         # 周六 → 回退到周五
-            now -= datetime.timedelta(days=1)
-        elif weekday == 6:       # 周日 → 回退到周五
-            now -= datetime.timedelta(days=2)
-
-        return int(now.strftime("%Y%m%d"))
+        """取数窗口收口。定义已收敛到 `utils.latest_closed_trading_date`
+        —— check.py 的修复路径也要用同一条规则，两处各写一份必然分叉。"""
+        return latest_closed_trading_date()
 
     def update_single_stock(self, stock_code: str, incremental: bool = True,
                             pool_type: str = 'all') -> bool:
@@ -368,6 +357,7 @@ class StockDataUpdater:
             consecutive_fail = 0
             incremental = (mode != 'full')
             total = len(codes_to_update)
+            aborted = False
 
             try:
                 for i, stock_code in enumerate(codes_to_update, 1):
@@ -396,6 +386,7 @@ class StockDataUpdater:
                             consecutive_fail = 0
                         else:
                             print("  ✗ 重连失败，终止更新")
+                            aborted = True
                             break
 
                     if i % self._rate_limit_interval == 0:
@@ -421,6 +412,19 @@ class StockDataUpdater:
                 print("进度已保存，重新运行可选择断点续传。")
                 return
 
+            # 异常终止（重连失败）时**不能**删进度文件 —— 那会把「已完成的 N 只」
+            # 一起抹掉，下次运行从零开始重拉。断点只在本轮真正跑完后才清。
+            if aborted:
+                _save_progress({
+                    'mode': mode,
+                    'completed': list(completed_codes),
+                    'failed': failed_stocks,
+                    'timestamp': datetime.datetime.now().isoformat()
+                })
+                print(f"\n⚠ 更新被中断（重连失败）。已完成 {success_count}/{total} 只，"
+                      f"进度已保存，重新运行可选断点续传。")
+                return
+
             _clear_progress()
 
             # 自愈：本轮新抓到的股票若还没有复权列，补因子 → 物化 → 重算特征。
@@ -429,11 +433,16 @@ class StockDataUpdater:
 
             self.db.report_gate_stats()
 
-            # 登记 ingestion 血缘：后续 adjust/features/audit 的新鲜度都以它为基准
-            provenance.record(self.db.db_path, key=provenance.KEY_INGEST,
-                              scope=f'mode={mode} pool={pool_type}',
-                              rows=success_count,
-                              detail=f'成功 {success_count}/{total}，失败 {len(failed_stocks)}')
+            # 登记 ingestion 血缘：后续 adjust/features/audit 的新鲜度都以它为基准。
+            # total == 0 时**不登记** —— 那通常意味着数据源取股票列表失败
+            # （get_all_a_shares 异常时静默返回 []），把它记成 fresh 会让 selfcheck 误报绿灯。
+            if total == 0:
+                print("⚠ 本轮没有可更新的股票（数据源返回空列表？），不登记 ingestion 血缘")
+            else:
+                provenance.record(self.db.db_path, key=provenance.KEY_INGEST,
+                                  scope=f'mode={mode} pool={pool_type}',
+                                  rows=success_count,
+                                  detail=f'成功 {success_count}/{total}，失败 {len(failed_stocks)}')
 
             print("*" * 32 + " 更新完成统计 " + "*" * 32)
             print(f"成功：{success_count}/{total}")

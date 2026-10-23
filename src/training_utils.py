@@ -447,6 +447,131 @@ class PairwiseWeightedBCE(DynamicWeightedBCE):
         return bce_loss + self.pairwise_weight * pw_loss
 
 
+def _rankdata(x):
+    """平均秩（并列取平均），等价于 scipy.stats.rankdata(method='average')。
+
+    自己实现是为了让评估链路不强依赖 scipy：评估脚本要能在任意环境跑起来。
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n = x.size
+    order = np.argsort(x, kind='mergesort')
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order] = np.arange(1, n + 1, dtype=np.float64)
+    sx = x[order]
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and sx[j + 1] == sx[i]:
+            j += 1
+        if j > i:
+            ranks[order[i:j + 1]] = 0.5 * (ranks[order[i]] + ranks[order[j]])
+        i = j + 1
+    return ranks
+
+
+def _spearman(a, b):
+    """Spearman 秩相关。样本不足或某一列为常数时返回 nan —— 不静默返回 0。"""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    ok = np.isfinite(a) & np.isfinite(b)
+    a, b = a[ok], b[ok]
+    if a.size < 5:
+        return float('nan')
+    ra, rb = _rankdata(a), _rankdata(b)
+    if np.std(ra) < 1e-12 or np.std(rb) < 1e-12:
+        return float('nan')
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+
+def _newey_west_t(x, lag=2):
+    """序列均值相对 0 的 t 值，方差用 Newey-West 修正（处理重叠收益的自相关）。
+
+    持有期 FUTURE_DAYS=3 意味着相邻三天的样本共用同一段行情，IC 序列必然自相关，
+    普通标准误会低估、t 值虚高。lag 取 FUTURE_DAYS-1 是常规做法。
+    """
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    n = x.size
+    if n < 3:
+        return float('nan')
+    xc = x - x.mean()
+    g0 = float(np.dot(xc, xc) / n)
+    var = g0
+    for l in range(1, min(lag, n - 1) + 1):
+        gl = float(np.dot(xc[:-l], xc[l:]) / n)
+        var += 2.0 * (1.0 - l / (lag + 1.0)) * gl
+    if var <= 1e-18:
+        return float('nan')
+    se = np.sqrt(var / n)
+    return float(x.mean() / se) if se > 1e-15 else float('nan')
+
+
+def daily_discriminative_stats(all_preds, all_targets, all_returns, day_indices,
+                               top_pct=1.0, nw_lag=2):
+    """逐日口径的判别力指标。与 pooled 口径的区别见下方说明。
+
+    为什么要单独算一份：
+        roc_auc_score(all_targets, all_preds) 把整个评估期的样本拼在一起算一次，
+        它把「哪几天整体好」也算成了模型的判别力。但选股能用的只有
+        「同一天里，买的那几只和没买的有没有区别」—— 跨日的部分无法交易。
+
+        实测（eval_protocol.py --trap，2026H1）：
+          只有跨日信号的打分器  pooled AUC 0.6197 / 日均超额 +0.08%
+          只有截面信号的打分器  pooled AUC 0.6464 / 日均超额 +1.53%
+        两者 pooled 只差 0.027，实际收益差 19 倍。pooled 口径会掩盖这个区别。
+
+    返回：
+        daily_auc             逐日 AUC 的平均（每天单独算一次再平均）
+        ic_mean               逐日 Spearman(预测, 未来收益) 的平均，即 IC
+        icir                  ic_mean / IC 的日间标准差，衡量稳定性
+        ic_t                  ic_mean 的 t 值（Newey-West 修正后）
+        daily_precision       逐日 Top top_pct% 内正样本比例的平均
+        n_days                参与统计的天数
+    """
+    out = {'daily_auc': float('nan'), 'ic_mean': float('nan'), 'icir': float('nan'),
+           'ic_t': float('nan'), 'daily_precision': float('nan'), 'n_days': 0}
+
+    days = np.asarray(day_indices)
+    if days.size == 0 or days.size != np.asarray(all_preds).size:
+        return out
+
+    preds = np.asarray(all_preds, dtype=np.float64)
+    targets = np.asarray(all_targets, dtype=np.float64)
+    rets = np.asarray(all_returns, dtype=np.float64)
+
+    aucs, ics, precs = [], [], []
+    for day in np.unique(days):
+        m = days == day
+        p, y, r = preds[m], targets[m], rets[m]
+        ok = np.isfinite(p) & np.isfinite(y) & np.isfinite(r)
+        p, y, r = p[ok], y[ok], r[ok]
+        if p.size < 20:            # 当天样本太少，AUC/IC 都是噪声
+            continue
+        if (y > 0).sum() >= 3 and (y <= 0).sum() >= 3:
+            try:
+                aucs.append(roc_auc_score(y, p))
+            except ValueError:
+                pass
+        ic = _spearman(p, r)
+        if np.isfinite(ic):
+            ics.append(ic)
+        k = max(1, int(p.size * top_pct / 100.0))
+        precs.append(float(np.mean(y[np.argsort(p)[::-1][:k]])))
+
+    out['n_days'] = len(ics)
+    if aucs:
+        out['daily_auc'] = float(np.mean(aucs))
+    if precs:
+        out['daily_precision'] = float(np.mean(precs))
+    if len(ics) >= 2:
+        arr = np.asarray(ics, dtype=np.float64)
+        mean, sd = float(arr.mean()), float(arr.std(ddof=1))
+        out['ic_mean'] = mean
+        out['icir'] = mean / sd if sd > 1e-12 else float('nan')
+        out['ic_t'] = _newey_west_t(arr, lag=nw_lag)
+    return out
+
+
 def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
                    device, batch_size=DataConfig.EVAL_BATCH_SIZE, model_name="", eval_day_indices=None, top_n_per_day=None, eval_daily_returns=None,
                    criterion=None, enable_portfolio_simulation=False, tradeable_mask=None,
@@ -483,7 +608,9 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
             'auc': 0.5, 'top_return': 0.0, 'daily_top_return': None, 'top_count': 0, 'top_threshold': 0.0,
             'high_conf_count': 0, 'low_conf_count': 0, 'pred_mean': 0.0,
             'pred_std': 0.0, 'filtered_count': 0, 'realistic_stats': None,
-            'test_loss': None
+            'test_loss': None,
+            'daily_auc': float('nan'), 'ic_mean': float('nan'), 'icir': float('nan'),
+            'ic_t': float('nan'), 'daily_precision': float('nan'), 'eval_days': 0,
         }
 
     all_preds = []
@@ -551,6 +678,22 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     except ValueError:
         auc = 0.5
 
+    # 逐日口径判别力（daily AUC / IC / ICIR）。
+    # pooled AUC 把「哪几天整体好」也算成判别力，那部分对选股不可用；
+    # 这是 AUC 高但收益低的已知成因之一，所以两个口径必须同时报。
+    # 没有日期索引时无法逐日分组 —— 明确留 nan，不退回 pooled 冒充逐日值。
+    # percent 必须在这之前定义：下面的逐日指标与后面的 Top-K% 统计共用同一个口径。
+    percent = DataConfig.TOP_K
+    _nw_lag = max(1, getattr(DataConfig, 'FUTURE_DAYS', 3) - 1)
+    if eval_day_indices is not None:
+        _dd = daily_discriminative_stats(all_preds, all_targets, all_returns,
+                                         eval_day_indices, top_pct=percent,
+                                         nw_lag=_nw_lag)
+    else:
+        _dd = {'daily_auc': float('nan'), 'ic_mean': float('nan'),
+               'icir': float('nan'), 'ic_t': float('nan'),
+               'daily_precision': float('nan'), 'n_days': 0}
+
     sorted_indices = np.argsort(all_preds)[::-1]
 
     # 头部分类性：Top K% 样本的正样本比例（Precision@K%）
@@ -561,7 +704,6 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
         subset_targets = all_targets[sorted_indices[:k]]
         precision_at[f'precision_top{top_pct}'] = float(np.mean(subset_targets))
 
-    percent = DataConfig.TOP_K
     top_k = max(1, int(len(all_preds) * percent / 100))
     top_indices = sorted_indices[:top_k]
     top_returns = all_returns[top_indices]
@@ -594,6 +736,13 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     stats = {
         'auc': auc,
         **precision_at,
+        # 逐日口径：与上面的 pooled auc 并列，哪个是「能用的判别力」看这一行
+        'daily_auc': _dd['daily_auc'],
+        'ic_mean': _dd['ic_mean'],
+        'icir': _dd['icir'],
+        'ic_t': _dd['ic_t'],
+        'daily_precision': _dd['daily_precision'],
+        'eval_days': _dd['n_days'],
         'top_return': top_return,
         'daily_top_return': daily_top_return,
         'top_count': top_k,
@@ -1075,18 +1224,21 @@ class EarlyStopping:
 
         self.best_loss = float('inf')
         self.best_return = -float('inf')
+        self.best_ic = -float('inf')
         self.best_return_auc = 0.0
         self.best_return_threshold = 0.0
 
-    def check_improve(self, avg_loss=None, top_return=None, auc=None, threshold=None):
+    def check_improve(self, avg_loss=None, top_return=None, auc=None, threshold=None,
+                      ic=None):
         """
         检查是否有改善
 
         Args:
             avg_loss: 平均损失
-            top_return: Top1%收益率
-            auc: AUC得分（仅当收益率改善时更新）
-            threshold: Top阈值（仅当收益率改善时更新）
+            ic: 逐日 IC（首选改善判据；日间方差比收益小一到两个量级）
+            top_return: Top1%收益率（**仅在 ic 不可用时**才作为判据）
+            auc: AUC得分（仅当改善时更新）
+            threshold: Top阈值（仅当改善时更新）
 
         Returns:
             improved: 是否有改善
@@ -1100,14 +1252,27 @@ class EarlyStopping:
             improved = True
             reasons.append(f'损失改善: {avg_loss:.4f}')
 
-        if top_return is not None and top_return > self.best_return:
+        # 收益不再是改善判据。原来只要某轮收益更高就重置计数器，而收益在
+        # 200 来天的窗口上标准误约 0.5% —— 等于让噪声不断刷新 patience，
+        # 早停几乎永不触发（总有一轮更高）。改用 IC 后判据才真正反映模型在进步。
+        if ic is not None and np.isfinite(ic):
+            if ic > self.best_ic:
+                self.best_ic = ic
+                improved = True
+                if auc is not None:
+                    self.best_return_auc = auc
+                if threshold is not None:
+                    self.best_return_threshold = threshold
+                reasons.append(f'判别力改善: IC {ic:+.4f}')
+        elif top_return is not None and top_return > self.best_return:
+            # 没有 IC 可用时的退化路径：明说是退化，不要静默当成一样可靠
             self.best_return = top_return
             improved = True
             if auc is not None:
                 self.best_return_auc = auc
             if threshold is not None:
                 self.best_return_threshold = threshold
-            reasons.append(f'收益率改善: {top_return*100:+.2f}%')
+            reasons.append(f'收益率改善(退化判据): {top_return*100:+.2f}%')
 
         if improved:
             self.no_improve_count = 0

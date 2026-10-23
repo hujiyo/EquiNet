@@ -76,9 +76,10 @@ class DataSelector:
 
         try:
             import akshare as ak
-        except ImportError:
-            print("  ✗ 请先安装 akshare: pip install akshare")
-            return {}
+        except ImportError as e:
+            raise RuntimeError(
+                '缺 akshare，无法获取股票名称做 ST 判定；'
+                '**不会**降级为「不过滤 ST」。请先 pip install akshare') from e
 
         max_retries = 5
         for attempt in range(max_retries):
@@ -104,8 +105,13 @@ class DataSelector:
                     print(f"  [AKShare] 获取失败 (尝试 {attempt + 1}/{max_retries})，{wait_time}秒后重试...")
                     time.sleep(wait_time)
                 else:
-                    print(f"  [AKShare] 获取失败: {e}")
-                    return {}
+                    # **必须抛出，不能返回 {}**。返回空字典会让下游
+                    # `code_to_name.get(code, '')` 拿到空串，`'ST' in ''` 恒为假 ——
+                    # ST 过滤整体失效却不报错。实测后果：ST 股 600636 就是这样
+                    # 混进了 selected 训练池。宁可不筛，也不静默筛错。
+                    raise RuntimeError(
+                        f'AKShare 连续 {max_retries} 次获取股票名称失败：{e}；'
+                        f'ST 过滤无法执行，已中止筛选（不会降级为不过滤）') from e
 
     def _batch_market_caps(self, stock_codes: List[str]) -> Dict[str, float]:
         """批量计算流通市值：成交额 × 100 / 换手率（一次 SQL）"""
@@ -179,7 +185,16 @@ class DataSelector:
         return filtered
 
     def apply_selection(self, selected_codes: List[str]) -> int:
-        """将筛选结果应用到 selected 池"""
+        """将筛选结果应用到 selected 池。
+
+        **拒绝空列表**：`sync_pool([], 'selected')` 会把整池标记为非活跃，
+        也就是「清空训练池」。上游任何一步静默返回空都会变成这个后果，
+        所以在这里显式失败。
+        """
+        if not selected_codes:
+            raise ValueError(
+                '筛选结果为空，拒绝清空 selected 池 —— '
+                '通常是上游某步（ST 名单/市值）静默失败，请检查后再试')
         added, removed = self.db.sync_pool(selected_codes, 'selected')
         print(f"\n✓ 训练池已更新: +{added} 只, -{removed} 只, 当前 {len(selected_codes)} 只")
         return len(selected_codes)

@@ -7,7 +7,7 @@ EquiNet 模型定义文件
 - MultiHeadAttention: 多头注意力机制（手写 MHA，参考 MiniMind）
 - TransformerLayer: Transformer层
 - AttentionPooling: 多注意力聚合（可学习query token + cross-attention）
-- StockTransformer: 连续值模型
+- StockTransformer: 逐日编码 + Transformer 序列分类模型
 - create_model(): 工厂函数，创建模型
 """
 
@@ -15,7 +15,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from config import ModelConfig, DataConfig
+from config import ModelConfig, DataConfig, RegularizationConfig
 
 
 class PositionalEncoding(nn.Module):
@@ -27,11 +27,12 @@ class PositionalEncoding(nn.Module):
     def __init__(self, d_model, seq_len=DataConfig.CONTEXT_LENGTH):
         super(PositionalEncoding, self).__init__()
         self.pe = nn.Embedding(seq_len, d_model)
-        # gain推导: 使position embedding输出std匹配FFN-Embedding输出std
-        # (预训练VISReg目标 EmbeddingConfig.TARGET_STD=0.2, 见 pretrain_embedding.py)
-        # xavier_uniform_输出std = gain × √(2/(45+128)) = gain × 0.10752
-        # 令其=0.2 → gain = 0.2/0.10752 ≈ 1.86
-        nn.init.xavier_uniform_(self.pe.weight, gain=1.86)
+        # gain 由目标 std 反推：xavier_uniform_ 输出 std = gain·√(2/(seq_len+d_model))。
+        # 令其等于 RegularizationConfig.TARGET_STD，使位置编码与 embedding 的
+        # 初始尺度一致（VISReg 也以同一 std 为尺度目标）。
+        target_std = RegularizationConfig.TARGET_STD
+        gain = target_std / math.sqrt(2.0 / (seq_len + d_model))
+        nn.init.xavier_uniform_(self.pe.weight, gain=gain)
 
     def forward(self, x):
         seq_len = x.size(1)
@@ -234,6 +235,7 @@ class StockTransformer(nn.Module):
     - FFN-Embedding: MLP(input_dim→d_model→hidden→GELU→d_model)
       纯 MLP 结构，3层网络无需残差连接即可充分学习非线性特征交互。
     - Transformer 层：标准 Attention + FFN 结构，专注于跨时间模式识别
+    - Embedding 与主干端到端联合训练，不冻结、不依赖预训练权重
     """
     def __init__(self, input_dim, d_model, nhead, num_layers, output_dim, seq_len,
                  embed_expand_ratio=2):
@@ -265,9 +267,19 @@ class StockTransformer(nn.Module):
         self.output_projection = nn.Linear(d_model, output_dim, bias=True)
         self.dropout = nn.Dropout(ModelConfig.DROPOUT_RATE)
 
+    def encode(self, x):
+        """
+        逐日 K 线编码：只做 FFN-Embedding，不进入 Transformer。
+
+        Args:
+            x: [N, input_dim] 单日特征
+        Returns:
+            z: [N, d_model] 逐日表示
+        """
+        return self.embed_mlp(self.embed_proj(x))
+
     def forward(self, x, return_attn=False):
-        x = self.embed_proj(x)
-        x = self.embed_mlp(x)
+        x = self.encode(x)
 
         x = self.pos_encoding(x)
         x = self.dropout(x)
@@ -292,38 +304,6 @@ class StockTransformer(nn.Module):
         if return_attn:
             return output, attn_weights
         return output
-
-    def load_pretrained_embedding(self, path):
-        """
-        加载预训练 embedding 权重（来自 pretrain_embedding.py）
-
-        Args:
-            path: 预训练权重 .pth 文件路径
-        """
-        checkpoint = torch.load(path, map_location='cpu', weights_only=True)
-
-        self.embed_proj.weight.data.copy_(checkpoint['embed_proj_weight'])
-        self.embed_mlp[0].weight.data.copy_(checkpoint['embed_mlp_0_weight'])
-        self.embed_mlp[2].weight.data.copy_(checkpoint['embed_mlp_2_weight'])
-
-        print(f"  已加载预训练 Embedding: {path}")
-
-    def freeze_embedding(self, freeze=True):
-        """
-        冻结或解冻 FFN-Embedding 参数
-
-        Args:
-            freeze: True=冻结，False=解冻
-        """
-        for param in self.embed_proj.parameters():
-            param.requires_grad = not freeze
-        for param in self.embed_mlp.parameters():
-            param.requires_grad = not freeze
-
-        n_frozen = (sum(p.numel() for p in self.embed_proj.parameters()) +
-                    sum(p.numel() for p in self.embed_mlp.parameters()))
-        status = "冻结" if freeze else "解冻"
-        print(f"  Embedding {status}: {n_frozen:,} 参数")
 
 # ==================== 工厂函数 ====================
 

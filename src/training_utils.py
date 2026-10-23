@@ -18,7 +18,7 @@ import contextlib
 from datetime import datetime
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
-from config import DataConfig,LossConfig,TrainingConfig
+from config import DataConfig,LossConfig,TrainingConfig,RegularizationConfig
 import torch.optim as optim
 from lion_pytorch import Lion
 from muon import SingleDeviceMuonWithAuxAdam as MuonWithAuxAdam
@@ -1188,6 +1188,10 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
             'weight_decay':     TrainingConfig.get_base_wd(),
             'loss_type':        LossConfig.LOSS_TYPE,
             'pos_weight':       LossConfig.POS_WEIGHT,
+            'embed_lr_ratio':   RegularizationConfig.EMBED_LR_RATIO,
+            'visreg_weight':    float(RegularizationConfig.VISREG_MAIN_WEIGHT),
+            'visreg_aux_batch_size': int(RegularizationConfig.VISREG_AUX_BATCH_SIZE),
+            'visreg_target_std': float(RegularizationConfig.TARGET_STD),
         },
         'eval_stats': {
             'top_return':   float(top_return),
@@ -1492,11 +1496,12 @@ def create_optimizer_from_config(model, lr=None):
 
 def create_optimizer_from_config_for_params(params, lr=None):
     """
-    根据配置创建优化器（接受参数列表而非模型，用于冻结embedding等场景）
+    根据配置创建优化器（接受参数列表或 PyTorch param_groups）
 
     Args:
-        params: 可迭代的参数列表（通常来自 [p for p in model.parameters() if p.requires_grad]）
-        lr: 学习率
+        params: 可迭代的参数列表，或 [{'params': [...], 'lr': ...}, ...] 形式的
+                param_groups（用于给 Embedding 设置独立学习率）
+        lr: 学习率（param_groups 中未指定 lr 的组使用此值）
 
     Returns:
         optimizer: 创建的优化器实例
@@ -1505,29 +1510,56 @@ def create_optimizer_from_config_for_params(params, lr=None):
     wd = TrainingConfig.get_base_wd()
     optimizer_type = TrainingConfig.OPTIMIZER_TYPE.lower()
 
+    params = list(params)
+    has_groups = bool(params) and isinstance(params[0], dict)
+    n_groups = len(params) if has_groups else 1
+
     if optimizer_type == 'lion':
         optimizer = Lion(params, lr=actual_lr, betas=TrainingConfig.LION_BETAS, weight_decay=wd)
-        print(f"优化器(部分参数): Lion (lr={actual_lr}, wd={wd}, betas={TrainingConfig.LION_BETAS})")
+        print(f"优化器(部分参数): Lion (lr={actual_lr}, wd={wd}, betas={TrainingConfig.LION_BETAS}, "
+              f"param_groups={n_groups})")
     elif optimizer_type == 'muon':
-        params_list = list(params)
-        hidden_weights = [p for p in params_list if p.ndim >= 2]
-        other_params = [p for p in params_list if p.ndim < 2]
-        muon_lr = actual_lr
         muon_wd = TrainingConfig.MUON_WEIGHT_DECAY
         muon_momentum = TrainingConfig.MUON_MOMENTUM
-        adamw_lr = TrainingConfig.MUON_ADAMW_LR_RATIO * muon_lr
+        adamw_betas = TrainingConfig.MUON_ADAMW_BETAS
+        ratio = TrainingConfig.MUON_ADAMW_LR_RATIO
 
-        param_groups = [
-            dict(params=hidden_weights, use_muon=True,
-                 lr=muon_lr, momentum=muon_momentum, weight_decay=muon_wd),
-            dict(params=other_params, use_muon=False,
-                 lr=adamw_lr, betas=TrainingConfig.MUON_ADAMW_BETAS, weight_decay=muon_wd),
-        ]
-        optimizer = MuonWithAuxAdam(param_groups)
-        print(f"优化器(部分参数): MuonWithAuxAdam (Muon lr={muon_lr}, AdamW lr={adamw_lr:.6f})")
+        if has_groups:
+            # 逐组拆分 2D(走 Muon)/1D(走 AdamW)，保留各组的独立学习率
+            muon_groups = []
+            for group in params:
+                group_params = list(group['params'])
+                group_lr = group.get('lr', actual_lr)
+                hidden = [p for p in group_params if p.ndim >= 2]
+                other = [p for p in group_params if p.ndim < 2]
+                if hidden:
+                    muon_groups.append(dict(params=hidden, use_muon=True,
+                                            lr=group_lr, momentum=muon_momentum,
+                                            weight_decay=muon_wd))
+                if other:
+                    muon_groups.append(dict(params=other, use_muon=False,
+                                            lr=group_lr * ratio, betas=adamw_betas,
+                                            weight_decay=muon_wd))
+            optimizer = MuonWithAuxAdam(muon_groups)
+            print(f"优化器(部分参数): MuonWithAuxAdam (param_groups={n_groups}, "
+                  f"Muon/AdamW 分组内联)")
+        else:
+            hidden_weights = [p for p in params if p.ndim >= 2]
+            other_params = [p for p in params if p.ndim < 2]
+            muon_lr = actual_lr
+            adamw_lr = ratio * muon_lr
+
+            param_groups = [
+                dict(params=hidden_weights, use_muon=True,
+                     lr=muon_lr, momentum=muon_momentum, weight_decay=muon_wd),
+                dict(params=other_params, use_muon=False,
+                     lr=adamw_lr, betas=adamw_betas, weight_decay=muon_wd),
+            ]
+            optimizer = MuonWithAuxAdam(param_groups)
+            print(f"优化器(部分参数): MuonWithAuxAdam (Muon lr={muon_lr}, AdamW lr={adamw_lr:.6f})")
     else:
         optimizer = optim.AdamW(params, lr=actual_lr, weight_decay=wd)
-        print(f"优化器(部分参数): AdamW (lr={actual_lr}, wd={wd})")
+        print(f"优化器(部分参数): AdamW (lr={actual_lr}, wd={wd}, param_groups={n_groups})")
 
     return optimizer
 

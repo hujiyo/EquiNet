@@ -201,113 +201,24 @@ class ModelConfig:
     # - bias初始化为 log(prior/(1-prior))，prior≈0.25 → bias≈-1.1
     OUTPUT_LAYER_GAIN = 0.1          # 输出层权重初始化增益（xavier_uniform的gain参数）
 
-# ==================== Embedding预训练参数 ====================
-class EmbeddingConfig:
-    """Embedding层参数（src/pretrain_embedding.py 使用）"""
-    # 训练超参数
-    EPOCHS = 100                          # 预训练轮数
-    BATCH_SIZE = 2560                     # 大batch，对比学习需要充足负样本
-    LEARNING_RATE = 3e-3                  # 预训练学习率
-    WEIGHT_DECAY = 0.1                   # 权重衰减
-    WARMUP_EPOCHS = 10                   # 预热轮数
-    COSINE_ETA_MIN = 1e-4                 # 余弦退火最小学习率
+# ==================== 表示正则参数 ====================
+class RegularizationConfig:
+    """单阶段训练中作用于 Embedding 的表示正则参数"""
+    # 目标标准差：同时用于位置编码初始化与 VISReg 的尺度归一化，
+    # 保证 embedding 的边际尺度与位置编码的初始尺度一致。
+    TARGET_STD = 0.2
 
-    # 数据采集
-    MAX_SAMPLES = 200_000               # 每个epoch的训练样本数
-    DEDUP_PRECISION = 1                 # batch内去重精度（小数位数），值越小去重越激进
-    BATCH_DEDUP_OVERSAMPLE = 2.0        # batch内去重过采样倍数（先多采再去重，保证多样性）
+    # VISReg：主训练每个 step 独立采样单日 K 线，对其 embedding 施加
+    # 尺度/形状(SWD)/中心化三项解耦正则；不参与任务判决，只约束表征分布。
+    VISREG_MAIN_WEIGHT = 0.1         # λ：相对 BCE 的权重，建议在 0.01~0.2 间标定
+    VISREG_AUX_BATCH_SIZE = 4096     # 每步独立采样的单日 K 线数
+    VISREG_NUM_SLICES = 256          # 随机投影方向数 K
+    VISREG_W_SCALE = 1.0             # 尺度项权重（逐维 std→1）
+    VISREG_W_SHAPE = 0.6             # 形状项权重（SWD 对齐高斯分位数）
+    VISREG_W_CENTER = 1.0            # 中心化项权重（批均值→0）
 
-    # 与 Recon MSE 同量级、batch size 不变（论文 3.2 似乎说明）。
-    VISREG_WEIGHT = 0.6                # λ, 正则项权重
-    VISREG_NUM_SLICES = 256             # 随机投影方向数 K (论文建议 K>C·D, 此处 D=128, K/D=2)
-    VISREG_W_SCALE = 1.0                # 尺度项权重 (逐维 std→1, VICReg 方差项)
-    VISREG_W_SHAPE = 0.6                # 形状项权重 (SWD 对齐高斯分位数)。
-                                        # 0.6 由单变量实验臂 shape06 定版：削弱"单峰高斯"
-                                        # 反压后，语义沉淀在 z 本体的晚期衰退消失——
-                                        # ep50→100 的 CKA/zK1/zr 由同步下滑转为稳定，
-                                        # 终值 zK1 0.355→0.389 / zr 0.532→0.568 /
-                                        # CKA 0.535→0.569，D= 0.084→0.080 同步小幅改善；
-                                        # 尺度(std=TARGET_STD)与中心化契约由独立条款保护不受影响。
-                                        # 对照: w_shape=1.0 基线与 dw16/lam45 臂数据见 git 历史
-    VISREG_W_CENTER = 1.0               # 中心化项权重 (批均值→0)
-    TARGET_STD = 0.2                    # 目标标准差（缩放后 VISReg 尺度项 target std依旧=1）
-
-    # 衍生特征解码：线性解码器额外解码 N 个"19维的跨域非线性函数"，
-    # 强迫 embedding 编码维度间关系（特征融合），而非逐维独立存储。
-    # 详见 pretrain_embedding.py:compute_derived_features
-    N_DERIVED_FEATURES = 11             # 衍生特征数量
-    DERIVED_EPS = 1e-6                  # 衍生特征除法防零 epsilon
-    DERIVED_WEIGHT = 1.0                # 衍生重建损失权重 (剪尾标准化后等权=1.0，可调防辅助任务主导)
-    DERIVED_WINSORIZE_PCT = (1.0, 99.0) # 衍生特征剪尾分位数：剔除极少数极端行情样本
-                                        # 对损失的支配（"极端值霸凌"），(0,100)=不剪尾
-
-    # 核加权类感知对比学习（几何轴主损失，SupCon；Khosla et al., 2020）：
-    # 正对权重 = 多头一致度核 K_ij（全粗+细分头中标签一致的比例），
-    # 施加在 projector 输出 g(z) 上（SimCLR/DINOv2 路线：projector 吸收
-    # "收紧"压力，z 保住 O/D 线性可读性，训练后丢弃）。
-    # 重建/VISReg 只保证"每条K线的信息可读出"，不管样本间相似度结构——
-    # 而下游 attention 消费的恰恰是 z 的点积相似度，该几何必须显式训练。
-    # 锚点设计：单标签（vpa-only 硬标签版）锚点贫乏——3 簇填不满空间、
-    # 簇内聚拢无终点（同=0.968）、与锚点弱相关的语义被挤出几何（vws
-    # 退化实测）；一致度核把锚点增殖为头组合胞元（~百级），全头一致
-    # 全力度聚拢、部分一致分级聚拢、全不一致斥远——样本按丰富语义
-    # 分级"沉淀"。正对核=CKA 目标核（同一数学对象），损失由 batch 内
-    # 全部成对点积构成，梯度触及 z 的每个方向。
-    # z 不坍缩由 VISReg（各向同性高斯散度）+ Recon（细粒度信息）保证。
-    # 历史注记：掩码视图 InfoNCE（SCARF式）已删除——其前提"被掩列可从
-    # 剩余列恢复"对本特征表示不成立（技术列依赖历史不在当日输入、
-    # 逐列分位数归一化破坏跨列代数关系）：掩技术列 → 模型学会忽略它们
-    # （alignment→0 任务空转）；掩源列 → 语义真空（伪方向视图）。
-    # SCARF 是无标签时代的拐杖，有确定性标签时直接用标签教几何。
-    SUPCON_ENABLED = True               # 总开关，False=退回纯线性探针模式
-    SUPCON_WEIGHT = 0.2                 # w_c：SupCon 权重（冷启动≈ln(B)~7.8，
-                                        # 与另两项 O(1) 相比 0.2 使加权贡献同数量级）；
-                                        # 剩余权重按 (1-w_c) 分配给 VISReg(λ)/Recon(1-λ)，
-                                        # λ=VISREG_WEIGHT 相对语义不变，w_c=0 时公式退回旧版
-    SUPCON_TAU = 0.2                    # 温度：控制不一致对推开力度（数千负样本常规 0.1~0.2）
-
-    # 分类头（粗粒度类别监督，Kronos 分层监督的"粗"端；头定义见
-    # pretrain_embedding.py:CLS_HEAD_SPEC）：
-    # 符号类衍生目标本质是类别 {-1,0,1}，被 MSE 当连续数训时存在
-    # "猜0.7也算对"的盲区，模型没有动力让同类K线在 embedding 空间靠拢；
-    # 交叉熵没有"差不多"，必须选边，逼 embedding 出现可线性读出的
-    # 类别可分结构（同类聚拢/异类分开）——下游 attention 消费点积
-    # 相似度，此几何直接可用。
-    # 注意与 VISReg 相克：可分性在 z 分布上产生多峰，高斯形状项拉单峰，
-    # 权重别开大（默认 0.1：4头平均CE≈0.5~0.7，加权贡献≈0.05~0.07，
-    # 与另三项 O(1) 量级相当但偏轻）。
-    CLS_ENABLED = True                   # 粗头总开关，False=退回纯回归监督
-    CLS_WEIGHT = 0.1                     # 粗头分类权重（4头 CE 等权平均后 × 该权重）
-    # "平"类区间：|v| ≤ ε 判平（ε 为每个头独立的分位数阈值，见
-    # pretrain_embedding.py:compute_cls_stats）。不用"恰好=0"（连续分布
-    # 上测度为零、平类退化）；用区间保证三类都非空。
-    CLS_FLAT_PCT = 15.0                  # 每个头 |v| 最小的百分之几判"平"
-                                         # （在 pre_sampled 池上预计算，确定性）
-
-    # ---- 多粒度细头（粗头之上的分辨率层） ----
-    # 3 类粗头只有"分得开"的压力，类内几何是平的（涨0.5%与涨9.8%标签同为
-    # "涨"，CE 施加完全相同的拉力）；细头把同一判别值等频分桶，在桶粒度上
-    # 继续施加同类聚拢压力，给类内几何加分辨率（Kronos 粗细token思想的
-    # 判别式移植）。等频分桶天然类平衡；训练后期仍有梯度（3类头 Acc 平台
-    # 化后细头继续供压）。注意 CE 不保证"相邻桶更近"（桶被当无序类别），
-    # 相邻结构只是 v 连续性的副作用，要严格有序需 CORAL 类损失（未采用）。
-    CLS_FINE_ENABLED = True              # 细头开关（仅 direction/vol_price_align 两族）
-    CLS_FINE_BUCKETS = 5                 # 桶数（大涨/小涨/平/小跌/大跌；vws 细版与
-                                         # dir/vpa 强相关属冗余不设，drv 新锚点先粗验证）
-    CLS_FINE_WEIGHT = 0.1                # 细头 CE 权重（ln5≈1.61 起步 vs 粗头 ln3≈1.1，
-                                         # 同乘 0.1 后量级相当）
-
-    # ---- CKA 几何监控（Kornblith et al., ICML 2019） ----
-    # 逐 epoch 计算 CKA(z, 4粗头标签核)：z 的 Gram 矩阵与"同类比例"标签核
-    # 的中心化相关——衡量类别成对几何与标签的一致性（"z 里挨得近的样本对
-    # 是否同类"）。probe B/C 测信息轴（单样本线性读出），CKA 测几何轴
-    # （样本对相对位置），两者正交。用于决策而非仅监控：
-    # 高=类别几何已饱和（SupCon 无油水），低=有空间（SupCon 该上的证据）。
-    CKA_LOG_ENABLED = True               # CKA 逐 epoch 日志开关
-
-    # 输出
-    OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out', 'embedding_pretrain')
-    BEST_EMBEDDING_PATH = os.path.join(OUTPUT_DIR, 'best_embedding.pth')
+    # Embedding 与主干联合训练时的学习率比例（相对主干学习率）
+    EMBED_LR_RATIO = 0.2
 
 # ==================== 训练参数 ====================
 class TrainingConfig:
@@ -710,6 +621,10 @@ def print_config_summary():
     print(f"  预热起始学习率: {TrainingConfig.WARMUP_START_LR}")
     main_epochs = TrainingConfig.EPOCHS - TrainingConfig.WARMUP_EPOCHS
     print(f"  余弦退火轮数: {TrainingConfig.COSINE_ANNEAL_EPOCHS} (后{main_epochs - TrainingConfig.COSINE_ANNEAL_EPOCHS}轮固定在ETA_MIN)")
+    print(f"  训练模式: 单阶段端到端 (Embedding 不冻结)")
+    print(f"  Embedding 学习率比例: {RegularizationConfig.EMBED_LR_RATIO}")
+    print(f"  VISReg: λ={RegularizationConfig.VISREG_MAIN_WEIGHT}, "
+          f"单日辅助batch={RegularizationConfig.VISREG_AUX_BATCH_SIZE}")
 
     print(f"数据参数:")
     print(f"  数据库: {DataConfig.DB_PATH}")

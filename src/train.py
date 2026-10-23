@@ -2,20 +2,24 @@
 EquiNet 模型训练脚本
 
 训练策略：
+- 单阶段端到端训练：FFN-Embedding 与 Transformer 主干一起优化，不冻结、不加载预训练权重
+- VISReg 作为 Embedding 的几何正则：每个 step 独立采样单日 K 线，额外计算
+  尺度/形状/中心化三项损失，只约束表征分布，不参与任务判决
 - 使用 DynamicWeightedBCE / PairwiseWeightedBCE / BalancedBCE 损失函数
-- 两阶段学习率调度：Warmup + Cosine Annealing
-- 训练时在验证集上评估，按验证集 loss 和实战收益率选择最佳模型
+- 学习率调度：Warmup + Cosine Annealing
+- 训练时在验证集上评估，按验证集 loss 和逐日 IC 选择最佳模型
 - 训练结束后用最佳模型在测试集上做最终评估
 '''
 
-import os, sys, torch, torch.nn as nn, numpy as np
+import os, torch, numpy as np
 import copy
 import random
 import csv
 from datetime import datetime
-from config import (TrainingConfig,DataConfig,DeviceConfig,ModelConfig,print_config_summary,LossConfig,EmbeddingConfig)
+from config import (TrainingConfig,DataConfig,DeviceConfig,print_config_summary,LossConfig,RegularizationConfig)
 
 from model import create_model
+from visreg import VISRegLoss
 
 from data import (
     load_and_preprocess_data,
@@ -111,9 +115,34 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
     test_eval_inputs, test_eval_targets, test_eval_cumulative_returns = None, None, None
     test_eval_day_indices, test_eval_daily_returns, test_eval_tradeable_mask = None, None, None
 
-    # 创建优化器（embedding 已冻结，只传可训练参数）
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = create_optimizer_from_config_for_params(trainable_params, lr=learning_rate)
+    # 单阶段端到端：Embedding 与主干一起训练。
+    # Embedding 用独立参数组和更低学习率，避免 6.8 万参数的逐日编码器
+    # 被稀疏的序列级标签一步带偏。
+    embed_params = [p for p in list(model.embed_proj.parameters())
+                    + list(model.embed_mlp.parameters()) if p.requires_grad]
+    embed_param_ids = {id(p) for p in embed_params}
+    other_params = [p for p in model.parameters()
+                    if p.requires_grad and id(p) not in embed_param_ids]
+    embed_lr = learning_rate * RegularizationConfig.EMBED_LR_RATIO
+    param_groups = [
+        {'params': other_params, 'lr': learning_rate},
+        {'params': embed_params, 'lr': embed_lr},
+    ]
+    optimizer = create_optimizer_from_config_for_params(param_groups, lr=learning_rate)
+    print(f"  参数组: 主干 {sum(p.numel() for p in other_params):,} (lr={learning_rate:g}), "
+          f"Embedding {sum(p.numel() for p in embed_params):,} (lr={embed_lr:g})")
+
+    # VISReg：主训练中的表示正则。辅助 batch 独立采样单日 K 线，
+    # 不展平 45 天序列窗口（展平会破坏 VISReg 假设的 i.i.d. 单日边际分布）。
+    visreg_loss_fn = VISRegLoss(
+        num_slices=RegularizationConfig.VISREG_NUM_SLICES,
+        w_scale=RegularizationConfig.VISREG_W_SCALE,
+        w_shape=RegularizationConfig.VISREG_W_SHAPE,
+        w_center=RegularizationConfig.VISREG_W_CENTER,
+    )
+    print(f"  VISReg: λ={RegularizationConfig.VISREG_MAIN_WEIGHT}, "
+          f"单日辅助batch={RegularizationConfig.VISREG_AUX_BATCH_SIZE}, "
+          f"target_std={RegularizationConfig.TARGET_STD}")
 
     # 创建学习率调度器
     warmup_scheduler, main_scheduler, warmup_epochs = create_scheduler_from_config(
@@ -206,6 +235,15 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         train_stock_info, feature_normalizer
     )
 
+    # VISReg 辅助池：把 [N, 45, 19] 展平成 [N*45, 19] 的视图，
+    # 每步随机取若干单日向量。这里取的是“某一天长什么样”的边际样本，
+    # 与主 batch 的 45 天序列窗口是两条独立的数据流。
+    if pool_inputs.ndim != 3:
+        raise ValueError(f"VISReg 需要 [N, context, input_dim] 的训练池，实际 {pool_inputs.shape}")
+    aux_pool_flat = pool_inputs.reshape(-1, pool_inputs.shape[-1])
+    aux_rng = np.random.default_rng(DataConfig.RANDOM_SEED + 1)
+    print(f"  VISReg 辅助池: {len(aux_pool_flat):,} 条单日 K 线")
+
     # 根据采样策略初始化采样器
     use_temporal = DataConfig.SAMPLING_STRATEGY == 'temporal'
     if use_temporal:
@@ -227,6 +265,10 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
                 print()
 
         total_loss = 0
+        epoch_visreg_raw = 0.0
+        epoch_z_std = 0.0
+        epoch_embed_grad = 0.0
+        visreg_steps = 0
 
         # 学习率更新
         if epoch < warmup_epochs:
@@ -236,7 +278,10 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             current_lr = main_scheduler.get_last_lr()[0]
             lr_status = "正常训练"
 
-        print(f'Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f} ({lr_status})')
+        lr_str = f"{current_lr:.6f}"
+        if len(optimizer.param_groups) > 1:
+            lr_str += f" (embedding {optimizer.param_groups[1]['lr']:.6f})"
+        print(f'Epoch {epoch + 1}/{epochs}, LR: {lr_str} ({lr_status})')
 
         # 从预计算池中采样
         if use_temporal:
@@ -275,15 +320,37 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             batch_inputs = epoch_inputs_tensor[start_idx:end_idx]
             batch_targets = epoch_targets_tensor[start_idx:end_idx]
 
+            # 独立采样单日辅助 batch（与主序列 batch 无重叠约束，采样有放回）
+            aux_idx = aux_rng.integers(0, len(aux_pool_flat),
+                                       size=RegularizationConfig.VISREG_AUX_BATCH_SIZE)
+            aux_x = torch.from_numpy(aux_pool_flat[aux_idx]).float().to(device)
+
+            aux_stats = {'visreg': 0.0, 'z_std': 0.0}
+
             def _loss_fn():
                 output = model(batch_inputs)
                 if hasattr(criterion, 'update_weights'):
                     criterion.update_weights(batch_targets)
                 loss = criterion(output.squeeze(-1), batch_targets)
+
+                # 辅助分支只过 Embedding；fp32 计算保证 VISReg 的分位数稳定
+                z_aux = model.encode(aux_x).float()
+                loss_visreg = visreg_loss_fn(z_aux / RegularizationConfig.TARGET_STD)
+                loss = loss + RegularizationConfig.VISREG_MAIN_WEIGHT * loss_visreg
+                aux_stats['visreg'] = loss_visreg.item()
+                aux_stats['z_std'] = z_aux.std(dim=0).mean().item()
+
                 return loss, output
 
             loss_val, _ = training_step(model, optimizer, _loss_fn)
             total_loss += loss_val * (end_idx - start_idx)
+            embed_grad_norm = torch.sqrt(sum(
+                p.grad.detach().pow(2).sum()
+                for p in embed_params if p.grad is not None))
+            epoch_embed_grad += embed_grad_norm.item()
+            epoch_visreg_raw += aux_stats['visreg']
+            epoch_z_std += aux_stats['z_std']
+            visreg_steps += 1
 
             # 进度显示
             progress = (step + 1) / actual_batches * 100
@@ -293,6 +360,10 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
 
         print()
         print()
+
+        avg_visreg = epoch_visreg_raw / max(visreg_steps, 1)
+        avg_z_std = epoch_z_std / max(visreg_steps, 1)
+        avg_embed_grad = epoch_embed_grad / max(actual_batches, 1)
 
         # 清理内存
         del epoch_inputs_tensor, epoch_targets_tensor
@@ -331,6 +402,11 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
               f'IC的t值 {_fmt_or_na(stats.get("ic_t"), "{:+.2f}")}, '
               f'日Top{DataConfig.TOP_K}%命中率 {_fmt_or_na(stats.get("daily_precision"), "{:.3f}")} '
               f'(统计天数 {stats.get("eval_days", 0)})')
+        print(f'         表示正则: VISReg {avg_visreg:.4f} '
+              f'(λ={RegularizationConfig.VISREG_MAIN_WEIGHT}), '
+              f'Embedding逐维std均值 {avg_z_std:.3f} '
+              f'(目标 {RegularizationConfig.TARGET_STD})')
+        print(f'         Embedding 梯度范数: {avg_embed_grad:.4e}')
         if daily_metrics_available is None:
             daily_metrics_available = bool(stats.get('eval_days', 0) >= 2 and
                                            np.isfinite(stats.get('ic_mean', np.nan)))
@@ -374,6 +450,9 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             'dispersion_iqr': stats.get('dispersion_iqr', 0),
             'pos_ratio': stats.get('pred_mean', 0),
             'high_conf_ratio': stats.get('high_conf_count', 0) / len(eval_targets) if eval_targets is not None else 0,
+            'visreg': avg_visreg,
+            'embed_z_std': avg_z_std,
+            'embed_grad_norm': avg_embed_grad,
         }
         epoch_returns.append(epoch_return)
 
@@ -571,7 +650,8 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
     # 选 epoch 看 daily_auc / ic_mean / icir，不要看 avg_realistic_return。
     fieldnames = ['turn', 'top_return', 'daily_return', 'train_loss', 'val_loss',
                   'auc', 'daily_auc', 'ic_mean', 'icir', 'ic_t', 'daily_precision',
-                  'eval_days', 'prec_top10', 'prec_top3', 'prec_top1', 'avg_realistic_return']
+                  'eval_days', 'prec_top10', 'prec_top3', 'prec_top1', 'avg_realistic_return',
+                  'visreg', 'embed_z_std', 'embed_grad_norm']
 
     with open(returns_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -595,6 +675,9 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
                 'prec_top3': f"{er['precision_top3']:.4f}" if er.get('precision_top3') is not None else "",
                 'prec_top1': f"{er['precision_top1']:.4f}" if er.get('precision_top1') is not None else "",
                 'avg_realistic_return': f"{er['avg_realistic_return']*100:.1f}" if er.get('avg_realistic_return') is not None else "",
+                'visreg': _fmt_or_na(er.get('visreg'), '{:.4f}', ''),
+                'embed_z_std': _fmt_or_na(er.get('embed_z_std'), '{:.4f}', ''),
+                'embed_grad_norm': _fmt_or_na(er.get('embed_grad_norm'), '{:.4e}', ''),
             }
             writer.writerow(row)
 
@@ -726,21 +809,11 @@ if __name__ == "__main__":
     print(f" 验证集: {len(val_stock_info)} 只股票")
     print(f" 测试集: {len(test_stock_info)} 只股票")
 
-    # 创建模型（微调模式）
+    # 创建模型（单阶段端到端训练）
     amp_str = "BF16混合精度" if TrainingConfig.USE_AMP else "FP32精度"
     print(f"\n正在创建模型 ({amp_str})...")
     model = create_model(seq_len=DataConfig.CONTEXT_LENGTH).to(device)
-
-    # 加载预训练 Embedding
-    embedding_path = EmbeddingConfig.BEST_EMBEDDING_PATH
-    if os.path.exists(embedding_path):
-        print(f"加载预训练 Embedding: {embedding_path}")
-        model.load_pretrained_embedding(embedding_path)
-        model.freeze_embedding(True)
-    else:
-        print(f"错误: 预训练 Embedding 不存在: {embedding_path}")
-        print("请先运行: python src/pretrain_embedding.py")
-        sys.exit(1)
+    print("  Embedding 与主干联合训练（不加载预训练权重、不冻结）")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

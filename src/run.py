@@ -16,7 +16,7 @@ from collections import defaultdict
 from datetime import datetime
 import matplotlib.pyplot as plt
 
-from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig, EmbeddingConfig)
+from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
 from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
                   create_recent_days_dataset, normalize_and_validate_context_window)
@@ -133,8 +133,7 @@ def list_available_models(output_dir=DataConfig.OUTPUT_DIR):
     """列出所有 run 目录下的 .pth 模型文件
 
     目录即模型：每次训练 run 独占 out/<日期戳>/，模型与产物都住在里面。
-    只扫一层子目录（<run>/xxx.pth），并排除 embedding 预训练目录——
-    那里的 .pth 是 embedding 权重，不是可评估的主模型。
+    只扫一层子目录（<run>/xxx.pth）。
 
     返回相对 output_dir 的路径（如 2026-08-30_193045/model_loss_xxx.pth），
     选择/加载逻辑按相对路径处理。
@@ -143,11 +142,7 @@ def list_available_models(output_dir=DataConfig.OUTPUT_DIR):
         print(f"  ✗ 输出目录 {output_dir} 不存在")
         return []
 
-    embedding_dir = os.path.abspath(EmbeddingConfig.OUTPUT_DIR)
-    pth_files = [
-        f for f in glob.glob(os.path.join(output_dir, '*', '*.pth'))
-        if os.path.abspath(os.path.dirname(f)) != embedding_dir
-    ]
+    pth_files = glob.glob(os.path.join(output_dir, '*', '*.pth'))
 
     if not pth_files:
         print(f"  ✗ {output_dir} 下没有找到 .pth 模型文件")

@@ -7,9 +7,9 @@
 </div>
 
 <p align="center">
-  <img src="docs/equinet-architecture-demo.gif" alt="EquiNet 项目架构动态演示:行情数据 → data_maintenance → equinet.db → src/ 核心库 → 两阶段训练 → 评估选股" width="860">
+  <a href="docs/equinet-architecture.html">交互式架构图：数据生产 → equinet.db → src/ 核心库 → 单阶段端到端训练 → 评估选股</a>
   <br>
-  <sub>▲ 架构图由开源项目 <a href="https://github.com/tt-a1i/archify">Archify</a> 生成 · <a href="docs/equinet-architecture.html">交互式演示请点击这里</a>(明暗主题 · 节点搜索 · 路径追踪 · 自动导览)</sub>
+  <sub>▲ 架构图由开源项目 <a href="https://github.com/tt-a1i/archify">Archify</a> 生成 · 支持明暗主题 · 节点搜索 · 路径追踪 · 自动导览</sub>
 </p>
 
 ---
@@ -24,8 +24,7 @@
 
 | 技术 | 用途 | 出处 |
 |------|------|------|
-| VISReg | Embedding 预训练的几何正则(尺度/形状/中心化三解耦,`src/visreg.py`) | [Wu, Balestriero & Levine, 2026 (arXiv:2606.02572)](https://arxiv.org/abs/2606.02572);SIGReg 改进版,源自 [LeJEPA (Balestriero & LeCun, 2025)](https://github.com/galilai-group/lejepa) |
-| SupCon 对比学习 | 预训练中多头一致度核加权的对比目标 | [Khosla et al., 2020 (arXiv:1911.05371)](https://arxiv.org/abs/1911.05371) |
+| VISReg | 训练中作用于逐日 Embedding 的几何正则(尺度/形状/中心化三解耦,`src/visreg.py`) | [Wu, Balestriero & Levine, 2026 (arXiv:2606.02572)](https://arxiv.org/abs/2606.02572);SIGReg 改进版,源自 [LeJEPA (Balestriero & LeCun, 2025)](https://github.com/galilai-group/lejepa) |
 | Lion / Muon | 可选优化器(`training_utils.py`) | [arXiv:2302.06675](https://arxiv.org/abs/2302.06675) / [Muon](https://github.com/KellerJordan/Muon) |
 
 ## 目录结构
@@ -39,9 +38,8 @@ EquiNet/
 ├── src/
 │   ├── config.py              # 统一配置文件
 │   ├── model.py               # 模型架构（Post-Norm Transformer）
-│   ├── train.py               # 主训练脚本
+│   ├── train.py               # 主训练脚本（单阶段端到端）
 │   ├── run.py                 # 推理 / 选股 / 全区间回测脚本
-│   ├── pretrain_embedding.py  # Embedding 预训练（VISReg 几何正则）
 │   └── ...                    # 其他模块
 ├── data_maintenance.py        # 数据维护工具入口
 ├── docs/                      # 技术文档 + 交互式架构图(equinet-architecture.html)
@@ -101,6 +99,10 @@ python src/train.py
 python src/run.py
 ```
 
+### 训练结构
+
+主训练为**单阶段端到端**：FFN-Embedding 与 Transformer 主干一起优化，不加载预训练权重、不冻结。每个训练 step 额外从训练池独立采样一批单日 K 线（默认 4096 条），只过 Embedding 计算 VISReg（尺度/形状/中心化），作为表征分布的几何正则加在任务 BCE 上。Embedding 使用独立参数组，学习率为主干的 `EMBED_LR_RATIO`（默认 0.2）倍。相关开关在 `config.py:RegularizationConfig`。
+
 ## 极端行情过滤
 
 市场普涨/普跌日的标签由 beta 驱动而非个股主力运作，混入训练会稀释信号。项目据此剔除噪声标签：
@@ -125,7 +127,7 @@ python src/run.py --begin 2023-03-01          # 容错：2023-03-01 / 2023/03/01
 
 `--begin` 指定后评估区间变为 `[begin, 最新]`，忽略训练/验证/测试集划分——模型用 begin 之前的历史做上下文，首个预测日恰好落在 begin 当天（无数据泄漏）。区间过长时终端只显示首尾，完整逐日统计导出到所选模型所在的 run 目录 `out/<日期戳>/daily_stats_<时间戳>.json`（与该模型的 `<模型名>_classification.png` 同住一个 run 目录）。
 
-> **目录即模型**：每次训练在 `out/` 下创建独立 run 目录（`out/<日期戳>/`），该次训练的模型（`model_loss_*.pth` / `model_realistic_*.pth`）、训练日志 CSV，以及后续评估产物（每日统计 JSON、分类可视化 PNG、看板 HTML）都集中在这个目录里。同一 run 的两个候选模型会成对出现在选择列表中，评估产物按模型命名，互不覆盖。
+> **目录即模型**：每次训练在 `out/` 下创建独立 run 目录（`out/<日期戳>/`），该次训练的模型（`model_loss_*.pth` / `model_ic_*.pth`）、训练日志 CSV，以及后续评估产物（每日统计 JSON、分类可视化 PNG、看板 HTML）都集中在这个目录里。同一 run 的两个候选模型会成对出现在选择列表中，评估产物按模型命名，互不覆盖。
 
 > EquiNet专注模型训练体系，本身不提供实际可实际应用的回测、交易、成本控制等逻辑
 
@@ -148,11 +150,11 @@ model_loss_top1_p1_11pct_thr0_485_auc0_6182_ep29_1214_1930.pth
   │         │    │          └── 阈值（实盘用）
   │         │    └── 收益率
   │         └── Top-K
-  └── 模型类型（model_loss / model_realistic）
+  └── 模型类型（model_loss / model_ic）
 ```
 
-model_loss - 按测试集loss保存的最佳模型
-model_realistic - 按实战收益率保存的最佳模型
+model_loss - 按验证集 loss 保存的最佳模型
+model_ic - 按验证集逐日 IC 保存的最佳模型
 top1 - Top1%选股，k取1
 p1_11pct - 收益率 +1.11% 在测试集上的收益率
 thr0_485 - 阈值 0.485（预测值≥0.485即入选Top1%）
@@ -210,9 +212,7 @@ python src/visualize_attention.py
 - 2026.10.1:环境全面升级并锁定版本（Python 3.13→3.12、torch 2.6.0+cu124→2.14.1+cu126、pandas 2.3.2→3.0.6、numpy 2.3.3→2.5.3、scikit-learn 1.7.1→1.9.1）；环境清单拆分为 `environment.yaml`（conda 层）+ `requirements.txt`（pip 层，含 CUDA 源与全部锁版本）；修复 `muon-optimizer` 误装 PyPI 同名包导致优化器缺少 `p.grad is None` 保护与 `reshape` 的问题；本地环境与实验室服务器（RTX 4090）逐包对齐
 - 2026.9.27:数据区间重划（训练 `2016~2022`、验证 `2023~2025`、测试 `2026~最新`），三个区间统一为「首个预测日 = 区间起始日当天」；Transformer 层数 6→4；归一化器随之在训练区间上重新拟合；`create_fixed_evaluation_dataset` 新增 `start_date` / `end_date` 口径，`attn_analysis.py` / `signal_flow.py` 同步改用验证集口径
 - 2026.8.31:新增K线形态特征
-- 2026.8:重构pretrain_embedding.py训练方法
-- 2026.8.15:embedding预训练解码器改为线性decoder并新增11维衍生特征掩码MSE损失项；新增衍生特征线性探针对照工具probe_derived.py验证跨维结构是否编码进Embedding内
-- 2026.7.16:将Embedding预训练的几何正则从SIGReg更新为VISReg
+- 2026.7.16:将Embedding的几何正则从SIGReg更新为VISReg
 - 2026.6.24:新增极端行情过滤（剔除市场普涨普跌日的噪声标签）与市场宽度工具；评估集支持 `--begin` 全区间回测；新增每日统计导出与 HTML 看板
 - 2026.6:重构 MultiHeadAttention 为手写实现（LLaMA2 风格 per-head Q/K RMSNorm）；全栈对齐 Qwen3.5 使用 Zero-Centered RMSNorm；data.py 样本生成收敛至向量化批处理；重构 FFN-Embedding 结构与 embedding 预训练脚本；重构数据维护工具
 - 2026.6.3:修正SIGReg的使用实现

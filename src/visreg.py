@@ -13,7 +13,7 @@ SIGReg: Sketched Isotropic Gaussian Regularization
 参考: https://github.com/galilai-group/lejepa
 
 ---
-调用方应在传入前把 z 缩放到目标尺度（即 z / target_std），如EmbeddingConfig.TARGET_STD
+调用方应在传入前把 z 缩放到目标尺度（即 z / target_std），如 RegularizationConfig.TARGET_STD
 """
 
 import math

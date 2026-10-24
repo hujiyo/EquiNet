@@ -163,6 +163,10 @@ class DataConfig:
     NORMALIZER_OUTPUT_DISTRIBUTION = 'normal'  # 'normal' (标准正态) 或 'uniform' (均匀分布)
     NORMALIZER_N_QUANTILES = 1000            # 分位数数量（越大越精确但越慢）
     NORMALIZER_PATH = os.path.join(SRC_DIR, 'normalizer.pkl')
+    # 归一化的并发线程数。归一化是逐元素映射，只影响启动耗时，不改变任何一个数值；
+    # 设 1 即单线程。启动阶段的时间几乎全花在这里，线程给少了启动慢，
+    # 给多了收益会饱和（受内存带宽限制，8 → 16 线程只快约一成）。
+    NORMALIZE_WORKERS = 8
 
     TOP_K = 1                   # 排序收益评估的百分比（取预测概率前N%的样本）
     TOP_N_PER_DAY = 0                 # 实战收益率：每天选股数量（0表示使用全局阈值模式）
@@ -185,8 +189,8 @@ class ModelConfig:
     OUTPUT_DIM = 1                   # 输出维度（上涨概率，0-1 之间）
 
     # 注意力机制参数
-    DROPOUT_RATE = 0                 # Dropout比率设置为0降低欠拟合
-    ATTENTION_DROPOUT = 0            # 注意力Dropout比率设置为0降低欠拟合
+    DROPOUT_RATE = 0.05                 # Dropout比率
+    ATTENTION_DROPOUT = 0.05            # 注意力Dropout比率
 
     # ========== 初始化策略 ==========
     # 与 LLaMA/MiniMind 一致，全部使用 PyTorch 默认初始化
@@ -225,10 +229,10 @@ class TrainingConfig:
     """训练相关参数"""
     # 训练批处理
     BATCH_SIZE = 512                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 120            # 每个测评周期内的参数更新步数
+    BATCHES_PER_EPOCH = 60            # 每个测评周期内的参数更新步数
 
     # 基础训练参数
-    EPOCHS = 30                     # 测评周期数（每个周期结束做一次验证集评估与选模）
+    EPOCHS = 60                     # 测评周期数（每个周期结束做一次验证集评估与选模）
     # 总步数 = EPOCHS × BATCHES_PER_EPOCH，学习率按"步"更新
 
     # ===== 两段式学习率调度（预热 → 退火），每一步更新一次 =====
@@ -236,9 +240,9 @@ class TrainingConfig:
     # 退火：LR_PEAK 按 LR_DECAY_SHAPE 降到 LR_FINAL，占 LR_DECAY_STEPS 步
     # 约束：LR_WARMUP_STEPS + LR_DECAY_STEPS == EPOCHS × BATCHES_PER_EPOCH
     LR_START = 1e-6                          # 初始学习率（预热起点，保证第一步也有更新）
-    LR_WARMUP_STEPS = BATCHES_PER_EPOCH*1    # 预热步数
+    LR_WARMUP_STEPS = BATCHES_PER_EPOCH*2    # 预热步数
     LR_PEAK = 1e-4                           # 最大学习率（同时是优化器的基准学习率）
-    LR_DECAY_STEPS = BATCHES_PER_EPOCH*29    # 退火步数
+    LR_DECAY_STEPS = BATCHES_PER_EPOCH*58    # 退火步数
     LR_FINAL = 5e-6                          # 最终学习率（退火终点）
     LR_DECAY_SHAPE = 'cosine'                # 退火曲线：'cosine'（余弦）或 'linear'（线性）
 
@@ -249,8 +253,8 @@ class TrainingConfig:
     # 通用优化器参数
     GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
 
-    # AdamW 参数（唯一优化器）
-    ADAMW_WEIGHT_DECAY = 0.1         # 权重衰减
+    # AdamW 参数
+    ADAMW_WEIGHT_DECAY = 0.05         # 权重衰减
 
     OPEN_EARLY_STOPPING = True        # 是否开启早停机制
 

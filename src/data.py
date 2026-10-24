@@ -23,6 +23,7 @@ from config import (
     CURRENT_POOL, INFORMATIONAL_ISSUE_TYPES, pool_join_sql, load_stock_codes,
 )
 from multiprocessing import Pool, cpu_count
+from concurrent.futures import ThreadPoolExecutor
 from sklearn.preprocessing import QuantileTransformer, StandardScaler
 from typing import Dict, List, Set, Optional
 
@@ -251,7 +252,8 @@ class FeatureNormalizer:
 
         return normalized
 
-    def transform_batch(self, input_seqs: np.ndarray, chunk_size: int = 100000) -> np.ndarray:
+    def transform_batch(self, input_seqs: np.ndarray, chunk_size: int = 100000,
+                        out: np.ndarray = None, workers: int = None) -> np.ndarray:
         """
         批量归一化多个样本（比逐个调用transform高效10-100倍）
 
@@ -259,29 +261,49 @@ class FeatureNormalizer:
         的 --begin 多年回测，样本数可达数百万）一次性展平导致内存爆炸（QuantileTransformer
         内部 np.interp 会再分配等大数组），按 chunk_size 分块处理，峰值内存仅与单块大小相关。
 
+        每个样本的每个特征都是独立的逐元素映射，所以把「分块 × 特征组」拆成互不重叠
+        的任务并发执行，与逐块串行计算逐位相同（处理的先后不改变任何一个元素的结果）。
+
         Args:
             input_seqs: [batch_size, context_length, 19] 原始输入序列
             chunk_size: 每块处理的样本数（默认 10万，单块峰值内存约数百MB）
+            out: 结果写入的数组。None 时新建同形状 float32 数组；传 input_seqs 本身
+                即原地归一化（大数组时省下一份等大的临时数组）
+            workers: 并发线程数。None 时用 DataConfig.NORMALIZE_WORKERS
 
         Returns:
-            [batch_size, context_length, 19] 归一化后的序列
+            [batch_size, context_length, 19] 归一化后的序列（即 out）
         """
         if not self.is_fitted:
             raise RuntimeError("归一化器未拟合！请先调用 fit() 方法")
 
-        total, context_length = input_seqs.shape[0], input_seqs.shape[1]
-        normalized = np.empty_like(input_seqs, dtype=np.float32)
+        total = input_seqs.shape[0]
+        if out is None:
+            out = np.empty_like(input_seqs, dtype=np.float32)
 
-        for start in range(0, total, chunk_size):
-            end = min(start + chunk_size, total)
-            chunk = input_seqs[start:end]
-            for name, col_slice in self._feature_groups:
-                orig_shape = chunk[:, :, col_slice].shape
-                normalized[start:end, :, col_slice] = self.pipelines[name].transform(
-                    chunk[:, :, col_slice].reshape(-1, 1)
-                ).reshape(orig_shape)
+        workers = max(1, DataConfig.NORMALIZE_WORKERS if workers is None else int(workers))
+        blocks = [(start, min(start + chunk_size, total), name, col_slice)
+                  for start in range(0, total, chunk_size)
+                  for name, col_slice in self._feature_groups]
 
-        return normalized
+        if workers == 1 or len(blocks) <= 1:
+            for block in blocks:
+                self._transform_block(out, input_seqs, *block)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for _ in executor.map(
+                        lambda block: self._transform_block(out, input_seqs, *block), blocks):
+                    pass
+
+        return out
+
+    def _transform_block(self, out: np.ndarray, input_seqs: np.ndarray,
+                         start: int, end: int, name: str, col_slice: slice):
+        """把 [start, end) 这段样本的单个特征组归一化，写进 out 的同一列切片"""
+        block = input_seqs[start:end, :, col_slice]
+        out[start:end, :, col_slice] = self.pipelines[name].transform(
+            block.reshape(-1, 1)
+        ).reshape(block.shape)
 
     def fit_transform(self, train_stock_info: List[Dict]) -> 'FeatureNormalizer':
         """
@@ -1018,9 +1040,11 @@ def create_fixed_evaluation_dataset(test_stock_info, feature_normalizer=None,
     # 释放分块列表（其总大小与拼接后的 array 相当），降低大评估集(--begin 多年)峰值内存
     del eval_inputs, eval_targets, eval_cumulative_returns, eval_tradeable_masks
 
-    # 批量细处理：分块归一化（大评估集如 --begin 多年回测时避免内存爆炸）
+    # 批量细处理：原地归一化（大评估集如 --begin 多年回测时省下一份等大的临时数组）
     if feature_normalizer is not None:
-        eval_inputs_array = feature_normalizer.transform_batch(eval_inputs_array)
+        eval_inputs_array = feature_normalizer.transform_batch(
+            eval_inputs_array, out=eval_inputs_array
+        )
         # 过滤归一化后产生的NaN/Inf样本（分块计算 finite_mask，避免 [N, ctx*feat] 整体展开占内存）
         n_eval = len(eval_inputs_array)
         finite_mask = np.ones(n_eval, dtype=bool)
@@ -1916,10 +1940,8 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None, max_pool
         all_returns = np.concatenate(all_returns, axis=0)
 
         if feature_normalizer is not None:
-            chunk_size = 100_000
-            for start in range(0, len(all_inputs), chunk_size):
-                end = min(start + chunk_size, len(all_inputs))
-                all_inputs[start:end] = feature_normalizer.transform_batch(all_inputs[start:end])
+            # 原地归一化：并发线程按分块各自写自己的切片，峰值内存只需一份结果数组
+            feature_normalizer.transform_batch(all_inputs, out=all_inputs)
 
         pos_indices = np.where(all_targets >= 0.5)[0]
         neg_indices = np.where(all_targets < 0.5)[0]

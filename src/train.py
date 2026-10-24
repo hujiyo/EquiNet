@@ -255,7 +255,7 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
     global_step = 0   # 全训练累计的优化步数，学习率按它取值
 
     # 逐步指标日志：训练损失每一步都落盘（成本≈0），供监控页画稠密曲线。
-    # 验证损失仍只在测评周期末算一次（全量验证集一次约 10-15 秒，不能每步做）。
+    # 验证损失仍只在测评周期末算一次（全量验证集一次约 16 秒，不能每步做）。
     step_csv_path = os.path.join(run_dir, 'step_metrics.csv')
     step_csv = open(step_csv_path, 'w', newline='', encoding='utf-8')
     step_writer = csv.writer(step_csv)

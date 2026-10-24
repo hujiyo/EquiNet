@@ -754,6 +754,11 @@ def calculate_realistic_return(all_preds, all_returns, all_day_indices, top_perc
     1. 全局阈值模式（top_n_per_day=None）: 按全局Top%确定阈值，每天选超过阈值的股票
     2. 每日Top N模式（top_n_per_day指定）: 每天选预测分数最高的前N只股票
     """
+    # 必须是 ndarray：调用方给的 day_indices 是 Python list，按天循环里
+    # `list == day` 会走 numpy 广播，每次都要把百万元素的列表重新转成数组。
+    all_day_indices = np.asarray(all_day_indices)
+    all_preds = np.asarray(all_preds)
+    all_returns = np.asarray(all_returns)
     unique_days = np.unique(all_day_indices)
     unique_days = np.sort(unique_days)
     
@@ -846,6 +851,10 @@ def calculate_portfolio_simulation(all_preds, all_cumulative_returns, all_daily_
     - len=2: 累计亏损/弱势止损 → 次日收盘卖出
     - len=3: 正常持有满3天 → 第3天收盘卖出
     """
+    # 同 calculate_realistic_return：list 会在按天循环里被反复重转成数组
+    all_day_indices = np.asarray(all_day_indices)
+    all_preds = np.asarray(all_preds)
+    all_cumulative_returns = np.asarray(all_cumulative_returns)
     max_holdings = DataConfig.MAX_HOLDINGS if DataConfig.MAX_HOLDINGS > 0 else \
                    DataConfig.MAX_SELECT_PER_DAY if DataConfig.MAX_SELECT_PER_DAY > 0 else 4
     max_buy_per_day = DataConfig.MAX_BUY_PER_DAY if DataConfig.MAX_BUY_PER_DAY > 0 else max_holdings

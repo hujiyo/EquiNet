@@ -249,11 +249,17 @@ JOIN pool_membership pm ON sd.stock_code = pm.stock_code
 但从正确性看，测试集里的真错价同样会污染输入与标签。
 改成同时作用于评估集是几行的事，但会改变测试指标。
 
-### 6.4 数据停更
+### 6.4 数据更新状态
 
-库内最新数据 2026-07-31，已停更约 2 个月（原负责更新的同学离职）。
-恢复更新后按 §7 的顺序重跑。**`selfcheck` 会直接指出哪一步没跟上**
+库内最新数据 **2026-10-23**：`stock_daily` / `stock_status` / `data_issues` /
+`pool_membership` 四者已对齐到同一天（`data_meta` 里全部 `fresh`）。
+更新完成后按 §7 的顺序重跑，**`selfcheck` 会直接指出哪一步没跟上**
 （靠 `data_meta.source_max_date` 判断，不靠人记得）。
+
+批量采集的风险：连接半死时 socket 读会无限阻塞，一个死连接就让 worker 永久挂起
+（父进程 `imap` 等不到这一片，整轮既无进度也无提交，看起来像在跑）。
+`_fetch_chunk` 登录后即设 `QUERY_TIMEOUT`，超时按「该批失败」处理；
+只需补一部分股票时用 `--codes-file`，不必重拉全市场。
 
 ### 6.5 `stock_metadata` 表是空的
 

@@ -34,6 +34,7 @@
 
     python -m data_maintenance.fetch_status --fetch                # 全量（约 15 分钟）
     python -m data_maintenance.fetch_status --fetch --only-missing # 断点续拉
+    python -m data_maintenance.fetch_status --fetch --codes-file c.txt  # 只补指定股票
     python -m data_maintenance.fetch_status --report               # 只读统计
     python -m data_maintenance.fetch_status --verify               # 与库内停牌行对照
 
@@ -73,6 +74,11 @@ FETCH_FIELDS = 'date,code,tradestatus,isST'
 # 每个并行任务负责多少只股票。20 只 ≈ 10 万行 ≈ 8 MB（pickle 后），
 # 保证 worker 内存只驻一个分块、父进程也只缓冲少量在途结果。
 CHUNK = 20
+# 单次查询的 socket 超时（秒）。数据源在连接半死时会「不返回也不断开」，
+# socket 读无限阻塞 —— 不设超时的话，一个死连接就让 worker 永久挂起：
+# 父进程的 imap 永远等不到这一片，整轮既不出进度也不提交，
+# 表现是 worker 满载但零进展。
+QUERY_TIMEOUT = 60
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS stock_status (
@@ -146,6 +152,10 @@ def _fetch_chunk(args):
         for attempt in range(3):
             try:
                 if bs.login().error_code == '0':
+                    # 登录成功就给底层 socket 设超时，避免半死连接让读操作永久阻塞
+                    import baostock.common.context as bs_ctx
+                    if getattr(bs_ctx, 'default_socket', None) is not None:
+                        bs_ctx.default_socket.settimeout(QUERY_TIMEOUT)
                     return True
             except Exception:
                 pass
@@ -206,7 +216,8 @@ def _fetch_chunk(args):
 
 
 def fetch_status(db_path: str = DEFAULT_DB, workers: int = MAX_WORKERS,
-                 end_date: str = None, only_missing: bool = False) -> int:
+                 end_date: str = None, only_missing: bool = False,
+                 codes: list = None) -> int:
     import datetime
     if end_date is None:
         end_date = datetime.datetime.now().strftime('%Y-%m-%d')
@@ -215,7 +226,11 @@ def fetch_status(db_path: str = DEFAULT_DB, workers: int = MAX_WORKERS,
     con = sqlite3.connect(f'file:{db_path.replace(chr(92), "/")}?mode=ro', uri=True)
     all_codes = [r[0] for r in con.execute(
         'SELECT DISTINCT stock_code FROM stock_daily ORDER BY stock_code')]
-    if only_missing:
+    if codes is not None:
+        # 指定子集：一轮批量采集被中断或部分失败后，只补这几只，不必重拉全市场
+        codes = [c for c in codes if str(c).isdigit()]
+        print(f'指定股票: {len(codes):,} 只（跳过全市场枚举）')
+    elif only_missing:
         have = {r[0] for r in con.execute('SELECT DISTINCT stock_code FROM stock_status')}
         codes = [c for c in all_codes if c not in have and c.isdigit()]
         print(f'断点续拉: 全库 {len(all_codes):,} 只, 已有 {len(have):,} 只, 待补 {len(codes):,} 只')
@@ -353,6 +368,8 @@ def main():
     ap.add_argument('--verify', action='store_true', help='与库内停牌行对照')
     ap.add_argument('--workers', type=int, default=MAX_WORKERS)
     ap.add_argument('--end-date')
+    ap.add_argument('--codes-file',
+                    help='只更新文件里的股票代码（空格/逗号/换行分隔），用于中断或部分失败后补拉')
     args = ap.parse_args()
 
     db_path = os.path.abspath(args.db)
@@ -361,8 +378,14 @@ def main():
         sys.exit(1)
 
     if args.fetch:
+        codes = None
+        if args.codes_file:
+            with open(args.codes_file, 'r', encoding='utf-8') as f:
+                raw = f.read().replace(',', ' ').split()
+            codes = [c for c in raw if c.isdigit()]
+            print(f'从 {args.codes_file} 读入 {len(codes):,} 只股票代码')
         fetch_status(db_path, workers=args.workers, end_date=args.end_date,
-                     only_missing=args.only_missing)
+                     only_missing=args.only_missing, codes=codes)
     if args.report:
         report(db_path)
     if args.verify:

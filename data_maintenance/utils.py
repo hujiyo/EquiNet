@@ -85,9 +85,12 @@ def normalize_stock_df(
         })
 
     # --- 日期处理 ---
-    if df['date'].dtype == object:
-        df['date'] = df['date'].astype(str).str.replace('-', '')
-        df = df[df['date'] != '']
+    # 判据用「是不是整数列」而不是「是不是 object」：pandas 3.x 起字符串列默认推断为
+    # `str` dtype 而非 `object`，按 dtype == object 判断会让日期串原样进入 astype(int)，
+    # 抛 `invalid literal for int() with base 10: '2026-06-03'`。
+    if not pd.api.types.is_integer_dtype(df['date']):
+        df['date'] = df['date'].astype(str).str.replace('-', '', regex=False)
+        df = df[df['date'].str.strip() != '']
         if len(df) == 0:
             return None
     df['date'] = df['date'].astype(int)

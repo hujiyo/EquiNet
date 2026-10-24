@@ -2,14 +2,13 @@
 训练工具模块
 
 提供训练相关的工具类和函数，供其他训练脚本导入使用：
-- WarmupScheduler: 学习率预热调度器
+- StepLRScheduler: 两段式学习率调度器（预热 + 退火，按步更新）
 - GradientMonitor: 梯度监控器
 - DynamicWeightedBCE: 动态加权BCE损失函数
 - EarlyStopping: 早停机制
 - evaluate_model: 模型评估函数
 - save_model_with_metadata: 带元数据的模型保存
 - print_dispersion_sparkline: 预测值分布可视化
-- create_optimizer_from_config: 根据配置创建优化器
 - create_scheduler_from_config: 根据配置创建学习率调度器
 '''
 
@@ -20,89 +19,58 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from config import DataConfig,LossConfig,TrainingConfig,RegularizationConfig
 import torch.optim as optim
-from lion_pytorch import Lion
-from muon import SingleDeviceMuonWithAuxAdam as MuonWithAuxAdam
 
-class WarmupScheduler:
+class StepLRScheduler:
     """
-    学习率预热调度器
-    在前几轮训练中，学习率从很小的值逐步增加到目标学习率
-    这有助于模型在训练初期更稳定地收敛
+    两段式学习率调度器：预热 → 退火，每个优化步（batch）更新一次。
+
+    - 预热：start_lr 线性升到 peak_lr，共 warmup_steps 步
+    - 退火：peak_lr 按 cosine / linear 降到 final_lr，共 decay_steps 步
+    两段步数之和等于总步数时，学习率正好在最后一步落到 final_lr。
+
+    多 param_group 按构造瞬间各组学习率相对基准组的比例同步缩放：
+    例如 Embedding 组是基准组的 0.2 倍，则全程保持 0.2 倍。
     """
-    def __init__(self, optimizer, warmup_epochs, target_lr, start_lr=None):
+
+    def __init__(self, optimizer, start_lr, peak_lr, final_lr,
+                 warmup_steps, decay_steps, shape='cosine'):
+        if shape not in ('cosine', 'linear'):
+            raise ValueError(f"退火曲线只支持 'cosine' / 'linear'，当前 {shape!r}")
+        if peak_lr <= 0:
+            raise ValueError("peak_lr 必须为正数")
         self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.target_lr = target_lr
-        self.start_lr = start_lr if start_lr is not None else target_lr / 100
-        self.current_epoch = 0
+        self.start_lr = float(start_lr)
+        self.peak_lr = float(peak_lr)
+        self.final_lr = float(final_lr)
+        self.warmup_steps = max(0, int(warmup_steps))
+        self.decay_steps = max(0, int(decay_steps))
+        self.shape = shape
 
-        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
-        target_ratio = target_lr / self.base_lrs[0] if self.base_lrs[0] != 0 else 1.0
-        start_ratio = self.start_lr / target_lr if target_lr != 0 else 1.0
+        base = optimizer.param_groups[0]['lr']
+        self.group_scales = [g['lr'] / base if base else 1.0 for g in optimizer.param_groups]
+        self.last_step = -1
 
-        for group, base_lr in zip(optimizer.param_groups, self.base_lrs):
-            group['lr'] = base_lr * target_ratio * start_ratio
-    
-    def step(self, epoch=None):
-        if epoch is not None:
-            self.current_epoch = epoch
-        else:
-            self.current_epoch += 1
-        
-        if self.current_epoch < self.warmup_epochs:
-            progress = (self.current_epoch + 1) / self.warmup_epochs
-        else:
-            progress = 1.0
+    def lr_at(self, step):
+        """返回第 step 步的基准学习率（不含 param_group 倍率）"""
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            t = step / self.warmup_steps
+            return self.start_lr + (self.peak_lr - self.start_lr) * t
+        if self.decay_steps <= 0:
+            return self.peak_lr
+        u = min(max((step - self.warmup_steps) / self.decay_steps, 0.0), 1.0)
+        factor = (1.0 - u) if self.shape == 'linear' else 0.5 * (1.0 + math.cos(math.pi * u))
+        return self.final_lr + (self.peak_lr - self.final_lr) * factor
 
-        target_ratio = self.target_lr / self.base_lrs[0] if self.base_lrs[0] != 0 else 1.0
-        start_ratio = self.start_lr / self.target_lr if self.target_lr != 0 else 1.0
+    def phase_name(self, step):
+        return '预热' if (self.warmup_steps > 0 and step < self.warmup_steps) else '退火'
 
-        for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-            scale = start_ratio + (1.0 - start_ratio) * progress
-            group['lr'] = base_lr * target_ratio * scale
-        
-        return self.optimizer.param_groups[0]['lr']
-    
-    def get_last_lr(self):
-        return [group['lr'] for group in self.optimizer.param_groups]
-
-
-class CosineAnnealFreezeLR:
-    """
-    余弦退火 + 固定学习率调度器
-
-    学习率变化：warmup → 余弦退火 → 固定在 eta_min
-    余弦退火仅持续 anneal_epochs 轮，之后学习率固定不再下降。
-
-    支持多 param_group 不同学习率：按各自 base_lr 的比例独立退火。
-    eta_min 为第一个 group 的最低学习率，其余 group 按比例计算。
-    base_lrs 在第一次 step() 时才记录，确保拿到预热结束后的真实目标 lr。
-    """
-    def __init__(self, optimizer, anneal_epochs, eta_min):
-        self.optimizer = optimizer
-        self.eta_min = eta_min
-        self.anneal_epochs = max(1, anneal_epochs)
-        self.current_step = 0
-        self.base_lrs = None
-        self.eta_mins = None
-
-    def _ensure_base_lrs(self):
-        if self.base_lrs is None:
-            self.base_lrs = [group['lr'] for group in self.optimizer.param_groups]
-            self.eta_mins = []
-            if self.base_lrs and self.base_lrs[0] != 0:
-                for base_lr in self.base_lrs:
-                    self.eta_mins.append(self.eta_min * base_lr / self.base_lrs[0])
-            else:
-                self.eta_mins = [self.eta_min] * len(self.base_lrs)
-
-    def step(self):
-        self._ensure_base_lrs()
-        self.current_step += 1
-        if self.current_step <= self.anneal_epochs:
-            for param_group, base_lr, em in zip(self.optimizer.param_groups, self.base_lrs, self.eta_mins):
-                cosine_factor = 0.5 * (1 + math.cos(math.pi * self.current_step / self.anneal_epochs))
-                param_group['lr'] = em + (base_lr - em) * cosine_factor
+    def step(self, step):
+        """把第 step 步的学习率写入各 param_group，返回基准组学习率"""
+        lr = self.lr_at(step)
+        for group, scale in zip(self.optimizer.param_groups, self.group_scales):
+            group['lr'] = lr * scale
+        self.last_step = step
+        return lr
 
     def get_last_lr(self):
         return [group['lr'] for group in self.optimizer.param_groups]
@@ -1184,11 +1152,16 @@ def save_model_with_metadata(model_state_dict, top_return, top_threshold, auc,
             'epochs':           TrainingConfig.EPOCHS,
             'learning_rate':    TrainingConfig.get_base_lr(),
             'batch_size':       TrainingConfig.BATCH_SIZE,
-            'optimizer_type':   TrainingConfig.OPTIMIZER_TYPE,
-            'weight_decay':     TrainingConfig.get_base_wd(),
+                'weight_decay':     TrainingConfig.get_base_wd(),
             'loss_type':        LossConfig.LOSS_TYPE,
             'pos_weight':       LossConfig.POS_WEIGHT,
             'embed_lr_ratio':   RegularizationConfig.EMBED_LR_RATIO,
+            'lr_start':         float(TrainingConfig.LR_START),
+            'lr_peak':          float(TrainingConfig.LR_PEAK),
+            'lr_final':         float(TrainingConfig.LR_FINAL),
+            'lr_warmup_steps':  int(TrainingConfig.LR_WARMUP_STEPS),
+            'lr_decay_steps':   int(TrainingConfig.LR_DECAY_STEPS),
+            'lr_decay_shape':   TrainingConfig.LR_DECAY_SHAPE,
             'visreg_weight':    float(RegularizationConfig.VISREG_MAIN_WEIGHT),
             'visreg_aux_batch_size': int(RegularizationConfig.VISREG_AUX_BATCH_SIZE),
             'visreg_target_std': float(RegularizationConfig.TARGET_STD),
@@ -1429,7 +1402,7 @@ def training_step(model, optimizer, loss_fn):
 
     Args:
         model: PyTorch模型
-        optimizer: 优化器实例（AdamW、Lion、Muon等）
+        optimizer: 优化器实例（AdamW）
         loss_fn: 无参回调函数，返回 (loss_tensor, output_tensor)。
                  调用方在闭包中封装具体的loss计算逻辑。
 
@@ -1450,53 +1423,9 @@ def training_step(model, optimizer, loss_fn):
     return loss.item(), output
 
 
-def create_optimizer_from_config(model, lr=None):
-    """
-    根据配置创建优化器（统一入口）
-
-    Args:
-        model: PyTorch模型
-        lr: 学习率，如果为None则自动使用当前优化器的默认学习率
-
-    Returns:
-        optimizer: 创建的优化器实例
-    """
-    actual_lr = lr if lr is not None else TrainingConfig.get_base_lr()
-    wd = TrainingConfig.get_base_wd()
-    optimizer_type = TrainingConfig.OPTIMIZER_TYPE.lower()
-
-    if optimizer_type == 'lion':
-        optimizer = Lion(model.parameters(), lr=actual_lr, betas=TrainingConfig.LION_BETAS, weight_decay=wd)
-        print(f"优化器: Lion (lr={actual_lr}, wd={wd}, betas={TrainingConfig.LION_BETAS})")
-    elif optimizer_type == 'muon':
-        muon_lr = actual_lr
-        muon_wd = TrainingConfig.MUON_WEIGHT_DECAY
-        muon_momentum = TrainingConfig.MUON_MOMENTUM
-        adamw_lr = TrainingConfig.MUON_ADAMW_LR_RATIO * muon_lr
-
-        hidden_weights = [p for p in model.parameters() if p.ndim >= 2]
-        other_params = [p for p in model.parameters() if p.ndim < 2]
-
-        param_groups = [
-            dict(params=hidden_weights, use_muon=True,
-                 lr=muon_lr, momentum=muon_momentum, weight_decay=muon_wd),
-            dict(params=other_params, use_muon=False,
-                 lr=adamw_lr, betas=TrainingConfig.MUON_ADAMW_BETAS, weight_decay=muon_wd),
-        ]
-        optimizer = MuonWithAuxAdam(param_groups)
-        print(f"优化器: MuonWithAuxAdam (Muon lr={muon_lr}, AdamW lr={adamw_lr:.6f}, wd={muon_wd})")
-        print(f"  2D权重(Muon): {len(hidden_weights)} 个参数")
-        print(f"  1D参数(AdamW): {len(other_params)} 个参数")
-    else:  # 'adamw' 或其他
-        optimizer = optim.AdamW(model.parameters(), lr=actual_lr, weight_decay=wd)
-        print(f"优化器: AdamW (lr={actual_lr}, wd={wd})")
-
-    return optimizer
-
-
 def create_optimizer_from_config_for_params(params, lr=None):
     """
-    根据配置创建优化器（接受参数列表或 PyTorch param_groups）
+    创建 AdamW 优化器（接受参数列表或 PyTorch param_groups）
 
     Args:
         params: 可迭代的参数列表，或 [{'params': [...], 'lr': ...}, ...] 形式的
@@ -1504,110 +1433,44 @@ def create_optimizer_from_config_for_params(params, lr=None):
         lr: 学习率（param_groups 中未指定 lr 的组使用此值）
 
     Returns:
-        optimizer: 创建的优化器实例
+        torch.optim.AdamW
     """
     actual_lr = lr if lr is not None else TrainingConfig.get_base_lr()
     wd = TrainingConfig.get_base_wd()
-    optimizer_type = TrainingConfig.OPTIMIZER_TYPE.lower()
 
     params = list(params)
     has_groups = bool(params) and isinstance(params[0], dict)
     n_groups = len(params) if has_groups else 1
 
-    if optimizer_type == 'lion':
-        optimizer = Lion(params, lr=actual_lr, betas=TrainingConfig.LION_BETAS, weight_decay=wd)
-        print(f"优化器(部分参数): Lion (lr={actual_lr}, wd={wd}, betas={TrainingConfig.LION_BETAS}, "
-              f"param_groups={n_groups})")
-    elif optimizer_type == 'muon':
-        muon_wd = TrainingConfig.MUON_WEIGHT_DECAY
-        muon_momentum = TrainingConfig.MUON_MOMENTUM
-        adamw_betas = TrainingConfig.MUON_ADAMW_BETAS
-        ratio = TrainingConfig.MUON_ADAMW_LR_RATIO
-
-        if has_groups:
-            # 逐组拆分 2D(走 Muon)/1D(走 AdamW)，保留各组的独立学习率
-            muon_groups = []
-            for group in params:
-                group_params = list(group['params'])
-                group_lr = group.get('lr', actual_lr)
-                hidden = [p for p in group_params if p.ndim >= 2]
-                other = [p for p in group_params if p.ndim < 2]
-                if hidden:
-                    muon_groups.append(dict(params=hidden, use_muon=True,
-                                            lr=group_lr, momentum=muon_momentum,
-                                            weight_decay=muon_wd))
-                if other:
-                    muon_groups.append(dict(params=other, use_muon=False,
-                                            lr=group_lr * ratio, betas=adamw_betas,
-                                            weight_decay=muon_wd))
-            optimizer = MuonWithAuxAdam(muon_groups)
-            print(f"优化器(部分参数): MuonWithAuxAdam (param_groups={n_groups}, "
-                  f"Muon/AdamW 分组内联)")
-        else:
-            hidden_weights = [p for p in params if p.ndim >= 2]
-            other_params = [p for p in params if p.ndim < 2]
-            muon_lr = actual_lr
-            adamw_lr = ratio * muon_lr
-
-            param_groups = [
-                dict(params=hidden_weights, use_muon=True,
-                     lr=muon_lr, momentum=muon_momentum, weight_decay=muon_wd),
-                dict(params=other_params, use_muon=False,
-                     lr=adamw_lr, betas=adamw_betas, weight_decay=muon_wd),
-            ]
-            optimizer = MuonWithAuxAdam(param_groups)
-            print(f"优化器(部分参数): MuonWithAuxAdam (Muon lr={muon_lr}, AdamW lr={adamw_lr:.6f})")
-    else:
-        optimizer = optim.AdamW(params, lr=actual_lr, weight_decay=wd)
-        print(f"优化器(部分参数): AdamW (lr={actual_lr}, wd={wd}, param_groups={n_groups})")
-
+    optimizer = optim.AdamW(params, lr=actual_lr, weight_decay=wd)
+    print(f"优化器: AdamW (lr={actual_lr}, wd={wd}, param_groups={n_groups})")
     return optimizer
 
 
-def create_scheduler_from_config(optimizer, epochs, lr=None, eta_min=None, warmup_start_lr=None):
+def create_scheduler_from_config(optimizer):
     """
-    根据配置创建学习率调度器（预热 + 余弦退火）
+    按 TrainingConfig 的两段式配置创建学习率调度器。
 
-    Args:
-        optimizer: PyTorch优化器
-        epochs: 总训练轮数
-        lr: 目标学习率，如果为None则自动使用当前优化器的默认学习率
-        eta_min: 余弦退火最小学习率，如果为None则使用 TrainingConfig.COSINE_ETA_MIN
-        warmup_start_lr: 预热起始学习率，如果为None则使用 TrainingConfig.WARMUP_START_LR
+    预热步数 + 退火步数必须等于总步数（EPOCHS × BATCHES_PER_EPOCH），
+    由 TrainingConfig.validate_lr_schedule() 校验。
 
     Returns:
-        tuple: (warmup_scheduler, main_scheduler, warmup_epochs)
-            - warmup_scheduler: 预热调度器
-            - main_scheduler: 余弦退火调度器
-            - warmup_epochs: 预热轮数（用于打印状态）
+        StepLRScheduler: 每个优化步调用一次 step(step)
     """
-    actual_lr = lr if lr is not None else TrainingConfig.get_base_lr()
-    actual_eta_min = eta_min if eta_min is not None else TrainingConfig.COSINE_ETA_MIN
-    actual_warmup_start_lr = warmup_start_lr if warmup_start_lr is not None else TrainingConfig.WARMUP_START_LR
-
-    warmup_epochs = TrainingConfig.WARMUP_EPOCHS
-
-    warmup_scheduler = WarmupScheduler(
+    total = TrainingConfig.validate_lr_schedule()
+    scheduler = StepLRScheduler(
         optimizer,
-        warmup_epochs=warmup_epochs,
-        target_lr=actual_lr,
-        start_lr=actual_warmup_start_lr
+        start_lr=TrainingConfig.LR_START,
+        peak_lr=TrainingConfig.LR_PEAK,
+        final_lr=TrainingConfig.LR_FINAL,
+        warmup_steps=TrainingConfig.LR_WARMUP_STEPS,
+        decay_steps=TrainingConfig.LR_DECAY_STEPS,
+        shape=TrainingConfig.LR_DECAY_SHAPE,
     )
-
-    total_main_epochs = max(1, epochs - warmup_epochs)
-    anneal_epochs = TrainingConfig.COSINE_ANNEAL_EPOCHS
-
-    if anneal_epochs < total_main_epochs:
-        main_scheduler = CosineAnnealFreezeLR(
-            optimizer,
-            anneal_epochs=anneal_epochs,
-            eta_min=actual_eta_min
-        )
-    else:
-        main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=total_main_epochs,
-            eta_min=actual_eta_min
-        )
-
+    scheduler.step(0)
+    print(f"  学习率调度: 预热 {TrainingConfig.LR_WARMUP_STEPS} 步 "
+          f"{TrainingConfig.LR_START:g}→{TrainingConfig.LR_PEAK:g}，退火 "
+          f"{TrainingConfig.LR_DECAY_STEPS} 步 {TrainingConfig.LR_PEAK:g}→{TrainingConfig.LR_FINAL:g}"
+          f"（{TrainingConfig.LR_DECAY_SHAPE}，共 {total} 步，按步更新）")
+    return scheduler
     return warmup_scheduler, main_scheduler, warmup_epochs

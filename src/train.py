@@ -6,12 +6,13 @@ EquiNet 模型训练脚本
 - VISReg 作为 Embedding 的几何正则：每个 step 独立采样单日 K 线，额外计算
   尺度/形状/中心化三项损失，只约束表征分布，不参与任务判决
 - 使用 DynamicWeightedBCE / PairwiseWeightedBCE / BalancedBCE 损失函数
-- 学习率调度：Warmup + Cosine Annealing
+- 学习率调度：预热 + 退火，按优化步更新（见 TrainingConfig.LR_*）
 - 训练时在验证集上评估，按验证集 loss 和逐日 IC 选择最佳模型
 - 训练结束后用最佳模型在测试集上做最终评估
 '''
 
 import os, torch, numpy as np
+import math
 import copy
 import random
 import csv
@@ -33,7 +34,7 @@ from data import (
 )
 
 from training_utils import (
-    WarmupScheduler,
+    StepLRScheduler,
     evaluate_model,
     save_model_with_metadata,
     DynamicWeightedBCE,
@@ -144,12 +145,10 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
           f"单日辅助batch={RegularizationConfig.VISREG_AUX_BATCH_SIZE}, "
           f"target_std={RegularizationConfig.TARGET_STD}")
 
-    # 创建学习率调度器
-    warmup_scheduler, main_scheduler, warmup_epochs = create_scheduler_from_config(
-        optimizer,
-        epochs=epochs,
-        lr=learning_rate
-    )
+    # 创建学习率调度器（两段式：预热 → 退火，按步更新）
+    lr_scheduler = create_scheduler_from_config(optimizer)
+    # 预热区结束对应的周期数，只用于选模门槛（预热期内的测评不参与选模）
+    warmup_epochs = math.ceil(TrainingConfig.LR_WARMUP_STEPS / batches_per_epoch)
 
     # 损失函数选择
     if LossConfig.LOSS_TYPE.lower() == 'pairwise_bce':
@@ -253,6 +252,15 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
     # 记录每轮收益率
     epoch_returns = []
 
+    global_step = 0   # 全训练累计的优化步数，学习率按它取值
+
+    # 逐步指标日志：训练损失每一步都落盘（成本≈0），供监控页画稠密曲线。
+    # 验证损失仍只在测评周期末算一次（全量验证集一次约 10-15 秒，不能每步做）。
+    step_csv_path = os.path.join(run_dir, 'step_metrics.csv')
+    step_csv = open(step_csv_path, 'w', newline='', encoding='utf-8')
+    step_writer = csv.writer(step_csv)
+    step_writer.writerow(['step', 'epoch', 'lr', 'train_loss', 'visreg', 'embed_z_std'])
+
     for epoch in range(epochs):
         model.train()
 
@@ -270,18 +278,16 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         epoch_embed_grad = 0.0
         visreg_steps = 0
 
-        # 学习率更新
-        if epoch < warmup_epochs:
-            current_lr = warmup_scheduler.step(epoch)
-            lr_status = f"预热阶段 ({epoch + 1}/{warmup_epochs})"
-        else:
-            current_lr = main_scheduler.get_last_lr()[0]
-            lr_status = "正常训练"
+        # 学习率按步更新：epoch 头只打印本周期起点的学习率
+        start_step = global_step
+        current_lr = lr_scheduler.lr_at(start_step)
+        lr_status = f'{lr_scheduler.phase_name(start_step)}中'
 
-        lr_str = f"{current_lr:.6f}"
+        lr_str = f"{current_lr:.6g}"
         if len(optimizer.param_groups) > 1:
-            lr_str += f" (embedding {optimizer.param_groups[1]['lr']:.6f})"
-        print(f'Epoch {epoch + 1}/{epochs}, LR: {lr_str} ({lr_status})')
+            lr_str += f" (embedding {current_lr * lr_scheduler.group_scales[1]:.6g})"
+        print(f'Epoch {epoch + 1}/{epochs} · step {start_step + 1}~'
+              f'{start_step + batches_per_epoch} · LR: {lr_str} ({lr_status})')
 
         # 从预计算池中采样
         if use_temporal:
@@ -314,6 +320,10 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             print(f'  ⚠ 警告：实际batch数({actual_batches}) < 期望batch数({batches_per_epoch})，将使用实际数量')
 
         for step in range(actual_batches):
+            # 每个优化步先更新学习率，再前向/反向
+            lr_now = lr_scheduler.step(global_step)
+            global_step += 1
+
             start_idx = step * batch_size
             end_idx = (step + 1) * batch_size
 
@@ -352,11 +362,19 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
             epoch_z_std += aux_stats['z_std']
             visreg_steps += 1
 
+            # 逐步指标落盘（每 50 步 flush 一次，监控页不必等训练结束）
+            step_writer.writerow([
+                global_step - 1, epoch + 1, f'{lr_now:.6e}',
+                f'{loss_val:.6f}', f"{aux_stats['visreg']:.6f}", f"{aux_stats['z_std']:.6f}",
+            ])
+            if global_step % 50 == 0:
+                step_csv.flush()
+
             # 进度显示
             progress = (step + 1) / actual_batches * 100
             processed_samples = (step + 1) * batch_size
             avg_loss = total_loss / processed_samples
-            print(f'\r  训练进度: {progress:.1f}%, Loss: {avg_loss:.4f}', end='', flush=True)
+            print(f'\r  训练进度: {progress:.1f}%, Loss: {avg_loss:.4f}, LR: {lr_now:.2e}', end='', flush=True)
 
         print()
         print()
@@ -370,9 +388,7 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # 更新学习率
-        if epoch >= warmup_epochs:
-            main_scheduler.step()
+        # 学习率已在每个 batch 内按步更新，这里不再按轮推进
 
         # 评估模型（在验证集上）
         stats = evaluate_model(
@@ -525,6 +541,9 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         if early_stopping.should_stop() and TrainingConfig.OPEN_EARLY_STOPPING:
             print(f"\n⚠ 早停触发：连续{patience}轮无改善，停止训练")
             break
+
+    step_csv.close()
+    print(f"✓ 逐步指标已保存: {os.path.relpath(step_csv_path, DataConfig.OUTPUT_DIR)}")
 
     # ========== 最终测试集评估 → 保存模型 ==========
     print("\n" + "=" * 60)

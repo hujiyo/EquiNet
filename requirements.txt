@@ -25,13 +25,6 @@ scipy==1.18.1
 matplotlib==3.11.2
 akshare==1.19.1
 baostock==0.9.4
-lion-pytorch==0.2.5
-
-# ---- 优化器：必须锁定这个 git commit ----
-# 警告：PyPI 上同样叫 muon-optimizer 的 0.1.0 是【另一份实现】，
-#       缺少 `p.grad is None` 保护与 `update.reshape(p.shape)`，
-#       会让优化器在参数无梯度时崩溃。必须用 KellerJordan 官方仓库。
-muon-optimizer @ git+https://github.com/KellerJordan/Muon@6399c658d3c4a3356ba823fa6664b10e23871068
 
 # ---- 以下为上述依赖的传递依赖，一并锁定以保证可复现 ----
 beautifulsoup4==4.15.0

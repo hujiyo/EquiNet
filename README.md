@@ -25,7 +25,6 @@
 | 技术 | 用途 | 出处 |
 |------|------|------|
 | VISReg | 训练中作用于逐日 Embedding 的几何正则(尺度/形状/中心化三解耦,`src/visreg.py`) | [Wu, Balestriero & Levine, 2026 (arXiv:2606.02572)](https://arxiv.org/abs/2606.02572);SIGReg 改进版,源自 [LeJEPA (Balestriero & LeCun, 2025)](https://github.com/galilai-group/lejepa) |
-| Lion / Muon | 可选优化器(`training_utils.py`) | [arXiv:2302.06675](https://arxiv.org/abs/2302.06675) / [Muon](https://github.com/KellerJordan/Muon) |
 
 ## 目录结构
 
@@ -102,6 +101,17 @@ python src/run.py
 ### 训练结构
 
 主训练为**单阶段端到端**：FFN-Embedding 与 Transformer 主干一起优化，不加载预训练权重、不冻结。每个训练 step 额外从训练池独立采样一批单日 K 线（默认 4096 条），只过 Embedding 计算 VISReg（尺度/形状/中心化），作为表征分布的几何正则加在任务 BCE 上。Embedding 使用独立参数组，学习率为主干的 `EMBED_LR_RATIO`（默认 0.2）倍。相关开关在 `config.py:RegularizationConfig`。
+
+### 学习率调度
+
+学习率按**优化步**（每个 batch 更新一次）推进，分两段：
+
+| 阶段 | 学习率变化 | 步数 |
+|---|---|---|
+| 预热 | `LR_START` 线性升到 `LR_PEAK` | `LR_WARMUP_STEPS` |
+| 退火 | `LR_PEAK` 按 `LR_DECAY_SHAPE`（`cosine` / `linear`）降到 `LR_FINAL` | `LR_DECAY_STEPS` |
+
+两段步数之和必须等于总步数 `EPOCHS × BATCHES_PER_EPOCH`，配错时 `TrainingConfig.validate_lr_schedule()` 直接报错。`epoch` 只作为测评周期：每个周期结束做一次验证集评估与选模，不参与学习率调度。多项参数组（如 Embedding 组）按主干的固定倍率同步缩放。
 
 ## 极端行情过滤
 

@@ -210,7 +210,7 @@ class RegularizationConfig:
 
     # VISReg：主训练每个 step 独立采样单日 K 线，对其 embedding 施加
     # 尺度/形状(SWD)/中心化三项解耦正则；不参与任务判决，只约束表征分布。
-    VISREG_MAIN_WEIGHT = 0.1         # λ：相对 BCE 的权重，建议在 0.01~0.2 间标定
+    VISREG_MAIN_WEIGHT = 0.4         # λ：相对 BCE 的权重
     VISREG_AUX_BATCH_SIZE = 4096     # 每步独立采样的单日 K 线数
     VISREG_NUM_SLICES = 256          # 随机投影方向数 K
     VISREG_W_SCALE = 1.0             # 尺度项权重（逐维 std→1）
@@ -223,24 +223,24 @@ class RegularizationConfig:
 # ==================== 训练参数 ====================
 class TrainingConfig:
     """训练相关参数"""
-    # 基础训练参数（优化训练策略）
-    EPOCHS = 80                     # 训练轮数
-    WARMUP_EPOCHS = 8               # 预热轮数
-    COSINE_ANNEAL_EPOCHS = 14       # 余弦退火轮数（之后学习率固定在ETA_MIN）
-
-    # 余弦退火调度器参数,学习率预热参数
-    COSINE_ETA_MIN = 1e-4          # 余弦退火最小学习率 / 固定阶段学习率
-    WARMUP_START_LR = 1e-4           # 预热起始学习率（提高起始值，减少过于保守的预热）
-
     # 训练批处理
     BATCH_SIZE = 512                 # GPU每次并行训练的样本数（增加批大小）
-    BATCHES_PER_EPOCH = 120            # 每轮训练的批次数（调低以适配时间序采样）
+    BATCHES_PER_EPOCH = 120            # 每个测评周期内的参数更新步数
 
-    # 优化器选择（字符串，互斥）
-    # 'adamw':    标准AdamW
-    # 'lion':     Lion（符号动量），内存省、泛化好（lion-pytorch库）
-    # 'muon':     Muon（Newton-Schulz正交化），收敛快（KellerJordan/Muon库）
-    OPTIMIZER_TYPE = 'adamw'
+    # 基础训练参数
+    EPOCHS = 30                     # 测评周期数（每个周期结束做一次验证集评估与选模）
+    # 总步数 = EPOCHS × BATCHES_PER_EPOCH，学习率按"步"更新
+
+    # ===== 两段式学习率调度（预热 → 退火），每一步更新一次 =====
+    # 预热：LR_START 线性升到 LR_PEAK，占 LR_WARMUP_STEPS 步
+    # 退火：LR_PEAK 按 LR_DECAY_SHAPE 降到 LR_FINAL，占 LR_DECAY_STEPS 步
+    # 约束：LR_WARMUP_STEPS + LR_DECAY_STEPS == EPOCHS × BATCHES_PER_EPOCH
+    LR_START = 1e-6                          # 初始学习率（预热起点，保证第一步也有更新）
+    LR_WARMUP_STEPS = BATCHES_PER_EPOCH*1    # 预热步数
+    LR_PEAK = 1e-4                           # 最大学习率（同时是优化器的基准学习率）
+    LR_DECAY_STEPS = BATCHES_PER_EPOCH*29    # 退火步数
+    LR_FINAL = 5e-6                          # 最终学习率（退火终点）
+    LR_DECAY_SHAPE = 'cosine'                # 退火曲线：'cosine'（余弦）或 'linear'（线性）
 
     # 自动混合精度（AMP）
     USE_AMP = True                   # 启用BF16自动混合精度（矩阵乘法用BF16，归一化/激活/损失保持FP32）
@@ -249,49 +249,48 @@ class TrainingConfig:
     # 通用优化器参数
     GRADIENT_CLIP_NORM = 1.0         # 梯度裁剪范数
 
-    # AdamW 参数（OPTIMIZER_TYPE='adamw'时生效）
-    ADAMW_LR = 0.001                 # AdamW 学习率
-    ADAMW_WEIGHT_DECAY = 0.1         # AdamW 权重衰减
+    # AdamW 参数（唯一优化器）
+    ADAMW_WEIGHT_DECAY = 0.1         # 权重衰减
 
-    # Lion 参数（OPTIMIZER_TYPE='lion'时生效）
-    LION_LR = 0.0003                # Lion 学习率（AdamW的~1/3，论文推荐1/3~1/10）
-    LION_WEIGHT_DECAY = 0.01        # Lion 权重衰减（比AdamW大约1000倍，论文推荐1e-2量级）
-    LION_BETAS = (0.9, 0.99)        # Lion 动量系数
-
-    # Muon 参数（OPTIMIZER_TYPE='muon'时生效）
-    # Muon通过Newton-Schulz迭代对2D权重矩阵的梯度动量进行正交化，加速收敛
-    # 2D权重(Linear/Conv)走Muon，1D参数(bias/LayerNorm)走AdamW
-    # 使用KellerJordan/Muon官方库的SingleDeviceMuonWithAuxAdam
-    # 参考: https://github.com/KellerJordan/Muon
-    MUON_LR = 0.02                  # Muon 学习率（官方默认0.02，示例用0.05）
-    MUON_WEIGHT_DECAY = 0           # Muon 权重衰减（官方默认0，正交化本身已提供正则化）
-    MUON_MOMENTUM = 0.95            # Muon动量系数（官方默认0.95）
-    MUON_ADAMW_LR_RATIO = 0.8       # AdamW部分学习率 = MUON_LR × 此比例（官方示例: scalar lr=0.04 / muon lr=0.05）
-    MUON_ADAMW_BETAS = (0.8, 0.95)  # AdamW部分的beta参数（官方示例: 0.8, 0.95）
-
-    OPEN_EARLY_STOPPING = False       # 是否开启早停机制
+    OPEN_EARLY_STOPPING = True        # 是否开启早停机制
 
     @staticmethod
     def get_base_lr():
-        """返回当前优化器对应的默认学习率"""
-        opt = TrainingConfig.OPTIMIZER_TYPE.lower()
-        if opt.startswith('lion'):
-            return TrainingConfig.LION_LR
-        if opt == 'muon':
-            return TrainingConfig.MUON_LR
-        return TrainingConfig.ADAMW_LR
+        """优化器的基准学习率 = 学习率调度的最大学习率"""
+        return TrainingConfig.LR_PEAK
+
+    @staticmethod
+    def total_steps():
+        """总优化步数 = 测评周期数 × 每周期步数"""
+        return TrainingConfig.EPOCHS * TrainingConfig.BATCHES_PER_EPOCH
+
+    @staticmethod
+    def validate_lr_schedule():
+        """校验两段式学习率配置，配错时直接报错而不是悄悄跑偏"""
+        cfg = TrainingConfig
+        total = cfg.total_steps()
+        planned = cfg.LR_WARMUP_STEPS + cfg.LR_DECAY_STEPS
+        if planned != total:
+            raise ValueError(
+                f"学习率调度与总步数不一致: 预热 {cfg.LR_WARMUP_STEPS} + 退火 "
+                f"{cfg.LR_DECAY_STEPS} = {planned}，但总步数 = EPOCHS "
+                f"{cfg.EPOCHS} × BATCHES_PER_EPOCH {cfg.BATCHES_PER_EPOCH} = {total}"
+            )
+        if cfg.LR_DECAY_SHAPE not in ('cosine', 'linear'):
+            raise ValueError(f"LR_DECAY_SHAPE 只支持 'cosine' / 'linear'，当前 {cfg.LR_DECAY_SHAPE!r}")
+        if cfg.LR_START < 0:
+            raise ValueError("LR_START 不能为负数（0 表示预热从 0 起步）")
+        if min(cfg.LR_PEAK, cfg.LR_FINAL) <= 0:
+            raise ValueError("LR_PEAK / LR_FINAL 必须为正数")
+        if cfg.LR_START > cfg.LR_PEAK or cfg.LR_FINAL > cfg.LR_PEAK:
+            raise ValueError("LR_START 与 LR_FINAL 都不能超过 LR_PEAK")
+        return total
 
     @staticmethod
     def get_base_wd():
-        """返回当前优化器对应的默认权重衰减"""
-        opt = TrainingConfig.OPTIMIZER_TYPE.lower()
-        if opt.startswith('lion'):
-            return TrainingConfig.LION_WEIGHT_DECAY
-        if opt == 'muon':
-            return TrainingConfig.MUON_WEIGHT_DECAY
+        """返回权重衰减"""
         return TrainingConfig.ADAMW_WEIGHT_DECAY
 
-# ==================== 损失函数配置 ====================
 class LossConfig:
     """损失函数相关配置"""
     # 'dynamic_bce':批权重动态平衡 | 'pairwise_bce':BCE+Pairwise排序 | 'balanced_bce':正负各半损失量纲不变
@@ -606,21 +605,22 @@ def print_config_summary():
     print(f"  输出维度: {ModelConfig.OUTPUT_DIM}")
     print(f"  序列长度: {DataConfig.CONTEXT_LENGTH}")
 
-    optimizer_names = {'adamw': 'AdamW', 'lion': 'Lion', 'muon': 'Muon'}
-    optimizer_display = optimizer_names.get(TrainingConfig.OPTIMIZER_TYPE.lower(), TrainingConfig.OPTIMIZER_TYPE)
-
+    total_steps = TrainingConfig.validate_lr_schedule()
     print(f"训练参数:")
-    print(f"  训练轮数: {TrainingConfig.EPOCHS}")
+    print(f"  测评周期数: {TrainingConfig.EPOCHS}")
+    print(f"  总步数: {total_steps} ({TrainingConfig.EPOCHS} × {TrainingConfig.BATCHES_PER_EPOCH})")
     print(f"  学习率: {TrainingConfig.get_base_lr()}")
     print(f"  权重衰减: {TrainingConfig.get_base_wd()}")
     print(f"  批处理大小: {TrainingConfig.BATCH_SIZE}")
-    print(f"  每轮批次数: {TrainingConfig.BATCHES_PER_EPOCH}")
-    print(f"  优化器: {optimizer_display}")
+    print(f"  每周期步数: {TrainingConfig.BATCHES_PER_EPOCH}")
+    print(f"  优化器: AdamW")
     print(f"  混合精度(AMP): {'BF16' if TrainingConfig.USE_AMP else '关闭(FP32)'}")
-    print(f"  预热轮数: {TrainingConfig.WARMUP_EPOCHS}")
-    print(f"  预热起始学习率: {TrainingConfig.WARMUP_START_LR}")
-    main_epochs = TrainingConfig.EPOCHS - TrainingConfig.WARMUP_EPOCHS
-    print(f"  余弦退火轮数: {TrainingConfig.COSINE_ANNEAL_EPOCHS} (后{main_epochs - TrainingConfig.COSINE_ANNEAL_EPOCHS}轮固定在ETA_MIN)")
+    print(f"  学习率调度(按步更新): 预热 {TrainingConfig.LR_WARMUP_STEPS} 步 "
+          f"{TrainingConfig.LR_START:g}→{TrainingConfig.LR_PEAK:g}，"
+          f"退火 {TrainingConfig.LR_DECAY_STEPS} 步 "
+          f"{TrainingConfig.LR_PEAK:g}→{TrainingConfig.LR_FINAL:g}"
+          f"（{TrainingConfig.LR_DECAY_SHAPE}）")
+    print(f"  早停: {'开启' if TrainingConfig.OPEN_EARLY_STOPPING else '关闭'}")
     print(f"  训练模式: 单阶段端到端 (Embedding 不冻结)")
     print(f"  Embedding 学习率比例: {RegularizationConfig.EMBED_LR_RATIO}")
     print(f"  VISReg: λ={RegularizationConfig.VISREG_MAIN_WEIGHT}, "

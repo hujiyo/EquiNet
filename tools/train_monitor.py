@@ -3,12 +3,14 @@
 EquiNet 训练实时监控服务（含系统资源监控）
 
 用法:
-    python tools/train_monitor.py --log <训练日志路径> --steps <out目录> --port 8080
+    python tools/train_monitor.py --port 8080
 
 浏览器打开 http://<服务器IP>:8080/
 
---steps 指向 train.py 产出的 out 目录（自动取最新的 step_metrics.csv），
-用于画每步的训练损失；不给则该图留空。
+默认【自动跟随】训练：目标日志取 train_logs/current_run.txt 指向的那份（没有就取
+最新的 .log），逐步指标按日志名的时间戳去 out/ 下匹配同一时刻的 step_metrics.csv。
+所以换一次训练不用改监控、也不用改命令行；页面右上角还能直接切到历史运行。
+需要钉死看某一份文件时才用 --log / --steps / --compare 覆盖。
 
 图表用 Apache ECharts 5.5.1，本地托管于 <仓库根>/static/echarts.min.js，
 不依赖 CDN。该文件属于第三方库、不入仓库，缺失时页面会提示；可用 --static 指定目录。
@@ -26,12 +28,21 @@ import shutil
 import subprocess
 import threading
 import time
+import glob
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(HERE)
 # ECharts 等第三方静态资源不入库；默认从仓库根目录的 static/ 读取，
 # 可用 --static 指定其它目录（需包含 echarts.min.js）。
-STATIC_DIR = os.path.join(os.path.dirname(HERE), 'static')
+STATIC_DIR = os.path.join(REPO_ROOT, 'static')
+
+# 训练进程把日志写到仓库【同级】的 train_logs/，并用 current_run.txt 指认当前
+# 那一次；out/ 下每次运行一个时间戳目录。监控默认就从这两处自动发现目标，
+# 不需要为每次训练重新拼命令行参数。
+DEFAULT_RUNS_DIR = os.path.join(os.path.dirname(REPO_ROOT), 'train_logs')
+DEFAULT_OUT_DIR = os.path.join(REPO_ROOT, 'out')
 
 SAMPLE_INTERVAL = 2.5      # 资源采样间隔（秒），与前端轮询一致
 RES_WINDOW_SEC = 300       # 图上显示最近多少秒的资源历史
@@ -190,23 +201,218 @@ def res_history(window_sec=RES_WINDOW_SEC):
     return pts
 
 
+# ========================= 运行目标发现 =========================
+#
+# 监控不该跟某一次实验绑定。训练侧只约定两件事：
+#   1. 日志落在 runs_dir 下，命名为 <名称>_<YYYYMMDD>_<HHMMSS>.log
+#      （train.py 的启动脚本已经这样做），并把当前那次写进 current_run.txt；
+#   2. 每步指标写在 out/<YYYY-MM-DD_HHMMSS>/step_metrics.csv。
+# 监控据此自己找目标：默认跟 current_run.txt，找不到就取最新的日志；
+# 逐步指标按日志名里的时间戳去找同一时刻创建的 out 目录。
+# 于是换一次训练不需要改监控，也不需要在页面上改任何东西。
+
+RE_LOG_STAMP = re.compile(r'(\d{8})_(\d{6})')
+
+
+def _parse_ts(text, fmt):
+    try:
+        return time.mktime(time.strptime(text, fmt))
+    except (ValueError, OverflowError):
+        return None
+
+
+def log_timestamp(path):
+    """从日志文件名里取出 YYYYMMDD_HHMMSS 的时间戳（秒）。取不到返回 None。"""
+    m = RE_LOG_STAMP.search(os.path.basename(path or ''))
+    return _parse_ts(m.group(1) + m.group(2), '%Y%m%d%H%M%S') if m else None
+
+
+def read_current_run(runs_dir):
+    """读 runs_dir/current_run.txt，返回其中记录的日志路径（不存在则 None）。"""
+    marker = os.path.join(runs_dir, 'current_run.txt')
+    try:
+        with open(marker, encoding='utf-8', errors='replace') as f:
+            p = f.read().strip()
+    except OSError:
+        return None
+    if not p:
+        return None
+    if not os.path.isabs(p):
+        p = os.path.join(runs_dir, p)
+    return p if os.path.isfile(p) else None
+
+
+# train_logs/ 里除了训练日志，还混着评估守护、监控、数据维护的日志，它们的
+# 文件名同样带时间戳，日志开头打印的配置块也很像。真正只有训练日志会出现
+# 轮次标题 / 训练进度行，按这个判别（分块扫描，通常在第一个块就命中）。
+_LOG_MARK = re.compile(r'Epoch\s+\d+/\d+\s*·|训练进度:')
+_LOG_VERDICT = {}
+
+
+def looks_like_training_log(path, sniff=2_000_000, chunk=262144):
+    """判断这个 .log 是不是 train.py 的训练日志（按内容，带缓存）。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    key = (st.st_mtime_ns, min(st.st_size, sniff))
+    hit = _LOG_VERDICT.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    ok = False
+    try:
+        with open(path, 'rb') as f:
+            done = 0
+            while done < sniff:
+                buf = f.read(chunk)
+                if not buf:
+                    break
+                done += len(buf)
+                if _LOG_MARK.search(buf.decode('utf-8', 'replace')):
+                    ok = True
+                    break
+    except OSError:
+        ok = False
+    _LOG_VERDICT[path] = (key, ok)
+    return ok
+
+
+def list_runs(runs_dir, limit=40):
+    """列出 runs_dir 下的训练日志，最新的在前。
+
+    先按命名约定粗筛（<名称>_<YYYYMMDD>_<HHMMSS>.log），再用内容确认确实是
+    train.py 的训练日志；软链（例如 current.log）按真实文件去重。
+    """
+    if not runs_dir or not os.path.isdir(runs_dir):
+        return []
+    seen, runs = set(), []
+    for p in glob.glob(os.path.join(runs_dir, '*.log')):
+        if not RE_LOG_STAMP.search(os.path.basename(p)):
+            continue
+        try:
+            real = os.path.realpath(p)
+            st = os.stat(real)
+        except OSError:
+            continue
+        if real in seen:
+            continue
+        seen.add(real)
+        runs.append({'name': os.path.basename(real), 'path': real,
+                     'mtime': st.st_mtime, 'size': st.st_size})
+    runs.sort(key=lambda r: r['mtime'], reverse=True)
+    # 内容判别只对最近的候选做，避免把上百个归档日志全读一遍
+    kept = [r for r in runs[:max(limit * 2, 60)] if looks_like_training_log(r['path'])]
+    return kept[:limit]
+
+
+def resolve_log(explicit, runs_dir):
+    """决定这次请求看哪份日志：显式参数 > current_run.txt > 最新的日志。"""
+    if explicit and os.path.isfile(explicit):
+        return explicit
+    p = read_current_run(runs_dir)
+    if p:
+        return p
+    runs = list_runs(runs_dir)
+    return runs[0]['path'] if runs else (explicit or '')
+
+
+def find_step_csv(out_dir, log_path):
+    """给日志配出对应的 step_metrics.csv。
+
+    日志名与 out 目录名的时间戳相差几秒（两边各自取当前时间），所以按
+    “时间戳最接近”匹配，10 分钟内才算同一次运行。日志名里没有时间戳时
+    才退回最新文件；有时间戳但对不上就返回 None —— 宁可让逐步损失用日志
+    里的逐批损失重建，也不能把别的运行的曲线当成这一次的。
+    """
+    if not out_dir or not os.path.isdir(out_dir):
+        return None
+    cands = []
+    for p in glob.glob(os.path.join(out_dir, '*', 'step_metrics.csv')):
+        try:
+            mtime = os.stat(p).st_mtime
+        except OSError:
+            continue
+        run_ts = _parse_ts(os.path.basename(os.path.dirname(p)), '%Y-%m-%d_%H%M%S')
+        cands.append((mtime, run_ts, p))
+    if not cands:
+        return None
+    ts = log_timestamp(log_path)
+    if ts is not None:
+        close = [(abs(rt - ts), p) for _, rt, p in cands if rt is not None]
+        close = [(d, p) for d, p in close if d <= 600]
+        return min(close)[1] if close else None
+    return max(cands)[2]
+
+
 # ========================= 训练日志解析 =========================
 
 RE_EPOCH = re.compile(
-    r'^Epoch\s+(?P<ep>\d+)/(?P<tot>\d+)\s*·\s*step\s+'
-    r'(?P<s0>\d+)~(?P<s1>\d+)\s*·\s*LR:\s*(?P<lr>[0-9.eE+-]+)\s*(?P<note>.*)$')
-RE_FULL = re.compile(
-    r'\[模型\]\s*训练损失:\s*([0-9.]+),\s*(?:验证集|测试集)损失:\s*([0-9.]+),\s*'
-    r'AUC\(pooled\):\s*([0-9.]+),\s*AUC\(逐日\):\s*([0-9.n/a]+)')
+    r'^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{1,2}:[0-9]{2}:[0-9]{2}[.,]?[0-9]*\s+)?'
+    r'Epoch\s+(?P<ep>\d+)/(?P<tot>\d+)'
+    r'(?:\s*·\s*step\s+(?P<s0>\d+)~(?P<s1>\d+))?'
+    r'\s*·\s*LR:\s*(?P<lr>[0-9.eE+-]+)\s*(?P<note>.*)$')
+# 评估块（"【模型】训练损失: ..."）里的字段逐个抓，而不是一条大正则卡死顺序。
+# 训练侧换个打印顺序、少打一项、把回归实验的 AUC 换成别的指标，这里都还能取到
+# 剩下的字段；用一整条正则的话，任何一处对不上就整行丢弃，页面直接变空。
+RE_EVAL_TAG = re.compile(r'\[模型\]')
+_EVAL_FIELDS = (
+    ('train_loss', re.compile(r'训练损失:\s*([0-9.]+)')),
+    ('val_loss', re.compile(r'(?:验证集|测试集)损失:\s*([0-9.]+)')),
+    ('auc_pooled', re.compile(r'AUC\(pooled\):\s*([0-9.]+)')),
+    ('auc_daily', re.compile(r'AUC\(逐日\):\s*([0-9.n/a]+)')),
+)
 RE_DAILY = re.compile(
     r'逐日判别力:\s*IC\s*([+-]?[0-9.]+|n/a),\s*ICIR\s*([+-]?[0-9.]+|n/a),\s*'
     r'IC的t值\s*([+-]?[0-9.]+|n/a),\s*日Top(\d+)%命中率\s*([0-9.]+|n/a)\s*'
     r'\(统计天数\s*(\d+)\)')
 RE_PROG = re.compile(r'训练进度:\s*([0-9.]+)%,\s*Loss:\s*([0-9.]+)')
-RE_TOPRET = re.compile(r'Top(\d+)%收益:\s*([+-][0-9.]+)%')
-RE_REAL = re.compile(r'平均实战收益率:\s*([+-][0-9.]+)%')
+RE_TOPRET = re.compile(r'Top(\d+)%收益:\s*([+-]?[0-9.]+)%')
+RE_REAL = re.compile(r'平均实战收益率:\s*([+-]?[0-9.]+)%')
 RE_NEWBEST = re.compile(r'新最佳模型（(.*?)）')
 RE_BASELINE = re.compile(r'基线档案:\s*(.+)$')
+
+# 评估块里凡是「名称: 数值」形式的打印，都当成指标自动收进 extras。
+# 训练侧以后新增一项打印，页面上就会自动多出一条曲线，不需要改监控；
+# 已经由上面白名单接管的字段不重复收，避免同一指标出现两次。
+RE_GENERIC_KV = re.compile(
+    r'^\s*([^\s:：][^:：]{0,23}?)\s*[:：]\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)')
+_GENERIC_SKIP = {
+    '训练损失', '验证集损失', '测试集损失', 'AUC(pooled)', 'AUC(逐日)',
+    'Top1%收益', '日Top1%收益', '实战收益率', '平均实战收益率',
+    '训练进度', 'Loss', 'LR', '学习率',
+}          # 带这些符号的行是字典 / 直方图 / 区间，拆出来的不是指标
+_NOISE_LINE = '{}[]'
+# 这些行是"破纪录/改善"的一次性播报，不是每轮都会有的周期指标，
+# 收进来会让曲线出现孤立点（而且其中的 IC/AUC 已由白名单展示）。
+_GENERIC_SKIP_LINE = ('新最佳模型', '改善', '每日统计', '已保存')
+
+
+def _generic_metrics(ln):
+    """把一行里的「名称: 数值」拆成 {指标名: 数值}。
+
+    只认冒号紧跟纯数字的写法；阈值/区间类的键（含 <>）跳过，它们不是时间序列。
+    """
+    if any(s in ln for s in _GENERIC_SKIP_LINE):
+        return {}
+    if any(ch in ln for ch in _NOISE_LINE):
+        # 行首的标签（如 "[模型]"）本身带方括号，先摘掉再判断有没有列表结构
+        ln = re.sub(r'\[[^\]]{0,12}\]', ' ', ln)
+        if any(ch in ln for ch in _NOISE_LINE):
+            return {}
+    found = {}
+    for part in re.split(r'[,，]', ln):
+        m = RE_GENERIC_KV.match(part)
+        if not m:
+            continue
+        label = m.group(1).strip().lstrip('✓✅📈⚠').strip()
+        # 按逗号拆开后，括号里的逗号会切出半截标签（如 "最大持仓4)】…"），
+        # 这种带孤立右括号的片段一律不要。
+        if not label or label in _GENERIC_SKIP or any(c in label for c in '<>)】）'):
+            continue
+        v = _num(m.group(2))
+        if v is not None:
+            found[label] = v
+    return found
 
 _CACHE = {'key': None, 'val': None}
 
@@ -278,15 +484,24 @@ def _parse_uncached(path, tail_lines=60):
             continue
         m = RE_PROG.search(ln)
         if m:
-            cur['progress_pct'] = _num(m.group(1))
-            cur['progress_loss'] = _num(m.group(2))
+            pct, loss = _num(m.group(1)), _num(m.group(2))
+            cur['progress_pct'] = pct
+            cur['progress_loss'] = loss
+            # 逐批损失也留一份：万一次运行的 step_metrics.csv 缺失（老日志、
+            # 或换了写盘方式），逐步损失图还能用这些点重建，不至于只剩验证损失。
+            if pct is not None and loss is not None:
+                cur.setdefault('progress', []).append([pct, loss])
             continue
-        m = RE_FULL.search(ln)
-        if m:
-            cur['train_loss'] = _num(m.group(1))
-            cur['val_loss'] = _num(m.group(2))
-            cur['auc_pooled'] = _num(m.group(3))
-            cur['auc_daily'] = _num(m.group(4)) if m.group(4) != 'n/a' else None
+        if RE_EVAL_TAG.search(ln):
+            for key, rx in _EVAL_FIELDS:
+                fm = rx.search(ln)
+                if not fm:
+                    continue
+                cur[key] = None if fm.group(1) == 'n/a' else _num(fm.group(1))
+            # 同一行里除了上面这些白名单字段，可能还藏着别的指标（Prec@K 之类）
+            ex = _generic_metrics(ln)
+            if ex:
+                cur.setdefault('extras', {}).update(ex)
             continue
         m = RE_DAILY.search(ln)
         if m:
@@ -307,6 +522,10 @@ def _parse_uncached(path, tail_lines=60):
         m = RE_NEWBEST.search(ln)
         if m:
             out['best'].append({'epoch': cur['epoch'], 'what': m.group(1)})
+            continue
+        ex = _generic_metrics(ln)
+        if ex:
+            cur.setdefault('extras', {}).update(ex)
 
     if cur is not None:
         out['current'] = cur
@@ -320,6 +539,7 @@ def _parse_uncached(path, tail_lines=60):
         out['epochs'].append(cur)
     out['epochs'] = [e for e in out['epochs'] if e.get('epoch') is not None]
     out['done_count'] = len(out['epochs'])
+    out['log_step_series'] = steps_from_log(out['epochs'])
     out['last_update_age'] = round(time.time() - os.path.getmtime(path), 1)
     return out
 
@@ -483,6 +703,30 @@ def load_compare_series(specs):
     return out
 
 
+def steps_from_log(epochs, max_points=1500):
+    """用日志里的『训练进度: x%, Loss: y』行重建逐步损失序列。
+
+    正常情况下逐步损失来自 train.py 写的 step_metrics.csv；老日志、或者哪天
+    换了写盘方式没有这个 CSV 时，用这里的重建结果顶上，图不会变成空白。
+    横坐标按该轮的 step 区间把百分比换算成全局步数。
+    """
+    pts = []
+    for e in epochs or []:
+        s0, s1 = e.get('step_from'), e.get('step_to')
+        prog = e.get('progress') or []
+        if not s0 or not s1 or s1 < s0 or not prog:
+            continue
+        span = s1 - s0 + 1
+        for pct, loss in prog:
+            if loss is None:
+                continue
+            pts.append([s0 + int(round(pct / 100.0 * span)) - 1, loss])
+    if len(pts) > max_points:
+        stride = len(pts) // max_points + 1
+        pts = pts[::stride]
+    return pts
+
+
 # ========================= 页面 =========================
 
 HTML = r"""<!DOCTYPE html>
@@ -504,6 +748,8 @@ HTML = r"""<!DOCTYPE html>
         position:sticky;top:0;background:var(--bg);z-index:20}
  h1{font-size:14px;margin:0;font-weight:600}
  .meta{color:var(--dim);font-size:12px}
+ .sel{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+      border-radius:5px;font:inherit;font-size:12px;padding:2px 6px;max-width:340px}
  .wrap{padding:12px 18px 40px;display:grid;gap:12px;
        grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
@@ -546,6 +792,7 @@ HTML = r"""<!DOCTYPE html>
   <h1>EquiNet 训练监控</h1>
   <span class="meta" id="conn">连接中…</span>
   <span class="meta" id="clock"></span>
+  <select id="runsel" class="sel" title="选择要看的运行；自动 = 跟随最新/current_run.txt"></select>
   <span class="meta" id="logpath"></span>
 </header>
 <div id="jserr" style="display:none;margin:8px 18px;padding:8px 12px;border:1px solid #ff6b6b;
@@ -582,7 +829,8 @@ HTML = r"""<!DOCTYPE html>
   <div class="card full">
     <h2>逐步损失（训练每步 · 验证每周期）</h2>
     <div id="stepchart"></div>
-    <div class="hint">训练损失每一步一个点（来自 step_metrics.csv，成本≈0）；验证损失要走全量验证集，只在每个测评周期末算一次。</div>
+    <div class="hint">训练损失每一步一个点；验证损失要走全量验证集，只在每个测评周期末算一次。
+      <span id="stepsrc"></span></div>
   </div>
 
   <div class="card full">
@@ -591,6 +839,15 @@ HTML = r"""<!DOCTYPE html>
     <div id="bigchart"></div>
     <div class="hint">滚轮缩放；按住拖动平移；底部滑块缩放；图例可点击隐藏曲线。
       资源图默认显示最近 5 分钟，同样可缩放。</div>
+  </div>
+
+  <div class="card full">
+    <h2>其它指标（从日志自动识别）</h2>
+    <div class="btns" id="extraBtns"></div>
+    <div id="extrachart" style="width:100%;height:300px"></div>
+    <table id="extratbl" style="margin-top:8px"></table>
+    <div class="hint">评估块里任何「名称: 数值」的打印都会自动收进来（最多 12 个），
+      训练侧新增指标不需要改监控；按钮切换看哪一个，图例仍可点击隐藏。</div>
   </div>
 
   <div class="card">
@@ -661,7 +918,8 @@ const METRICS = {
 let curMetric = 'loss';
 const charts = {};
 const views = {};
-const STATE = {epochs:[], res:[], compare:[]};
+const STATE = {epochs:[], res:[], compare:[], run:null, runs:[],
+               extraRows:[], extraPick:null};
 // 资源图用的固定配置（它不在指标切换器里，是独立的一张图）
 const RES_METRIC = {name:'资源', res:true, series:[
     {key:'cpu_pct',  name:'CPU%',      color:'#4ea1ff'},
@@ -905,6 +1163,126 @@ function renderRes(s){
       ? g.procs.map(p=>`PID ${p.pid}: ${(p.mem_mb/1024).toFixed(2)} GB`).join(' · ') : '无');
 }
 
+function fmtClock(t){
+  if(!t) return '';
+  const d=new Date(t*1000);
+  return ('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2)+' '+
+         ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2);
+}
+
+// 运行切换器：列表来自服务端扫 train_logs/ 的结果，选中项通过 ?run= 传给接口，
+// 因此回看历史实验不需要重启服务，也不需要改代码。
+function renderRuns(d){
+  const sel=$('runsel'); if(!sel) return;
+  const runs=d.runs||[];
+  const sig=runs.map(r=>r.name).join('|');
+  if(sel.__sig!==sig){
+    sel.__sig=sig;
+    sel.innerHTML='<option value="__auto__">自动跟随（最新 / current_run.txt）</option>'+
+      runs.map(r=>`<option value="${r.name}">${r.name.replace(/^train_/,'').replace(/\.log$/,'')} · ${fmtClock(r.mtime)}</option>`).join('');
+  }
+  sel.value = STATE.run || '__auto__';
+  if(sel.__bound) return;
+  sel.__bound=true;
+  sel.onchange=()=>{ STATE.run = sel.value==='__auto__' ? null : sel.value; tick(); };
+}
+
+const EXTRA_MAX = 12;
+
+// 自动识别的指标：后端把评估块里「名称: 数值」都收进 epoch.extras，
+// 这里不预设任何键名，出现什么就画什么 —— 训练侧加指标不用改页面。
+function extraKeysOf(epochs){
+  const seen=[];
+  for(const e of (epochs||[])){
+    const x=e.extras||{};
+    for(const k in x){ if(seen.indexOf(k)<0) seen.push(k); }
+  }
+  return seen.slice(0, EXTRA_MAX);
+}
+
+function extraRowsOf(epochs){
+  return extraKeysOf(epochs).map(k=>{
+    const pts=[];
+    for(const e of epochs){
+      const x=e.extras||{};
+      if(x[k]!==undefined && x[k]!==null) pts.push([e.epoch, x[k]]);
+    }
+    return {k, pts};
+  });
+}
+
+function buildExtraButtons(){
+  const box=$('extraBtns'); if(!box) return;
+  const sig=STATE.extraRows.map(r=>r.k).join('|');
+  if(box.__sig!==sig){
+    box.__sig=sig; box.innerHTML='';
+    STATE.extraRows.forEach(r=>{
+      const b=document.createElement('button'); b.className='btn'; b.textContent=r.k;
+      b.onclick=()=>{ STATE.extraPick=r.k; buildExtraButtons(); updateExtraChart(); };
+      box.appendChild(b);
+    });
+  }
+  [...box.children].forEach(b=>{
+    b.className='btn'+(b.textContent===STATE.extraPick?' on':''); });
+}
+
+function updateExtraChart(){
+  const el=$('extrachart'); if(!el) return;
+  const row=STATE.extraRows.find(r=>r.k===STATE.extraPick);
+  if(!row){ return; }
+  if(!charts['extrachart']) charts['extrachart']=echarts.init(el,null,{renderer:'canvas'});
+  const c=charts['extrachart'];
+  c.setOption({
+    animation:false, backgroundColor:'transparent',
+    grid:{left:70,right:36,top:20,bottom:56},
+    tooltip:{trigger:'axis', backgroundColor:'rgba(20,24,33,.96)', borderColor:'#30384a',
+      textStyle:{color:'#e8ecf4', fontSize:12},
+      formatter: ps=>{ let s='<b>Epoch '+ps[0].axisValue+'</b>';
+        ps.forEach(p=>{ if(p.value&&p.value[1]!==null)
+          s+='<br>'+p.marker+p.seriesName+': <b>'+Number(p.value[1]).toFixed(5)+'</b>'; });
+        return s; }},
+    xAxis:{type:'value', name:'Epoch', nameLocation:'middle', nameGap:26, scale:true,
+      nameTextStyle:{color:'#8b93a7', fontSize:12},
+      axisLine:{lineStyle:{color:'#39415a'}}, axisLabel:{color:'#8b93a7', fontSize:11},
+      splitLine:{lineStyle:{color:'#1e2432'}}},
+    yAxis:{type:'value', name:row.k, nameLocation:'middle', nameGap:52, scale:true,
+      nameTextStyle:{color:'#8b93a7', fontSize:11},
+      axisLine:{lineStyle:{color:'#39415a'}}, axisLabel:{color:'#8b93a7', fontSize:11},
+      splitLine:{lineStyle:{color:'#1e2432'}}},
+    dataZoom:[{type:'inside', xAxisIndex:0, filterMode:'none'},
+              {type:'slider', xAxisIndex:0, height:20, bottom:12,
+               borderColor:'#30384a', backgroundColor:'#151922',
+               fillerColor:'rgba(78,161,255,.15)', handleStyle:{color:'#4ea1ff'},
+               textStyle:{color:'#8b93a7', fontSize:10}}],
+    series:[{name:row.k, type:'line', showSymbol:true, symbolSize:5, connectNulls:true,
+      lineStyle:{width:1.8, color:'#3ddc97'}, itemStyle:{color:'#3ddc97'}, data:row.pts}],
+  }, {replaceMerge:['series','dataZoom']});
+}
+
+function renderExtraTable(){
+  const tb=$('extratbl'); if(!tb) return;
+  if(!STATE.extraRows.length){
+    tb.innerHTML='<tr><td class="k">（日志里还没有可识别的「名称: 数值」指标）</td></tr>';
+    return;
+  }
+  tb.innerHTML=STATE.extraRows.map(r=>{
+    const n=r.pts.length, last=n?r.pts[n-1]:null, prev=n>1?r.pts[n-2]:null;
+    const delta=(prev&&last)?(last[1]-prev[1]):null;
+    return `<tr><td class="k">${r.k}</td><td class="v">${last?fmt(last[1],4):'—'}</td>`+
+      `<td class="k" style="text-align:right">${last?('Epoch '+last[0]):''}`+
+      (delta===null?'':` · Δ ${delta>=0?'+':''}${delta.toFixed(4)}`)+'</td></tr>';
+  }).join('');
+}
+
+function renderExtras(d){
+  STATE.extraRows = extraRowsOf(d.epochs||[]);
+  if(!STATE.extraPick || !STATE.extraRows.some(r=>r.k===STATE.extraPick))
+    STATE.extraPick = STATE.extraRows.length ? STATE.extraRows[0].k : null;
+  buildExtraButtons();
+  updateExtraChart();
+  renderExtraTable();
+}
+
 function render(d){
   // 先把连接状态更新掉 —— 之前它排在 renderRes/图表代码后面，
   // 一旦那些地方抛异常，页面就会永远停在「连接中」，掩盖真正的错误。
@@ -915,7 +1293,9 @@ function render(d){
     conn.className='meta '+(age<120?'live':(age<900?'stale':'dead'));
   }catch(e){ conn.textContent='● 已连接'; conn.className='meta live'; }
 
-  $('logpath').textContent = d.log||'';
+  $('logpath').textContent = (d.log ? d.log.split('/').pop() : '') +
+    ' · 逐步指标: ' + (d.steps_csv ? d.steps_csv.split('/').slice(-2).join('/') : '未找到');
+  renderRuns(d);
   if(d.system){ try{ renderRes(d.system); }catch(e){ jsErr('资源渲染失败: '+e.message); } }
   if(!d.ok){ conn.textContent='✕ '+(d.error||'读取失败'); conn.className='meta dead'; return; }
   $('clock').textContent='服务器时间 '+d.server_time;
@@ -958,7 +1338,12 @@ function render(d){
       .map(b=>`Epoch ${b.epoch} · ${b.what}`).join('<br>'):'—';
 
   STATE.epochs=d.epochs||[];   STATE.compare=d.compare||[];
+  renderExtras(d);
   STATE.steps=d.step_series||[];
+  if($('stepsrc')) $('stepsrc').textContent =
+      d.step_source==='csv' ? '（来自 step_metrics.csv）'
+    : d.step_source==='log' ? '（没找到 step_metrics.csv，已用日志里的逐批损失重建）'
+    : '（暂时没有逐步损失数据）';
   updateStepChart();
   STATE.res=d.res_hist||[];
   updateChart('bigchart');
@@ -969,7 +1354,8 @@ function render(d){
 
 async function tick(){
   try{
-    const r=await fetch('api/status',{cache:'no-store'});
+    const q = STATE.run ? ('?run='+encodeURIComponent(STATE.run)) : '';
+    const r=await fetch('api/status'+q,{cache:'no-store'});
     render(await r.json());
   }catch(e){
     $('conn').textContent='✕ 无法连接服务: '+e; $('conn').className='meta dead';
@@ -1046,7 +1432,6 @@ def resolve_steps_path(path):
     if not path:
         return None
     if os.path.isdir(path):
-        import glob
         hits = sorted(glob.glob(os.path.join(path, "*", "step_metrics.csv")),
                       key=os.path.getmtime)
         return hits[-1] if hits else None
@@ -1078,9 +1463,29 @@ def load_step_series(path, max_points=1500):
 
 
 class Handler(BaseHTTPRequestHandler):
-    log_path = None
+    explicit_log = None          # 只在 --log 显式指定时非空；为空即自动发现
+    runs_dir = DEFAULT_RUNS_DIR
+    out_dir = DEFAULT_OUT_DIR
+    steps_path = None
+    results_path = None
 
+    def _pick_target(self):
+        """解析出这次请求要看哪份日志、哪份逐步指标。
 
+        ?run=<文件名> 可以在页面上临时切到历史运行（不重启服务）；
+        不传就按 current_run.txt → 最新日志自动跟随。
+        """
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        want = (q.get('run') or [''])[0]
+        log = None
+        if want and want != '__auto__' and RE_LOG_STAMP.search(want):
+            cand = os.path.join(self.runs_dir, os.path.basename(want))
+            if os.path.isfile(cand) and looks_like_training_log(cand):
+                log = cand
+        if log is None:
+            log = resolve_log(self.explicit_log, self.runs_dir)
+        steps = resolve_steps_path(self.steps_path) or find_step_csv(self.out_dir, log)
+        return log, steps
 
     def _send(self, code, body, ctype):
         data = body.encode('utf-8') if isinstance(body, str) else body
@@ -1094,14 +1499,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith('/api/status'):
             try:
-                d = parse_log(self.log_path)
+                log, steps = self._pick_target()
+                d = parse_log(log)
                 # 评估结果来自独立的 _eval_daemon.py，不在训练日志里
-                merge_eval_results(d, getattr(self, 'results_path', None))
+                merge_eval_results(d, self.results_path)
                 # 消融对照：把其它 run 的曲线一并返回，前端叠加显示
                 d['compare'] = getattr(self, '_compare_cache', None) or []
                 d['system'] = collect_system()
                 d['res_hist'] = res_history()
-                d['step_series'] = load_step_series(resolve_steps_path(getattr(self, 'steps_path', None)))
+                series = load_step_series(steps)
+                source = 'csv'
+                if not series:
+                    series = d.pop('log_step_series', None) or []
+                    source = 'log' if series else 'none'
+                else:
+                    d.pop('log_step_series', None)
+                d['step_series'] = series
+                d['step_source'] = source
+                d['steps_csv'] = steps
+                d['auto'] = self.explicit_log is None
+                d['runs'] = [{'name': r['name'], 'mtime': r['mtime']}
+                             for r in list_runs(self.runs_dir)]
                 self._send(200, json.dumps(_sanitize_json(d), ensure_ascii=False),
                            'application/json; charset=utf-8')
             except Exception as e:
@@ -1129,8 +1547,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--log', required=True)
+    ap = argparse.ArgumentParser(
+        description='训练监控服务。默认自动跟随 train_logs/current_run.txt，'
+                    '换一次训练不需要改任何参数。')
+    ap.add_argument('--log', default=None,
+                    help='固定只看这一份日志；不给则自动跟随 current_run.txt / 最新日志')
+    ap.add_argument('--runs', default=DEFAULT_RUNS_DIR,
+                    help=f'训练日志目录，页面上的运行切换列表来自这里（默认 {DEFAULT_RUNS_DIR}）')
+    ap.add_argument('--out', default=DEFAULT_OUT_DIR,
+                    help=f'训练输出目录，用于自动匹配 step_metrics.csv（默认 {DEFAULT_OUT_DIR}）')
     ap.add_argument('--port', type=int, default=8080)
     ap.add_argument('--bind', default='0.0.0.0')
     ap.add_argument('--static', default=None,
@@ -1139,7 +1564,7 @@ def main():
                     help='对照实验曲线，格式 标签=路径，可重复。'
                          '用于消融对比，会以虚线叠加到各图表上')
     ap.add_argument('--steps', default=None,
-                    help='step_metrics.csv 路径，用于画每步的训练损失')
+                    help='固定用这份 step_metrics.csv；不给则按日志时间自动匹配')
     ap.add_argument('--results', default=None,
                     help='_eval_daemon.py 写出的 eval_results.jsonl 路径')
     args = ap.parse_args()
@@ -1147,7 +1572,9 @@ def main():
     global STATIC_DIR
     if args.static:
         STATIC_DIR = args.static
-    Handler.log_path = args.log
+    Handler.explicit_log = args.log
+    Handler.runs_dir = args.runs
+    Handler.out_dir = args.out
     Handler.steps_path = args.steps
     Handler.results_path = args.results
 
@@ -1170,7 +1597,13 @@ def main():
 
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     print(f"监控服务: http://{args.bind}:{args.port}/")
-    print(f"日志: {args.log}")
+    if Handler.explicit_log:
+        print(f"日志: {Handler.explicit_log}（--log 固定）")
+        print(f"逐步指标: {resolve_steps_path(Handler.steps_path) or find_step_csv(Handler.out_dir, Handler.explicit_log)}")
+    else:
+        log = resolve_log(None, Handler.runs_dir)
+        print(f"日志: {log or '（暂未发现）'}（自动跟随 {Handler.runs_dir}）")
+        print(f"逐步指标: {find_step_csv(Handler.out_dir, log) or '（自动匹配）'}")
     try:
         srv.serve_forever()
     finally:

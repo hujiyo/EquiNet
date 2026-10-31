@@ -16,7 +16,8 @@ from collections import defaultdict
 from datetime import datetime
 import matplotlib.pyplot as plt
 
-from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig)
+from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig,
+                    SAMPLE_COLUMNS, SAMPLE_SELECT_SQL, CLOSE_RAW_IDX)
 from model import create_model
 from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
                   create_recent_days_dataset, normalize_and_validate_context_window)
@@ -233,9 +234,7 @@ def load_all_stock_data(db_path=DataConfig.DB_PATH):
 
     conn = sqlite3.connect(db_path)
     try:
-        query = """SELECT sd.stock_code, sd.date, sd.open, sd.high, sd.low, sd.close,
-                          sd.vwap, sd.volume, sd.exchange, sd.m5, sd.m10, sd.m20,
-                          sd.dif, sd.dea, sd.macd_hist, sd.macd_hist_diff, sd.bb_upper, sd.bb_lower
+        query = f"""SELECT sd.stock_code, sd.date, {SAMPLE_SELECT_SQL}
                    FROM stock_daily sd
                    JOIN stock_pool sp ON sd.stock_code = sp.stock_code
                    WHERE sp.pool_type='selected' AND sp.is_active=1
@@ -247,7 +246,7 @@ def load_all_stock_data(db_path=DataConfig.DB_PATH):
     stock_list = []
     if len(df) == 0:
         return stock_list
-    cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange', 'm5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'macd_hist_diff', 'bb_upper', 'bb_lower']
+    cols = list(SAMPLE_COLUMNS)
     for stock_code, group in df.groupby('stock_code', sort=False):
         data = group[cols].values
         latest_date = str(group['date'].iloc[-1])
@@ -292,8 +291,8 @@ def score_all_stocks(model, stock_list, device, feature_normalizer=None,
         all_codes.append(stock_code)
         all_dates.append(latest_date)
         
-        # 最新收盘价和涨跌幅
-        latest_close = data[-1, 3]
+        # 最新收盘价用**不复权**价（展示口径）；涨跌幅用后复权价，跨除权日才正确
+        latest_close = data[-1, CLOSE_RAW_IDX]
         if len(data) >= 2 and data[-2, 3] > 0:
             change_pct = (data[-1, 3] - data[-2, 3]) / data[-2, 3] * 100
         else:

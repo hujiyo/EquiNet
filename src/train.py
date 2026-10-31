@@ -234,7 +234,7 @@ def train(model, train_stock_info, val_stock_info, test_stock_info,
         train_stock_info, feature_normalizer
     )
 
-    # VISReg 辅助池：把 [N, 45, 19] 展平成 [N*45, 19] 的视图，
+    # VISReg 辅助池：把 [N, 45, 18] 展平成 [N*45, 18] 的视图，
     # 每步随机取若干单日向量。这里取的是“某一天长什么样”的边际样本，
     # 与主 batch 的 45 天序列窗口是两条独立的数据流。
     if pool_inputs.ndim != 3:

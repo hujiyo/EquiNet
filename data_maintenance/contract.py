@@ -118,13 +118,13 @@ SAMPLING = Sampling()
 # 下游用魔法下标索引的只有两处（复权收盘价与不复权收盘价），
 # 这里给出唯一定义，避免「第 16 列是什么」靠注释和约定维护。
 SAMPLE_COLUMNS = (
-    'open', 'high', 'low', 'close', 'vwap', 'volume', 'exchange',
+    'open', 'high', 'low', 'close', 'vwap', 'volume',
     'm5', 'm10', 'm20', 'dif', 'dea', 'macd_hist', 'macd_hist_diff',
     'bb_upper', 'bb_lower',
-    'close_raw',          # 第 16 列：**不复权**收盘价，仅供高价股过滤
+    'close_raw',          # 第 15 列：**不复权**收盘价，仅供高价股过滤
 )
 CLOSE_IDX = SAMPLE_COLUMNS.index('close')          # 3：后复权收盘价（模型输入基准）
-CLOSE_RAW_IDX = SAMPLE_COLUMNS.index('close_raw')  # 16：不复权收盘价（过滤基准）
+CLOSE_RAW_IDX = SAMPLE_COLUMNS.index('close_raw')  # 15：不复权收盘价（过滤基准）
 
 # 契约列名 → `stock_daily` 物理列名。
 # 价格列取**后复权**（`*_adj`），`close_raw` 取不复权原始收盘价。
@@ -132,7 +132,7 @@ CLOSE_RAW_IDX = SAMPLE_COLUMNS.index('close_raw')  # 16：不复权收盘价（�
 # 就不存在「SELECT 改了但 cols 没改」这种静默错位。
 _SAMPLE_SOURCE = {
     'open': 'open_adj', 'high': 'high_adj', 'low': 'low_adj', 'close': 'close_adj',
-    'vwap': 'vwap_adj', 'volume': 'volume', 'exchange': 'exchange',
+    'vwap': 'vwap_adj', 'volume': 'volume',
     'm5': 'm5', 'm10': 'm10', 'm20': 'm20', 'dif': 'dif', 'dea': 'dea',
     'macd_hist': 'macd_hist', 'macd_hist_diff': 'macd_hist_diff',
     'bb_upper': 'bb_upper', 'bb_lower': 'bb_lower',
@@ -145,9 +145,11 @@ SAMPLE_SELECT_SQL = ', '.join(
     f'sd.{_SAMPLE_SOURCE[c]} AS {c}' for c in SAMPLE_COLUMNS
 )
 
-# `src/data.py` 归一到 ModelConfig.INPUT_DIM 维输入后，前 16 列是上面这些，
-# 再追加 wick_up / wick_dn / body_ratio 三列 K 线形态占比。
-MODEL_INPUT_DIM = 19
+# `src/data.py` 归一到 ModelConfig.INPUT_DIM 维输入后，前 15 列就是上面这些
+# （close_raw 只作过滤基准），再追加 wick_up / wick_dn / body_ratio 三列 K 线形态占比。
+# 换手率是成交量的派生量（volume / 流通股本），窗口内与成交量只差一个常数，
+# 因此不进模型输入。
+MODEL_INPUT_DIM = 18
 
 
 # ==================== 排除策略：哪些问题驱动「样本排除」 ====================

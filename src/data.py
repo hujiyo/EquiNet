@@ -55,19 +55,18 @@ class FeatureNormalizer:
             ('close',         slice(3, 4)),
             ('vwap',          slice(4, 5)),
             ('volume',        slice(5, 6)),
-            ('exchange',      slice(6, 7)),
-            ('m5',            slice(7, 8)),
-            ('m10',           slice(8, 9)),
-            ('m20',           slice(9, 10)),
-            ('dif',           slice(10, 11)),
-            ('dea',           slice(11, 12)),
-            ('macd_hist',     slice(12, 13)),
-            ('macd_hist_diff',slice(13, 14)),
-            ('bb_upper',      slice(14, 15)),
-            ('bb_lower',      slice(15, 16)),
-            ('wick_up',       slice(16, 17)),
-            ('wick_dn',       slice(17, 18)),
-            ('body_ratio',    slice(18, 19)),
+            ('m5',            slice(6, 7)),
+            ('m10',           slice(7, 8)),
+            ('m20',           slice(8, 9)),
+            ('dif',           slice(9, 10)),
+            ('dea',           slice(10, 11)),
+            ('macd_hist',     slice(11, 12)),
+            ('macd_hist_diff',slice(12, 13)),
+            ('bb_upper',      slice(13, 14)),
+            ('bb_lower',      slice(14, 15)),
+            ('wick_up',       slice(15, 16)),
+            ('wick_dn',       slice(16, 17)),
+            ('body_ratio',    slice(17, 18)),
         ]
 
     def __init__(self,
@@ -235,10 +234,10 @@ class FeatureNormalizer:
         对单个样本应用归一化
 
         Args:
-            input_seq: [context_length, 19] 原始输入序列
+            input_seq: [context_length, 18] 原始输入序列
 
         Returns:
-            normalized_seq: [context_length, 19] 归一化后的序列
+            normalized_seq: [context_length, 18] 归一化后的序列
         """
         if not self.is_fitted:
             raise RuntimeError("归一化器未拟合！请先调用 fit() 方法")
@@ -265,14 +264,14 @@ class FeatureNormalizer:
         的任务并发执行，与逐块串行计算逐位相同（处理的先后不改变任何一个元素的结果）。
 
         Args:
-            input_seqs: [batch_size, context_length, 19] 原始输入序列
+            input_seqs: [batch_size, context_length, 18] 原始输入序列
             chunk_size: 每块处理的样本数（默认 10万，单块峰值内存约数百MB）
             out: 结果写入的数组。None 时新建同形状 float32 数组；传 input_seqs 本身
                 即原地归一化（大数组时省下一份等大的临时数组）
             workers: 并发线程数。None 时用 DataConfig.NORMALIZE_WORKERS
 
         Returns:
-            [batch_size, context_length, 19] 归一化后的序列（即 out）
+            [batch_size, context_length, 18] 归一化后的序列（即 out）
         """
         if not self.is_fitted:
             raise RuntimeError("归一化器未拟合！请先调用 fit() 方法")
@@ -391,7 +390,7 @@ def process_single_file(args):
 
     Args:
         stock_code: 股票代码
-        data: 预加载的行情数据 numpy 数组 (N, 19)
+        data: 预加载的行情数据 numpy 数组 (N, 16)
         times: 预加载的日期数组 (N,)
         train_start_date: 训练集起始日期 (YYYYMMDD)
         train_end_date: 训练集截止日期 (YYYYMMDD)
@@ -1169,11 +1168,10 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
             - OHLC: open_rel/close_rel 相对前日收盘价（clip [-0.1,0.1]）；high/low 距开盘运动总量（恒≥0/≤0，无clip）；wick_up/wick_dn/body_ratio 影线/实体占比（除零守卫，[0,1]）
             - VWAP: 相对当日收盘价偏离，clip [-0.1, 0.1]（价格类特征）
             - 成交量: (volume_i - MA_N) / MA_N，MA_N 为过去 N 日均量，无 clip
-            - 换手率: (exchange_i - MA_N) / MA_N，MA_N 为过去 N 日均换手率，无 clip
         - 细处理：归一化 → 标准化数据（均值≈0，方差≈1）
 
     Args:
-        stock_data: 股票原始数据 [N, 19]
+        stock_data: 股票原始数据 [N, 16]（contract.SAMPLE_COLUMNS）
         start_idx: 上下文窗口起始索引（需要 >= 1，因为需要前一天作为基准）
         context_length: 上下文窗口长度
         check_limit_up: 是否检查涨停（默认 True）
@@ -1182,8 +1180,8 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         apply_fine_normalization: 是否应用细处理（默认 True）。设为 False 时只执行粗处理。
 
     Returns:
-            input_seq: [context_length, 19] 归一化后的输入序列，或 None（如果验证失败）
-            - 粗处理后：open_rel/close_rel/vwap: [-0.1, 0.1], high/low: 距开盘运动总量, wick_up/wick_dn/body_ratio: [0,1], Volume: 相对N日均值变化率, Exchange: 相对N日均值变化率
+            input_seq: [context_length, 18] 归一化后的输入序列，或 None（如果验证失败）
+            - 粗处理后：open_rel/close_rel/vwap: [-0.1, 0.1], high/low: 距开盘运动总量, wick_up/wick_dn/body_ratio: [0,1], 成交量: 相对N日均值变化率
             - 细处理后：均值≈0，方差≈1
 
     验证项：
@@ -1255,7 +1253,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     #   列0/列3 open_rel/close_rel：相对前一日收盘价，反映隔夜跳空与当日涨跌
     #   列1/列2 high/low「距开盘运动总量」：high_rel=(高−开)/开 恒≥0、low_rel=(低−开)/开 恒≤0，
     #     保留原始运动口径（不含 clip，跳空/涨跌停尺度直接可见）
-    #   列16/17/18 wick_up/wick_dn/body_ratio：标准K线解剖占比（2026-08 新增形态域）：
+    #   列15/16/17 wick_up/wick_dn/body_ratio：标准K线解剖占比（2026-08 新增形态域）：
     #     wick_up    = (高 − max(开,收)) / (高 − 低)      ∈ [0,1]，0=光头(无上影)
     #     wick_dn    = (min(开,收) − 低) / (高 − 低)      ∈ [0,1]，0=探底回升无下探
     #     body_ratio = 1 − wick_up − wick_dn              ∈ [0,1]，实体占比
@@ -1287,9 +1285,9 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
                        (input_seq_raw[:, 1] - np.maximum(opens, closes_arr)) / safe_rng)
     wick_dn = np.where(degenerate, 0.0,
                        (np.minimum(opens, closes_arr) - input_seq_raw[:, 2]) / safe_rng)
-    input_seq[:, 16] = np.clip(wick_up, 0.0, 1.0)
-    input_seq[:, 17] = np.clip(wick_dn, 0.0, 1.0)
-    input_seq[:, 18] = np.clip(1.0 - input_seq[:, 16] - input_seq[:, 17], 0.0, 1.0)
+    input_seq[:, 15] = np.clip(wick_up, 0.0, 1.0)
+    input_seq[:, 16] = np.clip(wick_dn, 0.0, 1.0)
+    input_seq[:, 17] = np.clip(1.0 - input_seq[:, 15] - input_seq[:, 16], 0.0, 1.0)
 
     # VWAP: 相对当日收盘价的偏离（捕捉盘中均价与收盘价的关系）
     # > 0: 均价高于收盘 → 盘中强势但尾盘回落（抛压）
@@ -1297,56 +1295,44 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     input_seq[:, 4] = (vwaps - closes) / closes
 
     N = DataConfig.MA_WINDOW
-    exchanges = input_seq_raw[:, 6]
 
     # 只 clip 价格相对偏离类：open_rel(列0)/close_rel(列3)/vwap(列4) 仍在 ±0.1（涨跌停尺度）
-    # wick_up(列16)/wick_dn(列17)/body_ratio(列18) 天然落在 [0,1] 且已在其构造处裁剪，无需再 clip
+    # wick_up(列15)/wick_dn(列16)/body_ratio(列17) 天然落在 [0,1] 且已在其构造处裁剪，无需再 clip
     np.clip(input_seq[:, 0], -0.1, 0.1, out=input_seq[:, 0])
     np.clip(input_seq[:, 3], -0.1, 0.1, out=input_seq[:, 3])
     np.clip(input_seq[:, 4], -0.1, 0.1, out=input_seq[:, 4])
 
     abs_indices = start_idx + np.arange(context_length)
 
-    # 成交量(col 5) 和 换手率(col 6): 相对 N 日均值变化率
+    # 成交量(col 5): 相对前 N 日均值的变化率
     if start_idx >= N:
-        for col, raw_vals in [(5, volumes), (6, exchanges)]:
-            full_col = stock_data[:, col]
-            cumsum = np.empty(len(full_col) + 1, dtype=np.float64)
-            cumsum[0] = 0
-            np.cumsum(full_col, out=cumsum[1:])
-            ma_values = (cumsum[abs_indices] - cumsum[abs_indices - N]) / N
-            if np.any(~np.isfinite(ma_values)) or np.any(ma_values <= 0):
-                return None
-            input_seq[:, col] = (raw_vals - ma_values) / ma_values
+        full_col = stock_data[:, 5]
+        cumsum = np.empty(len(full_col) + 1, dtype=np.float64)
+        cumsum[0] = 0
+        np.cumsum(full_col, out=cumsum[1:])
+        ma_values = (cumsum[abs_indices] - cumsum[abs_indices - N]) / N
+        if np.any(~np.isfinite(ma_values)) or np.any(ma_values <= 0):
+            return None
+        input_seq[:, 5] = (volumes - ma_values) / ma_values
     else:
         left_starts = np.maximum(0, abs_indices - N)
         deficits = N - (abs_indices - left_starts)
-        for col, raw_vals in [(5, volumes), (6, exchanges)]:
-            full_col = stock_data[:, col]
-            ma_values = np.empty(context_length, dtype=np.float32)
-            for k in range(context_length):
-                if deficits[k] > 0:
-                    ma_values[k] = np.mean(np.concatenate([
-                        full_col[left_starts[k]:abs_indices[k]],
-                        full_col[abs_indices[k] + 1:abs_indices[k] + 1 + deficits[k]]
-                    ]))
-                else:
-                    ma_values[k] = np.mean(full_col[left_starts[k]:abs_indices[k]])
-            if np.any(~np.isfinite(ma_values)) or np.any(ma_values <= 0):
-                return None
-            input_seq[:, col] = (raw_vals - ma_values) / ma_values
+        full_col = stock_data[:, 5]
+        ma_values = np.empty(context_length, dtype=np.float32)
+        for k in range(context_length):
+            if deficits[k] > 0:
+                ma_values[k] = np.mean(np.concatenate([
+                    full_col[left_starts[k]:abs_indices[k]],
+                    full_col[abs_indices[k] + 1:abs_indices[k] + 1 + deficits[k]]
+                ]))
+            else:
+                ma_values[k] = np.mean(full_col[left_starts[k]:abs_indices[k]])
+        if np.any(~np.isfinite(ma_values)) or np.any(ma_values <= 0):
+            return None
+        input_seq[:, 5] = (volumes - ma_values) / ma_values
 
-    # MA偏离度特征（已在数据库中预计算为 (close-MA)/MA 比值）
-    input_seq[:, 7:10] = input_seq_raw[:, 7:10]
-
-    # MACD特征（已在数据库中预计算为 (value)/close 比值）
-    input_seq[:, 10:13] = input_seq_raw[:, 10:13]
-
-    # MACD柱状图变化量（已在数据库中预计算为 macd_hist[t]-macd_hist[t-1]）
-    input_seq[:, 13] = input_seq_raw[:, 13]
-
-    # BB特征（已在数据库中预计算）
-    input_seq[:, 14:16] = input_seq_raw[:, 14:16]
+    # m5/m10/m20、MACD 四列、布林带两列：数据库中已预计算，列位与原始列一一对应（第 6-14 列直传）
+    input_seq[:, 6:15] = input_seq_raw[:, 6:15]
 
     # ========== 细处理阶段（可选）==========
     # 应用高级特征归一化，将粗处理结果转换为均值≈0、方差≈1的标准化数据
@@ -1512,7 +1498,7 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
     # OHLC 编码：
     #   列0/列3 open_rel/close_rel: 相对前一日收盘价
     #   列1/列2 high/low「距开盘运动总量」: high_rel=(高−开)/开 恒≥0、low_rel=(低−开)/开 恒≤0
-    #   列16/17/18 wick_up/wick_dn/body_ratio: 标准影线占比 ∈[0,1]（窗口版同款公式；一字板守卫填0）
+    #   列15/16/17 wick_up/wick_dn/body_ratio: 标准影线占比 ∈[0,1]（窗口版同款公式；一字板守卫填0）
     input_seqs[:, 0, 0] = (raw_w[:, 0, 0] - prev_close[:, 0]) / safe_prev_close[:, 0]
     input_seqs[:, 0, 3] = (raw_w[:, 0, 3] - prev_close[:, 0]) / safe_prev_close[:, 0]
 
@@ -1537,9 +1523,9 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
                        (raw_w[:, :, 1] - closes_w_body) / safe_rngs), 0.0, 1.0)
     wick_dn = np.clip(np.where(degenerate, 0.0,
                        (body_bottom - raw_w[:, :, 2]) / safe_rngs), 0.0, 1.0)
-    input_seqs[:, :, 16] = wick_up.astype(np.float32)
-    input_seqs[:, :, 17] = wick_dn.astype(np.float32)
-    input_seqs[:, :, 18] = np.clip(1.0 - wick_up - wick_dn, 0.0, 1.0).astype(np.float32)
+    input_seqs[:, :, 15] = wick_up.astype(np.float32)
+    input_seqs[:, :, 16] = wick_dn.astype(np.float32)
+    input_seqs[:, :, 17] = np.clip(1.0 - wick_up - wick_dn, 0.0, 1.0).astype(np.float32)
 
     vwaps_w = raw_w[:, :, 4]
     safe_closes_w = np.where(closes_w != 0, closes_w, 1.0)
@@ -1552,7 +1538,7 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
 
     abs_idx = vs[:, None] + offsets[None, :]
 
-    for col in [5, 6]:
+    for col in [5]:
         full_col = stock_data[:, col].astype(np.float64)
         cs = np.empty(T + 1, dtype=np.float64)
         cs[0] = 0
@@ -1579,16 +1565,8 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
         row_bad = np.any(invalid_ma, axis=1)
         input_seqs[row_bad] = np.nan
 
-    input_seqs[:, :, 7:10] = raw_w[:, :, 7:10]
-
-    # MACD特征（已在数据库中预计算）
-    input_seqs[:, :, 10:13] = raw_w[:, :, 10:13]
-
-    # MACD柱状图变化量（已在数据库中预计算）
-    input_seqs[:, :, 13] = raw_w[:, :, 13]
-
-    # BB特征（已在数据库中预计算）
-    input_seqs[:, :, 14:16] = raw_w[:, :, 14:16]
+    # m5/m10/m20、MACD 四列、布林带两列：数据库中已预计算，列位与原始列一一对应（第 6-14 列直传）
+    input_seqs[:, :, 6:15] = raw_w[:, :, 6:15]
 
     nan_rows = np.any(~np.isfinite(input_seqs), axis=(1, 2))
     good = ~nan_rows
@@ -1815,14 +1793,14 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None, max_pool
 
     Returns:
         正常模式 (max_pool_size=None):
-            all_inputs: [N, context_length, 19] float32 归一化后的输入
+            all_inputs: [N, context_length, 18] float32 归一化后的输入
             all_targets: [N] float32 标签 (0/1)
             all_returns: [N] float32 累计收益率
             pos_indices: [M] int 正样本在 all_inputs 中的索引
             neg_indices: [K] int 负样本在 all_inputs 中的索引
             sample_key_to_pool_idx: dict  (stock_idx, start_idx) -> pool_index 映射
         采样模式 (max_pool_size is not None):
-            all_inputs: [M, 19] float32 归一化后的 K 线（展平采样，无时间维度）
+            all_inputs: [M, 18] float32 归一化后的 K 线（展平采样，无时间维度）
             all_targets / all_returns / pos_indices / neg_indices: None
             sample_key_to_pool_idx: {} (空 dict，展平后不再对应)
 
@@ -1910,11 +1888,11 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None, max_pool
             sampled_chunks = []
             remaining = max_pool_size
             for i in range(len(all_inputs)):
-                arr = all_inputs[i]  # [N_i, 45, 19] 已归一化
+                arr = all_inputs[i]  # [N_i, 45, 18] 已归一化
                 n = arr.shape[0] * arr.shape[1]  # N_i * 45
                 k = int(n * max_pool_size / total_klines)  # floor: 保证 sum(k_i) <= max_pool_size，避免 round 累加超限导致尾部股票 k=0 被跳过
                 k = min(k, remaining, n)
-                flat = arr.reshape(-1, arr.shape[-1])  # [N_i*45, 19]
+                flat = arr.reshape(-1, arr.shape[-1])  # [N_i*45, 18]
                 if k < n:
                     idx = np.random.choice(n, k, replace=False)
                     sampled_chunks.append(flat[idx])
@@ -1922,7 +1900,7 @@ def precompute_training_pool(train_stock_info, feature_normalizer=None, max_pool
                     sampled_chunks.append(flat.copy())
                 all_inputs[i] = None  # 释放原数组
                 remaining -= k
-            all_inputs = np.concatenate(sampled_chunks, axis=0)  # [max_pool_size, 19]
+            all_inputs = np.concatenate(sampled_chunks, axis=0)  # [max_pool_size, 18]
             print(f"  K线级预采样: {total_klines:,} → {len(all_inputs):,} 条")
         else:
             all_inputs = np.concatenate(all_inputs, axis=0)

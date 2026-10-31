@@ -178,7 +178,7 @@ class DataConfig:
 class ModelConfig:
     """模型架构相关参数"""
     # 基础模型参数
-    INPUT_DIM = 19                   # 输入特征维度数（16 原始列 + wick_up/wick_dn/body_ratio 三列 K线形态占比）
+    INPUT_DIM = 18                   # 输入特征维度数（15 原始列 + wick_up/wick_dn/body_ratio 三列 K线形态占比）
     D_MODEL = 128                    # 模型维度（Transformer 内部维度）
     FFN_EXPAND_RATIO = 4             # FFN 隐藏层扩展比例（hidden_dim = d_model * FFN_EXPAND_RATIO）
     NHEAD = 4                        # 注意力头数
@@ -589,7 +589,7 @@ def _assert_contract() -> None:
     assert SAMPLE_COLUMNS[CLOSE_IDX] == 'close', f'CLOSE_IDX={CLOSE_IDX} 不是 close'
     assert SAMPLE_COLUMNS[CLOSE_RAW_IDX] == 'close_raw', \
         f'CLOSE_RAW_IDX={CLOSE_RAW_IDX} 不是 close_raw'
-    assert len(SAMPLE_COLUMNS) == 17, f'样本列应为 17（16 输入列 + close_raw），实际 {len(SAMPLE_COLUMNS)}'
+    assert len(SAMPLE_COLUMNS) == 16, f'样本列应为 16（15 输入列 + close_raw），实际 {len(SAMPLE_COLUMNS)}'
     assert DataConfig.CONTAMINATE_LEFT == SAMPLING.label_backspan + SAMPLING.context_length - 1
     assert DataConfig.CONTAMINATE_RIGHT == 0, '污染区间右界就是问题日自身（序号空间）'
 

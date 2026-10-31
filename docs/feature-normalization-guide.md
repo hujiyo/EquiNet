@@ -28,14 +28,14 @@
                                    ↓
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  src/data.py · 粗处理 (coarse normalization)                             │
-│  从17列中取15列（去掉 date, volume），转换为去量纲的变化率/偏离度          │
-│  输出 [45, 15]                                                            │
+│  从16列中取15列（去掉 date 和 close_raw），转换为去量纲的变化率/偏离度   │
+│  输出 [45, 18]                                                           │
 └──────────────────────────────────┬───────────────────────────────────────┘
                                    ↓
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  src/data.py · 细处理 (FeatureNormalizer)                                │
-│  7组独立 QuantileTransformer + StandardScaler                            │
-│  输出 [45, 15]，所有特征均值≈0、方差≈1                                    │
+│  18组独立 QuantileTransformer + StandardScaler                           │
+│  输出 [45, 18]                                                           │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -243,7 +243,7 @@ ema[0] = mean(prices[:window])  # 前 window 个点的简单平均
 | 15 | `bb_lower` | REAL | 衍生 | (LOWER-close)/close |
 | - | `updated_at` | TEXT | 自动 | 更新时间戳 |
 
-> **注意**：模型输入取 `open`…`bb_lower` 共 16 列，再追加 3 列 K 线形态占比（wick_up / wick_dn / body_ratio）。`date` 仅用于数据分割和标签计算；`close_raw`（不复权收盘价）仅用于高价股过滤。
+> **注意**：模型输入取 `open`…`bb_lower` 中去掉 `exchange` 的 15 列，再追加 3 列 K 线形态占比（wick_up / wick_dn / body_ratio），共 18 维。`date` 仅用于数据分割和标签计算；`close_raw`（不复权收盘价）仅用于高价股过滤；`exchange` 留在库里但不再进模型输入（换手率是成交量的派生量）。
 
 ---
 
@@ -277,29 +277,29 @@ $$\text{Volume}_t = \frac{\text{volume}_t - \overline{\text{volume}}_{N}}{\overl
 
 > **为什么不做 clip？** 成交量的变化没有硬性上界（放量可以翻数倍），clip 会丢失有价值的放量信号。
 
-#### Exchange（列 6）：相对 N 日均值变化率
+#### MA偏离度（列 6-8）：直传
 
-$$\text{Exchange}_t = \frac{\text{exchange}_t - \overline{\text{exchange}}_{N}}{\overline{\text{exchange}}_{N}}$$
-
-与成交量（列 5）处理方式相同，N=10。
-
-#### MA偏离度（列 7-9）：直传
-
-$$m_{N,t} = \text{input\_raw}[:, 7+N]$$
+$$m_{N,t} = \text{input\_raw}[:, 6+N]$$
 
 已在 `features.py` 中预计算为 `(close-MA)/MA` 格式，本身就是无量纲偏离度，直接传入。
 
-#### MACD（列 10-12）：直传
+#### MACD（列 9-11）：直传
 
-$$\text{dif}_t, \text{dea}_t, \text{macd\_hist}_t = \text{input\_raw}[:, 10:13]$$
+$$\text{dif}_t, \text{dea}_t, \text{macd\_hist}_t = \text{input\_raw}[:, 9:12]$$
 
 已在 `features.py` 中预计算并除以 close，无量纲，直接传入。
 
-#### 布林带（列 13-14）：直传
+#### 布林带（列 12-13）：直传
 
-$$\text{bb\_upper}_t, \text{bb\_lower}_t = \text{input\_raw}[:, 13:15]$$
+$$\text{bb\_upper}_t, \text{bb\_lower}_t = \text{input\_raw}[:, 12:14]$$
 
 已在 `features.py` 中预计算，直接传入。
+
+#### 影线占比（列 15-17）：K 线解剖
+
+$$w_{\text{up}} = \frac{h - \max(o,c)}{h - l},\quad w_{\text{dn}} = \frac{\min(o,c) - l}{h - l},\quad b = 1 - w_{\text{up}} - w_{\text{dn}}$$
+
+三者都落在 [0,1] 且构造处已裁剪，无需再 clip；一字板（h≈l）守卫填 0。
 
 ### 粗处理后的数据范围
 
@@ -308,7 +308,6 @@ $$\text{bb\_upper}_t, \text{bb\_lower}_t = \text{input\_raw}[:, 13:15]$$
 | OHLC | [-0.1, 0.1] | ≈ 0 | 范围小，零均值 |
 | VWAP | [-0.1, 0.1] | ≈ 0 | 范围小，零均值 |
 | 成交量 | 不定 | ≈ 0 | 长尾分布（放量日变化率可达数倍） |
-| 换手率 | 不定 | ≈ 0 | 长尾分布 |
 | MA偏离度 | 不定 | ≈ 0 | 偏态分布 |
 | MACD | 不定 | ≈ 0 | DIF/DEA/柱状图分布各异 |
 | 布林带 | 不定 | 不定 | 上/下轨偏离度分布各异 |
@@ -354,13 +353,15 @@ $$x_{\text{final}} = \frac{x_{\text{normal}} - \mu}{\sigma}$$
 
 | Pipeline | 覆盖特征 | 设计原因 |
 |----------|---------|---------|
-| `ohl_pipeline` | OHLC (col 0-3) | 价格变化率，分布相似，范围 [-0.1, 0.1] |
-| `vwap_pipeline` | VWAP (col 4) | 均价偏离度，分布独立于 OHLC |
-| `volume_pipeline` | 成交量 (col 5) | 量能特征，长尾分布 |
-| `exchange_pipeline` | Exchange (col 6) | 换手率特征，分布独立 |
-| `ma_pipeline` | MA偏离度 (col 7-9) | 三类 MA 偏离度分布相似 |
-| `macd_pipeline` | MACD (col 10-12) | DIF/DEA/柱状图分布相似 |
-| `bb_pipeline` | 布林带 (col 13-14) | 上/下轨偏离度分布相似 |
+| `open` / `high` / `low` / `close` | OHLC (col 0-3) | 价格变化率，范围 [-0.1, 0.1]，逐列独立拟合 |
+| `vwap` | VWAP (col 4) | 均价偏离度，分布独立于 OHLC |
+| `volume` | 成交量 (col 5) | 量能特征，长尾分布 |
+| `m5` / `m10` / `m20` | 均线偏离度 (col 6-8) | 三个窗口分布相似，仍逐列拟合 |
+| `dif` / `dea` / `macd_hist` / `macd_hist_diff` | MACD (col 9-12) | 四列分布形态各不相同 |
+| `bb_upper` / `bb_lower` | 布林带 (col 13-14) | 上/下轨偏离度分布不同 |
+| `wick_up` / `wick_dn` / `body_ratio` | 影线占比 (col 15-17) | 有 [0,1] 硬边界，必须单独拟合 |
+
+**每列一个 pipeline**，共 18 组。逐列拟合意味着某一列的分布变化不会影响其它列的分位数估计。
 
 每个 pipeline 结构：
 
@@ -386,16 +387,19 @@ Pipeline([
 | 2 | Low | `low` | — | (low-close₁)/close₁, clip | ohl_pipeline |
 | 3 | Close | `close` | — | (close-close₁)/close₁, clip | ohl_pipeline |
 | 4 | VWAP | `vwap` | amount/volume | (vwap-close)/close, clip | vwap_pipeline |
-| 5 | 成交量 | `volume` | — | (volume-MA₁₀)/MA₁₀ | volume_pipeline |
-| 6 | Exchange | `exchange`(换手率) | — | (exchange-MA₁₀)/MA₁₀ | exchange_pipeline |
-| 7 | MA5 | `close` | (close-MA5)/MA5 | 直传 | ma_pipeline |
-| 8 | MA10 | `close` | (close-MA10)/MA10 | 直传 | ma_pipeline |
-| 9 | MA20 | `close` | (close-MA20)/MA20 | 直传 | ma_pipeline |
-| 10 | DIF | `close` | (EMA12-EMA26)/close | 直传 | macd_pipeline |
-| 11 | DEA | `close` | EMA9(DIF)/close | 直传 | macd_pipeline |
-| 12 | MACD_hist | `close` | 2*(DIF-DEA)/close | 直传 | macd_pipeline |
-| 13 | BB_upper | `close` | (close-UPPER)/close | 直传 | bb_pipeline |
-| 14 | BB_lower | `close` | (LOWER-close)/close | 直传 | bb_pipeline |
+| 5 | 成交量 | `volume` | — | (volume-MA₁₀)/MA₁₀ | volume |
+| 6 | MA5 | `close` | (close-MA5)/MA5 | 直传 | m5 |
+| 7 | MA10 | `close` | (close-MA10)/MA10 | 直传 | m10 |
+| 8 | MA20 | `close` | (close-MA20)/MA20 | 直传 | m20 |
+| 9 | DIF | `close` | (EMA12-EMA26)/close | 直传 | dif |
+| 10 | DEA | `close` | EMA9(DIF)/close | 直传 | dea |
+| 11 | MACD_hist | `close` | 2*(DIF-DEA)/close | 直传 | macd_hist |
+| 12 | MACD_hist_diff | `close` | hist[t]-hist[t-1] | 直传 | macd_hist_diff |
+| 13 | BB_upper | `close` | (close-UPPER)/close | 直传 | bb_upper |
+| 14 | BB_lower | `close` | (LOWER-close)/close | 直传 | bb_lower |
+| 15 | wick_up | `open·high·low·close` | (h-max(o,c))/(h-l) | 直传 | wick_up |
+| 16 | wick_dn | `open·high·low·close` | (min(o,c)-l)/(h-l) | 直传 | wick_dn |
+| 17 | body_ratio | `open·high·low·close` | 1-wick_up-wick_dn | 直传 | body_ratio |
 
 > `close₁` 表示前一日收盘价。MA₁₀ 表示过去10日的简单移动平均。
 
@@ -450,9 +454,9 @@ normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
 
 **A**: VWAP 的偏离度与 OHLC 变化率在同一量级（正常情况下不超过 ±5%）。clip 到 ±10% 只是过滤异常值，不影响正常数据。代码中 `np.clip(input_seq[:, :5], -0.1, 0.1)` 是前 5 列一起 clip。
 
-### Q3: 成交量和换手率为什么不做 clip？
+### Q3: 成交量为什么不做 clip？
 
-**A**: 成交量和换手率没有自然的上界。放量日成交量可以是均值的数倍，这是重要的交易信号。如果 clip，会丢失这些关键信息。
+**A**: 成交量没有自然的上界。放量日成交量可以是均值的数倍，这是重要的交易信号。如果 clip，会丢失这些关键信息。
 
 ### Q4: 衍生特征为什么在数据库中预计算而非在线计算？
 

@@ -54,7 +54,7 @@ class FeatureNormalizer:
             ('low',           slice(2, 3)),
             ('close',         slice(3, 4)),
             ('vwap',          slice(4, 5)),
-            ('amount',        slice(5, 6)),
+            ('volume',        slice(5, 6)),
             ('exchange',      slice(6, 7)),
             ('m5',            slice(7, 8)),
             ('m10',           slice(8, 9)),
@@ -1168,8 +1168,8 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
         - 粗处理：CSV → 归一化格式
             - OHLC: open_rel/close_rel 相对前日收盘价（clip [-0.1,0.1]）；high/low 距开盘运动总量（恒≥0/≤0，无clip）；wick_up/wick_dn/body_ratio 影线/实体占比（除零守卫，[0,1]）
             - VWAP: 相对当日收盘价偏离，clip [-0.1, 0.1]（价格类特征）
-            - Amount: (amount_i - MA_N) / MA_N，MA_N 为过去 N 日均量，无 clip
-            - Exchange: (exchange_i - MA_N) / MA_N，MA_N 为过去 N 日均换手率，无 clip
+            - 成交量: (volume_i - MA_N) / MA_N，MA_N 为过去 N 日均量，无 clip
+            - 换手率: (exchange_i - MA_N) / MA_N，MA_N 为过去 N 日均换手率，无 clip
         - 细处理：归一化 → 标准化数据（均值≈0，方差≈1）
 
     Args:
@@ -1204,14 +1204,14 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     prev_day_data = stock_data[start_idx - 1]
 
     prev_close = prev_day_data[3]
-    prev_amount = prev_day_data[5]
-    if prev_close == 0 or prev_amount == 0 or np.any(prev_day_data[:4] == 0):
+    prev_volume = prev_day_data[5]
+    if prev_close == 0 or prev_volume == 0 or np.any(prev_day_data[:4] == 0):
         return None
     
     closes = input_seq_raw[:, 3]
     vwaps = input_seq_raw[:, 4]
-    amounts = input_seq_raw[:, 5]
-    if np.any(closes == 0) or np.any(amounts == 0):
+    volumes = input_seq_raw[:, 5]
+    if np.any(closes == 0) or np.any(volumes == 0):
         return None
 
     # 高价股过滤：必须用**不复权**收盘价（CLOSE_RAW_IDX）。
@@ -1307,9 +1307,9 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
 
     abs_indices = start_idx + np.arange(context_length)
 
-    # Amount(col 5) 和 Exchange(col 6): 相对N日均线变化率
+    # 成交量(col 5) 和 换手率(col 6): 相对 N 日均值变化率
     if start_idx >= N:
-        for col, raw_vals in [(5, amounts), (6, exchanges)]:
+        for col, raw_vals in [(5, volumes), (6, exchanges)]:
             full_col = stock_data[:, col]
             cumsum = np.empty(len(full_col) + 1, dtype=np.float64)
             cumsum[0] = 0
@@ -1321,7 +1321,7 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     else:
         left_starts = np.maximum(0, abs_indices - N)
         deficits = N - (abs_indices - left_starts)
-        for col, raw_vals in [(5, amounts), (6, exchanges)]:
+        for col, raw_vals in [(5, volumes), (6, exchanges)]:
             full_col = stock_data[:, col]
             ma_values = np.empty(context_length, dtype=np.float32)
             for k in range(context_length):

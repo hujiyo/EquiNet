@@ -55,7 +55,7 @@
 | `high` | 最高价 | 元 | `high` | `最高` |
 | `low` | 最低价 | 元 | `low` | `最低` |
 | `close` | 收盘价 | 元 | `close` | `收盘` |
-| `amount` | 成交额 | 千元 (Baostock) / 元 (AKShare) | `amount` | `成交额` |
+| `amount` | 成交额 | 元 | `amount` | `成交额` |
 | `volume` | 成交量 | 股 | `volume` | `成交量` |
 | `exchange` | 换手率 | %（百分比数值，如 2.5 表示 2.5%） | `turn` | `换手率` |
 | `vwap` | 成交量加权平均价 | 元 | **计算得出** `amount/volume` | **计算得出** `amount/volume` |
@@ -73,7 +73,7 @@ df['vwap'] = df['vwap'].fillna(df['close'])  # 成交量为0时（停牌等）�
 
 ### 数据库中的 volume 列
 
-`volume`（成交量，单位：股）存入数据库但**不参与模型训练**。它仅用于计算 VWAP，以及在某些数据校验逻辑中判断停牌。
+`volume`（成交量，单位：股）是模型第 5 列输入（相对 10 日均量的变化率），同时用于计算 VWAP 与停牌校验。换手率 `exchange` 是它的派生量（`volume / 流通股本 × 100`，保留两位小数），两者在窗口内的差别只来自股本变动和那位小数取整。
 
 ---
 
@@ -229,8 +229,8 @@ ema[0] = mean(prices[:window])  # 前 window 个点的简单平均
 | 1 | `high` | REAL | API | 最高价（元） |
 | 2 | `low` | REAL | API | 最低价（元） |
 | 3 | `close` | REAL | API | 收盘价（元） |
-| 4 | `amount` | REAL | API | 成交额（千元/元） |
-| 5 | `volume` | REAL | API | 成交量（股，不参与训练） |
+| 4 | `amount` | REAL | API | 成交额（元） |
+| 5 | `volume` | REAL | API | 成交量（股，模型第 5 列输入） |
 | 6 | `exchange` | REAL | API | 换手率（%） |
 | 7 | `vwap` | REAL | 计算 | amount/volume |
 | 8 | `m5` | REAL | 衍生 | (close-MA5)/MA5 |
@@ -243,7 +243,7 @@ ema[0] = mean(prices[:window])  # 前 window 个点的简单平均
 | 15 | `bb_lower` | REAL | 衍生 | (LOWER-close)/close |
 | - | `updated_at` | TEXT | 自动 | 更新时间戳 |
 
-> **注意**：模型输入取 15 列，去掉了 `date` 和 `volume`。`date` 仅用于数据分割和标签计算，`volume` 仅用于 VWAP 计算和数据校验。
+> **注意**：模型输入取 `open`…`bb_lower` 共 16 列，再追加 3 列 K 线形态占比（wick_up / wick_dn / body_ratio）。`date` 仅用于数据分割和标签计算；`close_raw`（不复权收盘价）仅用于高价股过滤。
 
 ---
 
@@ -269,19 +269,19 @@ VWAP 与当日收盘价的偏离度：
 - **正值**（VWAP > Close）：盘中均价高于收盘价 → 盘中强势但尾盘回落（抛压）
 - **负值**（VWAP < Close）：盘中均价低于收盘价 → 盘中弱势但尾盘拉升（买盘强）
 
-#### Amount（列 5）：相对 N 日均值变化率
+#### 成交量（列 5）：相对 N 日均值变化率
 
-$$\text{Amount}_t = \frac{\text{amount}_t - \overline{\text{amount}}_{N}}{\overline{\text{amount}}_{N}}$$
+$$\text{Volume}_t = \frac{\text{volume}_t - \overline{\text{volume}}_{N}}{\overline{\text{volume}}_{N}}$$
 
-其中 $\overline{\text{amount}}_{N}$ 是过去 N=10 天成交额的简单移动平均。
+其中 $\overline{\text{volume}}_{N}$ 是过去 N=10 天成交量的简单移动平均（不含当日）。
 
-> **为什么不做 clip？** 成交额的变化没有硬性上界（放量可以翻数倍），clip 会丢失有价值的放量信号。
+> **为什么不做 clip？** 成交量的变化没有硬性上界（放量可以翻数倍），clip 会丢失有价值的放量信号。
 
 #### Exchange（列 6）：相对 N 日均值变化率
 
 $$\text{Exchange}_t = \frac{\text{exchange}_t - \overline{\text{exchange}}_{N}}{\overline{\text{exchange}}_{N}}$$
 
-与 Amount 处理方式相同，N=10。
+与成交量（列 5）处理方式相同，N=10。
 
 #### MA偏离度（列 7-9）：直传
 
@@ -307,8 +307,8 @@ $$\text{bb\_upper}_t, \text{bb\_lower}_t = \text{input\_raw}[:, 13:15]$$
 |------|------|------|---------|
 | OHLC | [-0.1, 0.1] | ≈ 0 | 范围小，零均值 |
 | VWAP | [-0.1, 0.1] | ≈ 0 | 范围小，零均值 |
-| Amount | 不定 | ≈ 0 | 长尾分布（放量日变化率可达数倍） |
-| Exchange | 不定 | ≈ 0 | 长尾分布 |
+| 成交量 | 不定 | ≈ 0 | 长尾分布（放量日变化率可达数倍） |
+| 换手率 | 不定 | ≈ 0 | 长尾分布 |
 | MA偏离度 | 不定 | ≈ 0 | 偏态分布 |
 | MACD | 不定 | ≈ 0 | DIF/DEA/柱状图分布各异 |
 | 布林带 | 不定 | 不定 | 上/下轨偏离度分布各异 |
@@ -336,7 +336,7 @@ $$\text{bb\_upper}_t, \text{bb\_lower}_t = \text{input\_raw}[:, 13:15]$$
 $$x_{\text{normal}} = \Phi^{-1}(\text{CDF}(x))$$
 
 **优势**：
-- 自动处理偏态分布（Amount 的长尾会被压缩）
+- 自动处理偏态分布（成交量的长尾会被压缩）
 - 对异常值鲁棒（极端值被映射到正态的尾部，不会被放大）
 - 保证输出单调性（原始排序不变）
 
@@ -356,7 +356,7 @@ $$x_{\text{final}} = \frac{x_{\text{normal}} - \mu}{\sigma}$$
 |----------|---------|---------|
 | `ohl_pipeline` | OHLC (col 0-3) | 价格变化率，分布相似，范围 [-0.1, 0.1] |
 | `vwap_pipeline` | VWAP (col 4) | 均价偏离度，分布独立于 OHLC |
-| `amount_pipeline` | Amount (col 5) | 量能特征，长尾分布 |
+| `volume_pipeline` | 成交量 (col 5) | 量能特征，长尾分布 |
 | `exchange_pipeline` | Exchange (col 6) | 换手率特征，分布独立 |
 | `ma_pipeline` | MA偏离度 (col 7-9) | 三类 MA 偏离度分布相似 |
 | `macd_pipeline` | MACD (col 10-12) | DIF/DEA/柱状图分布相似 |
@@ -371,7 +371,7 @@ Pipeline([
 ])
 ```
 
-> **为什么分组而非用一个全局 pipeline？** 不同特征组的分布形态差异大。OHLC 集中在 [-0.1, 0.1] 且近似对称，Amount 则是长尾分布。如果混在一起拟合 QuantileTransformer，各自的分位数估计会互相干扰。
+> **为什么分组而非用一个全局 pipeline？** 不同特征组的分布形态差异大。OHLC 集中在 [-0.1, 0.1] 且近似对称，成交量则是长尾分布。如果混在一起拟合 QuantileTransformer，各自的分位数估计会互相干扰。
 
 ---
 
@@ -386,7 +386,7 @@ Pipeline([
 | 2 | Low | `low` | — | (low-close₁)/close₁, clip | ohl_pipeline |
 | 3 | Close | `close` | — | (close-close₁)/close₁, clip | ohl_pipeline |
 | 4 | VWAP | `vwap` | amount/volume | (vwap-close)/close, clip | vwap_pipeline |
-| 5 | Amount | `amount` | — | (amount-MA₁₀)/MA₁₀ | amount_pipeline |
+| 5 | 成交量 | `volume` | — | (volume-MA₁₀)/MA₁₀ | volume_pipeline |
 | 6 | Exchange | `exchange`(换手率) | — | (exchange-MA₁₀)/MA₁₀ | exchange_pipeline |
 | 7 | MA5 | `close` | (close-MA5)/MA5 | 直传 | ma_pipeline |
 | 8 | MA10 | `close` | (close-MA10)/MA10 | 直传 | ma_pipeline |
@@ -450,9 +450,9 @@ normalizer = FeatureNormalizer.load(DataConfig.NORMALIZER_PATH)
 
 **A**: VWAP 的偏离度与 OHLC 变化率在同一量级（正常情况下不超过 ±5%）。clip 到 ±10% 只是过滤异常值，不影响正常数据。代码中 `np.clip(input_seq[:, :5], -0.1, 0.1)` 是前 5 列一起 clip。
 
-### Q3: Amount 和 Exchange 为什么不做 clip？
+### Q3: 成交量和换手率为什么不做 clip？
 
-**A**: 成交额和换手率没有自然的上界。放量日成交额可以是均值的数倍，这是重要的交易信号。如果 clip，会丢失这些关键信息。
+**A**: 成交量和换手率没有自然的上界。放量日成交量可以是均值的数倍，这是重要的交易信号。如果 clip，会丢失这些关键信息。
 
 ### Q4: 衍生特征为什么在数据库中预计算而非在线计算？
 

@@ -27,6 +27,32 @@ from concurrent.futures import ThreadPoolExecutor
 from sklearn.preprocessing import QuantileTransformer, StandardScaler
 from typing import Dict, List, Set, Optional
 
+
+def _stratified_random_pick(n: int, k: int, rng: np.random.RandomState) -> np.ndarray:
+    """在 n 个有序位置上时间分层地取 k 个（返回升序下标）
+
+    把 [0, n) 切成 k 个等宽箱，每箱内随机取一个位置。
+    - 箱保证样本沿时间轴均匀铺开，不会扎堆在某一小段行情；
+    - 箱内随机保证没有固定相位，不会与星期几/月初月末/季度等日历周期对齐；
+    - 相邻被选位置间距在 [1, 2*n/k] 之间随机波动（受箱边界约束），
+      比固定步长更适合处理「相邻窗口 44/45 天重叠」的冗余。
+
+    k >= n 时直接返回全部位置（升序），k <= 0 时返回空数组。
+    """
+    if k <= 0:
+        return np.empty(0, dtype=np.intp)
+    if k >= n:
+        return np.arange(n, dtype=np.intp)
+
+    # 箱边界：用整数除法保证 k 个箱严格递增、且覆盖到 n（k<n 时每箱至少 1 宽）
+    edges = (np.arange(k + 1) * n) // k
+    widths = np.diff(edges)
+    # 每箱内随机取一点。k 可达数千、股票可达数千只，逐箱调用 randint 太慢，
+    # 用连续均匀数取整（偏差在 1e-15 量级，可忽略）。
+    picks = edges[:-1] + (rng.random_sample(k) * widths).astype(np.intp)
+    return picks.astype(np.intp)
+
+
 class FeatureNormalizer:
     """
     特征归一化器 - 两阶段归一化
@@ -72,7 +98,8 @@ class FeatureNormalizer:
     def __init__(self,
                  output_distribution='normal',
                  n_quantiles=1000,
-                 random_state=42):
+                 random_state=42,
+                 subsample=None):
         """
         Args:
             output_distribution: 'normal' 或 'uniform'
@@ -80,10 +107,14 @@ class FeatureNormalizer:
                 - 'uniform': 输出符合 [0, 1] 均匀分布
             n_quantiles: 分位数数量，越多越精确但越慢
             random_state: 随机种子
+            subsample: QuantileTransformer 的 subsample。None = 用传入的全部值
+                估分位；整数则会在拟合时再随机抽这么多个「值」，上层按时间分层
+                的窗口抽样会被这层二次随机洗掉，故默认 None。
         """
         self.output_distribution = output_distribution
         self.n_quantiles = n_quantiles
         self.random_state = random_state
+        self.subsample = subsample
 
         # 特征组定义：(名称, 列切片)
         # 每个维度各自独立拟合分位数映射，互不污染
@@ -109,45 +140,66 @@ class FeatureNormalizer:
                 output_distribution=self.output_distribution,
                 n_quantiles=self.n_quantiles,
                 random_state=self.random_state,
-                subsample=100000
+                subsample=self.subsample
             )),
             ('scaler', StandardScaler())
         ])
 
-    def _collect_training_features(self, train_stock_info: List[Dict]) -> Dict[str, np.ndarray]:
+    def _collect_training_features(self, train_stock_info: List[Dict]) -> Dict[str, List[np.ndarray]]:
         """
         从训练集收集所有特征值（避免数据泄漏）
         关键：只使用每只股票的训练集部分（train_end_idx 之前）
         使用向量化批处理进行粗处理，确保与训练时的数据处理逻辑完全一致
 
+        抽样口径：全池、按每只股票的训练窗口数比例分层，时间轴上均匀铺开。
+
+        具体做法（时间分层 + 箱内随机）：
+        1. 先只读索引元数据统计全池可用窗口总量，定出全池统一的「每只股票取几个」
+           的比例 p = 预算 / 全池可用窗口，于是每只股票的目标数 k_i ≈ p × n_i，
+           长历史股票多取、短历史股票少取，保底 1 个；
+        2. 把这 k_i 个名额铺在时间轴上：把该股票的有效窗口切成 k_i 个等宽的箱，
+           **每个箱内随机取一个窗口**。
+        第 2 步是关键——箱保证窗口在时间上均匀铺开（不会扎堆在某一段行情），
+        箱内随机则保证不存在固定的相对相位，因此不会与任何日历周期（星期几、
+        月初月末、季度）对齐；即便池子增删股票，也不会让某只股票的样本相位整体平移。
+
         Returns:
-            {name: flat_values} 每个特征组的展平值
+            {name: [chunk, ...]}：每个特征组按股票切分的展平值分片，由调用方
+            逐组拼接以控制内存峰值（见 fit）。
         """
-        buckets = {name: [] for name, _ in self._feature_groups}
-
         context_length = DataConfig.CONTEXT_LENGTH
-        max_windows = 100000
-        total_windows = 0
+        n_features = ModelConfig.INPUT_DIM
+        window_bytes = context_length * n_features * 4
 
-        for stock_idx, stock in enumerate(train_stock_info):
-            if total_windows >= max_windows:
-                break
+        # 预算 = min(配置窗口数, 内存上限能装下的窗口数)。
+        # 峰值约为采集量的 1.5 倍：逐组拼接结果 + QuantileTransformer 内部 float64 拷贝。
+        mem_cap = int(DataConfig.NORMALIZER_FIT_MEMORY_GB * (1024 ** 3) / (window_bytes * 1.5))
+        max_windows = min(int(DataConfig.NORMALIZER_FIT_WINDOWS), mem_cap)
 
-            data = stock['data']
+        # 第一遍只读索引元数据（不碰行情数组）：筛掉训练段太短的股票，
+        # 并统计全池可用窗口总量，用来定全池统一的抽样比例。
+        eligible = []
+        total_available = 0
+        for stock in train_stock_info:
             train_start_idx = stock.get('train_start_idx', 1)
-            train_end_idx = stock.get('train_end_idx', len(data))
-
+            train_end_idx = stock.get('train_end_idx', len(stock['data']))
             range_min = max(1, train_start_idx + 1)
             range_max = train_end_idx - context_length
-
             if range_max < range_min:
                 continue
-
-            # 计算采样步长，控制总量在 max_windows 以内
             available = range_max - range_min + 1
-            remaining = max_windows - total_windows
-            stride = max(1, available // max(1, remaining))
+            eligible.append((stock, range_min, range_max))
+            total_available += available
 
+        ratio = max_windows / max(1, total_available)
+        rng = np.random.RandomState(self.random_state)
+
+        buckets = {name: [] for name, _ in self._feature_groups}
+        total_windows = 0
+        used_stocks = 0
+        per_stock = []
+
+        for stock_idx, (stock, range_min, range_max) in enumerate(eligible):
             # 向量化处理：只做粗归一化，不需要标签、收益和未来数据
             inputs, _, _, _, _, _, _ = _vectorized_process_stock(
                 stock, stock_idx,
@@ -167,28 +219,41 @@ class FeatureNormalizer:
                 start_max_override=range_max,
             )
 
-            if inputs is None:
+            if inputs is None or len(inputs) == 0:
                 continue
 
-            # 按 stride 采样，控制总量
-            if stride > 1 and len(inputs) > remaining:
-                indices = np.arange(0, len(inputs), stride)[:remaining]
-                inputs = inputs[indices]
+            n = len(inputs)
+            # 该股票的名额：按自身训练窗口数等比，保底 1 个（不足预算时全取）
+            k = max(1, int(round(n * ratio)))
+            k = min(k, n)
+            pick = _stratified_random_pick(n, k, rng)
+            inputs = inputs[pick]
+            if len(inputs) == 0:
+                continue
 
             total_windows += len(inputs)
+            used_stocks += 1
+            per_stock.append(len(inputs))
 
             for name, col_slice in self._feature_groups:
                 buckets[name].append(inputs[:, :, col_slice].flatten())
 
-        result = {}
-        for name in buckets:
-            result[name] = np.concatenate(buckets[name]) if buckets[name] else np.array([])
+        print(f"[FeatureNormalizer] 收集到的训练数据 ({total_windows} 个窗口 "
+              f"× {context_length} 天 = {total_windows * context_length:,} 个值/特征):")
+        uncovered = len(eligible) - used_stocks
+        if ratio < 1:
+            ratio_str = f"抽样比例 {ratio:.4f}（约每 {1/ratio:.1f} 个窗口取 1 个）"
+        else:
+            ratio_str = "预算大于全池可用窗口，全部窗口参与拟合"
+        print(f"  覆盖 {used_stocks}/{len(eligible)} 只，{ratio_str}，"
+              f"单股窗口 {min(per_stock) if per_stock else 0}~"
+              f"{max(per_stock) if per_stock else 0} 个；"
+              f"未覆盖 {uncovered} 只（训练段内无合法窗口）")
 
-        print(f"[FeatureNormalizer] 收集到的训练数据 ({total_windows} 个窗口):")
-        for name, _ in self._feature_groups:
-            print(f"  {name.upper()}: {len(result[name])} 个值")
-
-        return result
+        # 返回 {name: [chunk, ...]} 而非拼好的整组：由 fit() 逐组 pop 出去拼接、
+        # 拟合、释放，任一时刻只有一个特征组的完整数组存活。若在这里把 18 组
+        # 全拼好，分片与结果会同时驻留，峰值约为采集量的 2 倍。
+        return buckets
 
     def fit(self, train_stock_info: List[Dict]):
         """
@@ -203,31 +268,35 @@ class FeatureNormalizer:
         print("\n[FeatureNormalizer] 开始拟合归一化器...")
         print(f"  输出分布: {self.output_distribution}")
         print(f"  分位数数量: {self.n_quantiles}")
+        print(f"  subsample: {self.subsample if self.subsample is not None else 'None（用全部收集到的值）'}")
 
-        # 收集训练数据
-        feature_data = self._collect_training_features(train_stock_info)
+        # 收集训练数据：返回的是 {name: [chunk, ...]}，逐组拼接后立即拟合并释放
+        buckets = self._collect_training_features(train_stock_info)
 
-        # 拟合每个特征组的 pipeline
         print("\n[FeatureNormalizer] 拟合每个特征的 pipeline...")
-        for name, _ in self._feature_groups:
-            self.pipelines[name].fit(feature_data[name].reshape(-1, 1))
-        self.is_fitted = True
-
-        self._print_transform_stats(feature_data)
-        print("\n[FeatureNormalizer] ✓ 拟合完成！")
-
-    def _print_transform_stats(self, feature_data: Dict[str, np.ndarray]):
-        """打印变换后的统计信息，验证归一化效果"""
         print("\n[FeatureNormalizer] 变换后的统计信息:")
-
+        max_stat_values = 2_000_000
         for name, _ in self._feature_groups:
-            transformed = self.pipelines[name].transform(
-                feature_data[name].reshape(-1, 1)
-            ).flatten()
-            print(f"  {name.upper()}:")
+            chunks = buckets.pop(name, [])
+            if not chunks:
+                raise RuntimeError(f"特征组 {name!r} 没有收集到任何值")
+            values = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+            del chunks
+            self.pipelines[name].fit(values.reshape(-1, 1))
+            print(f"  {name.upper()}: {len(values):,} 个值")
+
+            # 在释放前顺手算展示统计（只取至多 200 万个值，避免额外的大数组）
+            sample = values if len(values) <= max_stat_values else \
+                values[::(len(values) // max_stat_values + 1)]
+            transformed = self.pipelines[name].transform(sample.reshape(-1, 1)).flatten()
             print(f"    均值: {transformed.mean():.6f}")
             print(f"    标准差: {transformed.std():.6f}")
             print(f"    范围: [{transformed.min():.6f}, {transformed.max():.6f}]")
+            del values, sample, transformed
+        self.is_fitted = True
+        del buckets
+
+        print("\n[FeatureNormalizer] ✓ 拟合完成！")
 
     def transform(self, input_seq: np.ndarray) -> np.ndarray:
         """
@@ -334,6 +403,7 @@ class FeatureNormalizer:
                 'output_distribution': self.output_distribution,
                 'n_quantiles': self.n_quantiles,
                 'random_state': self.random_state,
+                'subsample': self.subsample,
             }, f)
 
         print(f"[FeatureNormalizer] ✓ 归一化器已保存到: {path}")
@@ -369,7 +439,8 @@ class FeatureNormalizer:
         normalizer = cls(
             output_distribution=data['output_distribution'],
             n_quantiles=data['n_quantiles'],
-            random_state=data['random_state']
+            random_state=data['random_state'],
+            subsample=data.get('subsample')   # 旧 pkl 无此键：其 pipeline 已自带 subsample
         )
 
         normalizer.pipelines = data['pipelines']
@@ -1835,9 +1906,18 @@ def fit_feature_normalizer(output_path=None):
     print("\n[步骤2] 创建特征归一化器...")
     print(f"  输出分布: {DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION}")
     print(f"  分位数数量: {DataConfig.NORMALIZER_N_QUANTILES}")
+    window_bytes = DataConfig.CONTEXT_LENGTH * ModelConfig.INPUT_DIM * 4
+    mem_cap = int(DataConfig.NORMALIZER_FIT_MEMORY_GB * (1024 ** 3) / (window_bytes * 1.5))
+    print(f"  窗口预算: {DataConfig.NORMALIZER_FIT_WINDOWS:,} 个，"
+          f"内存上限 {DataConfig.NORMALIZER_FIT_MEMORY_GB:.1f}GB "
+          f"(≈{mem_cap:,} 个窗口)，实际取 {min(DataConfig.NORMALIZER_FIT_WINDOWS, mem_cap):,}")
 
     normalizer = FeatureNormalizer(
-    output_distribution=DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION,n_quantiles=DataConfig.NORMALIZER_N_QUANTILES)
+        output_distribution=DataConfig.NORMALIZER_OUTPUT_DISTRIBUTION,
+        n_quantiles=DataConfig.NORMALIZER_N_QUANTILES,
+        random_state=DataConfig.RANDOM_SEED,
+        subsample=DataConfig.NORMALIZER_SUBSAMPLE,
+    )
 
     print("\n[步骤3] 在训练集上拟合归一化器...")
     normalizer.fit(train_stock_info)

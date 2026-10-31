@@ -417,15 +417,26 @@ Pipeline([
 python src/data.py
 ```
 
-可选参数：
-```bash
-python src/data.py --output-distribution uniform   # 使用均匀分布
-python src/data.py --n-quantiles 500               # 调整分位数数量
-```
+**拟合样本**：进入训练集的全部股票（与训练用同一批股票）在训练区间
+（2016-01-01 ~ 2022-12-31）内的窗口。
+全池按统一比例抽样，默认目标 100 万个窗口（每个窗口 45 天 × 18 列），
+实际取 `NORMALIZER_FIT_WINDOWS` 与内存上限（`NORMALIZER_FIT_MEMORY_GB`）中的较小者。
+每只股票按自身可用的训练窗口数等比例贡献，保底 1 个，保证每只有效股票都参与拟合，
+预算也不会被代码序靠前的少数股票吃光。
+
+采样方式为**时间分层 + 箱内随机**：把一只股票的名额对应的窗口序列切成等宽的箱，
+每个箱内随机取一个窗口。箱保证窗口在训练时间轴上均匀铺开，避免相邻窗口 44/45 天
+重叠带来的冗余；箱内随机保证没有固定相位，不会与星期几、月初月末、季度等日历周期
+对齐。可用训练窗口总量不足预算时直接使用全部窗口。
+
+`QuantileTransformer` 的 `subsample` 默认为 `None`（用收集到的全部值估分位）。
+若设成整数，它会在拟合时再随机抽这么多个**值**，把上层的分层采样效果抹掉。
 
 **关键**：只在训练集上拟合，避免数据泄漏。
 
 **输出**：`./src/normalizer.pkl`
+
+分位数数量、输出分布、窗口预算、内存上限、文件路径等参数在 [config.py: `DataConfig`](../src/config.py) 中修改（见下节）。
 
 ### 配置参数
 
@@ -435,7 +446,10 @@ python src/data.py --n-quantiles 500               # 调整分位数数量
 NORMALIZER_OUTPUT_DISTRIBUTION = 'normal'   # 'normal' (标准正态) 或 'uniform' (均匀分布)
 NORMALIZER_N_QUANTILES = 1000               # 分位数数量
 NORMALIZER_PATH = './src/normalizer.pkl'    # 归一化器文件路径
-MA_WINDOW = 10                              # 量能/换手率相对均值的滑动窗口大小
+NORMALIZER_FIT_WINDOWS = 1_000_000          # 拟合窗口预算
+NORMALIZER_FIT_MEMORY_GB = 6.0              # 拟合峰值内存上限（GB）
+NORMALIZER_SUBSAMPLE = None                 # None=用全部值估分位
+MA_WINDOW = 10                              # 成交量相对均值的滑动窗口大小
 ```
 
 ### 训练时自动加载

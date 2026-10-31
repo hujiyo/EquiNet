@@ -163,6 +163,18 @@ class DataConfig:
     NORMALIZER_OUTPUT_DISTRIBUTION = 'normal'  # 'normal' (标准正态) 或 'uniform' (均匀分布)
     NORMALIZER_N_QUANTILES = 1000            # 分位数数量（越大越精确但越慢）
     NORMALIZER_PATH = os.path.join(SRC_DIR, 'normalizer.pkl')
+
+    # 拟合分位数所用的窗口数上限。每只有效股票至少贡献 1 个窗口，故实际值可略超。
+    # 窗口按「每只股票内部时间分层、箱内随机取一点」抽取（见 data.py），
+    # 既在时间轴上铺开、又不存在可被日历周期对齐的固定相位。
+    NORMALIZER_FIT_WINDOWS = 1_000_000
+    # 拟合阶段允许的峰值内存（GB）。峰值约为采集量的 1.5 倍（逐组拼接 +
+    # QuantileTransformer 内部 float64 拷贝），1M 窗口约 3.2GB 采集量、峰值约 4.9GB。
+    NORMALIZER_FIT_MEMORY_GB = 6.0
+    # QuantileTransformer 的 subsample：None = 用传入的全部值估分位。
+    # 设成整数会再随机抽这么多个「值」——窗口数 × 45 远大于它时，
+    # 上层的分层抽样会白做（等于又退回纯随机）。
+    NORMALIZER_SUBSAMPLE = None
     # 归一化的并发线程数。归一化是逐元素映射，只影响启动耗时，不改变任何一个数值；
     # 设 1 即单线程。启动阶段的时间几乎全花在这里，线程给少了启动慢，
     # 给多了收益会饱和（受内存带宽限制，8 → 16 线程只快约一成）。

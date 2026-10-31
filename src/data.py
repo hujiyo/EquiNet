@@ -480,6 +480,39 @@ def process_single_file(args):
         print(f"处理股票 {stock_code} 时出错: {e}")
         return None
 
+def load_pool_gap_ranges(db_path=None, pool=None):
+    """
+    池区间之间的断档：池按日期区间 JOIN，落在区间外的行不进内存，序列因此首尾相接。
+
+    返回 {股票代码: [(前段止, 后段起), ...]}，两端都是**开区间边界**，
+    即 (前段止, 后段起) 之间的行情行曾被池剔除过。
+
+    只有 pit 池有区间概念；selected 池整段历史全取，不存在断档。
+    """
+    pool = pool or CURRENT_POOL
+    if pool != 'pit':
+        return {}
+    import sqlite3
+    db_path = db_path or DataConfig.DB_PATH
+    con = sqlite3.connect(f'file:{db_path.replace(chr(92), "/")}?mode=ro', uri=True)
+    try:
+        df = pd.read_sql_query(
+            "SELECT stock_code, start_date, end_date FROM pool_membership "
+            "WHERE start_date > 0 ORDER BY stock_code, start_date", con)
+    finally:
+        con.close()
+
+    out = {}
+    for code, g in df.groupby('stock_code', sort=False):
+        starts = g['start_date'].to_numpy()
+        ends = g['end_date'].to_numpy()
+        pairs = [(int(ends[i]), int(starts[i + 1]))
+                 for i in range(len(starts) - 1) if ends[i] < starts[i + 1]]
+        if pairs:
+            out[code] = pairs
+    return out
+
+
 def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
                              train_start_date=DataConfig.TRAIN_START_DATE,
                              train_end_date=DataConfig.TRAIN_END_DATE,
@@ -577,7 +610,13 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
     val_stock_info = []
     test_stock_info = []
 
+    # 池区间断档：区间外的行被 JOIN 过滤掉，序列会拼接，跨越接缝的窗口必须丢弃。
+    pool_gaps = load_pool_gap_ranges(db_path)
+    n_gap_stocks = sum(1 for c in stock_codes if c in pool_gaps)
+    print(f"池区间断档: {n_gap_stocks} 只股票有接缝（这些股票跨越接缝的窗口会被丢弃）")
+
     for stock_info in all_stock_info:
+        gaps = pool_gaps.get(stock_info['file_name'], ())
         train_stock_info.append({
             'file_name': stock_info['file_name'],
             'data': stock_info['train_data'],
@@ -585,6 +624,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
             'train_start_idx': stock_info['train_start_idx'],
             'train_end_idx': stock_info['train_end_idx'],
             'times': stock_info['times'],
+            'pool_gap_ranges': gaps,
         })
 
         # 只有当验证集有数据时才添加（val_split_point < test_split_point）
@@ -598,6 +638,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
                 'val_split_point': val_sp,
                 'test_split_point': test_sp,
                 'times': stock_info['times'],
+                'pool_gap_ranges': gaps,
             })
 
         test_stock_info.append({
@@ -607,6 +648,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
             'test_split_point': stock_info['test_split_point'],
             'test_end_point': stock_info['test_end_point'],
             'times': stock_info['times'],
+            'pool_gap_ranges': gaps,
         })
 
     print(f"训练集: {len(train_stock_info)} 只股票")
@@ -1479,6 +1521,18 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
             excluded_arr = np.fromiter(excluded_market_dates, dtype=times_arr.dtype)
             extreme_mask = np.any(np.isin(future_dates, excluded_arr), axis=1)
             valid &= ~extreme_mask
+
+    # 池区间断档：区间外的行被 JOIN 剔除，序列首尾相接，接缝两侧的"相邻两天"其实隔了
+    # 几个月甚至几年。整个采样窗口（上下文 + 标签的未来几天）必须落在一段连续区间内。
+    # 不能用"日期间隔"判定：普通停牌也会让日期跳，而复牌跳空是明确保留的正常事件。
+    gap_ranges = stock_info.get('pool_gap_ranges')
+    if gap_ranges:
+        times_arr = np.asarray(stock_info['times'])
+        T_time = len(times_arr)
+        w_start = times_arr[np.clip(all_starts - 1, 0, T_time - 1)]
+        w_end = times_arr[np.clip(all_starts + required_length - 1, 0, T_time - 1)]
+        for gap_left, gap_right in gap_ranges:
+            valid &= ~((w_start < gap_right) & (w_end > gap_left))
 
     if not np.any(valid):
         return None, None, None, None, None, None, None

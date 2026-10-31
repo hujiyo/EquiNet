@@ -145,11 +145,12 @@ SAMPLE_SELECT_SQL = ', '.join(
     f'sd.{_SAMPLE_SOURCE[c]} AS {c}' for c in SAMPLE_COLUMNS
 )
 
-# `src/data.py` 归一到 ModelConfig.INPUT_DIM 维输入后，前 15 列就是上面这些
-# （close_raw 只作过滤基准），再追加 wick_up / wick_dn / body_ratio 三列 K 线形态占比。
+# `src/data.py` 归一到 ModelConfig.INPUT_DIM 维输入后，前 `len(SAMPLE_COLUMNS) - 1`
+# 列就是上面这些（`close_raw` 只作过滤基准），再追加 wick_up / wick_dn / body_ratio
+# 三列 K 线形态占比。
 # 换手率是成交量的派生量（volume / 流通股本），窗口内与成交量只差一个常数，
-# 因此不进模型输入。
-MODEL_INPUT_DIM = 18
+# 因此不进模型输入。维度由列清单派生，不手写 18，避免加列后切片静默错位。
+MODEL_INPUT_DIM = len(SAMPLE_COLUMNS) - 1 + 3
 
 
 # ==================== 排除策略：哪些问题驱动「样本排除」 ====================

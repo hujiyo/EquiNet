@@ -17,10 +17,11 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 
 from config import (ModelConfig, DataConfig, DeviceConfig, LossConfig,
-                    SAMPLE_COLUMNS, SAMPLE_SELECT_SQL, CLOSE_RAW_IDX)
+                    SAMPLE_COLUMNS, SAMPLE_SELECT_SQL, CLOSE_RAW_IDX, pool_join_sql)
 from model import create_model
-from data import (load_and_preprocess_data, create_fixed_evaluation_dataset,FeatureNormalizer,
-                  create_recent_days_dataset, normalize_and_validate_context_window)
+from data import (load_and_preprocess_data, create_fixed_evaluation_dataset, FeatureNormalizer,
+                  create_recent_days_dataset, normalize_and_validate_context_window,
+                  load_pool_gap_ranges)
 from training_utils import evaluate_model, create_eval_criterion, _get_amp_context
 
 
@@ -224,21 +225,31 @@ def generate_latest_input(stock_data, file_name, feature_normalizer=None):
 
 def load_all_stock_data(db_path=DataConfig.DB_PATH):
     """
-    加载所有股票原始数据（用于选股推理）
-    从 SQLite 数据库读取训练池(selected)中的股票。
+    加载所有股票最近的数据（用于选股推理）
+
+    与训练共用同一个池口径（contract.CURRENT_POOL）；每只股票只取最近
+    CONTEXT_LENGTH + MA_WINDOW + 5 行 —— 推理只消费最后 45 天，再往前留出
+    前收基准日与成交量均线回看，把整段历史读进内存纯属浪费。
+    退池/停牌的股票（最后一行早于最新交易日）与最近窗口跨池接缝的股票会被跳过。
 
     返回: [(stock_code, data_array, latest_date, times_array), ...]
     """
     import pandas as pd
     import sqlite3
 
+    # 上下文 45 + 前收 1 + 成交量均线回看 10，再留 5 行余量
+    recent_rows = DataConfig.CONTEXT_LENGTH + DataConfig.MA_WINDOW + 5
     conn = sqlite3.connect(db_path)
     try:
-        query = f"""SELECT sd.stock_code, sd.date, {SAMPLE_SELECT_SQL}
-                   FROM stock_daily sd
-                   JOIN stock_pool sp ON sd.stock_code = sp.stock_code
-                   WHERE sp.pool_type='selected' AND sp.is_active=1
-                   ORDER BY sd.stock_code, sd.date ASC"""
+        query = f"""SELECT * FROM (
+                        SELECT sd.stock_code, sd.date, {SAMPLE_SELECT_SQL},
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY sd.stock_code ORDER BY sd.date DESC
+                               ) AS rn
+                        FROM stock_daily sd
+                        {pool_join_sql('sd')}
+                    ) WHERE rn <= {recent_rows}
+                    ORDER BY stock_code, date ASC"""
         df = pd.read_sql_query(query, conn)
     finally:
         conn.close()
@@ -247,11 +258,33 @@ def load_all_stock_data(db_path=DataConfig.DB_PATH):
     if len(df) == 0:
         return stock_list
     cols = list(SAMPLE_COLUMNS)
+    pool_gaps = load_pool_gap_ranges(db_path)
+    latest_market_date = df['date'].max()   # 全体股票里的最新交易日
+    skipped_stale = 0
+    skipped_gap = 0
     for stock_code, group in df.groupby('stock_code', sort=False):
+        # 只保留"最新交易日仍在池内且有行情"的股票：退池/停牌的股票最后一行早于最新日，
+        # 拿它去打分等于用几个月前的窗口冒充今天的候选。
+        if group['date'].iloc[-1] != latest_market_date:
+            skipped_stale += 1
+            continue
         data = group[cols].values
-        latest_date = str(group['date'].iloc[-1])
         times = group['date'].values
+        # 最近窗口若跨池接缝（被池剔除后重新入池），序列是拼接出来的，不能拿去打分。
+        # 判定口径与训练一致：[s - MA_WINDOW, 末尾] 整段落在一段池区间内。
+        s = len(times) - DataConfig.CONTEXT_LENGTH
+        need_start = times[max(0, s - DataConfig.MA_WINDOW)]
+        need_end = times[-1]
+        if any(need_start < right and need_end > left
+               for left, right in pool_gaps.get(stock_code, ())):
+            skipped_gap += 1
+            continue
+        latest_date = str(latest_market_date)
         stock_list.append((stock_code, data, latest_date, times))
+    if skipped_stale:
+        print(f"  跳过 {skipped_stale} 只不在最新交易日（停牌/已退池）的股票")
+    if skipped_gap:
+        print(f"  跳过 {skipped_gap} 只最近窗口跨池接缝的股票")
     return stock_list
 
 

@@ -21,14 +21,15 @@
 └──────────────────────────────────┬───────────────────────────────────────┘
                                    ↓
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  SQLite 数据库 stock_daily 表 (17列)                                     │
-│  date, open, high, low, close, amount, volume, exchange, vwap,           │
-│  m5, m10, m20, dif, dea, macd_hist, bb_upper, bb_lower                   │
+│  SQLite 数据库 stock_daily 表 (26列)                                     │
+│  OHLC、amount / volume / exchange / vwap、m5/m10/m20、MACD、布林带、     │
+│  后复权价（*_adj）、close_raw、adj_factor 等                             │
 └──────────────────────────────────┬───────────────────────────────────────┘
                                    ↓
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  src/data.py · 粗处理 (coarse normalization)                             │
-│  从16列中取15列（去掉 date 和 close_raw），转换为去量纲的变化率/偏离度   │
+│  从 16 列样本（SAMPLE_COLUMNS）中取 15 列（去掉 close_raw；date 单独     │
+│  用于切分），转换为去量纲的变化率/偏离度                                 │
 │  输出 [45, 18]                                                           │
 └──────────────────────────────────┬───────────────────────────────────────┘
                                    ↓
@@ -218,32 +219,35 @@ ema[0] = mean(prices[:window])  # 前 window 个点的简单平均
 
 ---
 
-## 第三步：数据库完整表结构
+## 第三步：模型输入列（契约 `SAMPLE_COLUMNS`）
 
-经过前两步，数据库 `stock_daily` 表有 17 列：
+数据库 `stock_daily` 表本身有 26 列（含后复权价、`adj_factor`、`updated_at` 等）；
+下游样本矩阵只取其中 16 列，列名与顺序由 `data_maintenance/contract.py` 的
+`SAMPLE_COLUMNS` 唯一固定 —— 价格列取后复权（`*_adj`），`close_raw` 取不复权收盘价：
 
-| 列号 | 列名 | 类型 | 来源 | 说明 |
-|------|------|------|------|------|
-| - | `date` | INTEGER | API | 日期 YYYYMMDD（主键之一，不参与训练） |
-| 0 | `open` | REAL | API | 开盘价（元） |
-| 1 | `high` | REAL | API | 最高价（元） |
-| 2 | `low` | REAL | API | 最低价（元） |
-| 3 | `close` | REAL | API | 收盘价（元） |
-| 4 | `amount` | REAL | API | 成交额（元） |
-| 5 | `volume` | REAL | API | 成交量（股，模型第 5 列输入） |
-| 6 | `exchange` | REAL | API | 换手率（%） |
-| 7 | `vwap` | REAL | 计算 | amount/volume |
-| 8 | `m5` | REAL | 衍生 | (close-MA5)/MA5 |
-| 9 | `m10` | REAL | 衍生 | (close-MA10)/MA10 |
-| 10 | `m20` | REAL | 衍生 | (close-MA20)/MA20 |
-| 11 | `dif` | REAL | 衍生 | (EMA12-EMA26)/close |
-| 12 | `dea` | REAL | 衍生 | EMA9(DIF)/close |
-| 13 | `macd_hist` | REAL | 衍生 | 2*(DIF-DEA)/close |
-| 14 | `bb_upper` | REAL | 衍生 | (close-UPPER)/close |
-| 15 | `bb_lower` | REAL | 衍生 | (LOWER-close)/close |
-| - | `updated_at` | TEXT | 自动 | 更新时间戳 |
+| 下标 | 列名 | 数据库来源 | 说明 |
+|------|------|-----------|------|
+| 0 | `open` | `open_adj` | 后复权开盘价 |
+| 1 | `high` | `high_adj` | 后复权最高价 |
+| 2 | `low` | `low_adj` | 后复权最低价 |
+| 3 | `close` | `close_adj` | 后复权收盘价（模型输入基准） |
+| 4 | `vwap` | `vwap_adj` | 后复权成交量加权均价 |
+| 5 | `volume` | `volume` | 成交量（股），模型第 5 列输入 |
+| 6 | `m5` | `m5` | (close-MA5)/MA5 |
+| 7 | `m10` | `m10` | (close-MA10)/MA10 |
+| 8 | `m20` | `m20` | (close-MA20)/MA20 |
+| 9 | `dif` | `dif` | (EMA12-EMA26)/close |
+| 10 | `dea` | `dea` | EMA9(DIF)/close |
+| 11 | `macd_hist` | `macd_hist` | 2*(DIF-DEA)/close |
+| 12 | `macd_hist_diff` | `macd_hist_diff` | hist[t]-hist[t-1] |
+| 13 | `bb_upper` | `bb_upper` | (close-UPPER)/close |
+| 14 | `bb_lower` | `bb_lower` | (LOWER-close)/close |
+| 15 | `close_raw` | `close` | **不复权**收盘价，仅供高价股过滤 |
 
-> **注意**：模型输入取 `open`…`bb_lower` 中去掉 `exchange` 的 15 列，再追加 3 列 K 线形态占比（wick_up / wick_dn / body_ratio），共 18 维。`date` 仅用于数据分割和标签计算；`close_raw`（不复权收盘价）仅用于高价股过滤；`exchange` 留在库里但不再进模型输入（换手率是成交量的派生量）。
+> **注意**：模型输入取下标 0–14 的 15 列，再追加 3 列 K 线形态占比
+> （wick_up / wick_dn / body_ratio），共 18 维。`date` 不在样本矩阵里，单独用于数据分割和
+> 标签计算；`close_raw` 只作过滤基准；`amount` / `exchange` 留在库里（市值、换手率口径等），
+> 但不再进模型输入 —— 换手率是成交量的派生量。
 
 ---
 
@@ -382,11 +386,11 @@ Pipeline([
 
 | 模型列号 | 最终特征名 | API 原始字段 | 衍生计算 | 粗处理 | 细处理 Pipeline |
 |---------|-----------|-------------|---------|--------|----------------|
-| 0 | Open | `open` | — | (open-close₁)/close₁, clip | ohl_pipeline |
-| 1 | High | `high` | — | (high-close₁)/close₁, clip | ohl_pipeline |
-| 2 | Low | `low` | — | (low-close₁)/close₁, clip | ohl_pipeline |
-| 3 | Close | `close` | — | (close-close₁)/close₁, clip | ohl_pipeline |
-| 4 | VWAP | `vwap` | amount/volume | (vwap-close)/close, clip | vwap_pipeline |
+| 0 | Open | `open` | — | (open-close₁)/close₁, clip | open |
+| 1 | High | `high` | — | (high-close₁)/close₁, clip | high |
+| 2 | Low | `low` | — | (low-close₁)/close₁, clip | low |
+| 3 | Close | `close` | — | (close-close₁)/close₁, clip | close |
+| 4 | VWAP | `vwap` | amount/volume | (vwap-close)/close, clip | vwap |
 | 5 | 成交量 | `volume` | — | (volume-MA₁₀)/MA₁₀ | volume |
 | 6 | MA5 | `close` | (close-MA5)/MA5 | 直传 | m5 |
 | 7 | MA10 | `close` | (close-MA10)/MA10 | 直传 | m10 |

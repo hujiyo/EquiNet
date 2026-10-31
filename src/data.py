@@ -480,36 +480,37 @@ def process_single_file(args):
         print(f"处理股票 {stock_code} 时出错: {e}")
         return None
 
-def load_pool_gap_ranges(db_path=None, pool=None):
+def load_pool_gap_ranges(db_path=None):
     """
     池区间之间的断档：池按日期区间 JOIN，落在区间外的行不进内存，序列因此首尾相接。
 
-    返回 {股票代码: [(前段止, 后段起), ...]}，两端都是**开区间边界**，
-    即 (前段止, 后段起) 之间的行情行曾被池剔除过。
+    返回 {股票代码: [(前段最后一天, 后段第一天), ...]}，两者之间的行情行曾被池剔除过。
 
     只有 pit 池有区间概念；selected 池整段历史全取，不存在断档。
     """
-    pool = pool or CURRENT_POOL
-    if pool != 'pit':
+    if CURRENT_POOL != 'pit':
         return {}
     import sqlite3
     db_path = db_path or DataConfig.DB_PATH
     con = sqlite3.connect(f'file:{db_path.replace(chr(92), "/")}?mode=ro', uri=True)
     try:
-        df = pd.read_sql_query(
-            "SELECT stock_code, start_date, end_date FROM pool_membership "
-            "WHERE start_date > 0 ORDER BY stock_code, start_date", con)
+        # 同一只股票按开始日期排序，前一段的结束日 < 后一段的开始日 就是接缝；
+        # 之间的行情行被池区间过滤掉了，数组里前后两段会直接相邻。
+        rows = con.execute(
+            "SELECT stock_code, prev_end, start_date FROM ("
+            "    SELECT stock_code, start_date,"
+            "           LAG(end_date) OVER ("
+            "               PARTITION BY stock_code ORDER BY start_date"
+            "           ) AS prev_end"
+            "    FROM pool_membership WHERE start_date > 0"
+            ") WHERE prev_end IS NOT NULL AND prev_end < start_date"
+        ).fetchall()
     finally:
         con.close()
 
     out = {}
-    for code, g in df.groupby('stock_code', sort=False):
-        starts = g['start_date'].to_numpy()
-        ends = g['end_date'].to_numpy()
-        pairs = [(int(ends[i]), int(starts[i + 1]))
-                 for i in range(len(starts) - 1) if ends[i] < starts[i + 1]]
-        if pairs:
-            out[code] = pairs
+    for code, prev_end, start in rows:
+        out.setdefault(code, []).append((int(prev_end), int(start)))
     return out
 
 
@@ -611,7 +612,8 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
     test_stock_info = []
 
     # 池区间断档：区间外的行被 JOIN 过滤掉，序列会拼接，跨越接缝的窗口必须丢弃。
-    pool_gaps = load_pool_gap_ranges(db_path)
+    # max_stocks 冒烟模式退化成「按代码取 N 只 + 全历史」，数组里没有拼接，不能套这层过滤。
+    pool_gaps = {} if max_stocks else load_pool_gap_ranges(db_path)
     n_gap_stocks = sum(1 for c in stock_codes if c in pool_gaps)
     print(f"池区间断档: {n_gap_stocks} 只股票有接缝（这些股票跨越接缝的窗口会被丢弃）")
 
@@ -1319,17 +1321,20 @@ def normalize_and_validate_context_window(stock_data, start_idx, context_length,
     input_seq[:, 2] = (input_seq_raw[:, 2] - opens) / safe_opens
 
     # wick_up / wick_dn / body_ratio：标准影线占比（K线解剖形态域，新增列）
+    # 三列都在 float64 下算完再写进 float32 的 input_seq：body_ratio 若在写入后
+    # 用 float32 的 wick 反算，会和向量化路径（float64 算完再 cast）差 1 ulp，
+    # 经分位数变换放大后约 0.03 个标准差。
     closes_arr = input_seq_raw[:, 3]
     ranges = input_seq_raw[:, 1] - input_seq_raw[:, 2]
     degenerate = ~(ranges > safe_opens * 1e-6)     # 一字板/浮点级噪声振幅
     safe_rng = np.where(degenerate, 1.0, ranges)
-    wick_up = np.where(degenerate, 0.0,
-                       (input_seq_raw[:, 1] - np.maximum(opens, closes_arr)) / safe_rng)
-    wick_dn = np.where(degenerate, 0.0,
-                       (np.minimum(opens, closes_arr) - input_seq_raw[:, 2]) / safe_rng)
-    input_seq[:, 15] = np.clip(wick_up, 0.0, 1.0)
-    input_seq[:, 16] = np.clip(wick_dn, 0.0, 1.0)
-    input_seq[:, 17] = np.clip(1.0 - input_seq[:, 15] - input_seq[:, 16], 0.0, 1.0)
+    wick_up = np.clip(np.where(degenerate, 0.0,
+                       (input_seq_raw[:, 1] - np.maximum(opens, closes_arr)) / safe_rng), 0.0, 1.0)
+    wick_dn = np.clip(np.where(degenerate, 0.0,
+                       (np.minimum(opens, closes_arr) - input_seq_raw[:, 2]) / safe_rng), 0.0, 1.0)
+    input_seq[:, 15] = wick_up
+    input_seq[:, 16] = wick_dn
+    input_seq[:, 17] = np.clip(1.0 - wick_up - wick_dn, 0.0, 1.0)
 
     # VWAP: 相对当日收盘价的偏离（捕捉盘中均价与收盘价的关系）
     # > 0: 均价高于收盘 → 盘中强势但尾盘回落（抛压）
@@ -1523,13 +1528,17 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
             valid &= ~extreme_mask
 
     # 池区间断档：区间外的行被 JOIN 剔除，序列首尾相接，接缝两侧的"相邻两天"其实隔了
-    # 几个月甚至几年。整个采样窗口（上下文 + 标签的未来几天）必须落在一段连续区间内。
+    # 几个月甚至几年。整个读取范围必须落在一段连续区间内：
+    #   [窗口起点前 ma_window 天, 窗口末尾] = [s - ma_window, s + required_length - 1]
+    # 左端取 s - ma_window 而不是 s - 1：成交量均线要回看 s-ma_window ~ s-1，是唯一
+    # 读到窗口之外的特征。只用 s-1 会让接缝后第 1~ma_window-1 天起步的窗口留下
+    # "均线混着几个月前成交量"的样本。
     # 不能用"日期间隔"判定：普通停牌也会让日期跳，而复牌跳空是明确保留的正常事件。
     gap_ranges = stock_info.get('pool_gap_ranges')
     if gap_ranges:
         times_arr = np.asarray(stock_info['times'])
         T_time = len(times_arr)
-        w_start = times_arr[np.clip(all_starts - 1, 0, T_time - 1)]
+        w_start = times_arr[np.clip(all_starts - ma_window, 0, T_time - 1)]
         w_end = times_arr[np.clip(all_starts + required_length - 1, 0, T_time - 1)]
         for gap_left, gap_right in gap_ranges:
             valid &= ~((w_start < gap_right) & (w_end > gap_left))
@@ -1592,32 +1601,31 @@ def _vectorized_process_stock(stock_info, stock_idx, context_length, future_days
 
     abs_idx = vs[:, None] + offsets[None, :]
 
-    for col in [5]:
-        full_col = stock_data[:, col].astype(np.float64)
-        cs = np.empty(T + 1, dtype=np.float64)
-        cs[0] = 0
-        np.cumsum(full_col, out=cs[1:])
+    # 成交量(col 5)：相对前 ma_window 日均值的变化率（允许向右侧借数据补足窗口）
+    full_col = stock_data[:, 5].astype(np.float64)
+    cs = np.empty(T + 1, dtype=np.float64)
+    cs[0] = 0
+    np.cumsum(full_col, out=cs[1:])
 
-        left = np.maximum(abs_idx - ma_window, 0)
-        deficit = ma_window - (abs_idx - left)
+    left = np.maximum(abs_idx - ma_window, 0)
+    deficit = ma_window - (abs_idx - left)
 
-        # 历史区间 [left, abs_idx) 的和
-        hist_sum = cs[abs_idx] - cs[left]
-        # 借未来区间 [abs_idx+1, abs_idx+1+deficit) 的和，跳过当前日
-        # deficit==0 时区间为空，future_sum 自动为 0，退化为纯历史均值
-        future_end = np.minimum(abs_idx + 1 + deficit, T)
-        future_sum = cs[future_end] - cs[abs_idx + 1]
+    # 历史区间 [left, abs_idx) 的和
+    hist_sum = cs[abs_idx] - cs[left]
+    # 借未来区间 [abs_idx+1, abs_idx+1+deficit) 的和，跳过当前日
+    # deficit==0 时区间为空，future_sum 自动为 0，退化为纯历史均值
+    future_end = np.minimum(abs_idx + 1 + deficit, T)
+    future_sum = cs[future_end] - cs[abs_idx + 1]
 
-        # 始终除以 ma_window（凑满N天的语义，与标量版一致）
-        ma_vals = (hist_sum + future_sum) / ma_window
+    # 始终除以 ma_window（凑满N天的语义，与标量版一致）
+    ma_vals = (hist_sum + future_sum) / ma_window
 
-        raw_vals = raw_w[:, :, col]
-        safe_ma = np.where(ma_vals > 0, ma_vals, 1.0)
-        input_seqs[:, :, col] = ((raw_vals - ma_vals) / safe_ma).astype(np.float32)
+    safe_ma = np.where(ma_vals > 0, ma_vals, 1.0)
+    input_seqs[:, :, 5] = ((raw_w[:, :, 5] - ma_vals) / safe_ma).astype(np.float32)
 
-        invalid_ma = ~np.isfinite(ma_vals) | (ma_vals <= 0)
-        row_bad = np.any(invalid_ma, axis=1)
-        input_seqs[row_bad] = np.nan
+    invalid_ma = ~np.isfinite(ma_vals) | (ma_vals <= 0)
+    row_bad = np.any(invalid_ma, axis=1)
+    input_seqs[row_bad] = np.nan
 
     # m5/m10/m20、MACD 四列、布林带两列：数据库中已预计算，列位与原始列一一对应（第 6-14 列直传）
     input_seqs[:, :, 6:15] = raw_w[:, :, 6:15]

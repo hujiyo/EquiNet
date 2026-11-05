@@ -21,71 +21,76 @@
 ## 目录结构
 
 ```
-EquiNet/
-├── out/                       # 模型权重输出
-├── data_maintenance/          # 数据维护工具包
-│   ├── equinet.db             # SQLite 数据库
-│   └── ...                    # 其他模块
+EquiNet/                       # 本仓库：只做模型与训练
+├── out/                       # 模型权重与评估产物
 ├── src/
-│   ├── config.py              # 统一配置文件
+│   ├── config.py              # 统一配置（含外部数据仓库路径）
 │   ├── model.py               # 模型架构（Post-Norm Transformer）
 │   ├── train.py               # 主训练脚本（单阶段端到端）
 │   ├── run.py                 # 推理 / 选股 / 全区间回测脚本
 │   └── ...                    # 其他模块
-├── data_maintenance.py        # 数据维护工具入口
 ├── docs/                      # 技术文档
 ├── LICENSE                    # Apache-2.0许可证
 └── README.md
+
+equinet-data-manager/          # 独立仓库：行情库 + 维护工具（默认同级目录）
+├── data/
+│   ├── equinet.db             # SQLite 行情库
+│   └── backup/                # 数据库备份
+├── equinet_data_manager/      # 维护工具包（契约 / 更新 / 审计 / 自检）
+└── pyproject.toml
 ```
 
 ## 数据架构说明
 
-数据存储采用 SQLite 单数据库（`data_maintenance/equinet.db`），通过股票池（pool）机制管理：
+行情库是**独立的仓库 `equinet-data-manager`**，EquiNet 只读它、不维护它。
+EquiNet 侧用一行路径定位数据，其余全部由它派生：
+
+```python
+DATA_MANAGER_ROOT = os.path.join(os.path.dirname(PROJECT_ROOT), 'equinet-data-manager')
+DB_PATH = os.path.join(DATA_MANAGER_ROOT, 'data', 'equinet.db')
+```
+
+也就是说，**EquiNet 只要知道 equinet-data-manager 在哪**就能正常跑。数据仓库专职为
+EquiNet 服务；将来别的项目要用同一份副本数据，也指向这个目录即可。
+
+数据通过股票池（pool）机制管理：
 
 - **全量池 (all)**：所有 A 股行情数据
 - **训练池 (selected)**：经筛选后用于训练的股票子集
+- **PIT 池 (pit)**：逐日判定入池资格，当前生效池
 
 ### 数据库表结构
 
-- `stock_daily`：日行情数据（stock_code, date, OHLCV, exchange, vwap, m5, m10, m20）
+- `stock_daily`：日行情数据（stock_code, date, OHLCV, exchange, vwap, m5, m10, m20, 后复权列）
 - `stock_pool`：股票池管理（stock_code, pool_type, is_active）
 - `stock_metadata`：股票元信息（stock_code, stock_name, market, is_st, market_cap）
 
-> 数据维护（`data_maintenance/`）与数据使用（`src/`）完全隔离。`src/` 通过 SQLite 只读查询获取训练数据。
+> 数据维护与数据使用完全隔离：写入只发生在 `equinet-data-manager`，`src/` 通过 SQLite 只读查询获取训练数据。
 
 ## 数据管理
 
-通过 `data_maintenance.py` 交互式工具管理全部数据操作：
-采用两级池架构：全量股票池→ 筛选训练数据池
+数据维护的一切操作（更新 / 筛选 / 质检 / 审计 / PIT 池 / 自检）都在 `equinet-data-manager` 仓库里：
 
 ```bash
-python data_maintenance.py
+cd ../equinet-data-manager
+python -m equinet_data_manager          # 交互式菜单
+python -m equinet_data_manager.selfcheck --fast   # 数据前提自检
 ```
 
-菜单功能：
-
-| 选项 | 功能 | 说明 |
-|------|------|------|
-| 0. SQL 控制台 | 手动执行 SQL | 用于调试和自定义查询 |
-| 1. 更新数据 | 从外部数据源同步行情 | 支持增量 / 全量 / 训练池更新 |
-| 2. 筛选股票 | 全量池 → 训练池 | 主板 + 排除ST + 活跃度 + 市值筛选 |
-| 3. 检查数据质量 | 完整性验证与自动修复 | 缺失补拉、价格校验、OHLC逻辑检查 |
-| 4. 计算特征 | 计算衍生特征 | 基于 `close_adj`（后复权）计算 MA/MACD/BB 共 9 列；基准列未物化时显式报错并自愈，绝不静默回退不复权价（详见 docs/data-quality-system.md §8） |
-| 5. 数据库状态 | 查看统计信息 | 股票数、数据量、日期范围等 |
-| 6. 备份数据库 | SQLite 内置备份 | 按时间戳保存到 data_maintenance/backup/ |
+本仓库不再包含数据维护代码；训练启动时会自动调用 `equinet_data_manager.selfcheck.prerequisites()`
+校验「审计范围 = 训练池、派生状态未过期、契约列存在」。
 
 ### 开始使用
 
 ```bash
-# 首次使用（从零开始）
-python data_maintenance.py       # 选项1: 全量更新 → 选项2: 筛选 → 选项4: 计算特征
-python src/market_index.py       # 生成 out/market_index.json（极端行情过滤的数据源）
+# 数据准备（仅在 equinet-data-manager 仓库里做）
+cd ../equinet-data-manager
+python -m equinet_data_manager   # 增量更新 → 离线审计 → PIT 池 → 自检
+cd - >/dev/null
 
-# 日常维护
-python data_maintenance.py       # 选项1: 增量更新 → 选项3: 检查质量
-python src/market_index.py       # 行情更新后重新生成市场宽度数据
-
-# 训练 & 推理
+# 训练 & 推理（本仓库）
+python src/market_index.py       # 可选：生成 out/market_index.json（极端行情过滤的数据源）
 python src/train.py
 python src/run.py
 ```

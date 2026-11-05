@@ -10,15 +10,22 @@ import torch
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SRC_DIR)
 
+# ==================== 数据仓库 ====================
+# 行情库和数据契约都在独立的 equinet-data-manager 仓库里。它是 EquiNet 的数据层，
+# 别的项目要用同一份副本数据，也指向这里即可。
+# 一行路径定位，不搞额外的间接层。
+DATA_MANAGER_ROOT = os.path.join(os.path.dirname(PROJECT_ROOT), 'equinet-data-manager')
+DB_PATH = os.path.join(DATA_MANAGER_ROOT, 'data', 'equinet.db')
+DB_BACKUP_DIR = os.path.join(DATA_MANAGER_ROOT, 'data', 'backup')
+if DATA_MANAGER_ROOT not in sys.path:
+    sys.path.insert(0, DATA_MANAGER_ROOT)
+
 # ==================== 数据契约 ====================
 # 采样几何 / 样本列语义 / 股票池口径 / 特征基准 / 并行度上限的**唯一事实来源**
-# 是 data_maintenance/contract.py。这里只做引用与断言，绝不复述数值。
-# 原因：这些数曾经在 config.py 与 quality.py 各写一份，改动任一处会让污染区间
-# 静默错位（且方向是「排漏」——脏数据照常进训练集，不报错）。
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from data_maintenance.contract import (  # noqa: E402
+# 是 equinet_data_manager/contract.py。这里只做引用与断言，绝不复述数值。
+# 原因：这些数曾经在两边各写一份，改动任一处会让污染区间静默错位
+# （且方向是「排漏」——脏数据照常进训练集，不报错）。
+from equinet_data_manager.contract import (  # noqa: E402
     SAMPLING, SAMPLE_COLUMNS, SAMPLE_SELECT_SQL, CLOSE_IDX, CLOSE_RAW_IDX,
     MODEL_INPUT_DIM, FEATURE_PRICE_COL, MAX_WORKERS, CURRENT_POOL,
     INFORMATIONAL_ISSUE_TYPES, is_exclusion_type,
@@ -28,14 +35,13 @@ from data_maintenance.contract import (  # noqa: E402
 # ==================== 数据参数 ====================
 class DataConfig:
     """数据相关参数"""
-    # SQLite 数据库配置
-    DB_PATH = os.path.join(PROJECT_ROOT, 'data_maintenance', 'equinet.db')
-    DB_BACKUP_DIR = os.path.join(PROJECT_ROOT, 'data_maintenance', 'backup')
+    # SQLite 数据库配置（只读访问，写入归 equinet-data-manager）
+    DB_PATH = DB_PATH
+    DB_BACKUP_DIR = DB_BACKUP_DIR
 
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out')
 
-    # 数据源配置
-    DATA_SOURCE = 'baostock'  # 'baostock' 或 'akshare'
+    # 数据源选择属于「怎么取数」，由 equinet-data-manager 持有，训练侧不再过问。
     # 池准入三项硬条件（市值区间/代码前缀）的定义处在 contract，消费方是
     # pit_pool.py 与 select.py —— 这里**不再转载**：曾写成
     # `MARKET_CAP_MAX = MARKET_CAP_MAX` 这种自赋值（RHS 落到模块全局，能跑，
@@ -67,7 +73,7 @@ class DataConfig:
     # 与要分辨的差异同量级，结论不可信。写进流程而不是文档，见 train.py。
     MIN_EVAL_DAYS = 250
     
-    # 样本生成参数（定义处：data_maintenance/contract.py:SAMPLING）
+    # 样本生成参数（定义处：equinet_data_manager/contract.py:SAMPLING）
     CONTEXT_LENGTH = SAMPLING.context_length   # 历史数据长度（核心参数）
     FUTURE_DAYS = SAMPLING.future_days         # 未来预测天数
     BUFFER_DAY = SAMPLING.buffer_days > 0      # 额外采集1天安全余量（用于跌停推迟判断）
@@ -130,7 +136,7 @@ class DataConfig:
     EVAL_BATCH_SIZE = 512
 
     # ========== 数据质量排除 ==========
-    # 离线审计（python -m data_maintenance.audit --write）产出的 `data_issues`
+    # 离线审计（python -m equinet_data_manager.audit --write）产出的 `data_issues`
     # 表记录「哪天有什么问题」（事实层）；训练加载时由
     # src/data.py:apply_quality_exclusions 用 contract.SAMPLING 把问题日
     # 换算成被污染的采样起始位置（决策层）。没有预先展开好的区间表 ——
@@ -141,11 +147,11 @@ class DataConfig:
     # True : 启用（推荐）。表不存在时自动跳过并打印提示，不影响训练
     # False: 忽略质量排除（退回旧行为）
     #
-    # 重新生成问题日：python -m data_maintenance.audit --write
+    # 重新生成问题日：python -m equinet_data_manager.audit --write
     EXCLUDE_DATA_ISSUE_SAMPLES = True
 
     # ========== 训练前自检 ==========
-    # DataConfig.STRICT_SELFCHECK: 训练启动前跑 data_maintenance.selfcheck 的快速档，
+    # DataConfig.STRICT_SELFCHECK: 训练启动前跑 equinet_data_manager.selfcheck 的快速档，
     # 校验「数据前提」是否还成立（审计范围=训练池、派生状态未过期、派生表只有一份表达）。
     #   True : 发现 error 直接中止训练（推荐）—— 这些错误都会静默污染训练数据
     #   False: 只打印，继续训练

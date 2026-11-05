@@ -62,8 +62,11 @@ PROJECT_ROOT = os.path.dirname(SRC_DIR)
 sys.path.insert(0, SRC_DIR)
 sys.path.insert(0, PROJECT_ROOT)
 
-from data_maintenance.contract import pool_join_sql, CURRENT_POOL, pool_scope_label
-from config import DataConfig
+# 池口径从 config 取（config 是 EquiNet 与 equinet-data-manager 的唯一接口处），
+# 本文件不再自己 import 数据包 —— 否则就出现了第二个知道外部路径的地方。
+from config import (  # noqa: E402
+    DataConfig, pool_join_sql, CURRENT_POOL, pool_scope_label,
+)
 
 
 # ==================== 判读门槛 ====================

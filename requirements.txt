@@ -23,6 +23,9 @@ pandas==3.0.6
 scikit-learn==1.9.1
 scipy==1.18.1
 matplotlib==3.11.2
+# 抓数库只被 equinet-data-manager 使用，EquiNet 自身不再 import。
+# 两边共用同一个 conda 环境 equinet，所以清单在这里一并锁定；
+# 若哪天给数据仓库单独建环境，这两行随之移到它的 requirements.txt。
 akshare==1.19.1
 baostock==0.9.4
 

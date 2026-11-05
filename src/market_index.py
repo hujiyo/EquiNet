@@ -26,7 +26,15 @@ import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_DB_PATH = os.path.join(PROJECT_ROOT, 'data_maintenance', 'equinet.db')
+SRC_DIR = os.path.join(PROJECT_ROOT, 'src')
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+# 库位置统一由 config 派生（config 再从 equinet-data-manager 取），
+# 这里不自己拼路径 —— 否则数据仓库一搬家，这个脚本就静默指向不存在的文件。
+from config import DataConfig  # noqa: E402
+
+DEFAULT_DB_PATH = DataConfig.DB_PATH
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'out')
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 

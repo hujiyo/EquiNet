@@ -1,10 +1,10 @@
 # 数据质量体系（Data Quality System）
 
-> 建立于 2026-09-25。本文档描述 `data_maintenance` 的数据正确性保障机制。
+> 建立于 2026-09-25。本文档描述 equinet-data-manager 的数据正确性保障机制。
 
 ## 1. 这套东西解决什么问题
 
-原 `data_maintenance` 的问题不是「脏数据多」，而是**没有守门员**：
+数据维护包原来的问题不是「脏数据多」，而是**没有守门员**：
 
 - 清洗逻辑只有 `utils.normalize_stock_df` 一个入口，`database.py` 的
   `upsert_daily_data` / `bulk_upsert_daily` 不经过它 —— 任何直接调用都能灌脏数据
@@ -36,15 +36,15 @@
 - `vwap_out_of_range`：数据源量纲差异的指纹，可能是真实数据
 - `price_anomaly`：不复权下的除权日，属真实事件而非错误
 
-### 2.2 离线审计（`data_maintenance/audit.py`）
+### 2.2 离线审计（equinet-data-manager 仓库的 `equinet_data_manager/audit.py`）
 
 ```bash
-python -m data_maintenance.audit                     # 只报告
-python -m data_maintenance.audit --write             # 同时落库
-python -m data_maintenance.audit --pool all          # 扫全量池
+python -m equinet_data_manager.audit                     # 只报告
+python -m equinet_data_manager.audit --write             # 同时落库
+python -m equinet_data_manager.audit --pool all          # 扫全量池
 ```
 
-或走交互菜单 `python data_maintenance.py` → 选项 6。
+或走交互菜单 `python -m equinet_data_manager` → 选项 6。
 
 不联网、不修改任何行情数据，只读 `stock_daily`。2307 只 / 678 万行约 15 秒。
 
@@ -95,11 +95,11 @@ python -m data_maintenance.audit --pool all          # 扫全量池
 ### 3.1 契约：唯一事实来源
 
 采样几何、样本列语义、池口径、特征基准、并行度上限全部定义在
-**`data_maintenance/contract.py`** 一处。`src/config.py` 只引用不复述，并带启动断言。
-
-这条纪律是有代价换来的：`CONTEXT_LENGTH/FUTURE_DAYS/BUFFER_DAY` 曾在
-`src/config.py` 与 `data_maintenance/quality.py` 里各写一份，改动任一处会让污染区间
-**静默错位**（且方向是「排漏」——脏数据照常进训练集，不报错）。
+**`equinet_data_manager/contract.py`（equinet-data-manager 仓库）** 一处。
+`src/config.py` 只引用不复述，并带启动断言。
+这条纪律是有代价换来的：`CONTEXT_LENGTH/FUTURE_DAYS/BUFFER_DAY` 曾在训练侧配置
+与数据维护包的质量模块里各写一份，改动任一处会让污染区间**静默错位**
+（且方向是「排漏」——脏数据照常进训练集，不报错）。
 
 ## 4. 下游如何消费
 
@@ -118,7 +118,7 @@ EXCLUDE_DATA_ISSUE_SAMPLES = True    # 默认开启
 
 ### 4.1.1 训练前的自检（关键步骤不能靠人记得）
 
-`src/train.py` 在排除之前调用 `data_maintenance.selfcheck.prerequisites()`，
+`src/train.py` 在排除之前调用 `equinet_data_manager.selfcheck.prerequisites()`，
 校验：审计范围是否等于训练用的池、派生状态是否比源数据旧、派生表是否只有一份表达。
 `DataConfig.STRICT_SELFCHECK = True` 时发现 error **直接中止训练**。
 
@@ -272,22 +272,22 @@ JOIN pool_membership pm ON sd.stock_code = pm.stock_code
 
 ```bash
 # 数据更新后（有依赖顺序，selfcheck 会校验）
-python data_maintenance.py      # 选项 1：增量更新
+python -m equinet_data_manager      # 选项 1：增量更新
                                 #   门禁自动生效；末尾自动补复权/特征并登记 provenance
-python data_maintenance.py      # 选项 6：离线质量审计（重扫 data_issues）
+python -m equinet_data_manager      # 选项 6：离线质量审计（重扫 data_issues）
 python src/market_index.py      # 重建市场宽度数据
 
 # 股票池相关
-python data_maintenance.py      # 选项 2：筛选股票（select.py，今日口径）
-python data_maintenance.py      # 选项 7：采集逐日 tradestatus/isST（首次或增量）
-python data_maintenance.py      # 选项 8：生成 PIT 池（依赖上一项）
-python data_maintenance.py      # 选项 6：重新审计（池变了范围要跟着变）
+python -m equinet_data_manager      # 选项 2：筛选股票（select.py，今日口径）
+python -m equinet_data_manager      # 选项 7：采集逐日 tradestatus/isST（首次或增量）
+python -m equinet_data_manager      # 选项 8：生成 PIT 池（依赖上一项）
+python -m equinet_data_manager      # 选项 6：重新审计（池变了范围要跟着变）
 
 # 训练
 python src/train.py             # 启动即自检；自动读 data_issues 跳过污染样本
 
 # 随时
-python data_maintenance.py      # 选项 9：系统自检
+python -m equinet_data_manager      # 选项 9：系统自检
 ```
 
 **顺序不是靠背的。** `provenance.DEPENDENCIES` 声明依赖关系，
@@ -378,8 +378,8 @@ python data_maintenance.py      # 选项 9：系统自检
 ## 8.5 操作
 
 ```bash
-python -m data_maintenance.adjust_factor --fetch --materialize --verify
-python -m data_maintenance.adjust_factor --fetch --only-missing   # 断点续拉
+python -m equinet_data_manager.adjust_factor --fetch --materialize --verify
+python -m equinet_data_manager.adjust_factor --fetch --only-missing   # 断点续拉
 ```
 
 - `--fetch`：拉全市场因子。实测单只 0.19s，4 进程全市场约 4 分钟。
@@ -397,7 +397,7 @@ python -m data_maintenance.adjust_factor --fetch --only-missing   # 断点续拉
 反过来说明该行的 `close_adj` 会被算成 11,972，必须清除。
 
 **已清除**：`('000001', 20260430)` 与 `('__TEST__', 99999998)` 共 2 行
-（13,745,808 → 13,745,806）。全库备份见 `data_maintenance/backup/equinet_pre_hfq_20260925.db`。
+（13,745,808 → 13,745,806）。
 
 清除后 `000001` 序列恢复连续（20260429 close=11.52 → 20260506 close=11.36，无 99.0 尖峰）。
 
@@ -499,7 +499,7 @@ load_and_preprocess_data(max_stocks=None, num_workers=None)
 **✅ 已清理（2026-09-26 傍晚）**：4,763 行全部删除（其中 4,762 行由
 `stock_status.tradestatus=0` 确认为停牌，剩余 1 行同样不可能是 K 线），
 涉及 329 只股票，删除后重算特征并重跑审计。门禁保证这类行不会再入库。
-删除前备份：`data_maintenance/backup/equinet_20260926_172402.db`。
+删除前后续备份统一落在 equinet-data-manager 仓库的 `data/backup/`。
 `selfcheck` 的「停牌口径」断言从此应为 0；若再出现非零，说明门禁被绕过
 或数据源行为变化，按 error 处理。
 

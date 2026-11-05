@@ -9,13 +9,13 @@
 └──────────────────────────────────┬──────────────────────────────────────┘
                                    ↓
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  data_maintenance/update.py                                              │
+│  equinet_data_manager/update.py                                          │
 │  写入数据库9个原始列: date, open, high, low, close,                       │
 │                       amount, volume, exchange, vwap                     │
 └──────────────────────────────────┬───────────────────────────────────────┘
                                    ↓
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  data_maintenance/features.py                                            │
+│  equinet_data_manager/features.py                                        │
 │  在数据库中追加8个衍生列: m5, m10, m20, dif, dea, macd_hist,              │
 │                          bb_upper, bb_lower                               │
 └──────────────────────────────────┬───────────────────────────────────────┘
@@ -46,7 +46,7 @@
 
 ### 数据源
 
-项目使用 **Baostock**（默认）或 **AKShare** 作为数据源，定义在 [update.py](../data_maintenance/update.py)。
+项目使用 **Baostock**（默认）或 **AKShare** 作为数据源，定义在 [update.py](../../equinet-data-manager/equinet_data_manager/update.py)（equinet-data-manager 仓库）。
 
 ### API 返回的原始字段
 
@@ -80,7 +80,7 @@ df['vwap'] = df['vwap'].fillna(df['close'])  # 成交量为0时（停牌等）�
 
 ## 第二步：衍生特征计算
 
-原始 9 列入库后，由 [features.py](../data_maintenance/features.py) 计算并回写 8 个衍生特征列。所有衍生特征都做了**无量纲化**（除以 close 或 MA），确保不同价位的股票特征值在同一尺度上。
+原始 9 列入库后，由 [features.py](../../equinet-data-manager/equinet_data_manager/features.py)（equinet-data-manager 仓库）计算并回写 8 个衍生特征列。所有衍生特征都做了**无量纲化**（除以 close 或 MA），确保不同价位的股票特征值在同一尺度上。
 
 ### 2.1 均线偏离度 (MA Deviation)
 
@@ -222,7 +222,7 @@ ema[0] = mean(prices[:window])  # 前 window 个点的简单平均
 ## 第三步：模型输入列（契约 `SAMPLE_COLUMNS`）
 
 数据库 `stock_daily` 表本身有 26 列（含后复权价、`adj_factor`、`updated_at` 等）；
-下游样本矩阵只取其中 16 列，列名与顺序由 `data_maintenance/contract.py` 的
+下游样本矩阵只取其中 16 列，列名与顺序由 `equinet_data_manager/contract.py`（equinet-data-manager 仓库）的
 `SAMPLE_COLUMNS` 唯一固定 —— 价格列取后复权（`*_adj`），`close_raw` 取不复权收盘价：
 
 | 下标 | 列名 | 数据库来源 | 说明 |

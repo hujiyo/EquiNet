@@ -620,7 +620,7 @@ def load_and_preprocess_data(db_path=DataConfig.DB_PATH,
     # 因此不存在「改了 SELECT 忘了改 cols」这种会让模型静默读错列的错位。
     # 价格取**后复权**：除权日不再产生虚假跳空，涨跌幅/MA 偏离度/标签全部
     # 基于连续序列。`close_raw` 仅供高价股过滤，不进入模型输入。
-    # 后复权机制见 data_maintenance/adjust_factor.py。
+    # 后复权机制见 equinet_data_manager/adjust_factor.py。
     #
     # 池口径的唯一来源是 contract.CURRENT_POOL（训练与审计必须同一个池）。
     # 历史上这里是一段写死的 SQL，与审计的 CLI 默认值各说各话 —— 切换池时
@@ -822,7 +822,7 @@ def compute_label_distance_exclusions(stock_info_list, distance=None):
 def load_data_issue_dates(db_path=None, only_types=None):
     """加载质量审计产出的「问题日」，按股票分组
 
-    来源：`python -m data_maintenance.audit --write` 写出的 `data_issues` 表。
+    来源：`python -m equinet_data_manager.audit --write` 写出的 `data_issues` 表。
     **不加载任何预先展开好的区间** —— 展开是索引空间的事，只在本模块做一次。
     历史上审计侧也展开一遍并落成 `sample_exclusion`，两份表达最终不一致：
     审计侧把序号空间的 ±4/±44 加在日期整数上，导致 74.5% 的污染采样位置漏排，
@@ -886,7 +886,7 @@ def apply_quality_exclusions(stock_info_list, issues=None):
 
     if not issues:
         print("  数据质量排除: 未找到 data_issues 表或表为空，跳过"
-              "（运行 python -m data_maintenance.audit --write 生成）")
+              "（运行 python -m equinet_data_manager.audit --write 生成）")
         return 0
 
     total = 0

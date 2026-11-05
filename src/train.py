@@ -745,7 +745,7 @@ def _run_selfcheck_before_training():
     审计范围是否等于训练用的池、派生状态是否比源数据旧、派生表是否只有一份表达。
 
     为什么要做成代码而不是文档叮嘱：审计必须在数据更新之后跑，这一步原来只写在
-    docs/data-quality-system.md 第 7 节里，而且那条流水线**还漏了复权物化**。
+    数据维护文档里，而且那条流水线**还漏了复权物化**。
     漏跑不会报错，只会让训练拿到过期的排除区间，或让一部分股票带着未物化的
     复权列（特征基准静默异常）。
     """
@@ -753,7 +753,7 @@ def _run_selfcheck_before_training():
     print("训练前自检")
     print("=" * 60)
     try:
-        from data_maintenance.selfcheck import prerequisites
+        from equinet_data_manager.selfcheck import prerequisites
         findings = prerequisites(DataConfig.DB_PATH)
     except Exception as e:
         print(f"  ⚠ 自检无法运行：{e}")

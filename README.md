@@ -6,14 +6,6 @@
 
 </div>
 
-<p align="center">
-  <a href="docs/equinet-architecture.html">交互式架构图：数据生产 → equinet.db → src/ 核心库 → 单阶段端到端训练 → 评估选股</a>
-  <br>
-  <sub>▲ 架构图由开源项目 <a href="https://github.com/tt-a1i/archify">Archify</a> 生成 · 支持明暗主题 · 节点搜索 · 路径追踪 · 自动导览</sub>
-</p>
-
----
-
 ## 项目简介
 
 基于历史数据进行统计建模，对未来3天是否具有短期上涨趋势进行打分
@@ -41,7 +33,7 @@ EquiNet/
 │   ├── run.py                 # 推理 / 选股 / 全区间回测脚本
 │   └── ...                    # 其他模块
 ├── data_maintenance.py        # 数据维护工具入口
-├── docs/                      # 技术文档 + 交互式架构图(equinet-architecture.html)
+├── docs/                      # 技术文档
 ├── LICENSE                    # Apache-2.0许可证
 └── README.md
 ```

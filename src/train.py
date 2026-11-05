@@ -832,11 +832,6 @@ if __name__ == "__main__":
     amp_str = "BF16混合精度" if TrainingConfig.USE_AMP else "FP32精度"
     print(f"\n正在创建模型 ({amp_str})...")
     model = create_model(seq_len=DataConfig.CONTEXT_LENGTH).to(device)
-    print("  Embedding 与主干联合训练（不加载预训练权重、不冻结）")
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f" 模型参数数: {total_params:,}, 可训练: {trainable_params:,}")
 
     # 开始训练
     print("\n开始模型训练...")

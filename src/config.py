@@ -127,7 +127,7 @@ class DataConfig:
     EXTREME_UP_DOWN_RATIO = 50.0      # 涨跌比阈值（上涨家数/下跌家数 ≥ 此值视为极端）
 
     # 评估参数
-    EVAL_BATCH_SIZE = 4096            # 评估批处理大小（分批处理，减少显存占用）
+    EVAL_BATCH_SIZE = 512
 
     # ========== 数据质量排除 ==========
     # 离线审计（python -m data_maintenance.audit --write）产出的 `data_issues`
@@ -233,7 +233,7 @@ class RegularizationConfig:
     VISREG_W_SHAPE = 0.6             # 形状项权重（SWD 对齐高斯分位数）
     VISREG_W_CENTER = 1.0            # 中心化项权重（批均值→0）
 
-    # Embedding 与主干联合训练时的学习率比例（相对主干学习率）
+    # Embedding相对主干学习率比例
     EMBED_LR_RATIO = 0.2
 
 # ==================== 训练参数 ====================

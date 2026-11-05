@@ -7,7 +7,6 @@ doc*/
 *.csv
 *.pyc
 *.json
-!docs/equinet-architecture.archify.json
 *.jsonl
 *.db*
 

@@ -548,8 +548,6 @@ def evaluate_model(model, eval_inputs, eval_targets, eval_cumulative_returns,
     模型评估函数
     涨停样本已在向量化批处理中过滤，无需再次过滤
 
-    分批处理，减少显存占用
-
     Args:
         predict_fn: 可选的自定义推理函数 (model, eval_inputs, device) -> preds(np.ndarray)。
                     提供时（如 MC Dropout 推理）预测由它完成，损失仍用 eval 模式确定性前向计算；
